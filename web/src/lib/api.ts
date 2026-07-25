@@ -346,8 +346,8 @@ const realApi = {
   dockerTop: (id: string) => get<{ ok: boolean; text: string; error?: string }>(`/docker/top?id=${encodeURIComponent(id)}`),
   // --- pull requests (gh-backed) ---
   prCapability: (force = false) => get<{ available: boolean; authed: boolean; login?: string; reason?: string }>(`/prs/capability${force ? "?force=1" : ""}`),
-  prList: (root: string, filter: "mine" | "review" | "all", force = false) =>
-    get<PrListResponse>(`/prs/list?root=${encodeURIComponent(root)}&filter=${filter}${force ? "&force=1" : ""}`),
+  prList: (root: string, filter: "mine" | "review" | "all", state: "open" | "closed" | "all" = "open", force = false) =>
+    get<PrListResponse>(`/prs/list?root=${encodeURIComponent(root)}&filter=${filter}&state=${state}${force ? "&force=1" : ""}`),
   prDetail: (root: string, number: number, force = false) =>
     get<{ ok: boolean; detail?: PrDetail; error?: string }>(`/prs/detail?root=${encodeURIComponent(root)}&number=${number}${force ? "&force=1" : ""}`),
   prDiff: (root: string, number: number) =>
@@ -545,7 +545,7 @@ const demoApi: typeof realApi = {
   // "gh isn't set up" state a real machine without gh would, which is honest
   // and is a screen worth showing anyway.
   prCapability: (_force?: boolean) => D({ available: false, authed: false, reason: "pull requests need the GitHub CLI — not available in the demo" }),
-  prList: (_root: string, _filter: "mine" | "review" | "all", _force?: boolean) =>
+  prList: (_root: string, _filter: "mine" | "review" | "all", _state?: "open" | "closed" | "all", _force?: boolean) =>
     D<PrListResponse>({ ok: true, repo: null, prs: [], fetchedAt: 0, stale: false, loading: false, needsAuth: true, error: "not available in the demo" }),
   prDetail: (_root: string, _number: number, _force?: boolean) => D({ ok: false, error: "not available in the demo" }),
   prDiff: (_root: string, _number: number) => D({ ok: false, error: "not available in the demo" }),

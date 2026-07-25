@@ -35,6 +35,14 @@ import { PrFilterBar } from "./PrFilterBar.tsx";
 import { parseQuery, applyFilters, buildFacets, activeCount } from "../lib/prFilter.ts";
 
 type Filter = "mine" | "review" | "all";
+// The open/closed axis, orthogonal to the scope tabs. "closed" holds merged +
+// closed, like GitHub's own Closed tab.
+type StateSel = "open" | "closed" | "all";
+const STATES: { id: StateSel; label: string }[] = [
+  { id: "open", label: "Open" },
+  { id: "closed", label: "Closed" },
+  { id: "all", label: "All" },
+];
 type Tab = "overview" | "conversation" | "commits" | "files" | "checks" | "review";
 
 const FILTERS: { id: Filter; label: string; hint: string }[] = [
@@ -310,6 +318,8 @@ function PrRow({ p, active, onSelect }: { p: PrSummary; active: boolean; onSelec
         boxShadow: active ? "inset 2px 0 0 var(--primary)" : undefined,
       }}>
       <div className="flex items-center gap-1.5">
+        {p.state === "MERGED" ? <Chip text="merged" tint="var(--primary)" title="Merged" />
+          : p.state === "CLOSED" ? <Chip text="closed" tint="var(--error)" title="Closed without merging" /> : null}
         <span className="text-[10px] tabular-nums shrink-0" style={{ color: "var(--text3)" }}>#{p.number}</span>
         <span className="text-[11.5px] truncate" style={{ color: "var(--text)" }}>{p.title}</span>
         {p.isCurrentBranch && <Chip text="here" tint="var(--primary)" title="This checkout is on that branch" />}
@@ -344,6 +354,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
   const [root, setRoot] = useState("");
   const [repo, setRepo] = useState<PrRepoId | null>(null);
   const [filter, setFilter] = useState<Filter>("mine");
+  const [stateSel, setStateSel] = useState<StateSel>("open");
   // The filter query for the current scope tab — the single source of truth for
   // both the search box and every facet dropdown (parsed in lib/prFilter.ts).
   // Cleared when the scope changes so each tab (mine / review / all) starts
@@ -396,7 +407,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
     if (!root) return;
     const req = ++listReq.current;
     const want = filter;
-    api.prList(root, filter, force).then((r) => {
+    api.prList(root, filter, stateSel, force).then((r) => {
       if (req !== listReq.current) return; // a newer request already won
       setRepo(r.repo);
       setPrs(r.prs);
@@ -407,7 +418,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
       if (req !== listReq.current) return;
       setListState({ fetchedAt: 0, loading: false, error: String(e) });
     });
-  }, [root, filter]);
+  }, [root, filter, stateSel]);
 
   /**
    * Switching filter empties the pane before anything is fetched.
@@ -418,7 +429,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
    */
   const lastScope = useRef<string>("");
   useEffect(() => {
-    const scope = `${root}\u0000${filter}`;
+    const scope = `${root}\u0000${filter}\u0000${stateSel}`;
     if (lastScope.current === scope) return; // re-render, not a switch
     const first = lastScope.current === "";
     lastScope.current = scope;
@@ -429,7 +440,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
     setDetail(null);
     setDetailErr("");
     setListState((st) => ({ ...st, loading: true, fetchedAt: 0 }));
-  }, [filter, root]);
+  }, [filter, root, stateSel]);
 
   // Polling pauses while the view is hidden — no point spending requests on a
   // pane nobody is looking at — and resumes on return. Resuming refreshes; it
@@ -448,12 +459,12 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
     if (!active || !root) return;
     const others = (["mine", "review", "all"] as Filter[]).filter((f) => f !== filter);
     const timers = others.map((f, i) => setTimeout(() => {
-      api.prList(root, f, false)
+      api.prList(root, f, stateSel, false)
         .then((r) => setCounts((c) => ({ ...c, [f]: r.prs.length })))
         .catch(() => {});
     }, 1200 + i * 2500));
     return () => timers.forEach(clearTimeout);
-  }, [active, root, filter]);
+  }, [active, root, filter, stateSel]);
 
   const loadDetail = useCallback((n: number, force = false) => {
     const req = ++detailReq.current;
@@ -753,6 +764,20 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
                 </button>
               );
             })}
+            {/* Open / Closed / All — the state axis. Closed includes merged,
+                like GitHub's own Closed tab. */}
+            <div className="ml-auto flex rounded-full overflow-hidden shrink-0" style={{ border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}>
+              {STATES.map((s) => (
+                <button key={s.id} onClick={() => setStateSel(s.id)} title={`Show ${s.label.toLowerCase()} pull requests`}
+                  className="text-[10px] px-2 py-0.5"
+                  style={{
+                    color: stateSel === s.id ? "var(--bg)" : "var(--text3)",
+                    background: stateSel === s.id ? "var(--primary)" : "transparent",
+                  }}>
+                  {s.label}
+                </button>
+              ))}
+            </div>
           </div>
           {repo && prs.length > 0 && (
             <PrFilterBar
@@ -822,7 +847,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto min-h-0 agx-scroll p-3">
+              <div className="flex-1 overflow-y-auto min-h-0 agx-scroll p-4">
                 {tab === "overview" && (
                   <Overview
                     d={d} busy={busy} openThreads={openThreads.length}
@@ -837,7 +862,7 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
 
                 {tab === "conversation" && (
                   <Conversation
-                    d={d} lanes={lanes} raw={rawBots} onRaw={setRawBots} busy={busy}
+                    d={d} raw={rawBots} onRaw={setRawBots} busy={busy}
                     onResolve={(t) => act(t.isResolved ? "Unresolve" : "Resolve", () => api.prSetThreadResolved(root, t.id, !t.isResolved))}
                     onReply={async (t) => {
                       const first = t.comments[0];
@@ -850,22 +875,22 @@ export function PrView({ active, onOpenChatWith }: { active: boolean; onOpenChat
                 )}
 
                 {tab === "commits" && (
-                  <div className="text-[11px]">
+                  <div className="text-[11px] flex flex-col gap-1">
                     {d.commits.map((c) => (
                       <div key={c.oid}>
                         <button onClick={() => openCommit(selCommit === c.oid ? "" : c.oid)}
-                          className="w-full text-left flex items-center gap-2 py-1.5 border-b"
+                          className="w-full text-left flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-white/5 transition-colors"
                           style={{
-                            borderColor: "color-mix(in srgb, var(--border) 18%, transparent)",
                             opacity: c.isMerge ? 0.55 : 1,
-                            background: selCommit === c.oid ? "color-mix(in srgb, var(--primary) 10%, transparent)" : "transparent",
+                            background: selCommit === c.oid ? "color-mix(in srgb, var(--primary) 12%, transparent)" : undefined,
+                            border: `1px solid ${selCommit === c.oid ? "color-mix(in srgb, var(--primary) 35%, transparent)" : "transparent"}`,
                           }}>
-                          <span className="shrink-0" style={{ color: "var(--text3)" }}>{selCommit === c.oid ? "▾" : "▸"}</span>
-                          <span className="tabular-nums shrink-0" style={{ ...CODE_FONT_STYLE, color: "var(--primary)" }}>{c.short}</span>
-                          <span className="truncate" style={{ color: "var(--text2)" }}>{c.message}</span>
+                          <span className="shrink-0 text-[9px]" style={{ color: "var(--text3)" }}>{selCommit === c.oid ? "▾" : "▸"}</span>
+                          <span className="tabular-nums shrink-0 px-1.5 py-0.5 rounded" style={{ ...CODE_FONT_STYLE, color: "var(--primary)", background: "color-mix(in srgb, var(--primary) 12%, transparent)", fontSize: "10px" }}>{c.short}</span>
+                          <span className="truncate" style={{ color: "var(--text)" }}>{c.message}</span>
                           {c.isMerge && <Chip text="merge" tint="var(--text3)" title="Trunk catch-up, not work to review" />}
                           <span className="ml-auto shrink-0 flex items-center gap-1.5 text-[10px]" style={{ color: "var(--text3)" }}>
-                            <Avatar login={c.author} size={14} />{c.author}
+                            <Avatar login={c.author} size={16} />{c.author}
                           </span>
                         </button>
                         {selCommit === c.oid && (
@@ -931,17 +956,23 @@ function Overview({ d, busy, openThreads, onLocalReview, onMerge, onClose, onUpd
 
   return (
     <div className="flex flex-col gap-3">
-      <div>
-        <div className="text-[14px] leading-snug" style={{ color: "var(--text)" }}>{d.title}</div>
-        <div className="text-[10.5px] mt-1 flex items-center gap-1.5 flex-wrap" style={{ color: "var(--text3)" }}>
-          <Avatar login={d.author} size={15} />
-          <span>#{d.number} · {d.author} · {d.headRefName} → {d.baseRefName} ·</span>
-          <span style={{ color: "var(--success)" }}>+{d.additions}</span>
-          <span style={{ color: "var(--error)" }}>−{d.deletions}</span>
-          <span>· {d.changedFiles} files</span>
+      {/* The title stays put while the rest of the overview scrolls under it,
+          so you never lose which PR you are reading. Bleeds into the pane's
+          padding (-mx/-mt) and carries a solid background to scroll over. */}
+      <div className="sticky top-0 z-10 -mx-4 -mt-4 px-4 pt-4 pb-2"
+        style={{ background: "var(--bg)", borderBottom: "1px solid color-mix(in srgb, var(--border) 22%, transparent)" }}>
+        <div className="text-[16px] font-semibold leading-snug" style={{ color: "var(--text)" }}>{d.title}</div>
+        <div className="text-[10.5px] mt-2 flex items-center gap-2 flex-wrap" style={{ color: "var(--text3)" }}>
+          <Avatar login={d.author} size={18} />
+          <span style={{ color: "var(--text2)" }}>{d.author}</span>
+          <span className="tabular-nums">#{d.number}</span>
+          <span className="px-1.5 py-0.5 rounded tabular-nums" style={{ ...CODE_FONT_STYLE, fontSize: "9.5px", color: "var(--text2)", background: "color-mix(in srgb, var(--border) 22%, transparent)" }}>{d.headRefName} → {d.baseRefName}</span>
+          <span className="tabular-nums" style={{ color: "var(--success)" }}>+{d.additions}</span>
+          <span className="tabular-nums" style={{ color: "var(--error)" }}>−{d.deletions}</span>
+          <span className="tabular-nums">{d.changedFiles} file{d.changedFiles === 1 ? "" : "s"}</span>
         </div>
         {d.labels.length > 0 && (
-          <div className="flex gap-1 flex-wrap mt-1.5">{d.labels.map((l) => <Chip key={l.name} text={l.name} tint="var(--primary)" />)}</div>
+          <div className="flex gap-1.5 flex-wrap mt-2">{d.labels.map((l) => <Chip key={l.name} text={l.name} tint={l.color ? `#${l.color}` : "var(--primary)"} />)}</div>
         )}
       </div>
 
@@ -952,7 +983,7 @@ function Overview({ d, busy, openThreads, onLocalReview, onMerge, onClose, onUpd
       )}
 
       {/* merge, and why not */}
-      <section className="rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 38%, transparent)" }}>
+      <section className="rounded-xl overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 30%, transparent)", background: "color-mix(in srgb, var(--bg2) 45%, transparent)" }}>
         <div className="flex gap-2.5 items-start p-3">
           <span className="shrink-0 rounded-full flex items-center justify-center text-[13px]"
             style={{ width: 26, height: 26, background: canMerge ? "var(--success)" : "var(--error)", color: "var(--bg)" }}>
@@ -1196,19 +1227,22 @@ function Card({ who, chip, when, tone, url, children }: {
 }) {
   const edge = tone === "chg" ? "var(--error)" : tone === "appr" ? "var(--success)" : tone === "bot" ? "var(--info)" : "var(--border)";
   return (
-    <div className="rounded-md overflow-hidden mb-2"
-      style={{ border: `1px solid color-mix(in srgb, ${edge} ${tone ? 40 : 28}%, transparent)` }}>
-      <div className="flex items-center gap-2 px-2.5 py-1.5 text-[11px]"
-        style={{ background: `color-mix(in srgb, ${edge} ${tone ? 10 : 14}%, transparent)`, borderBottom: "1px solid color-mix(in srgb, var(--border) 22%, transparent)" }}>
-        <Avatar login={who} size={17} />
-        <b style={{ color: "var(--text)", fontWeight: 500 }}>{who}</b>
+    <div className="rounded-xl overflow-hidden"
+      style={{
+        border: `1px solid color-mix(in srgb, ${edge} ${tone ? 42 : 20}%, transparent)`,
+        background: "color-mix(in srgb, var(--bg2) 45%, transparent)",
+      }}>
+      <div className="flex items-center gap-2 px-3.5 py-2 text-[11px]"
+        style={{ background: `color-mix(in srgb, ${edge} ${tone ? 11 : 6}%, transparent)`, borderBottom: "1px solid color-mix(in srgb, var(--border) 18%, transparent)" }}>
+        <Avatar login={who} size={20} />
+        <b style={{ color: "var(--text)", fontWeight: 600 }}>{who}</b>
         {chip}
-        <span className="ml-auto flex items-center gap-1.5 shrink-0">
-          {when && <span className="text-[10px]" style={{ color: "var(--text3)" }}>{when}</span>}
+        <span className="ml-auto flex items-center gap-2 shrink-0">
+          {when && <span className="text-[10px] tabular-nums" style={{ color: "var(--text3)" }}>{when}</span>}
           {url && <GhLink href={url} title="Open on GitHub" />}
         </span>
       </div>
-      <div className="px-3 py-2.5">{children}</div>
+      <div className="px-3.5 py-3">{children}</div>
     </div>
   );
 }
@@ -1302,79 +1336,90 @@ function Thread({ t, onResolve, onReply, busy }: {
   );
 }
 
-function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, busy }: {
+function ReviewEntry({ r, threads, onResolve, onReply, busy }: {
+  r: PrReview; threads: PrThread[];
+  onResolve: (t: PrThread) => void; onReply: (t: PrThread) => void; busy: boolean;
+}) {
+  return (
+    <div>
+      <Card who={r.author} when={ago(r.submittedAt)} url={r.url}
+        tone={r.isBot ? "bot" : r.state === "CHANGES_REQUESTED" ? "chg" : r.state === "APPROVED" ? "appr" : undefined}
+        chip={r.isBot ? <Chip text="automation" tint="var(--info)" />
+          : r.state === "CHANGES_REQUESTED" ? <Chip text="requested changes" tint="var(--error)" />
+          : r.state === "APPROVED" ? <Chip text="approved" tint="var(--success)" /> : undefined}>
+        {r.body ? <Md body={r.body} /> : <span style={{ color: "var(--text3)" }}>({r.state.toLowerCase().replace("_", " ")}, no note)</span>}
+      </Card>
+      {threads.length > 0 && (
+        <div className="pl-3 ml-2" style={{ borderLeft: "2px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
+          {threads.map((t) => <Thread key={t.id} t={t} onResolve={onResolve} onReply={onReply} busy={busy} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CommentEntry({ c, raw }: { c: PrComment; raw: boolean }) {
+  if (!c.isBot) return <Card who={c.author} when={ago(c.createdAt)} url={c.url}><Md body={c.body} /></Card>;
+  return (
+    <Card who={c.author} when={ago(c.createdAt)} url={c.url} tone="bot" chip={<Chip text="automation" tint="var(--info)" />}>
+      {raw ? <pre className="overflow-x-auto text-[10px] max-h-72 agx-scroll" style={{ ...CODE_FONT_STYLE, color: "var(--text3)" }}>{c.body}</pre>
+        : <span style={{ color: "var(--text2)" }}>{c.digest || "(Nothing worth pulling out)"}</span>}
+    </Card>
+  );
+}
+
+function Conversation({ d, raw, onRaw, onResolve, onReply, busy }: {
   d: PrDetail;
-  lanes: { humans: PrReview[]; botReviews: PrReview[]; humanComments: PrComment[]; bots: PrComment[] };
   raw: boolean; onRaw: (v: boolean) => void;
   onResolve: (t: PrThread) => void; onReply: (t: PrThread) => void; busy: boolean;
 }) {
-  const kb = Math.round(lanes.bots.reduce((n, c) => n + c.body.length, 0) / 1024);
-  // Threads whose author never submitted a review of their own — a bot's
-  // findings, or a comment left outside a review. They still need a home.
-  const reviewAuthors = new Set(lanes.humans.map((r) => r.author));
-  const orphanThreads = d.threads.filter((t) => !reviewAuthors.has(t.comments[0]?.author ?? ""));
+  // One chronological timeline, like GitHub: oldest at the top, newest at the
+  // bottom, humans and automation interleaved in the order things actually
+  // happened. Review line-comments stay nested under the review they came with
+  // (a verdict and its reasons belong together). Machine comments sit in place
+  // but stay condensed to their digest unless you ask for the raw text.
+  const timeline = useMemo(() => {
+    const used = new Set<string>();
+    const entries: { at: string; node: React.ReactNode }[] = [];
+
+    d.reviews.forEach((r, i) => {
+      const mine = d.threads.filter((t) => !used.has(t.id) && t.comments[0]?.author === r.author);
+      // A review with no note, no verdict and no threads of its own is noise.
+      if (!r.body.trim() && r.state === "COMMENTED" && mine.length === 0) return;
+      mine.forEach((t) => used.add(t.id));
+      entries.push({ at: r.submittedAt, node: <ReviewEntry key={`rev-${i}`} r={r} threads={mine} onResolve={onResolve} onReply={onReply} busy={busy} /> });
+    });
+    for (const c of d.comments) {
+      entries.push({ at: c.createdAt, node: <CommentEntry key={`c-${c.id}`} c={c} raw={raw} /> });
+    }
+    for (const t of d.threads) {
+      if (used.has(t.id)) continue;
+      entries.push({ at: t.comments[0]?.createdAt ?? "", node: <Thread key={`t-${t.id}`} t={t} onResolve={onResolve} onReply={onReply} busy={busy} /> });
+    }
+    // Ascending: ISO timestamps sort lexically. Oldest first, newest last —
+    // the same order GitHub shows, so the freshest reply is where you look.
+    entries.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    return entries;
+  }, [d, raw, busy, onResolve, onReply]);
+
+  const bots = d.comments.filter((c) => c.isBot);
+  const kb = Math.round(bots.reduce((n, c) => n + c.body.length, 0) / 1024);
+
+  if (timeline.length === 0) {
+    return <div className="text-[11px]" style={{ color: "var(--text3)" }}>No comments yet.</div>;
+  }
 
   return (
-    <div className="text-[11px]">
-      <Lane label="humans" />
-      {lanes.humans.length === 0 && lanes.humanComments.length === 0 && (
-        <div style={{ color: "var(--text3)" }}>Nobody has said anything yet.</div>
-      )}
-      {lanes.humans.map((r, i) => {
-        // The line comments that belong to THIS review. GitHub nests them under
-        // the review they were submitted with, and that grouping is most of the
-        // meaning: a "requested changes" is a verdict, and the threads beneath
-        // it are the reasons. Split apart into separate lanes, you get a
-        // verdict with no reasons and a pile of reasons with no verdict.
-        const mine = d.threads.filter((t) => t.comments[0]?.author === r.author);
-        return (
-          <div key={`r${i}`} className="mb-2">
-            <Card who={r.author} when={ago(r.submittedAt)} url={r.url}
-              tone={r.state === "CHANGES_REQUESTED" ? "chg" : r.state === "APPROVED" ? "appr" : undefined}
-              chip={r.state === "CHANGES_REQUESTED" ? <Chip text="requested changes" tint="var(--error)" />
-                : r.state === "APPROVED" ? <Chip text="approved" tint="var(--success)" /> : undefined}>
-              {r.body ? <Md body={r.body} /> : <span style={{ color: "var(--text3)" }}>({r.state.toLowerCase().replace("_", " ")}, no note)</span>}
-            </Card>
-            {mine.length > 0 && (
-              <div className="pl-3 ml-2" style={{ borderLeft: "2px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
-                {mine.map((t) => <Thread key={t.id} t={t} onResolve={onResolve} onReply={onReply} busy={busy} />)}
-              </div>
-            )}
-          </div>
-        );
-      })}
-      {lanes.humanComments.map((c) => (
-        <Card key={c.id} who={c.author} when={ago(c.createdAt)} url={c.url}><Md body={c.body} /></Card>
-      ))}
-
-      {orphanThreads.length > 0 && (
-        <>
-          <Lane label="line threads" extra={`${orphanThreads.filter((t) => !t.isResolved).length} open of ${orphanThreads.length}`} />
-          {orphanThreads.map((t) => <Thread key={t.id} t={t} onResolve={onResolve} onReply={onReply} busy={busy} />)}
-        </>
-      )}
-
-      <Lane label="automation" extra={lanes.bots.length ? `${lanes.bots.length} comments · ${kb} KB` : undefined} />
-      {lanes.botReviews.map((r, i) => (
-        <Card key={`br${i}`} who={r.author} when={ago(r.submittedAt)} url={r.url} tone="bot" chip={<Chip text="automation" tint="var(--info)" />}>
-          <Md body={r.body} />
-        </Card>
-      ))}
-      {lanes.bots.length > 0 && (
-        <>
-          <button onClick={() => onRaw(!raw)} className="w-full text-left text-[10px] px-2.5 py-1.5 rounded mb-2"
-            style={{ color: "var(--text2)", border: "1px dashed color-mix(in srgb, var(--border) 50%, transparent)" }}>
-            <span style={{ color: "var(--primary)" }}>{raw ? "▾" : "▸"}</span>{" "}
-            {lanes.bots.length} machine comment{lanes.bots.length === 1 ? "" : "s"} · {kb} KB {raw ? "— hide raw" : "collapsed — show raw"}
+    <div className="text-[11px] flex flex-col gap-2">
+      {bots.length > 0 && (
+        <div className="flex items-center justify-end">
+          <button onClick={() => onRaw(!raw)} className="text-[10px] px-2 py-0.5 rounded"
+            style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}>
+            {raw ? "Condense machine comments" : `Show raw machine comments (${kb} KB)`}
           </button>
-          {lanes.bots.map((c) => (
-            <Card key={c.id} who={c.author} when={ago(c.createdAt)} url={c.url} tone="bot" chip={<Chip text="automation" tint="var(--info)" />}>
-              {raw ? <pre className="overflow-x-auto text-[10px] max-h-72 agx-scroll" style={{ ...CODE_FONT_STYLE, color: "var(--text3)" }}>{c.body}</pre>
-                : <span style={{ color: "var(--text2)" }}>{c.digest || "(Nothing worth pulling out)"}</span>}
-            </Card>
-          ))}
-        </>
+        </div>
       )}
+      {timeline.map((e) => e.node)}
     </div>
   );
 }
@@ -1451,24 +1496,24 @@ function Checks({ d, onRerun, busy }: { d: PrDetail; onRerun: () => void; busy: 
         const bad = list.filter((k) => k.state === "failure").length;
         const good = list.filter((k) => k.state === "success").length;
         return (
-          <div key={name} className="rounded overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 28%, transparent)" }}>
+          <div key={name} className="rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 24%, transparent)", background: "color-mix(in srgb, var(--bg2) 45%, transparent)" }}>
             <button onClick={() => setOpenGroups((o) => ({ ...o, [name]: !isOpen }))}
-              className="w-full text-left flex items-center gap-2 px-2.5 py-1.5"
-              style={{ background: "color-mix(in srgb, var(--border) 14%, transparent)" }}>
-              <span style={{ color: "var(--text3)" }}>{isOpen ? "▾" : "▸"}</span>
-              <b style={{ color: "var(--text)", fontWeight: 500 }}>{name}</b>
-              {bad > 0 && <span style={{ color: "var(--error)" }}>{bad} ✕</span>}
-              {good > 0 && <span style={{ color: "var(--success)" }}>{good} ✓</span>}
-              <span className="ml-auto tabular-nums" style={{ color: "var(--text3)" }}>{list.length}</span>
+              className="w-full text-left flex items-center gap-2 px-3 py-2"
+              style={{ background: "color-mix(in srgb, var(--border) 10%, transparent)" }}>
+              <span className="text-[9px]" style={{ color: "var(--text3)" }}>{isOpen ? "▾" : "▸"}</span>
+              <b style={{ color: "var(--text)", fontWeight: 600 }}>{name}</b>
+              {bad > 0 && <span className="text-[10px] tabular-nums" style={{ color: "var(--error)" }}>{bad} failing</span>}
+              {good > 0 && bad === 0 && <span className="text-[10px] tabular-nums" style={{ color: "var(--success)" }}>{good} passed</span>}
+              <span className="ml-auto tabular-nums text-[10px]" style={{ color: "var(--text3)" }}>{list.length}</span>
             </button>
             {isOpen && list.map((k, i) => (
-              <div key={`${k.name}-${i}`} className="flex items-center gap-2 px-2.5 py-1"
-                style={{ borderTop: "1px solid color-mix(in srgb, var(--border) 16%, transparent)" }}>
-                <span className="shrink-0 w-3 text-center" style={{ color: CHECK_TINT[k.state] }}>{CHECK_GLYPH[k.state]}</span>
+              <div key={`${k.name}-${i}`} className="flex items-center gap-2.5 px-3 py-1.5"
+                style={{ borderTop: "1px solid color-mix(in srgb, var(--border) 12%, transparent)" }}>
+                <span className="shrink-0 rounded-full" style={{ width: 7, height: 7, background: CHECK_TINT[k.state] }} />
                 <span className="truncate" style={{ color: k.state === "skipped" || k.state === "neutral" ? "var(--text3)" : "var(--text2)" }}>
                   {k.name.startsWith(name) ? k.name.slice(name.length).replace(/^\s*\/\s*/, "") || k.name : k.name}
                 </span>
-                <span className="ml-auto shrink-0 text-[9.5px] uppercase tracking-wide" style={{ color: CHECK_TINT[k.state] }}>{k.state}</span>
+                <span className="ml-auto shrink-0 text-[9px] uppercase tracking-wide px-1.5 py-px rounded-full" style={{ color: CHECK_TINT[k.state], background: `color-mix(in srgb, ${CHECK_TINT[k.state]} 12%, transparent)` }}>{k.state}</span>
                 {k.url && <a href={k.url} target="_blank" rel="noreferrer noopener" className="shrink-0 text-[10px]" style={{ color: "var(--text3)" }}>Log ↗</a>}
               </div>
             ))}
