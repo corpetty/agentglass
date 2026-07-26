@@ -22,7 +22,8 @@ import {
 import { maybeAlert, setAlertSink } from "./alerts.ts";
 import { getSkills, catalogMarkdown, catalogCsv } from "./skills.ts";
 import { getInsights } from "./insights.ts";
-import { getUsage } from "./usage.ts";
+import { getUsage, getAllUsage } from "./usage.ts";
+import { listAccounts, upsertAccount, removeAccount } from "./accounts.ts";
 import { submitGate, decideGate, pendingGates, awaitGate, restoreGates, GATE_MAX_MS } from "./gate.ts";
 import { parseControlCmd } from "./control.ts";
 import { otlpTracesToEvents, otlpLogsToEvents } from "./otlp.ts";
@@ -617,7 +618,7 @@ const server = Bun.serve<WsData>({
     // --- reads ---
     if (pathname === "/events/recent") {
       const limit = Math.min(2000, Number(url.searchParams.get("limit") || 300));
-      return json(getRecent(limit, url.searchParams.get("provider") || undefined));
+      return json(getRecent(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
     }
     if (pathname === "/events/filter-options") return json(getFilterOptions());
     // Every project the scanner has seen, with the real folder it lives in —
@@ -656,7 +657,30 @@ const server = Bun.serve<WsData>({
     }
 
     if (pathname === "/insights") return json({ insights: getInsights() });
-    if (pathname === "/usage") return json(await getUsage()); // Anthropic plan-limit windows (only meaningful for Claude)
+    // Anthropic plan-limit windows (only meaningful for Claude). No ?account=
+    // → the default account, preserving the original single-account shape.
+    if (pathname === "/usage") return json(await getUsage(url.searchParams.get("account") || undefined));
+    if (pathname === "/usage/all") return json({ usage: await getAllUsage() });
+
+    // --- accounts registry ---
+    if (pathname === "/accounts") {
+      if (req.method === "POST") {
+        if (!localOrigin(req)) return csrfBlocked();
+        let b: any = {};
+        try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+        const res = upsertAccount(b);
+        return json(res, res.ok ? 200 : 400);
+      }
+      return json({ accounts: listAccounts() });
+    }
+    // POST (not DELETE) for removal — the CORS allow-list is GET,POST only.
+    if (pathname === "/accounts/delete" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const res = removeAccount(String(b.id ?? ""));
+      return json(res, res.ok ? 200 : 400);
+    }
 
     // --- control plane: gate ---
     if (pathname === "/gate" && req.method === "POST") {
@@ -1229,11 +1253,11 @@ const server = Bun.serve<WsData>({
     }
     if (pathname === "/sessions") {
       const limit = Math.min(1000, Number(url.searchParams.get("limit") || 100));
-      return json(getSessions(limit, url.searchParams.get("provider") || undefined));
+      return json(getSessions(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
     }
     if (pathname === "/stats") {
       const windowMs = parseWindowMs(url.searchParams.get("window"));
-      return json({ ...statsSummary(windowMs, url.searchParams.get("provider") || undefined), server_started_at: STARTED_AT });
+      return json({ ...statsSummary(windowMs, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined), server_started_at: STARTED_AT });
     }
 
     // --- export ---

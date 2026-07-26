@@ -64,6 +64,34 @@ interface Config {
    *  for a packaged install or a shell-less deployment — exactly the people who
    *  want it off. The env var still wins when set. */
   terminalDisabled?: boolean;
+  /** Fallback account tagging for sessions with no explicit AGENTGLASS_ACCOUNT
+   *  (e.g. backfilled transcript scans): a directory prefix → account label. */
+  accountPaths?: { prefix: string; account: string }[];
+  /** The account registry — source of truth for per-account meters, config
+   *  dirs, and desktop instances. See accounts.ts. */
+  accounts?: RawAccount[];
+}
+
+/** A configured Claude account, as it lives on disk in config.json. The `id`
+ *  is the same string that tags every event/session (see accountForPath). All
+ *  fields but `id` are optional; a bare `{ id }` means "the default ~/.claude
+ *  login, no desktop instance". */
+export interface RawAccount {
+  /** Stable identifier and event tag, e.g. "work" | "personal". */
+  id: string;
+  /** Display name; falls back to `id`. */
+  label?: string;
+  /** Plan bucket for scheduling hints, e.g. "pro" | "max5x" | "max20x". */
+  plan_tier?: string;
+  /** This account's CLI login dir (CLAUDE_CONFIG_DIR). Holds `.credentials.json`
+   *  for the usage meter and `projects/` for the scanner. Absent = default
+   *  ~/.claude. */
+  claude_config_dir?: string;
+  /** Working-directory prefixes that attribute to this account — merged into
+   *  the top-level accountPaths fallback used by accountForPath(). */
+  account_paths?: string[];
+  /** Optional link to a desktop app instance name (Phase 3). */
+  desktop_instance?: string;
 }
 
 function load(path: string): Config {
@@ -316,4 +344,64 @@ export function configuredRepoDirs(): string[] {
   const raw = fromEnv.length ? fromEnv : config().repoDirs ?? [];
   const dirs = Array.isArray(raw) ? raw.filter((d): d is string => typeof d === "string") : [];
   return dirs.map(expand);
+}
+
+// Prefix → account fallback list, drawn from BOTH the flat `accountPaths` and
+// each registry account's `account_paths`, longest-prefix-first so the most
+// specific match wins. Boot snapshot: runtime account CRUD is picked up on the
+// next launch (attribution prefixes rarely change mid-run; the live meters in
+// accounts.ts read the registry directly).
+const accountPaths = [
+  ...(Array.isArray(config.accountPaths) ? config.accountPaths : [])
+    .filter((p) => p && typeof p.prefix === "string" && typeof p.account === "string")
+    .map((p) => ({ prefix: expand(p.prefix), account: p.account })),
+  ...(Array.isArray(config.accounts) ? config.accounts : []).flatMap((a) =>
+    (Array.isArray(a?.account_paths) ? a.account_paths : [])
+      .filter((prefix): prefix is string => typeof prefix === "string")
+      .map((prefix) => ({ prefix: expand(prefix), account: a.id }))
+  ),
+].sort((a, b) => b.prefix.length - a.prefix.length);
+
+/** Fallback account for a session with no explicit AGENTGLASS_ACCOUNT — the
+ *  longest matching prefix from `accountPaths`/`accounts[].account_paths`, or
+ *  null if nothing configured matches. Used by the transcript scanner (no hook
+ *  env to read) and by normalize() when a live event arrived without one. */
+export function accountForPath(cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  for (const p of accountPaths) {
+    if (cwd === p.prefix || cwd.startsWith(p.prefix + "/")) return p.account;
+  }
+  return null;
+}
+
+/** The account registry as written on disk (empty when unconfigured — the
+ *  registry module synthesizes a default in that case). */
+export function configuredAccounts(): RawAccount[] {
+  return Array.isArray(config.accounts) ? config.accounts : [];
+}
+
+/**
+ * Safely read-modify-write config.json for a mutation that must not clobber
+ * other hand-kept settings. Re-reads the file first; refuses to write over a
+ * present-but-malformed file (that would silently destroy the user's other
+ * keys). Also updates the in-memory snapshot so same-process reads stay fresh.
+ */
+export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?: string } {
+  let cur: Config = {};
+  try {
+    cur = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Config;
+  } catch (e) {
+    if (existsSync(CONFIG_PATH)) {
+      return { ok: false, error: `config file is malformed — fix ${CONFIG_PATH} to persist changes` };
+    }
+  }
+  try {
+    mutate(cur);
+    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(cur, null, 2) + "\n");
+    config.accounts = cur.accounts; // keep the boot snapshot's registry current
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }

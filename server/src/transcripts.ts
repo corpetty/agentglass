@@ -22,7 +22,8 @@ import { db, insertEvent, setSessionTitles, RETENTION_DAYS, type InsertResult } 
 // safeAbs: translates Windows drive paths, so a WSL-side transcript groups
 // under its own folder rather than collapsing onto the server's cwd.
 import { projectRootOf, safeAbs } from "./git.ts";
-import { workspaceRoot, inScope } from "./config.ts";
+import { workspaceRoot, inScope, accountForPath } from "./config.ts";
+import { listAccounts } from "./accounts.ts";
 
 // One root by default; a path.delimiter-separated list (":" on POSIX, ";" on
 // Windows) sweeps several at once — e.g. a WSL home next to a Windows one.
@@ -43,6 +44,24 @@ function projectsDirs(): string[] {
         .filter(Boolean)
     ),
   ];
+}
+
+/** The directories to sweep, each tagged with the account that owns it.
+ *
+ *  Only accounts with their OWN config dir contribute an authoritative tag:
+ *  which login wrote the transcript is decisive, so it beats the cwd-prefix
+ *  fallback. The default ~/.claude login is *shared* (two accounts can run
+ *  under it, distinguished only by which repo they worked in), so the default
+ *  projectsDirs() stay untagged (null) and their events fall back to
+ *  accountForPath()/the "work" default — exactly as before the registry, which
+ *  avoids silently reattributing existing history when accounts are added. */
+function scanRoots(): { dir: string; account: string | null }[] {
+  const roots = new Map<string, string | null>();
+  for (const a of listAccounts()) {
+    if (!a.usesDefaultDir) roots.set(a.projectsDir, a.id);
+  }
+  for (const dir of projectsDirs()) if (!roots.has(dir)) roots.set(dir, null);
+  return [...roots].map(([dir, account]) => ({ dir, account }));
 }
 const POLL_MS = Math.max(500, Number(process.env.AGENTGLASS_SCAN_INTERVAL_MS || 3000));
 export const SCAN_ENABLED = process.env.AGENTGLASS_SCAN_DISABLED !== "1";
@@ -294,7 +313,7 @@ function isMetaPrompt(o: Record<string, unknown>, text: string): boolean {
  */
 function lineToBodies(
   o: Record<string, unknown>,
-  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
+  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; rootAccount: string | null; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
   fallbackTs: number
 ): IngestBody[] {
   const type = str(o.type);
@@ -309,6 +328,12 @@ function lineToBodies(
     source_app: ctx.source_app,
     session_id: ctx.session_id,
     model_name: model ?? undefined,
+    // Which login wrote this transcript is authoritative (ctx.rootAccount, set
+    // when the file came from an account's own config dir). Only when the dir
+    // is untagged (the shared ~/.claude/projects) do we fall back to the
+    // cwd-prefix accountPaths — normalize() re-derives the same, but doing it
+    // here keeps the scan and live-hook paths symmetric.
+    account: ctx.rootAccount ?? accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
   };
   // Shared payload bits so every event carries where it came from — this is
   // what the folder filter and the project column read.
@@ -517,6 +542,7 @@ async function ingestFile(
   from: number,
   onLive: ((r: InsertResult) => void) | null,
   scope: string | null,
+  rootAccount: string | null,
   allowTail = true
 ): Promise<{ lines: number; ingested: number; source_app: string; project_path: string; session_id: string; skipped?: boolean }> {
   // Read the sweep's tuning once for this file: batch shape and the oversize cap.
@@ -652,7 +678,7 @@ async function ingestFile(
   }
   if (cwd) projectPaths.set(source_app, project_path);
 
-  const ctx = { source_app, project_path, cwd, session_id, toolCalls, seenUsage };
+  const ctx = { source_app, project_path, cwd, session_id, rootAccount, toolCalls, seenUsage };
   let ingested = 0;
   const fileMtime = statSync(path).mtimeMs;
   // What the session is called. Both kinds are appended as their own lines and
@@ -831,15 +857,15 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
   const cutoff = RETENTION_DAYS ? Date.now() - RETENTION_DAYS * 86_400_000 : 0;
   let total = 0;
 
-  for (const root of projectsDirs()) {
+  for (const root of scanRoots()) {
     let dirs: string[];
     try {
-      dirs = readdirSync(root);
+      dirs = readdirSync(root.dir);
     } catch {
       continue; // this root doesn't exist (yet) — the others still count
     }
     for (const dir of dirs) {
-      const dirPath = join(root, dir);
+      const dirPath = join(root.dir, dir);
       try {
         if (!statSync(dirPath).isDirectory()) continue;
       } catch {
@@ -869,7 +895,7 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
           const from = rewritten ? 0 : prev?.lines_done ?? 0;
           // A rewrite also invalidates the cached tail: its byte offset and its
           // carried tool calls describe content that no longer exists.
-          const r = await ingestFile(path, basename(path, ".jsonl"), from, onLive, scope, !rewritten);
+          const r = await ingestFile(path, basename(path, ".jsonl"), from, onLive, scope, root.account, !rewritten);
           // Out of scope: claim nothing, so widening the scope later can still
           // pick it up, and the hook path isn't blocked for a session we skipped.
           if (r.skipped) continue;

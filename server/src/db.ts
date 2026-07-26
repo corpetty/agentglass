@@ -16,7 +16,7 @@ import type {
 } from "../../shared/types.ts";
 import type { NormalizedEvent } from "./ingest.ts";
 import { costUsd, modelLabel } from "./pricing.ts";
-import { workspaceRoot, scopeRoots, isWithin } from "./config.ts";
+import { workspaceRoot, scopeRoots, isWithin, accountForPath } from "./config.ts";
 
 /**
  * Where the database lives.
@@ -235,6 +235,50 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_events_model ON events(model_name)");
 try { db.exec("ALTER TABLE events ADD COLUMN provider TEXT"); } catch { /* already present */ }
 db.exec("CREATE INDEX IF NOT EXISTS idx_events_provider_ts ON events(provider, timestamp)");
 
+// Which Claude account/instance produced an event — the account dimension.
+// Unlike provider it isn't derived from the model: it comes from the hook's
+// AGENTGLASS_ACCOUNT or the accountForPath() cwd-prefix fallback, so it's a
+// real written column (not a generated one) with its own scope helper.
+// Paired with timestamp in the index like the other scope columns, since an
+// account-scoped query always windows by time too.
+try { db.exec("ALTER TABLE events ADD COLUMN account TEXT"); } catch { /* already present */ }
+try { db.exec("ALTER TABLE sessions ADD COLUMN account TEXT"); } catch { /* already present */ }
+db.exec("CREATE INDEX IF NOT EXISTS idx_events_account_ts ON events(account, timestamp)");
+
+// Backfill `account` for rows ingested before this dimension existed (mostly
+// the transcript scanner's historical backfill, which never had a hook env to
+// read). Only touches NULL rows, driven by the same accountPaths config as
+// live tagging, so it's safe — and cheap — to run on every boot.
+backfillAccounts();
+function backfillAccounts(): void {
+  const rows = db
+    .query<{ id: number; payload: string }, []>(
+      `SELECT id, payload FROM events WHERE account IS NULL LIMIT 50000`
+    )
+    .all();
+  if (!rows.length) return;
+  const update = db.query(`UPDATE events SET account = $account WHERE id = $id`);
+  const run = db.transaction(() => {
+    for (const r of rows) {
+      // payload.cwd is only set for a worktree checkout (otherwise it equals
+      // project_path and is omitted) — project_path is what's reliably present.
+      let cwd: string | null = null;
+      try {
+        const p = JSON.parse(r.payload) as any;
+        cwd = p?.cwd ?? p?.project_path ?? null;
+      } catch { /* skip */ }
+      update.run({ $account: accountForPath(cwd) ?? "work", $id: r.id });
+    }
+  });
+  run();
+  console.log(`[db] backfilled account on ${rows.length} historical event(s)`);
+  db.exec(`
+    UPDATE sessions SET account = (
+      SELECT account FROM events WHERE events.session_id = sessions.session_id AND account IS NOT NULL LIMIT 1
+    ) WHERE account IS NULL
+  `);
+}
+
 // Covering indexes for /stats — the endpoint that freezes the terminal.
 //
 // statsSummary() runs six aggregations over a time window, and every one of
@@ -441,6 +485,21 @@ function providerScope(provider?: string | null): { clause: string; args: string
   return { clause: " AND provider = ?", args: [provider] };
 }
 
+/** SQL fragment + args to scope an events query to one account. Like provider,
+ *  account lives directly on `events` — no subquery needed. Empty when no
+ *  account is selected. Every call site queries `FROM events` unaliased. */
+function accountScope(account?: string | null): { clause: string; args: string[] } {
+  return account ? { clause: " AND account = ?", args: [account] } : { clause: "", args: [] };
+}
+
+/** Combine provider + account scopes into one clause/args pair, in bind order.
+ *  Named distinctly from the workspace `scopeClause()` it's often used beside. */
+function provAcctScope(provider?: string | null, account?: string | null): { clause: string; args: string[] } {
+  const p = providerScope(provider);
+  const a = accountScope(account);
+  return { clause: p.clause + a.clause, args: [...p.args, ...a.args] };
+}
+
 /**
  * Every project/cwd path the events table actually contains.
  *
@@ -561,12 +620,12 @@ const ftsInsert = db.query("INSERT INTO events_fts(rowid, text) VALUES ($id, $te
 const insertStmt = db.query(`
   INSERT INTO events (
     source_app, session_id, event_id, hook_event_type, tool_name, tool_use_id,
-    agent_id, agent_type, model_name, provider, is_error, error_text, duration_ms,
+    agent_id, agent_type, model_name, provider, account, is_error, error_text, duration_ms,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
     cost_usd, summary, payload, timestamp
   ) VALUES (
     $source_app, $session_id, $event_id, $hook_event_type, $tool_name, $tool_use_id,
-    $agent_id, $agent_type, $model_name, $provider, $is_error, $error_text, $duration_ms,
+    $agent_id, $agent_type, $model_name, $provider, $account, $is_error, $error_text, $duration_ms,
     $input_tokens, $output_tokens, $cache_creation_tokens, $cache_read_tokens,
     $cost_usd, $summary, $payload, $timestamp
   )
@@ -730,6 +789,7 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
       $agent_type: n.agent_type,
       $model_name: model,
       $provider: providerOf(model),
+      $account: n.account,
       $is_error: n.is_error,
       $error_text: n.error_text,
       $duration_ms: duration_ms,
@@ -780,12 +840,12 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
 
 const upsertStmt = db.query(`
   INSERT INTO sessions (
-    session_id, source_app, model_name, provider, project_path, cwd_path, started_at, ended_at, last_seen,
+    session_id, source_app, model_name, provider, account, project_path, cwd_path, started_at, ended_at, last_seen,
     event_count, tool_count, error_count,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
     cost_usd, pricing_baseline_usd
   ) VALUES (
-    $sid, $src, $model, $provider, $project, $cwd, $ts, $ended, $ts,
+    $sid, $src, $model, $provider, $account, $project, $cwd, $ts, $ended, $ts,
     1, $tool, $err,
     $in, $out, $cw, $cr, $cost, $estimated
   )
@@ -793,6 +853,7 @@ const upsertStmt = db.query(`
     source_app = excluded.source_app,
     model_name = COALESCE(excluded.model_name, sessions.model_name),
     provider = COALESCE(excluded.provider, sessions.provider),
+    account = COALESCE(excluded.account, sessions.account),
     project_path = COALESCE(excluded.project_path, sessions.project_path),
     cwd_path = COALESCE(excluded.cwd_path, sessions.cwd_path),
     -- An end can be taken back. A session that speaks after the moment it was
@@ -836,6 +897,7 @@ function upsertSession(
     $src: n.source_app,
     $model: n.model_name,
     $provider: providerOf(n.model_name),
+    $account: n.account,
     // Carried in the payload by both the scanner and the hooks; null for an
     // event that never recorded where it ran, which COALESCE leaves alone.
     $project: typeof n.payload?.project_path === "string" ? n.payload.project_path : null,
@@ -881,15 +943,15 @@ export function setSessionTitles(session_id: string, custom: string | null, ai: 
   if (ai) db.query("UPDATE sessions SET ai_title = ? WHERE session_id = ?").run(ai, session_id);
 }
 
-export function getRecent(limit = 300, provider?: string): WatchEvent[] {
+export function getRecent(limit = 300, provider?: string, account?: string): WatchEvent[] {
   const scope = scopeClause();
-  const prov = providerScope(provider);
-  if (!scope.clause && !prov.clause) return recentStmt.all(limit).map(parseEventRow).reverse();
+  const acct = provAcctScope(provider, account);
+  if (!scope.clause && !acct.clause) return recentStmt.all(limit).map(parseEventRow).reverse();
   return db
     .query<any, any[]>(
-      `SELECT * FROM events WHERE 1=1${prov.clause}${scope.clause} ORDER BY timestamp DESC, id DESC LIMIT ?`
+      `SELECT * FROM events WHERE 1=1${acct.clause}${scope.clause} ORDER BY timestamp DESC, id DESC LIMIT ?`
     )
-    .all(...prov.args, ...scope.args, limit)
+    .all(...acct.args, ...scope.args, limit)
     .map(parseEventRow)
     .reverse();
 }
@@ -1036,6 +1098,7 @@ function computeFilterOptions() {
     source_apps: distinct<string>("source_app"),
     hook_event_types: distinct<string>("hook_event_type"),
     models: distinct<string>("model_name", " AND model_name IS NOT NULL"),
+    accounts: distinct<string>("account", " AND account IS NOT NULL"),
   };
 }
 
@@ -1053,8 +1116,8 @@ function computeFilterOptions() {
 const SESSIONS_TTL_MS = 1000;
 const sessionsCache = new Map<string, { at: number; data: SessionRollup[] }>();
 
-export function getSessions(limit = 100, provider?: string): SessionRollup[] {
-  const key = `${limit}|${provider ?? ""}|${workspaceRoot() ?? ""}`;
+export function getSessions(limit = 100, provider?: string, account?: string): SessionRollup[] {
+  const key = `${limit}|${provider ?? ""}|${account ?? ""}|${workspaceRoot() ?? ""}`;
   const hit = sessionsCache.get(key);
   if (hit && Date.now() - hit.at < SESSIONS_TTL_MS) return hit.data;
   const s = sessionScopeClause();
@@ -1066,11 +1129,13 @@ export function getSessions(limit = 100, provider?: string): SessionRollup[] {
     : provider === UNKNOWN_PROVIDER
       ? { clause: " AND session_id IN (SELECT session_id FROM events WHERE provider IS NULL)", args: [] as string[] }
       : { clause: " AND session_id IN (SELECT session_id FROM events WHERE provider = ?)", args: [provider] };
+  // account is a real column on sessions (one per session), so scope it directly.
+  const acct = account ? { clause: " AND account = ?", args: [account] } : { clause: "", args: [] as string[] };
   const data = db
     .query<Record<string, unknown>, any[]>(
-      `SELECT * FROM sessions WHERE 1=1${prov.clause}${s.clause} ORDER BY last_seen DESC LIMIT ?`
+      `SELECT * FROM sessions WHERE 1=1${prov.clause}${acct.clause}${s.clause} ORDER BY last_seen DESC LIMIT ?`
     )
-    .all(...prov.args, ...s.args, limit)
+    .all(...prov.args, ...acct.args, ...s.args, limit)
     .map(parseSessionRow);
   sessionsCache.set(key, { at: Date.now(), data });
   // One entry per (limit, provider, scope); the limit set is tiny and scope
@@ -1111,11 +1176,11 @@ const statsCache = new Map<string, { at: number; data: StatsSummary }>();
 /** Full analytics summary over a rolling window (default 24h), optionally scoped
  *  to a single provider (Anthropic / OpenAI / Google / …). Always scoped to the
  *  open project, so spend, tool mix and the radar describe that project alone. */
-export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string): StatsSummary {
-  const key = `${windowMs}|${provider ?? ""}|${workspaceRoot() ?? ""}`;
+export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, account?: string): StatsSummary {
+  const key = `${windowMs}|${provider ?? ""}|${account ?? ""}|${workspaceRoot() ?? ""}`;
   const hit = statsCache.get(key);
   if (hit && Date.now() - hit.at < STATS_TTL_MS) return hit.data;
-  const data = computeStatsSummary(windowMs, provider);
+  const data = computeStatsSummary(windowMs, provider, account);
   // One entry per (window, provider, scope). The window set is fixed and small
   // (the header's chips) and scope rarely changes, so this never grows unbounded
   // in practice; prune stale entries anyway so a long-lived server can't leak.
@@ -1124,9 +1189,9 @@ export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string): St
   return data;
 }
 
-function computeStatsSummary(windowMs: number, provider?: string): StatsSummary {
+function computeStatsSummary(windowMs: number, provider?: string, account?: string): StatsSummary {
   const since = Date.now() - windowMs;
-  const { clause: prov, args: pa } = providerScope(provider);
+  const { clause: prov, args: pa } = provAcctScope(provider, account);
   const { clause: sc, args: sa } = scopeClause();
   // Every query below appends `pf` and binds `A` in this order, so folding the
   // project filter in here reaches all of them at once.
@@ -1216,7 +1281,7 @@ function computeStatsSummary(windowMs: number, provider?: string): StatsSummary 
     .sort((a, b) => b.total_ms - a.total_ms);
 
   // Most-used skills with attributed cost and per-bucket activity.
-  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider).slice(0, 20);
+  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider, account).slice(0, 20);
 
   // Per-app rollup within the window.
   const by_app: AppUsage[] = db
@@ -1306,8 +1371,8 @@ function computeStatsSummary(windowMs: number, provider?: string): StatsSummary 
  * skill starts). An approximation, but a useful one: it answers "what does
  * running /code-review actually cost?".
  */
-export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string): SkillUsage[] {
-  const { clause: pf, args: pa } = providerScope(provider);
+export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string, account?: string): SkillUsage[] {
+  const { clause: pf, args: pa } = provAcctScope(provider, account);
   // Project scope, same as every other aggregation in computeStatsSummary. Its
   // absence here leaked top_skills — and the cost charged to them — from every
   // other project on the machine into a cockpit opened for one.
