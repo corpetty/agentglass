@@ -31,6 +31,7 @@ import { CommandPalette } from "./components/CommandPalette.tsx";
 import { HelpLegend } from "./components/HelpLegend.tsx";
 import { StatsModal } from "./components/StatsModal.tsx";
 import { AccountsModal } from "./components/AccountsModal.tsx";
+import { QueueModal } from "./components/QueueModal.tsx";
 import { SkillsModal } from "./components/SkillsModal.tsx";
 import { Workspace } from "./components/workspace/Workspace.tsx";
 import { VIEW_IDS, loadViewOrder, loadLastView, type ViewId } from "./components/workspace/views.ts";
@@ -73,6 +74,7 @@ export default function App() {
   const [helpOpen, setHelpOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
   const [accountsOpen, setAccountsOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   // One overlay replaced five modals. `wsView` is which view it shows, and it
   // survives closing — reopening lands you where you left off, because
@@ -107,7 +109,7 @@ export default function App() {
   // Escape, then `d`, losing the git panel's state on the way. Inside the
   // workspace the letters now *switch views* instead of being swallowed.
   const anyPanelOpen =
-    paletteOpen || helpOpen || statsOpen || accountsOpen || skillsOpen || searchOpen ||
+    paletteOpen || helpOpen || statsOpen || accountsOpen || queueOpen || skillsOpen || searchOpen ||
     projectOpen || sessionView !== null || selected !== null;
   const anyPanelOpenRef = useRef(anyPanelOpen);
   anyPanelOpenRef.current = anyPanelOpen;
@@ -397,6 +399,7 @@ export default function App() {
         setHelpOpen(false);
         setStatsOpen(false);
         setAccountsOpen(false);
+        setQueueOpen(false);
         setSkillsOpen(false);
         setWsOpen(false);
         setSearchOpen(false);
@@ -456,6 +459,7 @@ export default function App() {
         case "open.help": setHelpOpen((o) => !o); break;
         case "open.stats": e.preventDefault(); setStatsOpen((o) => !o); break;
         case "open.accounts": e.preventDefault(); setAccountsOpen((o) => !o); break;
+        case "open.queue": e.preventDefault(); setQueueOpen((o) => !o); break;
         case "open.skills": e.preventDefault(); setSkillsOpen((o) => !o); break;
         case "open.search": e.preventDefault(); setSearchOpen((o) => !o); break;
       }
@@ -558,6 +562,7 @@ export default function App() {
         onOpenHelp={() => setHelpOpen(true)}
         onOpenStats={() => setStatsOpen(true)}
         onOpenAccounts={() => setAccountsOpen(true)}
+        onOpenQueue={() => setQueueOpen(true)}
         onOpenSkills={() => setSkillsOpen(true)}
         onOpenWorkspace={() => setWsOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -613,6 +618,7 @@ export default function App() {
       <EventModal event={selected} onClose={() => setSelected(null)} />
       <StatsModal open={statsOpen} onClose={() => setStatsOpen(false)} stats={stats} windowMs={windowMs} />
       <AccountsModal open={accountsOpen} onClose={() => setAccountsOpen(false)} />
+      <QueueModal open={queueOpen} onClose={() => setQueueOpen(false)} onOpenSession={(id) => { setQueueOpen(false); setSessionView({ id, app: "" }); }} />
       <SkillsModal open={skillsOpen} onClose={() => setSkillsOpen(false)} />
       <Workspace open={wsOpen} view={wsView} onView={setWsView} onClose={closeWorkspace} onSkills={() => setSkillsOpen(true)} chatFocusId={chatFocus} />
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} onSelectApp={(app) => setFilter((f) => ({ ...f, app }))} />

@@ -96,7 +96,7 @@ function MoreMenu({ onOpen }: { onOpen: () => void }) {
 
 export function Header({
   conn, windowMs, onWindow, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
-  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenAccounts, onOpenWorkspace, onOpenSettings, onClear, showUsage,
+  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenAccounts, onOpenQueue, onOpenWorkspace, onOpenSettings, onClear, showUsage,
   workspace, onOpenProject,
 }: {
   conn: ConnState;
@@ -117,6 +117,7 @@ export function Header({
   onOpenStats: () => void;
   onOpenSkills: () => void;
   onOpenAccounts: () => void;
+  onOpenQueue: () => void;
   onOpenWorkspace: () => void;
   onOpenSettings: () => void;
   onClear: () => void;
@@ -262,6 +263,7 @@ export function Header({
         {/* Skills demoted to a plain icon */}
         <IconBtn title="Skills explorer — browse every available skill (k)" onClick={onOpenSkills}><SkillsIcon /></IconBtn>
         <IconBtn title="Accounts — per-account usage meters & login status (a)" onClick={onOpenAccounts}>👥</IconBtn>
+        <IconBtn title="Queue — unattended jobs running across accounts (q)" onClick={onOpenQueue}>🗒️</IconBtn>
         <MoreMenu onOpen={onOpenSettings} />
         <ThemeSwitcher current={theme} onChange={onTheme} />
       </div>

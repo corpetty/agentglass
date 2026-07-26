@@ -1,4 +1,4 @@
-import type { WatchEvent, SessionRollup, StatsSummary, SkillInfo, FileChange, DiffHunk, Insight, SearchHit, PendingGate, GateRecord, SessionDetail, GitStatusResponse, CommitResult, WalkthroughResult, WalkthroughInputFile, GitRepoRef, FsCompletion, WorkingTree, GitActionResult, GitBranch, GitCommit, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, GitLogEntry, DockerOverview, DockerStat, DockerActionResult, DockerCapability, TerminalCommands, ChatImage, ConflictBlock, BlockChoice, UpdateStatus, ReleaseNotes, PrListResponse, PrDetail, PrActionResult, GitCapability, HookSetupStatus, HookSetupResult, PrCheckJob, ChatEngine, TmuxEngineInfo, ChatEffort, RemoteStatus } from "../../../shared/types.ts";
+import type { WatchEvent, SessionRollup, StatsSummary, SkillInfo, FileChange, DiffHunk, Insight, SearchHit, PendingGate, GateRecord, SessionDetail, GitStatusResponse, CommitResult, WalkthroughResult, WalkthroughInputFile, GitRepoRef, FsCompletion, WorkingTree, GitActionResult, GitBranch, GitCommit, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, GitLogEntry, DockerOverview, DockerStat, DockerActionResult, DockerCapability, TerminalCommands, ChatImage, ConflictBlock, BlockChoice, UpdateStatus, ReleaseNotes, PrListResponse, PrDetail, PrActionResult, GitCapability, HookSetupStatus, HookSetupResult, PrCheckJob, ChatEngine, TmuxEngineInfo, ChatEffort, RemoteStatus, Job, JobEvent, JobInput } from "../../../shared/types.ts";
 import { DEPS, type DepsResponse } from "../../../shared/deps.ts";
 import * as demo from "./demo.ts";
 
@@ -247,6 +247,12 @@ const realApi = {
   accounts: () => get<{ accounts: Account[] }>(`/accounts`),
   saveAccount: (a: AccountInput) => post<{ ok: boolean; error?: string; account?: Account }>("/accounts", a),
   deleteAccount: (id: string) => post<{ ok: boolean; error?: string }>("/accounts/delete", { id }),
+  jobs: () => get<{ jobs: Job[] }>(`/jobs`),
+  createJob: (input: JobInput) => post<{ ok: boolean; error?: string; job?: Job }>("/jobs", input),
+  jobDetail: (id: string) => get<{ job: Job; events: JobEvent[] }>(`/jobs/detail?id=${encodeURIComponent(id)}`),
+  updateJob: (id: string, patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) =>
+    post<{ ok: boolean; error?: string; job?: Job }>("/jobs/update", { id, ...patch }),
+  cancelJob: (id: string) => post<{ ok: boolean; error?: string }>("/jobs/cancel", { id }),
   skills: () => get<{ skills: SkillInfo[]; generated_at: number }>(`/skills`),
   changes: (limit = 200) => get<{ changes: FileChange[] }>(`/changes?limit=${limit}`),
   session: (id: string) => get<SessionDetail>(`/session?id=${encodeURIComponent(id)}`),
@@ -558,6 +564,11 @@ const demoApi: typeof realApi = {
   accounts: () => D({ accounts: [] as Account[] }),
   saveAccount: (_a: AccountInput) => D({ ok: false, error: "unavailable in the demo" }),
   deleteAccount: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
+  jobs: () => D({ jobs: [] as Job[] }),
+  createJob: (_input: JobInput) => D({ ok: false, error: "unavailable in the demo" }),
+  jobDetail: (_id: string) => D({ job: undefined as unknown as Job, events: [] as JobEvent[] }),
+  updateJob: (_id: string, _patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) => D({ ok: false, error: "unavailable in the demo" }),
+  cancelJob: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
   skills: () => D(demo.skills()),
   changes: () => D(demo.changes()),
   session: (id: string) => D(demo.session(id)),

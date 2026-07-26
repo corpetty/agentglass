@@ -18,6 +18,7 @@ export type ActionId =
   | "open.help"
   | "open.stats"
   | "open.accounts"
+  | "open.queue"
   | "open.skills"
   | "open.search";
 
@@ -29,6 +30,7 @@ export const DEFAULTS: Record<ActionId, string> = {
   "open.help": "?",
   "open.stats": "s",
   "open.accounts": "a",
+  "open.queue": "q",
   "open.skills": "k",
   "open.search": "/",
 };
@@ -38,6 +40,7 @@ export const LABELS: Record<ActionId, { label: string; hint: string }> = {
   "open.help": { label: "Legend & shortcuts", hint: "what the colours mean, and every key binding" },
   "open.stats": { label: "Statistics", hint: "totals, tool latency and cost breakdowns" },
   "open.accounts": { label: "Accounts", hint: "per-account usage meters and login status" },
+  "open.queue": { label: "Queue", hint: "unattended jobs running across accounts" },
   "open.skills": { label: "Skills catalog", hint: "every skill the fleet has available" },
   "open.search": { label: "Search", hint: "find a session, a file or an error" },
 };

@@ -66,6 +66,7 @@ import { paneAlive, killPane, forgetPane, startPaneSweeper, sendKey, sendableKey
 import { startScanner, ownsSession, knownProjects, resyncScope, SCAN_ENABLED } from "./transcripts.ts";
 import { workspaceRoot, setWorkspaceRoot, inScope } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
+import { createJob, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
 import { hookStatus, applyHooks } from "./hooksetup.ts";
 import { privateHost } from "./net.ts";
 import { resolveToken, tokenOk, isIntake, isAuthExempt } from "./auth.ts";
@@ -680,6 +681,40 @@ const server = Bun.serve<WsData>({
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = removeAccount(String(b.id ?? ""));
+      return json(res, res.ok ? 200 : 400);
+    }
+
+    // --- job queue ---
+    if (pathname === "/jobs") {
+      if (req.method === "POST") {
+        if (!localOrigin(req)) return csrfBlocked();
+        let b: any = {};
+        try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+        const res = createJob(b);
+        return json(res, res.ok ? 200 : 400);
+      }
+      return json({ jobs: listJobs() });
+    }
+    if (pathname === "/jobs/detail") {
+      const id = url.searchParams.get("id") || "";
+      const job = getJob(id);
+      if (!job) return json({ error: "no such job" }, 404);
+      return json({ job, events: jobEvents(id) });
+    }
+    // POST for writes — the CORS allow-list is GET,POST only (no PATCH/DELETE).
+    if (pathname === "/jobs/update" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const { id, ...patch } = b;
+      const res = updateJob(String(id ?? ""), patch);
+      return json(res, res.ok ? 200 : 400);
+    }
+    if (pathname === "/jobs/cancel" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const res = cancelJob(String(b.id ?? ""));
       return json(res, res.ok ? 200 : 400);
     }
 
