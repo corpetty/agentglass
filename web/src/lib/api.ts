@@ -69,6 +69,10 @@ const realApi = {
   exportUrl: (fmt: "csv" | "json") => withToken(`${SERVER}/export?format=${fmt}`),
   skillsExportUrl: (fmt: "md" | "csv" | "json" = "md") => withToken(`${SERVER}/skills/export?format=${fmt}`),
   usage: () => get<UsagePayload>(`/usage`),
+  usageAll: () => get<{ usage: UsagePayload[] }>(`/usage/all`),
+  accounts: () => get<{ accounts: Account[] }>(`/accounts`),
+  saveAccount: (a: AccountInput) => post<{ ok: boolean; error?: string; account?: Account }>("/accounts", a),
+  deleteAccount: (id: string) => post<{ ok: boolean; error?: string }>("/accounts/delete", { id }),
   skills: () => get<{ skills: SkillInfo[]; generated_at: number }>(`/skills`),
   changes: (limit = 200) => get<{ changes: FileChange[] }>(`/changes?limit=${limit}`),
   session: (id: string) => get<SessionDetail>(`/session?id=${encodeURIComponent(id)}`),
@@ -170,6 +174,10 @@ const demoApi: typeof realApi = {
   exportUrl: (fmt: "csv" | "json") => demo.eventsExportUri(fmt),
   skillsExportUrl: () => demo.skillsExportUri(),
   usage: () => D(demo.usage() as UsagePayload),
+  usageAll: () => D({ usage: [] as UsagePayload[] }),
+  accounts: () => D({ accounts: [] as Account[] }),
+  saveAccount: (_a: AccountInput) => D({ ok: false, error: "unavailable in the demo" }),
+  deleteAccount: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
   skills: () => D(demo.skills()),
   changes: () => D(demo.changes()),
   session: (id: string) => D(demo.session(id)),
@@ -238,8 +246,38 @@ export interface UsageWindow {
 }
 export interface UsagePayload {
   available: boolean;
+  /** Which account this reading is for (present once resolved via the registry). */
+  account?: string;
   five_hour?: UsageWindow;
   seven_day?: UsageWindow;
+  /** Per-model weekly buckets — only populated on Max plans. */
+  seven_day_opus?: UsageWindow;
+  seven_day_sonnet?: UsageWindow;
   fetched_at: number;
   error?: string;
+  reason?: "no_credentials" | "unauthorized" | "rate_limited" | "error";
+}
+
+/** A resolved account as returned by GET /accounts. */
+export interface Account {
+  id: string;
+  label: string;
+  planTier: string | null;
+  configDir: string;
+  credentialsPath: string;
+  projectsDir: string;
+  accountPaths: string[];
+  desktopInstance: string | null;
+  usesDefaultDir: boolean;
+  synthesized: boolean;
+}
+
+/** The on-disk (snake_case) shape POSTed to /accounts to create/update one. */
+export interface AccountInput {
+  id: string;
+  label?: string;
+  plan_tier?: string;
+  claude_config_dir?: string;
+  account_paths?: string[];
+  desktop_instance?: string;
 }

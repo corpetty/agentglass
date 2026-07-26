@@ -23,6 +23,7 @@ import { EventModal } from "./components/EventModal.tsx";
 import { CommandPalette } from "./components/CommandPalette.tsx";
 import { HelpLegend } from "./components/HelpLegend.tsx";
 import { StatsModal } from "./components/StatsModal.tsx";
+import { AccountsModal } from "./components/AccountsModal.tsx";
 import { SkillsModal } from "./components/SkillsModal.tsx";
 import { ChangesModal } from "./components/ChangesModal.tsx";
 import { GitPanel } from "./components/GitPanel.tsx";
@@ -43,6 +44,7 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
+  const [accountsOpen, setAccountsOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [changesOpen, setChangesOpen] = useState(false);
   const [gitOpen, setGitOpen] = useState(false);
@@ -146,6 +148,9 @@ export default function App() {
       } else if (e.key === "s" && !e.metaKey && !e.ctrlKey && !/input|textarea/i.test((e.target as HTMLElement)?.tagName ?? "")) {
         e.preventDefault(); // don't let the key leak into the modal's autofocused input
         setStatsOpen((o) => !o);
+      } else if (e.key === "a" && !e.metaKey && !e.ctrlKey && !/input|textarea/i.test((e.target as HTMLElement)?.tagName ?? "")) {
+        e.preventDefault();
+        setAccountsOpen((o) => !o);
       } else if (e.key === "k" && !e.metaKey && !e.ctrlKey && !/input|textarea/i.test((e.target as HTMLElement)?.tagName ?? "")) {
         e.preventDefault();
         setSkillsOpen((o) => !o);
@@ -174,6 +179,7 @@ export default function App() {
         setPaletteOpen(false);
         setHelpOpen(false);
         setStatsOpen(false);
+        setAccountsOpen(false);
         setSkillsOpen(false);
         setChangesOpen(false);
         setGitOpen(false);
@@ -217,6 +223,7 @@ export default function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         onOpenHelp={() => setHelpOpen(true)}
         onOpenStats={() => setStatsOpen(true)}
+        onOpenAccounts={() => setAccountsOpen(true)}
         onOpenSkills={() => setSkillsOpen(true)}
         onOpenChanges={() => setChangesOpen(true)}
         onOpenGit={() => setGitOpen(true)}
@@ -272,6 +279,7 @@ export default function App() {
 
       <EventModal event={selected} onClose={() => setSelected(null)} />
       <StatsModal open={statsOpen} onClose={() => setStatsOpen(false)} stats={stats} windowMs={windowMs} />
+      <AccountsModal open={accountsOpen} onClose={() => setAccountsOpen(false)} />
       <SkillsModal open={skillsOpen} onClose={() => setSkillsOpen(false)} />
       <ChangesModal open={changesOpen} onClose={() => setChangesOpen(false)} />
       <GitPanel open={gitOpen} onClose={() => setGitOpen(false)} />

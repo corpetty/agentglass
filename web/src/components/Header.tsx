@@ -94,7 +94,7 @@ function ChatIcon() {
 }
 
 /** Overflow menu: secondary actions nested behind one "⋯" button. */
-function MoreMenu({ sound, onSound, onOpenStats, onOpenHelp }: { sound: boolean; onSound: () => void; onOpenStats: () => void; onOpenHelp: () => void }) {
+function MoreMenu({ sound, onSound, onOpenStats, onOpenHelp, onOpenAccounts }: { sound: boolean; onSound: () => void; onOpenStats: () => void; onOpenHelp: () => void; onOpenAccounts: () => void }) {
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState({ top: 0, right: 0 });
@@ -118,6 +118,7 @@ function MoreMenu({ sound, onSound, onOpenStats, onOpenHelp }: { sound: boolean;
 
   const items: { label: string; hint?: string; onClick?: () => void; href?: string; download?: string }[] = [
     { label: "📊 Statistics", hint: "s", onClick: onOpenStats },
+    { label: "👥 Accounts", hint: "a", onClick: onOpenAccounts },
     { label: "❔ Legend & shortcuts", hint: "?", onClick: onOpenHelp },
     { label: sound ? "🔊 Alert sounds — on" : "🔇 Alert sounds — off", onClick: onSound },
     ...(autostart === null
@@ -181,7 +182,7 @@ function MoreMenu({ sound, onSound, onOpenStats, onOpenHelp }: { sound: boolean;
 
 export function Header({
   conn, windowMs, onWindow, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
-  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenChanges, onOpenGit, onOpenDocker, onOpenTerminal, onOpenChat, onClear, showUsage,
+  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenAccounts, onOpenSkills, onOpenChanges, onOpenGit, onOpenDocker, onOpenTerminal, onOpenChat, onClear, showUsage,
   workspace, onOpenProject,
 }: {
   conn: ConnState;
@@ -200,6 +201,7 @@ export function Header({
   onOpenPalette: () => void;
   onOpenHelp: () => void;
   onOpenStats: () => void;
+  onOpenAccounts: () => void;
   onOpenSkills: () => void;
   onOpenChanges: () => void;
   onOpenGit: () => void;
@@ -360,7 +362,7 @@ export function Header({
         </button>
         {/* Skills demoted to a plain icon */}
         <IconBtn title="Skills explorer — browse every available skill (k)" onClick={onOpenSkills}><SkillsIcon /></IconBtn>
-        <MoreMenu sound={sound} onSound={onSound} onOpenStats={onOpenStats} onOpenHelp={onOpenHelp} />
+        <MoreMenu sound={sound} onSound={onSound} onOpenStats={onOpenStats} onOpenHelp={onOpenHelp} onOpenAccounts={onOpenAccounts} />
         <ThemeSwitcher current={theme} onChange={onTheme} />
       </div>
     </header>
