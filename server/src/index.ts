@@ -20,7 +20,7 @@ import {
 import { maybeAlert } from "./alerts.ts";
 import { getSkills, catalogMarkdown, catalogCsv } from "./skills.ts";
 import { getInsights } from "./insights.ts";
-import { getUsage } from "./usage.ts";
+import { getUsage, getAllUsage } from "./usage.ts";
 import { submitGate, decideGate, pendingGates, GATE_MAX_MS } from "./gate.ts";
 import { otlpTracesToEvents, otlpLogsToEvents } from "./otlp.ts";
 import { decodeOtlpTraces, decodeOtlpLogs } from "./otlp_pb.ts";
@@ -42,6 +42,7 @@ import { ptyOpen, ptyMessage, ptyClose, projectCommands, shutdownTerminals, TERM
 import { chatStream, CHAT_ENABLED, CHAT_BYPASS_ALLOWED } from "./chat.ts";
 import { startScanner, ownsSession, knownProjects, resyncScope, SCAN_ENABLED } from "./transcripts.ts";
 import { workspaceRoot, setWorkspaceRoot, CONFIG_PATH } from "./config.ts";
+import { listAccounts, upsertAccount, removeAccount } from "./accounts.ts";
 import { privateHost } from "./net.ts";
 import { resolveToken, tokenOk, isIntake } from "./auth.ts";
 import { rateOk } from "./ratelimit.ts";
@@ -333,7 +334,30 @@ const server = Bun.serve<WsData>({
       return json(res, res.ok ? 200 : 400);
     }
     if (pathname === "/insights") return json({ insights: getInsights() });
-    if (pathname === "/usage") return json(await getUsage()); // Anthropic plan-limit windows (only meaningful for Claude)
+    // Anthropic plan-limit windows (only meaningful for Claude). No ?account=
+    // → the default account, preserving the original single-account shape.
+    if (pathname === "/usage") return json(await getUsage(url.searchParams.get("account") || undefined));
+    if (pathname === "/usage/all") return json({ usage: await getAllUsage() });
+
+    // --- accounts registry ---
+    if (pathname === "/accounts") {
+      if (req.method === "POST") {
+        if (!localOrigin(req)) return csrfBlocked();
+        let b: any = {};
+        try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+        const res = upsertAccount(b);
+        return json(res, res.ok ? 200 : 400);
+      }
+      return json({ accounts: listAccounts() });
+    }
+    // POST (not DELETE) for removal — the CORS allow-list is GET,POST only.
+    if (pathname === "/accounts/delete" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const res = removeAccount(String(b.id ?? ""));
+      return json(res, res.ok ? 200 : 400);
+    }
 
     // --- control plane: gate ---
     if (pathname === "/gate" && req.method === "POST") {

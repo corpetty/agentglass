@@ -20,9 +20,27 @@ import { normalize } from "./ingest.ts";
 import { db, insertEvent, RETENTION_DAYS, type InsertResult } from "./db.ts";
 import { projectRootOf } from "./git.ts";
 import { workspaceRoot, accountForPath } from "./config.ts";
+import { listAccounts } from "./accounts.ts";
 
 const PROJECTS_DIR =
   process.env.AGENTGLASS_PROJECTS_DIR || join(homedir(), ".claude", "projects");
+
+/** The directories to sweep, each tagged with the account that owns it.
+ *
+ *  Only accounts with their OWN config dir contribute an authoritative tag:
+ *  which login wrote the transcript is decisive, so it beats the cwd-prefix
+ *  fallback. The default ~/.claude login is *shared* (two accounts can run
+ *  under it, distinguished only by which repo they worked in), so its dir —
+ *  the legacy PROJECTS_DIR — stays untagged (null) and its events fall back to
+ *  accountForPath()/the "work" default, exactly as before the registry. */
+function scanRoots(): { dir: string; account: string | null }[] {
+  const roots = new Map<string, string | null>();
+  for (const a of listAccounts()) {
+    if (!a.usesDefaultDir) roots.set(a.projectsDir, a.id);
+  }
+  if (!roots.has(PROJECTS_DIR)) roots.set(PROJECTS_DIR, null);
+  return [...roots].map(([dir, account]) => ({ dir, account }));
+}
 const POLL_MS = Math.max(500, Number(process.env.AGENTGLASS_SCAN_INTERVAL_MS || 3000));
 export const SCAN_ENABLED = process.env.AGENTGLASS_SCAN_DISABLED !== "1";
 
@@ -159,7 +177,7 @@ function isMetaPrompt(o: Record<string, unknown>, text: string): boolean {
  */
 function lineToBodies(
   o: Record<string, unknown>,
-  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
+  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; rootAccount: string | null; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
   fallbackTs: number
 ): IngestBody[] {
   const type = str(o.type);
@@ -174,10 +192,12 @@ function lineToBodies(
     source_app: ctx.source_app,
     session_id: ctx.session_id,
     model_name: model ?? undefined,
-    // No hook env to read during a backfill scan — fall back to the
-    // configured accountPaths (normalize() re-derives this too, but doing it
-    // here keeps the scan and live-hook paths symmetric).
-    account: accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
+    // Which login wrote this transcript is authoritative (ctx.rootAccount, set
+    // when the file came from an account's own config dir). Only when the dir
+    // is untagged (the legacy ~/.claude/projects) do we fall back to the
+    // cwd-prefix accountPaths — normalize() re-derives the same, but doing it
+    // here keeps the scan and live-hook paths symmetric.
+    account: ctx.rootAccount ?? accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
   };
   // Shared payload bits so every event carries where it came from — this is
   // what the folder filter and the project column read.
@@ -305,7 +325,8 @@ async function ingestFile(
   fallbackSessionId: string,
   from: number,
   onLive: ((r: InsertResult) => void) | null,
-  scope: string | null
+  scope: string | null,
+  rootAccount: string | null
 ): Promise<{ lines: number; ingested: number; source_app: string; project_path: string; session_id: string; skipped?: boolean }> {
   const text = await Bun.file(path).text();
   const lines = text.split("\n");
@@ -357,7 +378,7 @@ async function ingestFile(
     source_app = fallbackSessionId.slice(0, 8);
   }
 
-  const ctx = { source_app, project_path, cwd, session_id, toolCalls, seenUsage };
+  const ctx = { source_app, project_path, cwd, session_id, rootAccount, toolCalls, seenUsage };
   let ingested = 0;
   let seen = 0;
   // Collected inside the transaction, delivered after it commits: broadcasting
@@ -414,63 +435,68 @@ function walkTranscripts(dir: string, out: string[] = []): string[] {
 async function scanOnce(onLive: ((r: InsertResult) => void) | null): Promise<number> {
   // Read the workspace once per sweep so every file in it sees the same scope.
   const scope = workspaceRoot();
-  let dirs: string[];
-  try {
-    dirs = readdirSync(PROJECTS_DIR);
-  } catch {
-    return 0; // no ~/.claude/projects yet — nothing to do
-  }
   // Transcripts older than the retention window would be pruned on the next
   // sweep anyway, so never spend time parsing them.
   const cutoff = RETENTION_DAYS ? Date.now() - RETENTION_DAYS * 86_400_000 : 0;
   let total = 0;
 
-  for (const dir of dirs) {
-    const dirPath = join(PROJECTS_DIR, dir);
+  // One pass per account config dir (plus the legacy ~/.claude/projects). A
+  // missing dir — an account that hasn't been provisioned or used yet — just
+  // yields nothing and is skipped.
+  for (const root of scanRoots()) {
+    let dirs: string[];
     try {
-      if (!statSync(dirPath).isDirectory()) continue;
+      dirs = readdirSync(root.dir);
     } catch {
-      continue;
+      continue; // no such projects dir yet — nothing to do for this account
     }
-    for (const path of walkTranscripts(dirPath)) {
-      let st: ReturnType<typeof statSync>;
+    for (const dir of dirs) {
+      const dirPath = join(root.dir, dir);
       try {
-        st = statSync(path);
+        if (!statSync(dirPath).isDirectory()) continue;
       } catch {
         continue;
       }
-      if (cutoff && st.mtimeMs < cutoff) continue; // outside retention
+      for (const path of walkTranscripts(dirPath)) {
+        let st: ReturnType<typeof statSync>;
+        try {
+          st = statSync(path);
+        } catch {
+          continue;
+        }
+        if (cutoff && st.mtimeMs < cutoff) continue; // outside retention
 
-      const prev = getFile.get(path);
-      // Unchanged since last sweep → skip without opening it.
-      if (prev && prev.size === st.size && prev.mtime === Math.floor(st.mtimeMs)) {
-        owned.add(prev.session_id);
-        continue;
-      }
+        const prev = getFile.get(path);
+        // Unchanged since last sweep → skip without opening it.
+        if (prev && prev.size === st.size && prev.mtime === Math.floor(st.mtimeMs)) {
+          owned.add(prev.session_id);
+          continue;
+        }
 
-      try {
-        // A transcript that got *shorter* was rewritten, not appended to, so a
-        // saved offset now points into different content. Re-read it whole
-        // rather than skipping past records that no longer exist.
-        const rewritten = !!prev && st.size < prev.size;
-        const from = rewritten ? 0 : prev?.lines_done ?? 0;
-        const r = await ingestFile(path, basename(path, ".jsonl"), from, onLive, scope);
-        // Out of scope: claim nothing, so widening the scope later can still
-        // pick it up, and the hook path isn't blocked for a session we skipped.
-        if (r.skipped) continue;
-        owned.add(r.session_id);
-        putFile.run({
-          $path: path,
-          $sid: r.session_id,
-          $src: r.source_app,
-          $proj: r.project_path,
-          $lines: r.lines,
-          $size: st.size,
-          $mtime: Math.floor(st.mtimeMs),
-        });
-        total += r.ingested;
-      } catch (e) {
-        console.error(`[scan] ${path}: ${e instanceof Error ? e.message : e}`);
+        try {
+          // A transcript that got *shorter* was rewritten, not appended to, so a
+          // saved offset now points into different content. Re-read it whole
+          // rather than skipping past records that no longer exist.
+          const rewritten = !!prev && st.size < prev.size;
+          const from = rewritten ? 0 : prev?.lines_done ?? 0;
+          const r = await ingestFile(path, basename(path, ".jsonl"), from, onLive, scope, root.account);
+          // Out of scope: claim nothing, so widening the scope later can still
+          // pick it up, and the hook path isn't blocked for a session we skipped.
+          if (r.skipped) continue;
+          owned.add(r.session_id);
+          putFile.run({
+            $path: path,
+            $sid: r.session_id,
+            $src: r.source_app,
+            $proj: r.project_path,
+            $lines: r.lines,
+            $size: st.size,
+            $mtime: Math.floor(st.mtimeMs),
+          });
+          total += r.ingested;
+        } catch (e) {
+          console.error(`[scan] ${path}: ${e instanceof Error ? e.message : e}`);
+        }
       }
     }
   }
@@ -523,8 +549,9 @@ export function startScanner(onLive: (r: InsertResult) => void): void {
   scanOnce(null)
     .then((n) => {
       const projects = projectPaths.size;
+      const roots = scanRoots().length;
       console.log(
-        `📚 scanned ${PROJECTS_DIR} — ${n} events from ${projects} project${projects === 1 ? "" : "s"} in ${Date.now() - t0}ms`
+        `📚 scanned ${roots} config dir${roots === 1 ? "" : "s"} — ${n} events from ${projects} project${projects === 1 ? "" : "s"} in ${Date.now() - t0}ms`
       );
       setInterval(async () => {
         if (sweepBusy) return; // a slow sweep must not stack up behind the timer
