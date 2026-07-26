@@ -127,6 +127,10 @@ function EventRow({ row, onSelect, compact }: { row: Row; onSelect?: (e: WatchEv
       )}
       {e.duration_ms != null && <span className="t-dim2 shrink-0">{fmtMs(e.duration_ms)}</span>}
       {e.cost_usd > 0 && <span className="shrink-0" style={{ color: "var(--success)" }}>{fmtUsd(e.cost_usd)}</span>}
+      {/* Only worth flagging the exception — the default account is the common case. */}
+      {e.account && e.account !== "work" && (
+        <span className="chip shrink-0" style={{ color: hashColor(e.account), background: `color-mix(in srgb, ${hashColor(e.account)} 14%, transparent)` }}>{e.account}</span>
+      )}
       {/* in a lane the column header already names the agent — the per-row tag is noise there */}
       {!compact && <span className="ml-auto shrink-0 truncate max-w-[120px]" style={{ color: `color-mix(in srgb, ${aColor} 75%, var(--text4))` }} title={aKey}>{aKey}</span>}
     </motion.div>

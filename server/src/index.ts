@@ -306,7 +306,7 @@ const server = Bun.serve<WsData>({
     // --- reads ---
     if (pathname === "/events/recent") {
       const limit = Math.min(2000, Number(url.searchParams.get("limit") || 300));
-      return json(getRecent(limit, url.searchParams.get("provider") || undefined));
+      return json(getRecent(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
     }
     if (pathname === "/events/filter-options") return json(getFilterOptions());
     // Every project the scanner has seen, with the real folder it lives in —
@@ -504,11 +504,11 @@ const server = Bun.serve<WsData>({
     }
     if (pathname === "/sessions") {
       const limit = Math.min(1000, Number(url.searchParams.get("limit") || 100));
-      return json(getSessions(limit, url.searchParams.get("provider") || undefined));
+      return json(getSessions(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
     }
     if (pathname === "/stats") {
       const windowMs = Math.min(3660 * 86_400_000, Math.max(60_000, Number(url.searchParams.get("window") || 24 * 3600 * 1000)));
-      return json(statsSummary(windowMs, url.searchParams.get("provider") || undefined));
+      return json(statsSummary(windowMs, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
     }
 
     // --- export ---

@@ -1,6 +1,7 @@
 // Normalize a raw hook POST body into structured, storable fields.
 import type { IngestBody } from "../../shared/types.ts";
 import type { TokenUsage } from "./pricing.ts";
+import { accountForPath } from "./config.ts";
 
 export interface NormalizedEvent {
   source_app: string;
@@ -11,6 +12,7 @@ export interface NormalizedEvent {
   agent_id: string | null;
   agent_type: string | null;
   model_name: string | null;
+  account: string;
   is_error: number;
   error_text: string | null;
   /** Raw token usage from this event (see usage_is_cumulative). */
@@ -174,6 +176,10 @@ export function normalize(body: IngestBody): NormalizedEvent {
   const usage: TokenUsage = hasPayloadUsage ? payloadUsage : sumTranscriptTokens(chat ?? undefined);
 
   const model_name = str(body.model_name) ?? str(pick(payload, "model", "model_name"));
+  // The transcript scanner only sets payload.cwd for a worktree checkout
+  // (otherwise it equals project_path and is omitted) — project_path is what's
+  // reliably present, so it has to be the fallback's primary signal.
+  const account = str(body.account) ?? accountForPath(str(pick(payload, "cwd", "project_path"))) ?? "work";
 
   // A single field arriving over /ingest is untrusted and unbounded; a 100MB
   // prompt becomes a 100MB DB row, a 100MB FTS entry, and a 100MB frame to
@@ -190,6 +196,7 @@ export function normalize(body: IngestBody): NormalizedEvent {
     agent_id,
     agent_type,
     model_name,
+    account,
     is_error,
     error_text,
     usage,

@@ -180,7 +180,7 @@ function MoreMenu({ sound, onSound, onOpenStats, onOpenHelp }: { sound: boolean;
 }
 
 export function Header({
-  conn, windowMs, onWindow, apps, types, providers, filter, onFilter, theme, onTheme,
+  conn, windowMs, onWindow, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
   sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenChanges, onOpenGit, onOpenDocker, onOpenTerminal, onOpenChat, onClear, showUsage,
   workspace, onOpenProject,
 }: {
@@ -190,8 +190,9 @@ export function Header({
   apps: string[];
   types: string[];
   providers: string[];
-  filter: { app: string; type: string; provider: string };
-  onFilter: (f: { app: string; type: string; provider: string }) => void;
+  accounts: string[];
+  filter: { app: string; type: string; provider: string; account: string };
+  onFilter: (f: { app: string; type: string; provider: string; account: string }) => void;
   theme: string;
   onTheme: (id: string) => void;
   sound: boolean;
@@ -211,7 +212,7 @@ export function Header({
   onOpenProject: () => void;
 }) {
   const live = conn === "open";
-  const hasFilter = filter.app || filter.type || filter.provider;
+  const hasFilter = filter.app || filter.type || filter.provider || filter.account;
 
   return (
     <header className="flex items-center gap-3 px-4 py-2.5 shrink-0 relative z-20"
@@ -275,6 +276,11 @@ export function Header({
       )}
       {providers.length > 1 && (
         <Select value={filter.provider} style={selStyle} options={[{ value: "", label: "all providers" }, ...providers.map((p) => ({ value: p, label: p }))]} onChange={(v) => onFilter({ ...filter, provider: v })} />
+      )}
+      {/* Account is explicit (from AGENTGLASS_ACCOUNT or an accountPaths match),
+          not auto-detected — only worth a filter once more than one shows up. */}
+      {accounts.length > 1 && (
+        <Select value={filter.account} style={selStyle} options={[{ value: "", label: "all accounts" }, ...accounts.map((a) => ({ value: a, label: a }))]} onChange={(v) => onFilter({ ...filter, account: v })} />
       )}
       {hasFilter && <button onClick={onClear} className="text-[11px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap" style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>clear ✕</button>}
       </div>{/* middle scroll zone */}

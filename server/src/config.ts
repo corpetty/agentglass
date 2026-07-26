@@ -21,6 +21,9 @@ interface Config {
   root?: string;
   /** Directories to sweep for git repos, e.g. ["~/code", "/mnt/hdd/code"]. */
   repoDirs?: string[];
+  /** Fallback account tagging for sessions with no explicit AGENTGLASS_ACCOUNT
+   *  (e.g. backfilled transcript scans): a directory prefix → account label. */
+  accountPaths?: { prefix: string; account: string }[];
 }
 
 function load(): Config {
@@ -147,4 +150,20 @@ export function configuredRepoDirs(): string[] {
   const fromEnv = (process.env.AGENTGLASS_REPO_DIRS || "").split(":").filter(Boolean);
   const dirs = fromEnv.length ? fromEnv : config.repoDirs ?? [];
   return dirs.map(expand);
+}
+
+const accountPaths = (config.accountPaths ?? [])
+  .map((p) => ({ prefix: expand(p.prefix), account: p.account }))
+  .sort((a, b) => b.prefix.length - a.prefix.length); // longest prefix first
+
+/** Fallback account for a session with no explicit AGENTGLASS_ACCOUNT — the
+ *  longest matching `accountPaths` prefix, or null if nothing configured
+ *  matches. Used by the transcript scanner (no hook env to read) and by
+ *  normalize() when a live event arrived without an explicit account. */
+export function accountForPath(cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  for (const p of accountPaths) {
+    if (cwd === p.prefix || cwd.startsWith(p.prefix + "/")) return p.account;
+  }
+  return null;
 }

@@ -15,6 +15,7 @@ import type {
 } from "../../shared/types.ts";
 import type { NormalizedEvent } from "./ingest.ts";
 import { costUsd, modelLabel } from "./pricing.ts";
+import { accountForPath } from "./config.ts";
 
 /**
  * Where the database lives.
@@ -75,7 +76,8 @@ CREATE TABLE IF NOT EXISTS events (
   cost_usd REAL NOT NULL DEFAULT 0,
   summary TEXT,
   payload TEXT NOT NULL DEFAULT '{}',
-  timestamp INTEGER NOT NULL
+  timestamp INTEGER NOT NULL,
+  account TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_app);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -89,6 +91,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   source_app TEXT NOT NULL,
   model_name TEXT,
   provider TEXT,
+  account TEXT,
   started_at INTEGER NOT NULL,
   ended_at INTEGER,
   last_seen INTEGER NOT NULL,
@@ -112,6 +115,43 @@ CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(text);
 // pre-existing sessions table, so ALTER it in before any statement referencing
 // it is prepared. Harmless (throws "duplicate column") once it already exists.
 try { db.exec("ALTER TABLE sessions ADD COLUMN provider TEXT"); } catch { /* already present */ }
+try { db.exec("ALTER TABLE sessions ADD COLUMN account TEXT"); } catch { /* already present */ }
+try { db.exec("ALTER TABLE events ADD COLUMN account TEXT"); } catch { /* already present */ }
+db.exec("CREATE INDEX IF NOT EXISTS idx_events_account ON events(account)");
+
+// Backfill `account` for rows ingested before this dimension existed (mostly
+// the transcript scanner's historical backfill, which never had a hook env to
+// read). Only touches NULL rows, driven by the same accountPaths config as
+// live tagging, so it's safe — and cheap — to run on every boot.
+backfillAccounts();
+function backfillAccounts(): void {
+  const rows = db
+    .query<{ id: number; payload: string }, []>(
+      `SELECT id, payload FROM events WHERE account IS NULL LIMIT 50000`
+    )
+    .all();
+  if (!rows.length) return;
+  const update = db.query(`UPDATE events SET account = $account WHERE id = $id`);
+  let n = 0;
+  for (const r of rows) {
+    // payload.cwd is only set for a worktree checkout (otherwise it equals
+    // project_path and is omitted) — project_path is what's reliably present.
+    let cwd: string | null = null;
+    try {
+      const p = JSON.parse(r.payload) as any;
+      cwd = p?.cwd ?? p?.project_path ?? null;
+    } catch { /* skip */ }
+    const account = accountForPath(cwd) ?? "work";
+    update.run({ $account: account, $id: r.id });
+    n++;
+  }
+  if (n) console.log(`[db] backfilled account on ${n} historical event(s)`);
+  db.exec(`
+    UPDATE sessions SET account = (
+      SELECT account FROM events WHERE events.session_id = sessions.session_id AND account IS NOT NULL LIMIT 1
+    ) WHERE account IS NULL
+  `);
+}
 
 /** Coarse vendor for a model name — the provider dimension. Returns null for an
  *  unknown/absent model so a session's known provider is never overwritten.
@@ -136,6 +176,19 @@ function providerScope(provider?: string | null): { clause: string; args: string
   return provider
     ? { clause: " AND session_id IN (SELECT session_id FROM sessions WHERE provider = ?)", args: [provider] }
     : { clause: "", args: [] };
+}
+
+/** SQL fragment + args to scope an events query to one account. Unlike
+ *  provider, account lives directly on `events` — no subquery needed. */
+function accountScope(account?: string | null): { clause: string; args: string[] } {
+  return account ? { clause: " AND account = ?", args: [account] } : { clause: "", args: [] };
+}
+
+/** Combine provider + account scopes into one clause/args pair. */
+function scope(provider?: string | null, account?: string | null): { clause: string; args: string[] } {
+  const p = providerScope(provider);
+  const a = accountScope(account);
+  return { clause: p.clause + a.clause, args: [...p.args, ...a.args] };
 }
 
 /** The searchable text blob for an event — the fleet's collective memory. */
@@ -163,12 +216,12 @@ const insertStmt = db.query(`
     source_app, session_id, hook_event_type, tool_name, tool_use_id,
     agent_id, agent_type, model_name, is_error, error_text, duration_ms,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
-    cost_usd, summary, payload, timestamp
+    cost_usd, summary, payload, timestamp, account
   ) VALUES (
     $source_app, $session_id, $hook_event_type, $tool_name, $tool_use_id,
     $agent_id, $agent_type, $model_name, $is_error, $error_text, $duration_ms,
     $input_tokens, $output_tokens, $cache_creation_tokens, $cache_read_tokens,
-    $cost_usd, $summary, $payload, $timestamp
+    $cost_usd, $summary, $payload, $timestamp, $account
   ) RETURNING id
 `);
 
@@ -296,6 +349,7 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
     $summary: n.summary,
     $payload: JSON.stringify(n.payload ?? {}),
     $timestamp: n.timestamp,
+    $account: n.account,
   }) as { id: number };
 
   const event = parseEventRow(rowToEvent.get(id));
@@ -306,11 +360,11 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
 
 const upsertStmt = db.query(`
   INSERT INTO sessions (
-    session_id, source_app, model_name, provider, started_at, ended_at, last_seen,
+    session_id, source_app, model_name, provider, account, started_at, ended_at, last_seen,
     event_count, tool_count, error_count,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, cost_usd
   ) VALUES (
-    $sid, $src, $model, $provider, $ts, $ended, $ts,
+    $sid, $src, $model, $provider, $account, $ts, $ended, $ts,
     1, $tool, $err,
     $in, $out, $cw, $cr, $cost
   )
@@ -318,6 +372,7 @@ const upsertStmt = db.query(`
     source_app = excluded.source_app,
     model_name = COALESCE(excluded.model_name, sessions.model_name),
     provider = COALESCE(excluded.provider, sessions.provider),
+    account = COALESCE(excluded.account, sessions.account),
     ended_at = COALESCE(excluded.ended_at, sessions.ended_at),
     last_seen = excluded.last_seen,
     event_count = sessions.event_count + 1,
@@ -347,6 +402,7 @@ function upsertSession(
     $src: n.source_app,
     $model: n.model_name,
     $provider: providerOf(n.model_name),
+    $account: n.account,
     $ts: n.timestamp,
     $ended: isTerminal(n.hook_event_type) ? n.timestamp : null,
     $tool: isToolPost(n.hook_event_type) ? 1 : 0,
@@ -371,13 +427,12 @@ function upsertSession(
 const recentStmt = db.query<any, [number]>(
   `SELECT * FROM events ORDER BY timestamp DESC, id DESC LIMIT ?`
 );
-export function getRecent(limit = 300, provider?: string): WatchEvent[] {
-  if (!provider) return recentStmt.all(limit).map(parseEventRow).reverse();
+export function getRecent(limit = 300, provider?: string, account?: string): WatchEvent[] {
+  const { clause, args } = scope(provider, account);
+  if (!clause) return recentStmt.all(limit).map(parseEventRow).reverse();
   return db
-    .query<any, any[]>(
-      `SELECT * FROM events WHERE session_id IN (SELECT session_id FROM sessions WHERE provider = ?) ORDER BY timestamp DESC, id DESC LIMIT ?`
-    )
-    .all(provider, limit)
+    .query<any, any[]>(`SELECT * FROM events WHERE 1=1${clause} ORDER BY timestamp DESC, id DESC LIMIT ?`)
+    .all(...args, limit)
     .map(parseEventRow)
     .reverse();
 }
@@ -399,12 +454,22 @@ export function getFilterOptions() {
     )
     .all()
     .map((r) => r.model_name);
-  return { source_apps: apps, hook_event_types: types, models };
+  const accounts = db
+    .query<{ account: string }, []>(
+      `SELECT DISTINCT account FROM events WHERE account IS NOT NULL ORDER BY 1`
+    )
+    .all()
+    .map((r) => r.account);
+  return { source_apps: apps, hook_event_types: types, models, accounts };
 }
 
-export function getSessions(limit = 100, provider?: string): SessionRollup[] {
-  const where = provider ? " WHERE provider = ?" : "";
-  const args = provider ? [provider, limit] : [limit];
+export function getSessions(limit = 100, provider?: string, account?: string): SessionRollup[] {
+  const conds = [
+    provider ? "provider = ?" : null,
+    account ? "account = ?" : null,
+  ].filter(Boolean);
+  const where = conds.length ? ` WHERE ${conds.join(" AND ")}` : "";
+  const args = [...(provider ? [provider] : []), ...(account ? [account] : []), limit];
   return db
     .query<SessionRollup, any[]>(`SELECT * FROM sessions${where} ORDER BY last_seen DESC LIMIT ?`)
     .all(...args);
@@ -418,9 +483,9 @@ function percentile(sorted: number[], p: number): number {
 
 /** Full analytics summary over a rolling window (default 24h), optionally scoped
  *  to a single provider (Anthropic / OpenAI / Google / …). */
-export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string): StatsSummary {
+export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, account?: string): StatsSummary {
   const since = Date.now() - windowMs;
-  const { clause: pf, args: pa } = providerScope(provider);
+  const { clause: pf, args: pa } = scope(provider, account);
   const A = [since, ...pa]; // bind order: timestamp first, then provider (if any)
 
   // Totals come from the authoritative sessions table for cost/tokens,
@@ -502,7 +567,7 @@ export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string): St
     .sort((a, b) => b.total_ms - a.total_ms);
 
   // Most-used skills with attributed cost and per-bucket activity.
-  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider).slice(0, 20);
+  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider, account).slice(0, 20);
 
   // Per-app rollup within the window.
   const by_app: AppUsage[] = db
@@ -585,8 +650,8 @@ export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string): St
  * skill starts). An approximation, but a useful one: it answers "what does
  * running /code-review actually cost?".
  */
-export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string): SkillUsage[] {
-  const { clause: pf, args: pa } = providerScope(provider);
+export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string, account?: string): SkillUsage[] {
+  const { clause: pf, args: pa } = scope(provider, account);
   const invocations = db
     .query<{ session_id: string; timestamp: number; skill: string }, any[]>(
       `SELECT session_id, timestamp, json_extract(payload, '$.tool_input.skill') AS skill

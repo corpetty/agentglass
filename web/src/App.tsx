@@ -36,9 +36,9 @@ import { ProjectPicker, PICKER_ANSWERED_KEY } from "./components/ProjectPicker.t
 export default function App() {
   const { events, conn, lastEvent } = useLive();
   const [windowMs, setWindowMs] = useState(3_600_000);
-  const [filter, setFilter] = useState({ app: "", type: "", provider: "" });
+  const [filter, setFilter] = useState({ app: "", type: "", provider: "", account: "" });
   const [theme, setTheme] = useState(initialTheme());
-  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[] }>({ source_apps: [], hook_event_types: [] });
+  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[]; accounts: string[] }>({ source_apps: [], hook_event_types: [], accounts: [] });
   const [selected, setSelected] = useState<WatchEvent | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -73,7 +73,7 @@ export default function App() {
   // Poll on an interval — NOT on every event. Passing lastEvent.id as `bump`
   // used to refetch /stats on every single event (a per-event server query +
   // full chart re-render). The 4s interval is plenty for a summary.
-  const { stats } = useStats(windowMs, undefined, filter.provider);
+  const { stats } = useStats(windowMs, undefined, filter.provider, filter.account);
 
   useEffect(() => {
     applyTheme(theme);
@@ -113,21 +113,27 @@ export default function App() {
   // The Anthropic plan meters only make sense when Anthropic is what you're
   // looking at (no filter + Anthropic present, or explicitly filtered to it).
   const showUsage = (!filter.provider && providers.includes("Anthropic")) || filter.provider === "Anthropic";
-  // Selecting a provider scopes EVERYTHING the client derives from the event
-  // buffer — feed, tool-mix, throughput, radar, fleet, KPIs. /stats (cost,
-  // latency, timeline) is scoped in parallel on the server via useStats(provider).
-  const visibleEvents = useMemo(
-    () => (filter.provider ? events.filter((e) => sessionProvider.get(e.session_id) === filter.provider) : events),
-    [events, filter.provider, sessionProvider]
-  );
+  // Selecting a provider or account scopes EVERYTHING the client derives from
+  // the event buffer — feed, tool-mix, throughput, radar, fleet, KPIs. /stats
+  // (cost, latency, timeline) is scoped in parallel on the server via
+  // useStats(provider, account). Account lives directly on the event (unlike
+  // provider, which is derived from model_name), so no session map is needed.
+  const visibleEvents = useMemo(() => {
+    if (!filter.provider && !filter.account) return events;
+    return events.filter(
+      (e) =>
+        (!filter.provider || sessionProvider.get(e.session_id) === filter.provider) &&
+        (!filter.account || e.account === filter.account)
+    );
+  }, [events, filter.provider, filter.account, sessionProvider]);
   const agents = useMemo(
-    () => (filter.provider ? deriveAgents(visibleEvents) : agentsAll),
-    [filter.provider, visibleEvents, agentsAll]
+    () => (filter.provider || filter.account ? deriveAgents(visibleEvents) : agentsAll),
+    [filter.provider, filter.account, visibleEvents, agentsAll]
   );
   const alerts = useMemo(() => deriveAlerts(agents), [agents]);
   useAlertSound(alerts.length, sound);
 
-  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "" }), []);
+  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "", account: "" }), []);
 
   // Keyboard shortcuts: ⌘K / Ctrl-K palette, ? help, Esc closes
   useEffect(() => {
@@ -201,6 +207,7 @@ export default function App() {
         apps={opts.source_apps}
         types={opts.hook_event_types}
         providers={providers}
+        accounts={opts.accounts}
         filter={filter}
         onFilter={setFilter}
         theme={theme}

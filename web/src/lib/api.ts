@@ -58,12 +58,12 @@ const realApi = {
   /** Scope + discovered projects. `workspace` is set when this instance was
    *  opened for a single project. */
   projects: () => get<{ projects: { source_app: string; path: string }[]; scanning: boolean; workspace: string | null }>("/projects"),
-  stats: (windowMs: number, provider?: string) =>
-    get<StatsSummary>(`/stats?window=${windowMs}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}`),
-  sessions: (limit = 100, provider?: string) =>
-    get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}`),
+  stats: (windowMs: number, provider?: string, account?: string) =>
+    get<StatsSummary>(`/stats?window=${windowMs}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}`),
+  sessions: (limit = 100, provider?: string, account?: string) =>
+    get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}`),
   filterOptions: () =>
-    get<{ source_apps: string[]; hook_event_types: string[]; models: string[] }>(
+    get<{ source_apps: string[]; hook_event_types: string[]; models: string[]; accounts: string[] }>(
       `/events/filter-options`
     ),
   exportUrl: (fmt: "csv" | "json") => withToken(`${SERVER}/export?format=${fmt}`),

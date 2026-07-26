@@ -19,7 +19,7 @@ import type { IngestBody } from "../../shared/types.ts";
 import { normalize } from "./ingest.ts";
 import { db, insertEvent, RETENTION_DAYS, type InsertResult } from "./db.ts";
 import { projectRootOf } from "./git.ts";
-import { workspaceRoot } from "./config.ts";
+import { workspaceRoot, accountForPath } from "./config.ts";
 
 const PROJECTS_DIR =
   process.env.AGENTGLASS_PROJECTS_DIR || join(homedir(), ".claude", "projects");
@@ -174,6 +174,10 @@ function lineToBodies(
     source_app: ctx.source_app,
     session_id: ctx.session_id,
     model_name: model ?? undefined,
+    // No hook env to read during a backfill scan — fall back to the
+    // configured accountPaths (normalize() re-derives this too, but doing it
+    // here keeps the scan and live-hook paths symmetric).
+    account: accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
   };
   // Shared payload bits so every event carries where it came from — this is
   // what the folder filter and the project column read.

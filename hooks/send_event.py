@@ -96,6 +96,9 @@ def main():
         "payload": payload,
         "model_name": model_name,
     }
+    account = os.environ.get("AGENTGLASS_ACCOUNT")
+    if account:
+        body["account"] = account
     if chat is not None:
         body["chat"] = chat
 

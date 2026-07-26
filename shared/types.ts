@@ -26,6 +26,8 @@ export interface IngestBody {
   summary?: string;
   model_name?: string;
   timestamp?: number; // ms; server stamps if absent
+  /** Which Claude account/instance produced this (e.g. "work" / "personal"). */
+  account?: string;
 }
 
 /** A normalized, stored event as returned by the API / WS. */
@@ -50,12 +52,15 @@ export interface WatchEvent {
   summary: string | null;
   timestamp: number; // ms
   payload: Record<string, unknown>;
+  /** Which Claude account/instance produced this (e.g. "work" / "personal"). */
+  account: string | null;
 }
 
 export interface SessionRollup {
   session_id: string;
   source_app: string;
   model_name: string | null;
+  account: string | null;
   started_at: number;
   ended_at: number | null;
   last_seen: number;
