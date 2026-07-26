@@ -30,6 +30,7 @@ import { EventModal } from "./components/EventModal.tsx";
 import { CommandPalette } from "./components/CommandPalette.tsx";
 import { HelpLegend } from "./components/HelpLegend.tsx";
 import { StatsModal } from "./components/StatsModal.tsx";
+import { AccountsModal } from "./components/AccountsModal.tsx";
 import { SkillsModal } from "./components/SkillsModal.tsx";
 import { Workspace } from "./components/workspace/Workspace.tsx";
 import { VIEW_IDS, loadViewOrder, loadLastView, type ViewId } from "./components/workspace/views.ts";
@@ -64,13 +65,14 @@ const keepIfSame = <T,>(set: (v: T) => void) => {
 
 export default function App() {
   const [windowMs, setWindowMs] = useState(3_600_000);
-  const [filter, setFilter] = useState({ app: "", type: "", provider: "" });
+  const [filter, setFilter] = useState({ app: "", type: "", provider: "", account: "" });
   const [theme, setTheme] = useState(initialTheme());
-  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[] }>({ source_apps: [], hook_event_types: [] });
+  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[]; accounts: string[] }>({ source_apps: [], hook_event_types: [], accounts: [] });
   const [selected, setSelected] = useState<WatchEvent | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
+  const [accountsOpen, setAccountsOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   // One overlay replaced five modals. `wsView` is which view it shows, and it
   // survives closing — reopening lands you where you left off, because
@@ -105,7 +107,7 @@ export default function App() {
   // Escape, then `d`, losing the git panel's state on the way. Inside the
   // workspace the letters now *switch views* instead of being swallowed.
   const anyPanelOpen =
-    paletteOpen || helpOpen || statsOpen || skillsOpen || searchOpen ||
+    paletteOpen || helpOpen || statsOpen || accountsOpen || skillsOpen || searchOpen ||
     projectOpen || sessionView !== null || selected !== null;
   const anyPanelOpenRef = useRef(anyPanelOpen);
   anyPanelOpenRef.current = anyPanelOpen;
@@ -193,7 +195,7 @@ export default function App() {
   // Poll on an interval — NOT on every event. Passing lastEvent.id as `bump`
   // used to refetch /stats on every single event (a per-event server query +
   // full chart re-render). The 4s interval is plenty for a summary.
-  const { stats } = useStats(windowMs, undefined, filter.provider);
+  const { stats } = useStats(windowMs, undefined, filter.provider, filter.account);
 
   useEffect(() => {
     applyTheme(theme);
@@ -270,19 +272,35 @@ export default function App() {
   // The Anthropic plan meters only make sense when Anthropic is what you're
   // looking at (no filter + Anthropic present, or explicitly filtered to it).
   const showUsage = (!filter.provider && providers.includes("Anthropic")) || filter.provider === "Anthropic";
-  // Selecting a provider scopes EVERYTHING the client derives from the event
-  // buffer — feed, tool-mix, throughput, radar, fleet, KPIs. /stats (cost,
-  // latency, timeline) is scoped in parallel on the server via useStats(provider).
+  // Selecting a provider or account scopes EVERYTHING the client derives from
+  // the event buffer — feed, tool-mix, throughput, radar, fleet, KPIs. /stats
+  // (cost, latency, timeline) is scoped in parallel on the server via
+  // useStats(provider, account). Account lives directly on the event (unlike
+  // provider, which is derived from model_name), so no session map is needed.
+  const scoped = !!(filter.provider || filter.account);
   const visibleEvents = useMemo(
-    () => (filter.provider ? events.filter((e) => sessionProvider.get(e.session_id) === filter.provider) : events),
-    [events, filter.provider, sessionProvider]
+    () =>
+      scoped
+        ? events.filter(
+            (e) =>
+              (!filter.provider || sessionProvider.get(e.session_id) === filter.provider) &&
+              (!filter.account || e.account === filter.account)
+          )
+        : events,
+    [events, filter.provider, filter.account, scoped, sessionProvider]
   );
   const agents = useMemo(
     () =>
-      filter.provider
-        ? deriveAgents(visibleEvents, openTools.filter((s) => sessionProvider.get(s.session_id) === filter.provider), titles)
+      scoped
+        ? deriveAgents(
+            visibleEvents,
+            openTools.filter(
+              (s) => !filter.provider || sessionProvider.get(s.session_id) === filter.provider
+            ),
+            titles
+          )
         : agentsAll,
-    [filter.provider, visibleEvents, agentsAll, openTools, sessionProvider, titles]
+    [scoped, filter.provider, visibleEvents, agentsAll, openTools, sessionProvider, titles]
   );
   const alerts = useMemo(() => deriveAlerts(agents), [agents]);
   useAlertSound(alerts.length, sound);
@@ -295,7 +313,7 @@ export default function App() {
     publishFleet(agentsAll, stats?.totals.cost_usd ?? 0);
   }, [agentsAll, stats]);
 
-  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "" }), []);
+  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "", account: "" }), []);
 
   // Zoom steps through a fixed ladder rather than taking a target, so every
   // caller (keys, settings, palette) lands on the same rungs. uiScale owns the
@@ -378,6 +396,7 @@ export default function App() {
         setPaletteOpen(false);
         setHelpOpen(false);
         setStatsOpen(false);
+        setAccountsOpen(false);
         setSkillsOpen(false);
         setWsOpen(false);
         setSearchOpen(false);
@@ -436,6 +455,7 @@ export default function App() {
       switch (action) {
         case "open.help": setHelpOpen((o) => !o); break;
         case "open.stats": e.preventDefault(); setStatsOpen((o) => !o); break;
+        case "open.accounts": e.preventDefault(); setAccountsOpen((o) => !o); break;
         case "open.skills": e.preventDefault(); setSkillsOpen((o) => !o); break;
         case "open.search": e.preventDefault(); setSearchOpen((o) => !o); break;
       }
@@ -527,6 +547,7 @@ export default function App() {
         apps={opts.source_apps}
         types={opts.hook_event_types}
         providers={providers}
+        accounts={opts.accounts}
         filter={filter}
         onFilter={setFilter}
         theme={theme}
@@ -536,6 +557,7 @@ export default function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         onOpenHelp={() => setHelpOpen(true)}
         onOpenStats={() => setStatsOpen(true)}
+        onOpenAccounts={() => setAccountsOpen(true)}
         onOpenSkills={() => setSkillsOpen(true)}
         onOpenWorkspace={() => setWsOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -590,6 +612,7 @@ export default function App() {
 
       <EventModal event={selected} onClose={() => setSelected(null)} />
       <StatsModal open={statsOpen} onClose={() => setStatsOpen(false)} stats={stats} windowMs={windowMs} />
+      <AccountsModal open={accountsOpen} onClose={() => setAccountsOpen(false)} />
       <SkillsModal open={skillsOpen} onClose={() => setSkillsOpen(false)} />
       <Workspace open={wsOpen} view={wsView} onView={setWsView} onClose={closeWorkspace} onSkills={() => setSkillsOpen(true)} chatFocusId={chatFocus} />
       <SearchModal open={searchOpen} onClose={() => setSearchOpen(false)} onSelectApp={(app) => setFilter((f) => ({ ...f, app }))} />

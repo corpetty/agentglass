@@ -106,7 +106,7 @@ function mkEvent(o: Partial<WatchEvent> & { source_app: string; session_id: stri
     tool_name: null, tool_use_id: null, agent_id: null, agent_type: null,
     model_name: null, is_error: 0, error_text: null, duration_ms: null,
     input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
-    cost_usd: 0, summary: null, timestamp: Date.now(), payload: {},
+    cost_usd: 0, summary: null, timestamp: Date.now(), payload: {}, account: null,
     ...o,
   } as WatchEvent;
 }
@@ -196,7 +196,7 @@ export function startStream(push: (e: WatchEvent) => void): () => void {
 
 // --- REST-shaped generators -------------------------------------------------
 export function filterOptions() {
-  return { source_apps: [...new Set(SESSIONS.map((s) => s.app))].sort(), hook_event_types: ["PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "Notification", "UserPromptSubmit", "Stop", "SubagentStop"], models: MODELS };
+  return { source_apps: [...new Set(SESSIONS.map((s) => s.app))].sort(), hook_event_types: ["PreToolUse", "PostToolUse", "SessionStart", "SessionEnd", "Notification", "UserPromptSubmit", "Stop", "SubagentStop"], models: MODELS, accounts: [] as string[] };
 }
 
 // Each time-range button shows a plausibly-smaller slice of the same fleet, so

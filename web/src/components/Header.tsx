@@ -95,8 +95,8 @@ function MoreMenu({ onOpen }: { onOpen: () => void }) {
 }
 
 export function Header({
-  conn, windowMs, onWindow, apps, types, providers, filter, onFilter, theme, onTheme,
-  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenWorkspace, onOpenSettings, onClear, showUsage,
+  conn, windowMs, onWindow, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
+  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenAccounts, onOpenWorkspace, onOpenSettings, onClear, showUsage,
   workspace, onOpenProject,
 }: {
   conn: ConnState;
@@ -105,8 +105,9 @@ export function Header({
   apps: string[];
   types: string[];
   providers: string[];
-  filter: { app: string; type: string; provider: string };
-  onFilter: (f: { app: string; type: string; provider: string }) => void;
+  accounts: string[];
+  filter: { app: string; type: string; provider: string; account: string };
+  onFilter: (f: { app: string; type: string; provider: string; account: string }) => void;
   theme: string;
   onTheme: (id: string) => void;
   sound: boolean;
@@ -115,6 +116,7 @@ export function Header({
   onOpenHelp: () => void;
   onOpenStats: () => void;
   onOpenSkills: () => void;
+  onOpenAccounts: () => void;
   onOpenWorkspace: () => void;
   onOpenSettings: () => void;
   onClear: () => void;
@@ -128,7 +130,7 @@ export function Header({
   const waiting = useSyncExternalStore(subscribeChats, attentionCount, attentionCount);
   const unauth = conn === "unauthorized";
   const pillColor = live ? "var(--success)" : unauth ? "var(--error)" : "var(--warning)";
-  const hasFilter = filter.app || filter.type || filter.provider;
+  const hasFilter = filter.app || filter.type || filter.provider || filter.account;
 
   return (
     <header className="flex items-center gap-x-3 gap-y-2 px-3 sm:px-4 py-2.5 shrink-0 relative z-20 flex-wrap sm:flex-nowrap"
@@ -212,6 +214,11 @@ export function Header({
       {providers.length > 1 && (
         <Select value={filter.provider} style={selStyle} options={[{ value: "", label: "All providers" }, ...providers.map((p) => ({ value: p, label: providerLabel(p) }))]} onChange={(v) => onFilter({ ...filter, provider: v })} />
       )}
+      {/* Account is explicit (from AGENTGLASS_ACCOUNT or an accountPaths match),
+          not auto-detected — only worth a filter once more than one shows up. */}
+      {accounts.length > 1 && (
+        <Select value={filter.account} style={selStyle} options={[{ value: "", label: "All accounts" }, ...accounts.map((a) => ({ value: a, label: a }))]} onChange={(v) => onFilter({ ...filter, account: v })} />
+      )}
       {hasFilter && <button onClick={onClear} className="text-[11px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap" style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>Clear ✕</button>}
       </div>{/* middle scroll zone */}
 
@@ -254,6 +261,7 @@ export function Header({
         </button>
         {/* Skills demoted to a plain icon */}
         <IconBtn title="Skills explorer — browse every available skill (k)" onClick={onOpenSkills}><SkillsIcon /></IconBtn>
+        <IconBtn title="Accounts — per-account usage meters & login status (a)" onClick={onOpenAccounts}>👥</IconBtn>
         <MoreMenu onOpen={onOpenSettings} />
         <ThemeSwitcher current={theme} onChange={onTheme} />
       </div>

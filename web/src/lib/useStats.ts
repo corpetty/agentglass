@@ -21,21 +21,21 @@ function pollFor(windowMs: number): number {
   return 30_000;                                    // 30d / all time
 }
 
-/** Poll /stats on an interval, optionally scoped to a provider. Pass
- *  `intervalMs` only to override the window-derived rate. */
-export function useStats(windowMs: number, intervalMs?: number, provider = "") {
+/** Poll /stats on an interval, optionally scoped to a provider and/or account.
+ *  Pass `intervalMs` only to override the window-derived rate. */
+export function useStats(windowMs: number, intervalMs?: number, provider = "", account = "") {
   const [stats, setStats] = useState<StatsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api
-      .stats(windowMs, provider || undefined)
+      .stats(windowMs, provider || undefined, account || undefined)
       .then((s) => {
         setStats(s);
         setError(null);
       })
       .catch((e) => setError(String(e)));
-  }, [windowMs, provider]);
+  }, [windowMs, provider, account]);
 
   const every = intervalMs ?? pollFor(windowMs);
   useEffect(() => {
