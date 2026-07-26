@@ -68,11 +68,17 @@ function resolve(raw: RawAccount, synthesized = false): Account {
   };
 }
 
-/** Every account, resolved. Synthesizes a single default when none configured. */
+/** Every account, resolved. The default ~/.claude login is ALWAYS represented:
+ *  by whichever configured account uses the default dir, or a synthesized
+ *  "work" account when none does. Without this, configuring a second account
+ *  (with its own config dir) would silently drop the meter for the first — the
+ *  one still living on the default login. */
 export function listAccounts(): Account[] {
-  const raw = configuredAccounts();
-  if (!raw.length) return [resolve({ id: DEFAULT_ACCOUNT_ID }, true)];
-  return raw.map((a) => resolve(a));
+  const resolved = configuredAccounts().map((a) => resolve(a));
+  if (!resolved.some((a) => a.usesDefaultDir)) {
+    return [resolve({ id: DEFAULT_ACCOUNT_ID }, true), ...resolved];
+  }
+  return resolved;
 }
 
 export function accountById(id: string): Account | null {
