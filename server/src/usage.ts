@@ -10,6 +10,7 @@
 // This uses an unofficial endpoint (the one Claude Code's `/usage` calls). It may
 // change; failures degrade gracefully to { available: false }.
 import { accountById, defaultAccount, listAccounts, type Account } from "./accounts.ts";
+import { accessToken } from "./oauth.ts";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -70,13 +71,15 @@ function userAgent(): string {
   return uaCache;
 }
 
-async function token(credentialsPath: string): Promise<string | null> {
-  try {
-    const c = (await Bun.file(credentialsPath).json()) as any;
-    return c?.claudeAiOauth?.accessToken ?? c?.accessToken ?? null;
-  } catch {
-    return null;
-  }
+function fetchUsage(t: string): Promise<Response> {
+  return fetch(USAGE_URL, {
+    headers: {
+      Authorization: `Bearer ${t}`,
+      "anthropic-beta": "oauth-2025-04-20",
+      "User-Agent": userAgent(),
+    },
+    signal: AbortSignal.timeout(8000),
+  });
 }
 
 function win(w: any): UsageWindow | undefined {
@@ -96,21 +99,20 @@ async function usageForAccount(acct: Account): Promise<UsagePayload> {
     slot.cache?.available ? TTL : slot.cache?.reason === "rate_limited" ? RATE_LIMIT_TTL : ERROR_TTL;
   if (slot.cache && now - slot.cacheAt < ttl) return slot.cache;
 
-  const t = await token(acct.credentialsPath);
+  // Refreshes first if the stored token is expired (see oauth.ts).
+  let t = await accessToken(acct.credentialsPath);
   if (!t) {
     slot.cache = degrade(slot, now, acct.id, "no credentials", "no_credentials");
     slot.cacheAt = now;
     return slot.cache;
   }
   try {
-    const r = await fetch(USAGE_URL, {
-      headers: {
-        Authorization: `Bearer ${t}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": userAgent(),
-      },
-      signal: AbortSignal.timeout(8000),
-    });
+    let r = await fetchUsage(t);
+    // A 401 despite a token we believed valid → force one refresh and retry.
+    if (r.status === 401) {
+      const fresh = await accessToken(acct.credentialsPath, { force: true });
+      if (fresh && fresh !== t) { t = fresh; r = await fetchUsage(t); }
+    }
     if (!r.ok) {
       const reason = r.status === 401 ? "unauthorized" : r.status === 429 ? "rate_limited" : "error";
       slot.cache = degrade(slot, now, acct.id, `HTTP ${r.status}`, reason);
