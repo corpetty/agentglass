@@ -1405,3 +1405,79 @@ export interface RemoteStatus {
   /** Only ever sent to a caller on this machine. */
   token?: string;
 }
+
+// --- job queue --------------------------------------------------------------
+
+/** A queued job's lifecycle.
+ *  queued   — eligible to run once deps/window/headroom allow.
+ *  blocked  — a dependency hasn't finished (or failed).
+ *  running  — an executor is driving `claude -p` for it right now.
+ *  done     — completed; result_session_id links the transcript.
+ *  failed   — exhausted max_attempts, or a non-retryable error.
+ *  expired  — its time window closed before it ran.
+ *  cancelled — cancelled by hand. */
+export type JobStatus = "queued" | "blocked" | "running" | "done" | "failed" | "expired" | "cancelled";
+
+export interface Job {
+  id: string;
+  prompt: string;
+  /** Repo/worktree the job runs in. */
+  cwd: string;
+  /** 0–100; higher runs first. */
+  priority: number;
+  /** Optional time window (ms epoch). Outside it the job waits, or expires
+   *  once window_end has passed without it running. */
+  window_start: number | null;
+  window_end: number | null;
+  /** A specific account id, or "any" to let the dispatcher pick by headroom. */
+  account_id: string;
+  model: string | null;
+  /** default | plan | acceptEdits | bypassPermissions (bypass needs opt-in). */
+  permission_mode: string;
+  /** Pre-approved tool specs — `claude -p` can't prompt, so anything not listed
+   *  is refused mid-run. */
+  allowed_tools: string[];
+  /** Mandatory turn cap — the backstop that stops a looping job burning a whole
+   *  window of quota. */
+  max_turns: number;
+  /** Job ids that must reach `done` before this one is eligible. */
+  depends_on: string[];
+  max_attempts: number;
+  attempts: number;
+  status: JobStatus;
+  /** Which account actually ran it (set when dispatched). */
+  account_used: string | null;
+  /** The session the run produced — the link into the fleet/transcript. */
+  result_session_id: string | null;
+  result_summary: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  ended_at: number | null;
+}
+
+/** One row of a job's attempt history. */
+export interface JobEvent {
+  id: number;
+  job_id: string;
+  ts: number;
+  kind: string; // queued | started | completed | failed | rate_limited | expired | requeued | cancelled
+  detail: string | null;
+}
+
+/** Body accepted by POST /jobs — only `prompt` and `cwd` are required. */
+export interface JobInput {
+  prompt: string;
+  cwd: string;
+  priority?: number;
+  window_start?: number | null;
+  window_end?: number | null;
+  account_id?: string;
+  model?: string | null;
+  permission_mode?: string;
+  allowed_tools?: string[];
+  max_turns?: number;
+  depends_on?: string[];
+  max_attempts?: number;
+}

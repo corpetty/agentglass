@@ -65,6 +65,7 @@ import { paneEngineCapability, attachCommand, validPaneName } from "./chatpane.t
 import { paneAlive, killPane, forgetPane, startPaneSweeper, sendKey, sendableKey, capture as capturePane } from "./tmuxpane.ts";
 import { startScanner, ownsSession, knownProjects, resyncScope, SCAN_ENABLED } from "./transcripts.ts";
 import { workspaceRoot, setWorkspaceRoot, inScope } from "./config.ts";
+import { startDispatcher, onDispatch } from "./dispatcher.ts";
 import { hookStatus, applyHooks } from "./hooksetup.ts";
 import { privateHost } from "./net.ts";
 import { resolveToken, tokenOk, isIntake, isAuthExempt } from "./auth.ts";
@@ -1468,6 +1469,16 @@ const gates = restoreGates();
 if (gates.restored || gates.expired) {
   console.log(`✋ gate: ${gates.restored} pending restored, ${gates.expired} expired while down (${process.env.AGENTGLASS_GATE_FAILCLOSED === "1" ? "denied" : "allowed"})`);
 }
+
+// The job queue's dispatcher — runs unattended `claude -p` work across accounts
+// within the cost/runaway/load guarantees in dispatcher.ts. Job lifecycle is
+// pushed to clients over the same WS stream and routed through the alert path.
+onDispatch((e) => {
+  broadcast({ type: "job", data: e } as any);
+  if (e.kind === "failed") console.warn(`[dispatch] job failed on ${e.account}: ${e.error}`);
+  if (e.kind === "paused") console.warn(`[dispatch] ${e.account} paused until ${new Date(e.until).toISOString()}`);
+});
+startDispatcher();
 
 // Hang up shells and clean temp dirs on the way out — a bare kill leaves them
 // orphaned. Re-raise so the default disposition still terminates the process.
