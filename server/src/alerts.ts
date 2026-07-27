@@ -107,6 +107,20 @@ export function pushGate(agent: string, tool: string, summary: string) {
     deliver("✋ Approval needed", `${agent} wants to run ${tool}${summary ? `: ${summary.slice(0, 200)}` : ""} — approve or deny in agentglass.`);
 }
 
+/** A queued job exhausted its retries — the human should look, since an
+ *  unattended run just lost work. Keyed by job so the same failure debounces. */
+export function pushJobFailed(job: string, account: string, error: string) {
+  if (shouldSend(`job-failed:${job}`))
+    deliver("❌ Queue job failed", `Job on ${account} failed: ${error.slice(0, 200)}`, 2);
+}
+
+/** An account hit its rate limit and was paused — the queue keeps going on the
+ *  other accounts, but it's worth knowing one is resting. */
+export function pushAccountPaused(account: string, until: number) {
+  if (shouldSend(`acct-paused:${account}`))
+    deliver("⏸ Account paused", `${account} hit its limit — queue paused it until ${new Date(until).toLocaleString()}.`, 1);
+}
+
 /** Inspect an event and fire an alert if it warrants one. */
 export function maybeAlert(e: WatchEvent) {
   const agent = `${e.source_app}:${e.session_id.slice(0, 8)}`;

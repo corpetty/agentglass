@@ -19,7 +19,7 @@ import {
   providerOf,
   gateHistory,
 } from "./db.ts";
-import { maybeAlert, setAlertSink } from "./alerts.ts";
+import { maybeAlert, setAlertSink, pushJobFailed, pushAccountPaused } from "./alerts.ts";
 import { getSkills, catalogMarkdown, catalogCsv } from "./skills.ts";
 import { getInsights } from "./insights.ts";
 import { getUsage, getAllUsage } from "./usage.ts";
@@ -66,7 +66,7 @@ import { paneAlive, killPane, forgetPane, startPaneSweeper, sendKey, sendableKey
 import { startScanner, ownsSession, knownProjects, resyncScope, SCAN_ENABLED } from "./transcripts.ts";
 import { workspaceRoot, setWorkspaceRoot, inScope } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
-import { createJob, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
+import { createJob, createJobs, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
 import { listInstances, launchInstance, stopInstance } from "./instances.ts";
 import { hookStatus, applyHooks } from "./hooksetup.ts";
 import { privateHost } from "./net.ts";
@@ -695,6 +695,14 @@ const server = Bun.serve<WsData>({
         return json(res, res.ok ? 200 : 400);
       }
       return json({ jobs: listJobs() });
+    }
+    if (pathname === "/jobs/batch" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const items = Array.isArray(b) ? b : Array.isArray(b?.jobs) ? b.jobs : null;
+      if (!items) return json({ ok: false, error: "expected an array of jobs, or { jobs: [...] }" }, 400);
+      return json({ ok: true, ...createJobs(items) });
     }
     if (pathname === "/jobs/detail") {
       const id = url.searchParams.get("id") || "";
@@ -1528,8 +1536,8 @@ if (gates.restored || gates.expired) {
 // pushed to clients over the same WS stream and routed through the alert path.
 onDispatch((e) => {
   broadcast({ type: "job", data: e } as any);
-  if (e.kind === "failed") console.warn(`[dispatch] job failed on ${e.account}: ${e.error}`);
-  if (e.kind === "paused") console.warn(`[dispatch] ${e.account} paused until ${new Date(e.until).toISOString()}`);
+  if (e.kind === "failed") { console.warn(`[dispatch] job failed on ${e.account}: ${e.error}`); pushJobFailed(e.job.id, e.account, e.error); }
+  if (e.kind === "paused") { console.warn(`[dispatch] ${e.account} paused until ${new Date(e.until).toISOString()}`); pushAccountPaused(e.account, e.until); }
 });
 startDispatcher();
 

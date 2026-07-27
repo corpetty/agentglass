@@ -141,6 +141,18 @@ export function createJob(input: JobInput): { ok: true; job: Job } | { ok: false
   return { ok: true, job };
 }
 
+/** Create many jobs at once (a predefined batch). Returns a per-item result in
+ *  order; a bad item is rejected without stopping the rest. Capped so one POST
+ *  can't enqueue an unbounded flood. */
+export function createJobs(inputs: JobInput[]): { created: number; results: ({ ok: true; id: string } | { ok: false; error: string })[] } {
+  const list = Array.isArray(inputs) ? inputs.slice(0, 500) : [];
+  const results = list.map((input) => {
+    const r = createJob(input);
+    return r.ok ? { ok: true as const, id: r.job.id } : { ok: false as const, error: r.error };
+  });
+  return { created: results.filter((r) => r.ok).length, results };
+}
+
 const insertStmt = db.query(`
   INSERT INTO jobs (
     id, prompt, cwd, priority, window_start, window_end, account_id, model,

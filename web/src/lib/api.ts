@@ -249,6 +249,7 @@ const realApi = {
   deleteAccount: (id: string) => post<{ ok: boolean; error?: string }>("/accounts/delete", { id }),
   jobs: () => get<{ jobs: Job[] }>(`/jobs`),
   createJob: (input: JobInput) => post<{ ok: boolean; error?: string; job?: Job }>("/jobs", input),
+  createJobs: (jobs: JobInput[]) => post<{ ok: boolean; created: number; results: ({ ok: true; id: string } | { ok: false; error: string })[] }>("/jobs/batch", { jobs }),
   jobDetail: (id: string) => get<{ job: Job; events: JobEvent[] }>(`/jobs/detail?id=${encodeURIComponent(id)}`),
   updateJob: (id: string, patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) =>
     post<{ ok: boolean; error?: string; job?: Job }>("/jobs/update", { id, ...patch }),
@@ -569,6 +570,7 @@ const demoApi: typeof realApi = {
   deleteAccount: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
   jobs: () => D({ jobs: [] as Job[] }),
   createJob: (_input: JobInput) => D({ ok: false, error: "unavailable in the demo" }),
+  createJobs: (_jobs: JobInput[]) => D({ ok: false, created: 0, results: [] as ({ ok: true; id: string } | { ok: false; error: string })[] }),
   jobDetail: (_id: string) => D({ job: undefined as unknown as Job, events: [] as JobEvent[] }),
   updateJob: (_id: string, _patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) => D({ ok: false, error: "unavailable in the demo" }),
   cancelJob: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
