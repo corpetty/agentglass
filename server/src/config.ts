@@ -348,19 +348,22 @@ export function configuredRepoDirs(): string[] {
 
 // Prefix → account fallback list, drawn from BOTH the flat `accountPaths` and
 // each registry account's `account_paths`, longest-prefix-first so the most
-// specific match wins. Boot snapshot: runtime account CRUD is picked up on the
-// next launch (attribution prefixes rarely change mid-run; the live meters in
-// accounts.ts read the registry directly).
-const accountPaths = [
-  ...(Array.isArray(config.accountPaths) ? config.accountPaths : [])
-    .filter((p) => p && typeof p.prefix === "string" && typeof p.account === "string")
-    .map((p) => ({ prefix: expand(p.prefix), account: p.account })),
-  ...(Array.isArray(config.accounts) ? config.accounts : []).flatMap((a) =>
-    (Array.isArray(a?.account_paths) ? a.account_paths : [])
-      .filter((prefix): prefix is string => typeof prefix === "string")
-      .map((prefix) => ({ prefix: expand(prefix), account: a.id }))
-  ),
-].sort((a, b) => b.prefix.length - a.prefix.length);
+// specific match wins. Read fresh from config() (which caches per path) so a
+// runtime account edit or a test that moves its home is followed, matching the
+// lazy contract the rest of this module now uses.
+function accountPrefixes(): { prefix: string; account: string }[] {
+  const c = config();
+  return [
+    ...(Array.isArray(c.accountPaths) ? c.accountPaths : [])
+      .filter((p) => p && typeof p.prefix === "string" && typeof p.account === "string")
+      .map((p) => ({ prefix: expand(p.prefix), account: p.account })),
+    ...(Array.isArray(c.accounts) ? c.accounts : []).flatMap((a) =>
+      (Array.isArray(a?.account_paths) ? a.account_paths : [])
+        .filter((prefix): prefix is string => typeof prefix === "string")
+        .map((prefix) => ({ prefix: expand(prefix), account: a.id }))
+    ),
+  ].sort((a, b) => b.prefix.length - a.prefix.length);
+}
 
 /** Fallback account for a session with no explicit AGENTGLASS_ACCOUNT — the
  *  longest matching prefix from `accountPaths`/`accounts[].account_paths`, or
@@ -368,7 +371,7 @@ const accountPaths = [
  *  env to read) and by normalize() when a live event arrived without one. */
 export function accountForPath(cwd: string | null | undefined): string | null {
   if (!cwd) return null;
-  for (const p of accountPaths) {
+  for (const p of accountPrefixes()) {
     if (cwd === p.prefix || cwd.startsWith(p.prefix + "/")) return p.account;
   }
   return null;
@@ -377,29 +380,31 @@ export function accountForPath(cwd: string | null | undefined): string | null {
 /** The account registry as written on disk (empty when unconfigured — the
  *  registry module synthesizes a default in that case). */
 export function configuredAccounts(): RawAccount[] {
-  return Array.isArray(config.accounts) ? config.accounts : [];
+  const a = config().accounts;
+  return Array.isArray(a) ? a : [];
 }
 
 /**
  * Safely read-modify-write config.json for a mutation that must not clobber
  * other hand-kept settings. Re-reads the file first; refuses to write over a
  * present-but-malformed file (that would silently destroy the user's other
- * keys). Also updates the in-memory snapshot so same-process reads stay fresh.
+ * keys). Invalidates the config cache so the change is visible immediately.
  */
 export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?: string } {
+  const path = configPath();
   let cur: Config = {};
   try {
-    cur = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Config;
+    cur = JSON.parse(readFileSync(path, "utf8")) as Config;
   } catch (e) {
-    if (existsSync(CONFIG_PATH)) {
-      return { ok: false, error: `config file is malformed — fix ${CONFIG_PATH} to persist changes` };
+    if (existsSync(path)) {
+      return { ok: false, error: `config file is malformed — fix ${path} to persist changes` };
     }
   }
   try {
     mutate(cur);
-    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify(cur, null, 2) + "\n");
-    config.accounts = cur.accounts; // keep the boot snapshot's registry current
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(cur, null, 2) + "\n");
+    cached = null; // force config() to re-read, so the new registry is seen now
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
