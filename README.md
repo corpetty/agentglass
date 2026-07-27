@@ -34,6 +34,7 @@ gate. No install, no server. *(Everything there is fake; it's a showcase.)*
 
 - [Every project, one cockpit](#every-project-one-cockpit)
 - [More than a dashboard — a workspace](#more-than-a-dashboard--a-workspace)
+- [Run work across your subscriptions — the harness](#run-work-across-your-subscriptions--the-harness) · [full guide](docs/HARNESS.md)
 - [Away from the desk — the phone companion](#away-from-the-desk--the-phone-companion)
 - [Why](#why) · [Themes](#themes)
 - [Quickstart](#quickstart) · [Requirements](#requirements-what-agentglass-expects-to-find)
@@ -232,6 +233,37 @@ discoverable).
 ---
 
 ![chat panel](.github/assets/chat.png)
+
+---
+
+## Run work across your subscriptions — the harness
+
+This fork adds a **scheduler**: agentglass doesn't just *watch* Claude Code, it
+*drives* headless `claude -p` work across more than one Claude subscription —
+keeping each account fully used **with no possibility of overage billing**. It's
+additive: a single-account setup is untouched. Full guide in
+[**`docs/HARNESS.md`**](docs/HARNESS.md).
+
+### 👥 Accounts — one cockpit, every subscription &nbsp;`a`
+
+Every event and session is tagged with the **account** (login) that produced it,
+so a work and a personal subscription live side by side in one dashboard. The
+**Accounts panel** (header 👥 or `a`) shows each account's live **5-hour and
+weekly usage gauges** with reset countdowns and a login-status chip — the direct
+answer to "am I actually using what I pay for". Meters **self-heal** an idle
+account's expired OAuth token the way Claude Code does, so a watched-but-unused
+account keeps reporting. Attribution follows the **login**, not the folder.
+
+### 🗒️ Queue — schedule unattended work &nbsp;`q`
+
+Queue a prompt to run in a repo, under an account, and the dispatcher runs it as
+a headless `claude -p` **when that account has headroom** — highest priority
+first, one job per account, skipping any account near its limit (an *interactive
+reserve* for the human at the keyboard), pausing and requeueing on a rate limit.
+**Cost-safe by construction:** a job's environment has its API keys stripped, so
+it can *only* bill the subscription, never pay-per-token; `--max-turns` is
+mandatory. Every finished job links to its **session** and on-disk **transcript**,
+so an automated run is as inspectable as one you drove by hand.
 
 ---
 
@@ -794,7 +826,17 @@ in its own buckets rather than charged again as ordinary input.
 | `AGENTGLASS_RATE_WINDOW_MS` | `10000` | Rate-limit window in ms for the intake sinks. |
 | `AGENTGLASS_CODE_DIR` | `~/code` | Where the skills explorer scans for per-project `.claude` skills/commands. |
 | `AGENTGLASS_WALKTHROUGH_MODEL` | `claude-haiku-4-5` | Model for the AI **Explain** walkthrough (uses a local `claude` CLI, else `ANTHROPIC_API_KEY`). |
-| `CLAUDE_CREDENTIALS` | `~/.claude/.credentials.json` | OAuth token for the Anthropic plan-usage meters (never leaves your machine except to `api.anthropic.com`). |
+| `CLAUDE_CREDENTIALS` | `~/.claude/.credentials.json` | OAuth token for the Anthropic plan-usage meters (never leaves your machine except to `api.anthropic.com`). Overrides the **default** account's credential path. |
+| `AGENTGLASS_ACCOUNT` | — | On a **hook's** environment: tag this session's events with this account id (see the [harness](docs/HARNESS.md)). The dispatcher sets it per job. |
+| `AGENTGLASS_TOKEN_REFRESH` | `1` | `0` → don't refresh an account's expired OAuth access token (the meter reports `re-login needed` instead of self-healing). |
+| `AGENTGLASS_DISPATCH_DISABLED` | — | `1` → don't run the job **dispatcher**. The queue still accepts jobs; nothing executes. |
+| `AGENTGLASS_DISPATCH_INTERVAL_MS` | `30000` | Dispatcher tick interval (min 5000). |
+| `AGENTGLASS_JOB_CONCURRENCY` | `1` | Headless jobs per account at once. Raise deliberately — 1 keeps usage human-shaped. |
+| `AGENTGLASS_QUEUE_CEILING` | `80` | Utilization % (max of 5-hour / weekly) at or above which the queue won't start new work on an account — the **interactive reserve**. |
+| `AGENTGLASS_JOB_TIMEOUT_MS` | `1800000` | Hard wall-clock ceiling per job (30 min). |
+| `AGENTGLASS_JOB_STARTUP_TIMEOUT_MS` | `30000` | Kill a job that emits nothing this long — usually a login it can't complete headless. |
+| `AGENTGLASS_INSTANCES_DISABLED` | — | `1` → disable the **Desktop instance** manager (detect / launch / stop). |
+| `AGENTGLASS_DESKTOP_BIN` | auto | Path to the Claude Desktop binary (auto-detects `claude-desktop-unofficial` / `claude-desktop`). |
 
 **Scope is a boundary, not just a filter.** With a project open, git writes, the
 terminal and chat are all refused outside it — the same rule that decides what the
@@ -811,7 +853,9 @@ Prefer a file over env vars? Drop a `~/.config/agentglass/config.json` (or
 `$XDG_CONFIG_HOME/agentglass/config.json`) with `root`, `repoDirs`,
 `terminalDisabled` and/or `chatBypass`; env vars override it. The last two
 matter for a desktop-launched app, which inherits no shell environment and so
-cannot be configured by `export` at all.
+cannot be configured by `export` at all. The same file holds the multi-account
+[`accounts`](docs/HARNESS.md#the-registry) registry (config is read once at
+startup — restart after a hand edit; the Accounts panel's CRUD reloads for you).
 
 > **Pricing is a user-editable default.** Numbers in `pricing.ts` are per 1M
 > tokens and matched against `model_name` by substring. Anthropic (Claude) rates
@@ -851,7 +895,10 @@ cannot be configured by `export` at all.
 | `POST /prs/review-prompt` | The prompt to review a PR with Claude, and the directory to run it in. Reads only, so the write switch does not gate it; the active scope still does. |
 | `GET /hooks/status` · `POST /hooks/install · /hooks/uninstall` | Whether the Claude Code hooks are wired into `~/.claude/settings.json`, and wiring or removing them — what **Settings ▸ Hooks** calls, so a packaged app needs no clone. |
 | `GET /health` | Liveness plus an identity marker (`service: "agentglass"`), so a client can tell our server from a stranger on the same port. Token-exempt. |
-| `GET /usage` | Anthropic plan-limit windows (5-hour / weekly) for the usage meters. |
+| `GET /usage` · `GET /usage/all` | Anthropic plan-limit windows (5-hour / weekly) for the usage meters — the default account, one account (`?account=`), or every account. |
+| `GET /accounts` · `POST /accounts` · `POST /accounts/delete` | The multi-account registry — list, create/update, remove. See [`docs/HARNESS.md`](docs/HARNESS.md). |
+| `GET /jobs` · `POST /jobs` · `POST /jobs/batch` · `GET /jobs/detail?id=` · `POST /jobs/update` · `POST /jobs/cancel` | The **job queue** — list, queue one / many, one job's attempt history, edit (priority/window/account), cancel. Executed unattended by the cost-safe dispatcher. |
+| `GET /instances` · `POST /instances/launch` · `POST /instances/stop` | **Desktop instances** — list with running state, launch / stop a profile. |
 | `GET /session?id=` | Full detail for one session (events, files, totals). |
 | `GET /insights` | Derived warnings — loops, fast burn, high failure rate, spend velocity. |
 | `GET /search?q=` | Full-text search across all captured prompts/commands/outputs. |
@@ -879,6 +926,11 @@ cannot be configured by `export` at all.
                                                        │      ├─ docker.ts       live containers (lazydocker)
                                                        │      ├─ terminal.ts     real PTY shells over WS (+ make/script catalog)
                                                        │      ├─ chat.ts         drive local `claude` sessions (stream-json)
+                                                       │      ├─ accounts.ts     multi-account registry (login → meter/dir)
+                                                       │      ├─ usage.ts        per-account 5h/weekly meters (+ oauth.ts refresh)
+                                                       │      ├─ queue.ts        job queue (priority, windows, deps)
+                                                       │      ├─ dispatcher.ts   cost-safe headless `claude -p` across accounts
+                                                       │      ├─ instances.ts    desktop profile detect/launch/stop
                                                        │      ├─ gate.ts         approve/deny control plane
                                                        │      ├─ walkthrough.ts  local-Claude "Explain" of a diff set
                                                        │      └─ WS /stream ─┐
