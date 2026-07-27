@@ -1,4 +1,4 @@
-import type { WatchEvent, SessionRollup, StatsSummary, SkillInfo, FileChange, DiffHunk, Insight, SearchHit, PendingGate, GateRecord, SessionDetail, GitStatusResponse, CommitResult, WalkthroughResult, WalkthroughInputFile, GitRepoRef, FsCompletion, WorkingTree, GitActionResult, GitBranch, GitCommit, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, GitLogEntry, DockerOverview, DockerStat, DockerActionResult, DockerCapability, TerminalCommands, ChatImage, ConflictBlock, BlockChoice, UpdateStatus, ReleaseNotes, PrListResponse, PrDetail, PrActionResult, GitCapability, HookSetupStatus, HookSetupResult, PrCheckJob, ChatEngine, TmuxEngineInfo, ChatEffort, RemoteStatus, Job, JobEvent, JobInput } from "../../../shared/types.ts";
+import type { WatchEvent, SessionRollup, StatsSummary, SkillInfo, FileChange, DiffHunk, Insight, SearchHit, PendingGate, GateRecord, SessionDetail, GitStatusResponse, CommitResult, WalkthroughResult, WalkthroughInputFile, GitRepoRef, FsCompletion, WorkingTree, GitActionResult, GitBranch, GitCommit, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, GitLogEntry, DockerOverview, DockerStat, DockerActionResult, DockerCapability, TerminalCommands, ChatImage, ConflictBlock, BlockChoice, UpdateStatus, ReleaseNotes, PrListResponse, PrDetail, PrActionResult, GitCapability, HookSetupStatus, HookSetupResult, PrCheckJob, ChatEngine, TmuxEngineInfo, ChatEffort, RemoteStatus, Job, JobEvent, JobInput, DesktopInstance } from "../../../shared/types.ts";
 import { DEPS, type DepsResponse } from "../../../shared/deps.ts";
 import * as demo from "./demo.ts";
 
@@ -253,6 +253,9 @@ const realApi = {
   updateJob: (id: string, patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) =>
     post<{ ok: boolean; error?: string; job?: Job }>("/jobs/update", { id, ...patch }),
   cancelJob: (id: string) => post<{ ok: boolean; error?: string }>("/jobs/cancel", { id }),
+  instances: () => get<{ instances: DesktopInstance[] }>(`/instances`),
+  launchInstance: (name: string) => post<{ ok: boolean; error?: string; note?: string }>("/instances/launch", { name }),
+  stopInstance: (name: string) => post<{ ok: boolean; error?: string; stopped?: number }>("/instances/stop", { name }),
   skills: () => get<{ skills: SkillInfo[]; generated_at: number }>(`/skills`),
   changes: (limit = 200) => get<{ changes: FileChange[] }>(`/changes?limit=${limit}`),
   session: (id: string) => get<SessionDetail>(`/session?id=${encodeURIComponent(id)}`),
@@ -569,6 +572,9 @@ const demoApi: typeof realApi = {
   jobDetail: (_id: string) => D({ job: undefined as unknown as Job, events: [] as JobEvent[] }),
   updateJob: (_id: string, _patch: Partial<Pick<Job, "priority" | "window_start" | "window_end" | "account_id" | "status">>) => D({ ok: false, error: "unavailable in the demo" }),
   cancelJob: (_id: string) => D({ ok: false, error: "unavailable in the demo" }),
+  instances: () => D({ instances: [] as DesktopInstance[] }),
+  launchInstance: (_name: string) => D({ ok: false, error: "unavailable in the demo" }),
+  stopInstance: (_name: string) => D({ ok: false, error: "unavailable in the demo" }),
   skills: () => D(demo.skills()),
   changes: () => D(demo.changes()),
   session: (id: string) => D(demo.session(id)),

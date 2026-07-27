@@ -67,6 +67,7 @@ import { startScanner, ownsSession, knownProjects, resyncScope, SCAN_ENABLED } f
 import { workspaceRoot, setWorkspaceRoot, inScope } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
 import { createJob, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
+import { listInstances, launchInstance, stopInstance } from "./instances.ts";
 import { hookStatus, applyHooks } from "./hooksetup.ts";
 import { privateHost } from "./net.ts";
 import { resolveToken, tokenOk, isIntake, isAuthExempt } from "./auth.ts";
@@ -715,6 +716,23 @@ const server = Bun.serve<WsData>({
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = cancelJob(String(b.id ?? ""));
+      return json(res, res.ok ? 200 : 400);
+    }
+
+    // --- desktop instances ---
+    if (pathname === "/instances") return json({ instances: listInstances() });
+    if (pathname === "/instances/launch" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const res = launchInstance(String(b.name ?? ""));
+      return json(res, res.ok ? 200 : 400);
+    }
+    if (pathname === "/instances/stop" && req.method === "POST") {
+      if (!localOrigin(req)) return csrfBlocked();
+      let b: any = {};
+      try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const res = stopInstance(String(b.name ?? ""));
       return json(res, res.ok ? 200 : 400);
     }
 

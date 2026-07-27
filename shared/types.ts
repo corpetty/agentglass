@@ -1466,6 +1466,24 @@ export interface JobEvent {
   detail: string | null;
 }
 
+/** A Claude Desktop instance (an Electron profile with its own user-data-dir),
+ *  as the process manager sees it. */
+export interface DesktopInstance {
+  /** "default" for the ~/.config/Claude profile, else the ~/.claude-instances
+   *  subdir name. */
+  name: string;
+  /** Absolute Electron --user-data-dir this instance runs under. */
+  dataDir: string;
+  running: boolean;
+  /** PIDs currently carrying this data dir (main + Electron helpers). */
+  pids: number[];
+  /** Account id linked via the registry's desktop_instance, if any. */
+  account: string | null;
+  isDefault: boolean;
+  /** False when the desktop binary isn't installed / manager is disabled. */
+  manageable: boolean;
+}
+
 /** Body accepted by POST /jobs — only `prompt` and `cwd` are required. */
 export interface JobInput {
   prompt: string;

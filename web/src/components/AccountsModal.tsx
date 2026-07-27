@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
 import { api, type Account, type AccountInput, type UsagePayload, type UsageWindow } from "../lib/api.ts";
+import type { DesktopInstance } from "../../../shared/types.ts";
 
 // Human reset label: "in 1h 44m" when soon, else "Wed 3:00 PM".
 function resetLabel(iso: string | null): string {
@@ -144,12 +145,35 @@ function EditForm({ initial, onSave, onCancel, error }: { initial: AccountInput;
   );
 }
 
+function InstanceRow({ inst, onLaunch, onStop }: { inst: DesktopInstance; onLaunch: (n: string) => void; onStop: (n: string) => void }) {
+  const color = inst.running ? "var(--success)" : "var(--text4)";
+  return (
+    <div className="rounded-xl px-3 py-2.5 flex items-center gap-2.5" style={{ background: "color-mix(in srgb, var(--bg3) 30%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
+      <span className="h-1.5 w-1.5 rounded-full shrink-0" style={{ background: color }} />
+      <span className="text-[13px] font-medium" style={{ color: "var(--text)" }}>{inst.name}</span>
+      {inst.isDefault && <span className="chip t-dim2" style={{ borderColor: "color-mix(in srgb, var(--border) 50%, transparent)" }}>default</span>}
+      {inst.account && <span className="text-[10px] t-dim2">→ {inst.account}</span>}
+      <span className="text-[10px] t-dim2 truncate hidden sm:block" title={inst.dataDir}>{inst.dataDir}</span>
+      <span className="ml-auto flex items-center gap-2 shrink-0">
+        <span className="text-[11px]" style={{ color }}>{inst.running ? `running · ${inst.pids.length}` : "stopped"}</span>
+        {inst.manageable && (inst.running
+          ? <button onClick={() => onStop(inst.name)} className="text-[11px] hover:opacity-80" style={{ color: "var(--error)" }}>stop</button>
+          : <button onClick={() => onLaunch(inst.name)} className="text-[11px] hover:opacity-80" style={{ color: "var(--primary-hover)" }}>launch</button>)}
+      </span>
+    </div>
+  );
+}
+
 export function AccountsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [usage, setUsage] = useState<Record<string, UsagePayload>>({});
+  const [instances, setInstances] = useState<DesktopInstance[]>([]);
   const [editing, setEditing] = useState<AccountInput | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
+  const loadInstances = useCallback(() => { api.instances().then((r) => setInstances(r.instances)).catch(() => {}); }, []);
+  const launch = async (name: string) => { await api.launchInstance(name); setTimeout(loadInstances, 1500); };
+  const stop = async (name: string) => { await api.stopInstance(name); setTimeout(loadInstances, 1000); };
   const loadAccounts = useCallback(() => { api.accounts().then((r) => setAccounts(r.accounts)).catch(() => {}); }, []);
   const loadUsage = useCallback(() => {
     api.usageAll().then((r) => {
@@ -163,9 +187,10 @@ export function AccountsModal({ open, onClose }: { open: boolean; onClose: () =>
     if (!open) return;
     loadAccounts();
     loadUsage();
-    const id = setInterval(loadUsage, 30_000);
+    loadInstances();
+    const id = setInterval(() => { loadUsage(); loadInstances(); }, 30_000);
     return () => clearInterval(id);
-  }, [open, loadAccounts, loadUsage]);
+  }, [open, loadAccounts, loadUsage, loadInstances]);
 
   const save = async (input: AccountInput) => {
     const r = await api.saveAccount(input);
@@ -208,6 +233,14 @@ export function AccountsModal({ open, onClose }: { open: boolean; onClose: () =>
                       <AccountCard key={a.id} a={a} u={usage[a.id]} onEdit={() => { setErr(null); setEditing(toInput(a)); }} onDelete={() => del(a.id)} />
                     ))}
                     {!accounts.length && !editing && <div className="text-[12px] t-dim2 px-1">No accounts yet.</div>}
+
+                    {instances.length > 0 && (
+                      <div className="flex flex-col gap-1.5 mt-2">
+                        <div className="text-[10px] uppercase tracking-[0.14em] t-dim2 px-1">Desktop instances</div>
+                        {instances.map((i) => <InstanceRow key={i.name} inst={i} onLaunch={launch} onStop={stop} />)}
+                        <div className="text-[10px] t-dim2 px-1">Link an instance to an account by setting its “desktop instance” in the account editor.</div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
