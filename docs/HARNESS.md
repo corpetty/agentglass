@@ -235,6 +235,30 @@ non-standard binary with `AGENTGLASS_DESKTOP_BIN`.
 
 ---
 
+## Cowork / Claude Desktop ingestion
+
+The scanner discovers CLI work from `~/.claude/projects`. Claude Desktop / Cowork
+writes nowhere near there — its data lives under the Desktop app's config dir
+(`~/.config/Claude` on Linux). Two stores there are ingested so Desktop/Cowork
+work appears in the cockpit alongside CLI sessions. Auto-on when that dir exists;
+`AGENTGLASS_COWORK_DISABLED=1` turns it off, `AGENTGLASS_COWORK_DIR` repoints it.
+All Cowork events and sessions carry the account tag **`cowork`**, so they filter
+apart from CLI work (it is not a registered account and has no usage meter — the
+Desktop login bills separately).
+
+| Store | Path | What it yields |
+|---|---|---|
+| Local-agent transcripts | `local-agent-mode-sessions/<acct>/<device>/local_<id>/audit.jsonl` | **Full message streams.** Near-identical to a CLI transcript (only `_audit_timestamp` and a system-line `cwd` differ), so they flow through the same ingest via a thin shim. Their cwd is a sandbox (an upload output dir, a VM mount, bare `$HOME`), never a repo, so all are bucketed under one synthetic **`Cowork`** project (path = `coworkUserFilesPath`, e.g. `~/Claude`) and named from their first prompt. |
+| Session index | `claude-code-sessions/<acct>/<device>/local_<id>.json` | **Title/model/timestamp metadata**, not messages. Projected onto the entry's real repo (`cwd`). When its `cliSessionId` matches a scanned CLI transcript this only *enriches* that session (adds the human title, never overwrites event-derived data); otherwise it lists a metadata-only session (event count 0) for a remote/VM run whose transcript never reached this machine. |
+
+Both respect `AGENTGLASS_RETENTION_DAYS` (default 8), same as CLI transcripts —
+older Cowork history needs a wider window. **Not** ingestible: the conversations
+behind `~/Claude/Projects/*` that run fully remotely / in the Cowork VM — those
+live only in the cloud and the Desktop app's IndexedDB, not on disk in readable
+form. See `../../Downloads/cowork-ingestion-plan.md` for the full design.
+
+---
+
 ## Safety & ToS posture
 
 - All automation runs on the **official Claude Code CLI** under each account's
@@ -267,6 +291,8 @@ non-standard binary with `AGENTGLASS_DESKTOP_BIN`.
 | `AGENTGLASS_JOB_STARTUP_TIMEOUT_MS` | `30000` | Kill a job that produces nothing this long (usually a login it can't complete headless). |
 | `AGENTGLASS_INSTANCES_DISABLED` | — | `1` → disable the desktop instance manager. |
 | `AGENTGLASS_DESKTOP_BIN` | auto | Path to the Claude Desktop binary (auto-detects `claude-desktop-unofficial` / `claude-desktop`). |
+| `AGENTGLASS_COWORK_DISABLED` | — | `1` → don't ingest Claude Desktop / Cowork sessions (see below). |
+| `AGENTGLASS_COWORK_DIR` | auto | The Claude Desktop config dir to read Cowork stores from. Auto: `~/.config/Claude` (Linux) / `~/Library/Application Support/Claude` (macOS). |
 
 ### API
 

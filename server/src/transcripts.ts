@@ -12,18 +12,26 @@
 // same offset is what makes the poll loop double as the live path: an active
 // session's transcript grows on disk, and we pick up the tail every tick.
 
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import type { IngestBody } from "../../shared/types.ts";
 import { normalize } from "./ingest.ts";
 import { entered, backoff, terminalHot } from "./loopwatch.ts";
-import { db, insertEvent, setSessionTitles, RETENTION_DAYS, type InsertResult } from "./db.ts";
+import { db, insertEvent, setSessionTitles, upsertSessionMeta, titleFromFirstPrompt, RETENTION_DAYS, type InsertResult } from "./db.ts";
 // safeAbs: translates Windows drive paths, so a WSL-side transcript groups
 // under its own folder rather than collapsing onto the server's cwd.
 import { projectRootOf, safeAbs } from "./git.ts";
 import { workspaceRoot, inScope, accountForPath } from "./config.ts";
 import { listAccounts } from "./accounts.ts";
+import {
+  coworkScanRoots,
+  matcherFor,
+  normalizeAuditLine,
+  coworkAuditProject,
+  parseIndexEntry,
+  type SourceFormat,
+} from "./cowork.ts";
 
 // One root by default; a path.delimiter-separated list (":" on POSIX, ";" on
 // Windows) sweeps several at once — e.g. a WSL home next to a Windows one.
@@ -55,13 +63,24 @@ function projectsDirs(): string[] {
  *  projectsDirs() stay untagged (null) and their events fall back to
  *  accountForPath()/the "work" default — exactly as before the registry, which
  *  avoids silently reattributing existing history when accounts are added. */
-function scanRoots(): { dir: string; account: string | null }[] {
+interface ScanRoot {
+  dir: string;
+  account: string | null;
+  /** How the files under this root are shaped. The CLI transcript roots are
+   *  `claude-code`; the Desktop/Cowork stores carry their own formats. */
+  format: SourceFormat;
+}
+function scanRoots(): ScanRoot[] {
   const roots = new Map<string, string | null>();
   for (const a of listAccounts()) {
     if (!a.usesDefaultDir) roots.set(a.projectsDir, a.id);
   }
   for (const dir of projectsDirs()) if (!roots.has(dir)) roots.set(dir, null);
-  return [...roots].map(([dir, account]) => ({ dir, account }));
+  const out: ScanRoot[] = [...roots].map(([dir, account]) => ({ dir, account, format: "claude-code" as const }));
+  // Desktop/Cowork stores, if this machine runs Claude Desktop. Appended after
+  // the CLI roots so nothing about existing scanning changes when they're absent.
+  out.push(...coworkScanRoots());
+  return out;
 }
 const POLL_MS = Math.max(500, Number(process.env.AGENTGLASS_SCAN_INTERVAL_MS || 3000));
 export const SCAN_ENABLED = process.env.AGENTGLASS_SCAN_DISABLED !== "1";
@@ -536,6 +555,15 @@ function evictTails(now: number): void {
  * still parsing them so a PostToolUse finds the tool name its PreToolUse
  * recorded. Correctness never depends on the cache being warm.
  */
+/** Per-format adaptation for a non-`claude-code` transcript. `normalizeLine`
+ *  reshapes each parsed line onto the CLI schema before it's read;
+ *  `projectFor` overrides how the file's cwd maps to a project (Cowork audit
+ *  sessions bucket under one synthetic project rather than projecting by their
+ *  sandbox cwd). */
+interface IngestOpts {
+  normalizeLine?: (o: Record<string, unknown>) => Record<string, unknown>;
+  projectFor?: (cwd: string) => { source_app: string; project_path: string };
+}
 async function ingestFile(
   path: string,
   fallbackSessionId: string,
@@ -543,7 +571,8 @@ async function ingestFile(
   onLive: ((r: InsertResult) => void) | null,
   scope: string | null,
   rootAccount: string | null,
-  allowTail = true
+  allowTail = true,
+  opts?: IngestOpts
 ): Promise<{ lines: number; ingested: number; source_app: string; project_path: string; session_id: string; skipped?: boolean }> {
   // Read the sweep's tuning once for this file: batch shape and the oversize cap.
   const BATCH_LINES = batchLines();
@@ -650,7 +679,11 @@ async function ingestFile(
     }
     cwd = sniffedCwd;
     session_id = sniffedSid || fallbackSessionId;
-    if (cwd) ({ source_app, project_path } = projectOf(cwd));
+    // A format that overrides projection (Cowork audit) files every session
+    // under one bucket regardless of its sandbox cwd; otherwise fold the cwd up
+    // to its repo. The raw cwd is still carried into each event's payload below.
+    if (opts?.projectFor) ({ source_app, project_path } = opts.projectFor(cwd));
+    else if (cwd) ({ source_app, project_path } = projectOf(cwd));
     else { source_app = fallbackSessionId.slice(0, 8); project_path = ""; }
   }
 
@@ -676,7 +709,7 @@ async function ingestFile(
       return { lines: 0, ingested: 0, source_app: "", project_path: "", session_id, skipped: true };
     }
   }
-  if (cwd) projectPaths.set(source_app, project_path);
+  if (cwd || (opts?.projectFor && project_path)) projectPaths.set(source_app, project_path);
 
   const ctx = { source_app, project_path, cwd, session_id, rootAccount, toolCalls, seenUsage };
   let ingested = 0;
@@ -761,6 +794,7 @@ async function ingestFile(
         } catch {
           continue;
         }
+        if (opts?.normalizeLine) o = opts.normalizeLine(o);
         // Not events, so lineToBodies drops them — but they're the only place the
         // session's human name exists.
         if (o.type === "custom-title") customTitle = str(o.customTitle) ?? customTitle;
@@ -827,11 +861,12 @@ async function ingestFile(
   return { lines: doneLines, ingested, source_app, project_path, session_id };
 }
 
-/** Every *.jsonl under a project dir, at any depth.
+/** Every file matching `match` under a project dir, at any depth.
  *  Claude Code nests a session's subagent transcripts in
  *  `<session-id>/subagents/`, and those are the multi-agent runs the whole
- *  dashboard is about — a flat listing would miss all of them. */
-function walkTranscripts(dir: string, out: string[] = []): string[] {
+ *  dashboard is about — a flat listing would miss all of them. The Cowork
+ *  stores are nested `<account>/<device>/...` and rely on the same recursion. */
+function walkFiles(dir: string, match: (name: string) => boolean, out: string[] = []): string[] {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -840,10 +875,63 @@ function walkTranscripts(dir: string, out: string[] = []): string[] {
   }
   for (const e of entries) {
     const p = join(dir, e.name);
-    if (e.isDirectory()) walkTranscripts(p, out);
-    else if (e.isFile() && e.name.endsWith(".jsonl")) out.push(p);
+    if (e.isDirectory()) walkFiles(p, match, out);
+    else if (e.isFile() && match(e.name)) out.push(p);
   }
   return out;
+}
+
+// A session-index file is tiny metadata, re-read only when its mtime moves.
+// Its own cache rather than the transcript_files/`owned` machinery, which is
+// about event progress and live-hook routing — neither of which applies to a
+// catalog entry that emits no events.
+const indexMtimes = new Map<string, number>();
+
+/** Ingest one Cowork session-index file (see cowork.ts): catalog metadata, not
+ *  events. Skips an unchanged file by mtime, resolves the entry's real cwd to a
+ *  project, upserts the session row — enriching an already-scanned transcript's
+ *  session (matched by cliSessionId) or creating a metadata-only one for a
+ *  remote/VM session — and attaches its human title. */
+function ingestIndexFile(path: string, account: string | null, scope: string | null, cutoff: number): void {
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(path);
+  } catch {
+    return;
+  }
+  if (indexMtimes.get(path) === st.mtimeMs) return;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return;
+  }
+  indexMtimes.set(path, st.mtimeMs);
+  const e = parseIndexEntry(raw);
+  if (!e) return;
+  // Outside retention: skip. Gated on the session's own last activity, not the
+  // file mtime, so it matches pruneOldRows exactly — we never write a catalog
+  // row the next prune would immediately delete, which would otherwise flicker
+  // the session in and out. Marking the file seen above keeps it from being
+  // re-read every sweep until it actually changes.
+  if (cutoff && e.last_seen < cutoff) return;
+  // Out-of-scope sessions aren't this cockpit's business — the same test the
+  // transcript path applies (raw cwd, or the repo root it folds up to).
+  if (scope && !inScope(e.cwd, scope) && !inScope(resolvedRoot(e.cwd), scope)) return;
+  const { source_app, project_path } = projectOf(e.cwd);
+  upsertSessionMeta({
+    session_id: e.session_id,
+    source_app,
+    model_name: e.model,
+    account,
+    project_path,
+    cwd: e.cwd !== project_path ? e.cwd : null,
+    started_at: e.started_at,
+    last_seen: e.last_seen,
+    ended_at: e.last_seen,
+  });
+  if (e.title) setSessionTitles(e.session_id, e.titleIsCustom ? e.title : null, e.titleIsCustom ? null : e.title);
+  projectPaths.set(source_app, project_path);
 }
 
 /** One sweep over every project directory under every root.
@@ -864,6 +952,7 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
     } catch {
       continue; // this root doesn't exist (yet) — the others still count
     }
+    const match = matcherFor(root.format);
     for (const dir of dirs) {
       const dirPath = join(root.dir, dir);
       try {
@@ -871,7 +960,17 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
       } catch {
         continue;
       }
-      for (const path of walkTranscripts(dirPath)) {
+      for (const path of walkFiles(dirPath, match)) {
+        // A session-index file is metadata, not a transcript: its own mtime-gated
+        // path, no event stream, no progress row.
+        if (root.format === "cowork-index") {
+          try {
+            ingestIndexFile(path, root.account, scope, cutoff);
+          } catch (e) {
+            console.error(`[scan] ${path}: ${e instanceof Error ? e.message : e}`);
+          }
+          continue;
+        }
         let st: ReturnType<typeof statSync>;
         try {
           st = statSync(path);
@@ -893,9 +992,17 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
           // rather than skipping past records that no longer exist.
           const rewritten = !!prev && st.size < prev.size;
           const from = rewritten ? 0 : prev?.lines_done ?? 0;
+          // Cowork audit files are named `audit.jsonl` in a per-session dir, so
+          // the session id is that dir's name, not the basename. They also need
+          // the schema shim and the single-bucket projection.
+          const audit = root.format === "cowork-audit";
+          const fallbackSid = audit ? basename(dirname(path)) : basename(path, ".jsonl");
+          const opts: IngestOpts | undefined = audit
+            ? { normalizeLine: normalizeAuditLine, projectFor: () => coworkAuditProject() }
+            : undefined;
           // A rewrite also invalidates the cached tail: its byte offset and its
           // carried tool calls describe content that no longer exists.
-          const r = await ingestFile(path, basename(path, ".jsonl"), from, onLive, scope, root.account, !rewritten);
+          const r = await ingestFile(path, fallbackSid, from, onLive, scope, root.account, !rewritten, opts);
           // Out of scope: claim nothing, so widening the scope later can still
           // pick it up, and the hook path isn't blocked for a session we skipped.
           if (r.skipped) continue;
@@ -910,6 +1017,9 @@ export async function scanOnce(onLive: ((r: InsertResult) => void) | null): Prom
             $mtime: Math.floor(st.mtimeMs),
           });
           total += r.ingested;
+          // Audit transcripts carry no title line, so name the session from its
+          // first prompt (a no-op once it has any title).
+          if (audit) titleFromFirstPrompt(r.session_id);
         } catch (e) {
           console.error(`[scan] ${path}: ${e instanceof Error ? e.message : e}`);
         }

@@ -943,6 +943,96 @@ export function setSessionTitles(session_id: string, custom: string | null, ai: 
   if (ai) db.query("UPDATE sessions SET ai_title = ? WHERE session_id = ?").run(ai, session_id);
 }
 
+/** Reduce a first user prompt to a one-line session label: drop an
+ *  `<uploaded_files>` block and any stray tags, collapse whitespace, cap it.
+ *  Returns "" when nothing readable is left (a bare file upload with no
+ *  instruction), which the caller reads as "no title". */
+function cleanPromptTitle(raw: string): string {
+  return raw
+    .replace(/<uploaded_files>[\s\S]*?<\/uploaded_files>/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+/** Give a still-untitled session a name from its first user prompt. Cowork
+ *  audit transcripts carry no title lines the way a CLI transcript does, so
+ *  without this every one shows as `Cowork:local_ab…`. Self-guarding and
+ *  idempotent: a no-op once the session has any title, so it's safe to call
+ *  each sweep. Writes to ai_title — an auto-derived name, not a user rename —
+ *  so a later manual rename still wins. */
+export function titleFromFirstPrompt(session_id: string): void {
+  const row = db
+    .query<{ custom_title: string | null; ai_title: string | null }, [string]>(
+      "SELECT custom_title, ai_title FROM sessions WHERE session_id = ?"
+    )
+    .get(session_id);
+  if (!row || row.custom_title || row.ai_title) return;
+  const p = db
+    .query<{ prompt: string | null }, [string]>(
+      `SELECT json_extract(payload, '$.prompt') AS prompt FROM events
+       WHERE session_id = ? AND hook_event_type = 'UserPromptSubmit'
+         AND json_extract(payload, '$.prompt') IS NOT NULL
+       ORDER BY timestamp ASC, id ASC LIMIT 1`
+    )
+    .get(session_id);
+  if (!p?.prompt) return;
+  const title = cleanPromptTitle(p.prompt);
+  if (title) db.query("UPDATE sessions SET ai_title = ? WHERE session_id = ?").run(title, session_id);
+}
+
+// Catalog metadata for a Cowork/Desktop session (see cowork.ts). This is not an
+// event — it never touches the token/cost/count rollups. For a session that
+// already has a real transcript (matched by cliSessionId) every existing column
+// is preserved: COALESCE keeps the authoritative value the scanner derived from
+// events, so the coarser index can only *fill gaps*, never overwrite. For a
+// remote/VM session whose transcript never reached this machine it inserts a
+// bare row (event_count 0) so the session still lists under its real title and
+// project. started_at widens to the earliest seen, last_seen to the latest.
+const upsertSessionMetaStmt = db.query(`
+  INSERT INTO sessions (
+    session_id, source_app, model_name, provider, account,
+    project_path, cwd_path, started_at, ended_at, last_seen
+  ) VALUES (
+    $sid, $src, $model, $provider, $account,
+    $project, $cwd, $started, $ended, $last
+  )
+  ON CONFLICT(session_id) DO UPDATE SET
+    model_name   = COALESCE(sessions.model_name, excluded.model_name),
+    provider     = COALESCE(sessions.provider, excluded.provider),
+    account      = COALESCE(sessions.account, excluded.account),
+    project_path = COALESCE(sessions.project_path, excluded.project_path),
+    cwd_path     = COALESCE(sessions.cwd_path, excluded.cwd_path),
+    started_at   = MIN(sessions.started_at, excluded.started_at),
+    last_seen    = MAX(sessions.last_seen, excluded.last_seen)
+`);
+
+export function upsertSessionMeta(m: {
+  session_id: string;
+  source_app: string;
+  model_name?: string | null;
+  account?: string | null;
+  project_path?: string | null;
+  cwd?: string | null;
+  started_at: number;
+  last_seen: number;
+  ended_at?: number | null;
+}): void {
+  upsertSessionMetaStmt.run({
+    $sid: m.session_id,
+    $src: m.source_app,
+    $model: m.model_name ?? null,
+    $provider: m.model_name ? providerOf(m.model_name) : null,
+    $account: m.account ?? null,
+    $project: m.project_path ?? null,
+    $cwd: m.cwd ?? null,
+    $started: m.started_at,
+    $ended: m.ended_at ?? null,
+    $last: m.last_seen,
+  });
+}
+
 export function getRecent(limit = 300, provider?: string, account?: string): WatchEvent[] {
   const scope = scopeClause();
   const acct = provAcctScope(provider, account);
