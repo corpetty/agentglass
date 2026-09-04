@@ -34,6 +34,7 @@ const EVENTS: ReadonlyArray<readonly [string, string | null, boolean]> = [
 // installer's MARKER, so the two agree on what to strip and what "installed"
 // means — the app can uninstall hooks `bun run setup` wrote and vice versa.
 const MARKER = "send_event.py";
+const SL_MARKER = "statusline.sh";
 
 export type { HookSetupStatus, HookSetupResult };
 
@@ -76,7 +77,7 @@ export function hooksDir(): string | null {
 // _hook_python: python3 everywhere but Windows, where python3 is usually absent
 // and `py`/`python` is what exists. sys.executable is deliberately not used —
 // a venv deleted later would break every hook.
-function hookPython(): string {
+export function hookPython(): string {
   if (process.platform !== "win32") return "python3";
   for (const cand of ["py", "python"]) {
     if (onPath(cand)) return cand;
@@ -105,21 +106,98 @@ function asArray(v: unknown): any[] {
   return Array.isArray(v) ? v : [];
 }
 
+/**
+ * One event's command line, and the `|| exit 0` that keeps it advisory.
+ *
+ * Claude Code reads exit code 2 from a PreToolUse hook as "deny this tool
+ * call", and python exits 2 when it cannot open the script it was given. So a
+ * forwarder that has been moved, renamed or deleted stops being telemetry and
+ * becomes a machine-wide block: every tool call, in every session, in every
+ * project, including the ones needed to undo it. The path written here is
+ * absolute and lives in ~/.claude/settings.json, which outlives this clone.
+ *
+ * Telemetry must never be able to gate tool execution. send_event.py already
+ * exits 0 on every path it controls; this covers the one it does not.
+ *
+ * Kept identical to `hook_command` in hooks/install_hooks.py — the two write
+ * the same file and a settings.json is not allowed to depend on which one did.
+ */
+export function hookCommand(python: string, sendEvent: string, event: string, addChat: boolean, windows = process.platform === "win32"): string {
+  // Quote the script path unconditionally: a clone under a spaced path breaks
+  // the hook command on every platform, not only Windows.
+  let cmd = `${python} "${sendEvent}" --event-type ${event}`;
+  if (addChat) cmd += " --add-chat";
+  return cmd + (windows ? " || exit /b 0" : " || exit 0");
+}
+
 // Append our forwarder to each event after stripping any prior agentglass entry
 // (so a moved install re-points cleanly). Every other hook is preserved.
-function doInstall(cfg: any, sendEvent: string, python: string): void {
+function doInstall(cfg: any, sendEvent: string, python: string, statusline?: string): void {
   const hooks = (cfg.hooks ??= {});
   for (const [event, matcher, addChat] of EVENTS) {
     const arr = asArray(hooks[event]).filter((e) => !isOurs(e));
-    // Quote the script path unconditionally: a clone under a spaced path breaks
-    // the hook command on every platform, not only Windows.
-    let cmd = `${python} "${sendEvent}" --event-type ${event}`;
-    if (addChat) cmd += " --add-chat";
+    const cmd = hookCommand(python, sendEvent, event, addChat);
     const entry: any = { hooks: [{ type: "command", command: cmd }] };
     if (matcher !== null) entry.matcher = matcher;
     arr.push(entry);
     hooks[event] = arr;
   }
+  if (statusline) installStatusLine(cfg, statusline);
+}
+
+/**
+ * The status line slot, taking whatever was in it along for the ride.
+ *
+ * `statusLine` is one slot rather than a list, so there is no adding to it
+ * without owning it. Owning it is only acceptable because the previous command
+ * is run on every render with the same stdin and owns the output — see
+ * hooks/statusline.sh, where every path out still runs the chain. It travels as
+ * a quoted argument so it stays visible in the settings.json the user reads,
+ * and so uninstall can restore it without consulting any state of ours.
+ *
+ * Not installed on Windows: the forwarder is POSIX sh, and a status line that
+ * fails is one the user sees on every single render. The usage poll still works
+ * there, just without the free feed.
+ */
+function installStatusLine(cfg: any, statusline: string): void {
+  if (process.platform === "win32") return;
+  const cur = cfg.statusLine;
+  const curCmd = cur && typeof cur === "object" && typeof cur.command === "string" ? cur.command : null;
+  // Already ours: re-point the script path, keep what it wraps.
+  const chained = curCmd && curCmd.includes(SL_MARKER) ? chainedFrom(curCmd) : curCmd;
+  cfg.statusLine = { type: "command", command: statusLineCommand(statusline, chained) };
+}
+
+function statusLineCommand(statusline: string, chained: string | null): string {
+  return chained ? `sh "${statusline}" ${shQuote(chained)}` : `sh "${statusline}"`;
+}
+
+/** Single-quote for `sh`, the way Python's shlex.quote does — the two
+ *  installers write the same string or they cannot undo each other. */
+function shQuote(s: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) && s !== "" ? s : `'${s.replace(/'/g, `'"'"'`)}'`;
+}
+
+/** What our wrapper was told to call. Mirrors shlex.split closely enough for
+ *  the shape we write: `sh "<path>" '<chained>'`. */
+function chainedFrom(cmd: string): string | null {
+  if (!cmd.includes(SL_MARKER)) return null;
+  const m = cmd.match(/^sh\s+"[^"]*"\s+(.+)$/);
+  if (!m) return null;
+  const rest = m[1]!.trim();
+  if (rest.startsWith("'") && rest.endsWith("'") && rest.length >= 2) {
+    return rest.slice(1, -1).replace(/'"'"'/g, "'");
+  }
+  return rest;
+}
+
+function uninstallStatusLine(cfg: any): void {
+  const cur = cfg.statusLine;
+  const curCmd = cur && typeof cur === "object" && typeof cur.command === "string" ? cur.command : null;
+  if (!curCmd || !curCmd.includes(SL_MARKER)) return;
+  const chained = chainedFrom(curCmd);
+  if (chained) cfg.statusLine = { type: "command", command: chained };
+  else delete cfg.statusLine;
 }
 
 // Drop only our entries; leave everyone else's hooks untouched, and remove a
@@ -133,6 +211,7 @@ function doUninstall(cfg: any): void {
     else delete hooks[event];
   }
   if (cfg.hooks && Object.keys(cfg.hooks).length === 0) delete cfg.hooks;
+  uninstallStatusLine(cfg);
 }
 
 // Sorted-key stringify for change detection, matching the Python installer's
@@ -196,7 +275,7 @@ export function applyHooks(action: "install" | "uninstall"): HookSetupResult {
   const cfg = r.cfg;
 
   const before = stable(cfg);
-  if (action === "install") doInstall(cfg, join(dir!, "send_event.py"), hookPython());
+  if (action === "install") doInstall(cfg, join(dir!, "send_event.py"), hookPython(), join(dir!, "statusline.sh"));
   else doUninstall(cfg);
   const changed = stable(cfg) !== before;
 
@@ -218,4 +297,7 @@ export function applyHooks(action: "install" | "uninstall"): HookSetupResult {
 }
 
 // Exported for the test that pins parity with the Python installer's merge.
-export const _internal = { doInstall, doUninstall, isOurs, stable, EVENTS, MARKER };
+export const _internal = {
+  doInstall, doUninstall, isOurs, stable, EVENTS, MARKER,
+  installStatusLine, uninstallStatusLine, statusLineCommand, chainedFrom, shQuote, SL_MARKER,
+};

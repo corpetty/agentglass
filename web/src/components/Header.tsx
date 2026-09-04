@@ -5,12 +5,11 @@ import { IS_DEMO, reauthPrompt } from "../lib/api.ts";
 import { subscribeUpdate, updateState, updateAvailable } from "../lib/updateStore.ts";
 import { MOD_KEY } from "../lib/format.ts";
 import { IS_MAC_DESKTOP } from "../lib/desktop.ts";
-import { ThemeSwitcher } from "./ThemeSwitcher.tsx";
-import { UsageWidget } from "./UsageWidget.tsx";
 import { Logo } from "./Logo.tsx";
 import { Select } from "./Select.tsx";
 import { subscribe as subscribeChats, attentionCount } from "../lib/chatStore.ts";
 import { WorkspaceIcon } from "./workspace/icons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 // Sessions whose model never resolved carry the "unknown" provider value; it
 // stays lowercase everywhere it is compared (server sentinel, providerOf), but
@@ -63,6 +62,61 @@ function SkillsIcon() {
 /* The git/diff/docker/terminal/chat glyphs moved to workspace/icons.tsx when
    their five buttons became one — the rail needs them too. */
 
+/** A cog, not an ellipsis.
+ *
+ *  "⋯" is the glyph for "more of the same kind of thing" — the rest of a menu
+ *  you were already in. This button opens preferences, and every application
+ *  ever written spells that with a cog, which is why it was the one control in
+ *  the header nobody could find without hovering everything first. */
+function GearIcon({ size = ICON.md }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3.1" />
+      <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z" />
+    </svg>
+  );
+}
+
+/** A plug: something is listening on this machine. */
+export function PortsIcon({ size = ICON.md }: { size?: number }) {
+  /*
+   * A socket, not a plug.
+   *
+   * The plug was a narrow object — 58% of its box across, against the 83% the
+   * rest of the rail fills — so at the same nominal size it read as a smaller
+   * icon, which is what it is a picture of and not what it is a control for.
+   * A socket is the same idea (a port something plugs INTO, which is closer to
+   * what the panel lists anyway) in a shape that fills a square.
+   */
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="3.5" />
+      <path d="M9.5 8.5v4M14.5 8.5v4" />
+      <path d="M8.5 16h7" />
+    </svg>
+  );
+}
+
+/** A gauge: how much of the machine is left. */
+export function ResourcesIcon({ size = ICON.md }: { size?: number }) {
+  /*
+   * A chip, not a dial.
+   *
+   * The dial was an arc: 45% of its box tall however wide it was made, because
+   * that is the shape of an arc, so it could be sized correctly and still read
+   * as the lightest thing on the strip. A chip is what the panel is about — how
+   * much of THIS machine is left — and it is square, which is the shape a rail
+   * of squares needs.
+   */
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <rect x="7.5" y="7.5" width="9" height="9" rx="1.5" />
+      <path d="M3 10h4.5M3 14h4.5M16.5 10H21M16.5 14H21" />
+      <path d="M10 3v4.5M14 3v4.5M10 16.5V21M14 16.5V21" />
+    </svg>
+  );
+}
+
 /** Settings button — the overflow menu became a real modal (SettingsModal),
  *  because a flat list of one-liners could not show a toggle's state without
  *  spelling it out in the label. */
@@ -76,13 +130,13 @@ function MoreMenu({ onOpen }: { onOpen: () => void }) {
     <button
       title={pending ? `Settings — ${pending} is available to install` : "Settings — preferences, exports, shortcuts"}
       onClick={onOpen}
-      className="relative h-8 w-8 grid place-items-center rounded-lg text-[15px]"
+      className="relative h-8 w-8 grid place-items-center rounded-lg"
       style={{
         border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)",
         background: "color-mix(in srgb, var(--bg3) 30%, transparent)",
-        color: "var(--text3)",
+        color: "var(--text2)",
       }}>
-      ⋯
+      <GearIcon />
       {pending && (
         // Small, unanimated, and outside the glyph. An update is not urgent —
         // it is worth noticing on the way past, not worth pulling the eye off
@@ -95,13 +149,15 @@ function MoreMenu({ onOpen }: { onOpen: () => void }) {
 }
 
 export function Header({
-  conn, windowMs, onWindow, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
-  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenAccounts, onOpenQueue, onOpenWorkspace, onOpenSettings, onClear, showUsage,
+  conn, windowMs, onWindow, retentionDays, apps, types, providers, accounts, filter, onFilter, theme, onTheme,
+  sound, onSound, onOpenPalette, onOpenHelp, onOpenStats, onOpenSkills, onOpenAccounts, onOpenQueue, onOpenWorkspace, onOpenSettings, onOpenMachine, onClear, showUsage,
   workspace, onOpenProject,
 }: {
   conn: ConnState;
   windowMs: number;
   onWindow: (ms: number) => void;
+  /** AGENTGLASS_RETENTION_DAYS. 0 (or undefined) → nothing is pruned. */
+  retentionDays?: number;
   apps: string[];
   types: string[];
   providers: string[];
@@ -120,6 +176,11 @@ export function Header({
   onOpenQueue: () => void;
   onOpenWorkspace: () => void;
   onOpenSettings: () => void;
+  /** The machine panel, on the tab that was asked for. Beside settings because
+   *  the three are the same kind of thing — this window's own controls, not the
+   *  fleet's — and because they must sit in one place the workspace can
+   *  reproduce exactly. */
+  onOpenMachine: (tab: "ports" | "resources") => void;
   onClear: () => void;
   showUsage: boolean;
   workspace: string | null;
@@ -189,12 +250,30 @@ export function Header({
           right-side controls get pushed off-screen and become unreachable. */}
       <div className="flex items-center gap-2 grow min-w-0 overflow-x-auto agw-noscrollbar order-3 basis-full sm:order-none sm:basis-0">
       <div className="flex items-center gap-0.5 p-0.5 rounded-lg shrink-0" style={{ background: "color-mix(in srgb, var(--bg3) 35%, transparent)" }}>
-        {WINDOWS.map((w) => (
-          <button key={w.label} onClick={() => onWindow(w.ms)} className="px-2 py-1 rounded-md text-[11px] transition-all"
-            style={windowMs === w.ms ? { background: "color-mix(in srgb, var(--primary) 22%, transparent)", color: "var(--primary-hover)" } : { color: "var(--text4)" }}>
-            {w.label}
-          </button>
-        ))}
+        {WINDOWS.map((w) => {
+          /*
+           * A window longer than retention cannot be answered in full.
+           *
+           * Every panel behind these chips reads the events table, which is
+           * pruned at AGENTGLASS_RETENTION_DAYS (8 by default) — so "30d" was
+           * eight days of data under a thirty-day label, and there was no way
+           * to tell that from a quiet month. The chip now says so rather than
+           * the dashboard implying otherwise, and points at the one view that
+           * does go further back.
+           *
+           * Nothing marked when retention is off (the desktop default), where
+           * every window really is what it claims.
+           */
+          const beyond = !!retentionDays && w.ms > retentionDays * 86_400_000;
+          return (
+            <button key={w.label} onClick={() => onWindow(w.ms)} className="px-2 py-1 rounded-md text-[11px] transition-all"
+              title={beyond ? `Events are kept for ${retentionDays} days, so this window is answered from the last ${retentionDays}d. Statistics (s) → “spend per day” goes further back.` : undefined}
+              style={windowMs === w.ms ? { background: "color-mix(in srgb, var(--primary) 22%, transparent)", color: "var(--primary-hover)" } : { color: "var(--text4)" }}>
+              {w.label}
+              {beyond && <sup className="ml-px text-[8px] opacity-70" aria-hidden>*</sup>}
+            </button>
+          );
+        })}
       </div>
 
       {/* max-w keeps long worktree names (e.g. feature-branch-…) from blowing the header open */}
@@ -224,9 +303,6 @@ export function Header({
       </div>{/* middle scroll zone */}
 
       <div className="shrink-0 flex items-center gap-1.5 sm:gap-2 ml-auto sm:ml-0 max-w-full overflow-x-auto agw-noscrollbar">
-        {/* Anthropic plan meters — only shown when viewing Anthropic (it's the
-            one provider with a usage API), and only where there's room. */}
-        {showUsage && <div className="hidden 2xl:block"><UsageWidget /></div>}
         {/* A keyboard-palette chip is dead weight on touch — hide it there. */}
         <button onClick={onOpenPalette} className="h-8 hidden sm:flex items-center gap-1.5 px-2.5 rounded-lg text-[11px]" style={selStyle}>
           <span>{MOD_KEY}K</span><span className="hidden sm:inline t-dim2">Search</span>
@@ -264,8 +340,12 @@ export function Header({
         <IconBtn title="Skills explorer — browse every available skill (k)" onClick={onOpenSkills}><SkillsIcon /></IconBtn>
         <IconBtn title="Accounts — per-account usage meters & login status (a)" onClick={onOpenAccounts}>👥</IconBtn>
         <IconBtn title="Queue — unattended jobs running across accounts (q)" onClick={onOpenQueue}>🗒️</IconBtn>
+        {/* Ports and resources sit next to settings, and the workspace rail
+            repeats exactly these three in the same order — so "where do I look
+            at the machine" has one answer wherever you happen to be. */}
+        <IconBtn title="Ports — what is listening, and which checkout started it" onClick={() => onOpenMachine("ports")}><PortsIcon /></IconBtn>
+        <IconBtn title="Resources — CPU, memory and disk, by checkout" onClick={() => onOpenMachine("resources")}><ResourcesIcon /></IconBtn>
         <MoreMenu onOpen={onOpenSettings} />
-        <ThemeSwitcher current={theme} onChange={onTheme} />
       </div>
     </header>
   );

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, chmodSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, chmodSync, readFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type {
   WatchEvent,
@@ -13,9 +13,11 @@ import type {
   AppUsage,
   TypeCount,
   OpenToolCall,
+  UsageDay,
 } from "../../shared/types.ts";
 import type { NormalizedEvent } from "./ingest.ts";
-import { costUsd, modelLabel } from "./pricing.ts";
+import { costUsd, modelLabel, hasPrice, equivalentTokens } from "./pricing.ts";
+import { providerOf as sharedProviderOf, UNKNOWN as UNKNOWN_MODEL } from "../../shared/models.ts";
 import { workspaceRoot, scopeRoots, isWithin, accountForPath } from "./config.ts";
 
 /**
@@ -70,6 +72,8 @@ function testDbPath(): string {
 const DB_PATH = process.env.NODE_ENV === "test"
   ? testDbPath()
   : process.env.AGENTGLASS_DB || defaultDbPath();
+/** Where the history actually is, for the one page that says so out loud. */
+export const dbPath = (): string => DB_PATH;
 const db = new Database(DB_PATH, { create: true });
 // The DB holds full prompts, file contents and command output in cleartext.
 // Default file perms (0644) leave it world-readable; only $HOME being 0700
@@ -79,14 +83,21 @@ const db = new Database(DB_PATH, { create: true });
 for (const suffix of ["", "-wal", "-shm"]) {
   try { chmodSync(DB_PATH + suffix, 0o600); } catch { /* not created yet — created 0600 once WAL kicks in */ }
 }
-db.exec("PRAGMA journal_mode = WAL;");
-db.exec("PRAGMA foreign_keys = ON;");
 // Wait for a lock instead of failing on it. WAL lets readers and one writer
 // work at once, but two writers still collide — and this database has several:
 // the ingest path, the transcript scanner's sweep, and the retention prune.
 // Without a timeout SQLite raises SQLITE_BUSY immediately, which surfaces as a
 // dropped event rather than as the momentary contention it actually is.
+//
+// FIRST, before the journal_mode switch below, and that order is load-bearing:
+// setting journal_mode takes a lock, and if another process is recovering the
+// WAL at that instant it fails with SQLITE_BUSY_RECOVERY — measured, as an
+// uncaught SQLiteError at module load that killed the whole server on the way
+// up. busy_timeout is a connection setting that needs no lock of its own, so
+// applying it first turns that crash into a wait.
 db.exec("PRAGMA busy_timeout = 5000;");
+db.exec("PRAGMA journal_mode = WAL;");
+db.exec("PRAGMA foreign_keys = ON;");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS events (
@@ -233,7 +244,32 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_events_model ON events(model_name)");
 // timestamp in the index, like the scope columns, because every provider-scoped
 // query also windows by time.
 try { db.exec("ALTER TABLE events ADD COLUMN provider TEXT"); } catch { /* already present */ }
+
+// A PreToolUse can be paired with exactly one Post.
+//
+// Pairing used to be a bare SELECT ... LIMIT 1 with nothing marking the row,
+// so a Pre could answer any number of Posts. Two concurrent calls to the same
+// tool both measured against the newest Pre — the second one's real duration
+// vanished — and a Post with no matching id fell back to *any* earlier Pre for
+// that tool with no age bound at all, which is how a 3,600,000 ms tool call
+// gets into the percentiles.
+//
+// Backfilled to 1 for every Pre that already has a Post, so the open-tool card
+// does not retroactively sprout a fleet of calls that finished last week.
+try {
+  db.exec("ALTER TABLE events ADD COLUMN paired INTEGER NOT NULL DEFAULT 0");
+  db.exec(`UPDATE events SET paired = 1
+           WHERE hook_event_type = 'PreToolUse' AND tool_use_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM events p
+                         WHERE p.tool_use_id = events.tool_use_id
+                           AND p.hook_event_type IN ('PostToolUse','PostToolUseFailure'))`);
+} catch { /* already present */ }
+db.exec("CREATE INDEX IF NOT EXISTS idx_events_pre_open ON events(session_id, tool_name, paired, id)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_events_provider_ts ON events(provider, timestamp)");
+// Finding a session's FIRST prompt: the list asks for up to two hundred of
+// them at once, and without this it is a scan of every UserPromptSubmit on the
+// machine per refresh. See firstPrompts().
+db.exec("CREATE INDEX IF NOT EXISTS idx_events_first_prompt ON events(hook_event_type, session_id, timestamp)");
 
 // Which Claude account/instance produced an event — the account dimension.
 // Unlike provider it isn't derived from the model: it comes from the hook's
@@ -354,6 +390,266 @@ for (const col of ["project_path", "cwd_path"]) {
 db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path)");
 
 // ---------------------------------------------------------------------------
+/**
+ * One scanner per database file — enforced in the file, not by hoping.
+ *
+ * The transcript scanner is the one writer here that is NOT idempotent: its
+ * events carry `event_id: null`, so the idempotency index above
+ * (`WHERE event_id IS NOT NULL`) cannot see, let alone drop, a line ingested
+ * twice. Two server processes on one file therefore inflate event counts,
+ * tokens and dollars in silence — nothing errors, the totals just grow.
+ *
+ * That is not hypothetical. Measured on this machine's own 354 MB history on
+ * 2026-08-07: 22 duplicate groups, 22 extra rows out of 100,354 scanner events.
+ * Small, and that is exactly why it went unnoticed for so long. Measured in the
+ * lab with two real processes racing one live tail: 4 appended turns became 5
+ * events and 5,000 input tokens instead of 4,000.
+ *
+ * It is easy to reach: `defaultDbPath()` resolves to the XDG data dir, so any
+ * checkout without a local `agentglass.db` — none of the worktrees on this
+ * machine have one — runs its scanner over the real history. The README's
+ * "attaches, never duplicates" only fires on a `:4000` port collision, and a
+ * second server started on another port on purpose sails straight past it.
+ *
+ * So the second process is held off here: the claim row names a pid and a port,
+ * and whoever finds a LIVE claim that is not theirs runs with the scanner
+ * disabled (see `startScanner`). Everything else it does — serving, hook ingest,
+ * git, the terminal — is unaffected, and hook ingest is idempotent anyway.
+ *
+ * A stale claim must never lock anyone out: this app is SIGKILLed routinely
+ * (the desktop shell kills its sidecar, `pkill` during development), so the row
+ * regularly outlives its process. `holderAlive` is what decides, and it is
+ * deliberately three checks deep because a bare `kill(pid, 0)` is wrong twice
+ * over — pids are reused after a reboot and after wraparound.
+ */
+db.exec(`
+CREATE TABLE IF NOT EXISTS db_claim (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  pid INTEGER NOT NULL,
+  port INTEGER NOT NULL,
+  host TEXT NOT NULL DEFAULT '',
+  boot_id TEXT NOT NULL DEFAULT '',
+  start_ticks INTEGER NOT NULL DEFAULT 0,
+  claimed_at INTEGER NOT NULL
+);
+`);
+
+export interface DbClaimRow {
+  pid: number;
+  port: number;
+  host: string;
+  boot_id: string;
+  start_ticks: number;
+  claimed_at: number;
+}
+
+/** The escape hatch, for the case this mechanism is the thing in the way.
+ *  `0` skips claiming AND skips being held off — the pre-fix behaviour. */
+const CLAIM_ENABLED = process.env.AGENTGLASS_DB_CLAIM !== "0";
+
+/** Identifies the boot, so a pid from before a reboot is never mistaken for a
+ *  live process. Linux only; empty elsewhere, where the ticks check below still
+ *  applies (and, failing both, a wrongly-live claim only disables a scanner). */
+function bootId(): string {
+  try { return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); } catch { return ""; }
+}
+/**
+ * Field 22 of /proc/<pid>/stat — when that pid started, in clock ticks.
+ *
+ * This is what distinguishes "the claim holder is still running" from "some
+ * unrelated process now has that pid". Parsed from after the last `)` because
+ * field 2 is the command name in parentheses and may itself contain spaces and
+ * parens; splitting the whole line on spaces gets the wrong column for anything
+ * named like `(my prog)`.
+ */
+function startTicks(pid: number): number {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return Number(rest[19]) || 0; // rest[0] is field 3 (state) → field 22 is index 19
+  } catch { return 0; }
+}
+
+/** Is the process named by this claim still running, and still the same one? */
+function holderAlive(row: DbClaimRow): boolean {
+  if (row.pid <= 0) return false;
+  // A claim written by another machine cannot be checked from here — there is no
+  // such pid locally to ask about. Treat it as stale rather than refuse to scan
+  // for ever: a database reachable from two hosts at once is a broken setup
+  // (SQLite over a network filesystem), and a permanent lockout would be worse
+  // than the duplicate ingest this guards.
+  if (row.host && row.host !== hostname()) return false;
+  const boot = bootId();
+  if (boot && row.boot_id && boot !== row.boot_id) return false; // rebooted since
+  try {
+    process.kill(row.pid, 0);
+  } catch (e) {
+    // EPERM means the pid exists and belongs to another user — alive, just not
+    // ours to signal. Only ESRCH ("no such process") means gone.
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+  const ticks = startTicks(row.pid);
+  if (ticks && row.start_ticks && ticks !== row.start_ticks) return false; // pid reused
+  return true;
+}
+
+const readClaim = db.query<DbClaimRow, []>(
+  "SELECT pid, port, host, boot_id, start_ticks, claimed_at FROM db_claim WHERE id = 1"
+);
+const writeClaim = db.query(`
+  INSERT INTO db_claim (id, pid, port, host, boot_id, start_ticks, claimed_at)
+  VALUES (1, $pid, $port, $host, $boot, $ticks, $at)
+  ON CONFLICT(id) DO UPDATE SET
+    pid = excluded.pid, port = excluded.port, host = excluded.host,
+    boot_id = excluded.boot_id, start_ticks = excluded.start_ticks,
+    claimed_at = excluded.claimed_at
+`);
+const dropClaim = db.query("DELETE FROM db_claim WHERE id = 1 AND pid = $pid AND host = $host");
+
+/** Set when another live process holds the file, so the scanner can stand down
+ *  and `/projects` can report honestly instead of claiming it is scanning. */
+let heldOffBy: DbClaimRow | null = null;
+/** The live holder of this database, or null when it is ours. */
+export function dbClaimedElsewhere(): DbClaimRow | null {
+  return heldOffBy;
+}
+
+export interface DbClaimResult {
+  /** True when this process owns the file and may run its scanner. */
+  ok: boolean;
+  /** The live process that beat us to it, when `ok` is false. */
+  holder: DbClaimRow | null;
+  /** A dead process's claim we cleared out of the way — a SIGKILLed predecessor. */
+  tookOver: DbClaimRow | null;
+}
+
+/**
+ * Claim this database for this process. Call once, at boot, with the real port.
+ *
+ * IMMEDIATE so two servers starting at the same instant cannot both read "no
+ * claim" and both write one: the write lock is taken at BEGIN, before the read,
+ * so the loser waits and then sees the winner's row.
+ *
+ * It FAILS OPEN — a throw here reports "claimed", not "held off". That is a
+ * deliberate choice and not a hole: this runs on the boot path, so failing
+ * closed would mean a broken guard can stop the app scanning at all, while
+ * failing open costs at worst the pre-fix behaviour, which the compare-and-swap
+ * on `lines_done` (transcripts.ts) still covers.
+ */
+export function claimDatabase(port: number): DbClaimResult {
+  if (!CLAIM_ENABLED) return { ok: true, holder: null, tookOver: null };
+  try {
+    return db.transaction((): DbClaimResult => {
+      const prev = readClaim.get();
+      if (prev && prev.pid !== process.pid && holderAlive(prev)) {
+        heldOffBy = prev;
+        return { ok: false, holder: prev, tookOver: null };
+      }
+      writeClaim.run({
+        $pid: process.pid,
+        $port: port,
+        $host: hostname(),
+        $boot: bootId(),
+        $ticks: startTicks(process.pid),
+        $at: Date.now(),
+      });
+      heldOffBy = null;
+      return { ok: true, holder: null, tookOver: prev && prev.pid !== process.pid ? prev : null };
+    }).immediate();
+  } catch (e) {
+    console.warn(`[db] could not claim ${DB_PATH}: ${e instanceof Error ? e.message : e} — scanning anyway`);
+    heldOffBy = null;
+    return { ok: true, holder: null, tookOver: null };
+  }
+}
+
+/** Give the claim back on a clean exit. Best-effort by design: the SIGKILL case
+ *  is precisely what `holderAlive` exists to handle, so a missed release costs
+ *  nothing beyond one liveness check at the next boot. */
+export function releaseDatabaseClaim(): void {
+  if (!CLAIM_ENABLED || heldOffBy) return;
+  try { dropClaim.run({ $pid: process.pid, $host: hostname() }); } catch { /* exiting anyway */ }
+}
+
+// ---------------------------------------------------------------------------
+/**
+ * Who did what, kept.
+ *
+ * The cockpit performs real writes — it stages and discards, force-pushes,
+ * merges pull requests, removes containers, and answers the gate that has an
+ * agent stopped at the other end of it. Every one of those was recorded only in
+ * a ring buffer that says of itself, at gitlog.ts:11, that it is "a live view of
+ * the current session, not an audit trail". So the moment more than one person
+ * can reach a cockpit — or one person can reach it from two devices — "who
+ * approved that" has no answer, and neither does "what happened to my branch
+ * while I was at lunch".
+ *
+ * Append-only, and small enough to stay that way: every row here is a human
+ * pressing something, which is tens of rows a day, not the thousands an hour
+ * the events table takes. Nothing prunes it and nothing needs to.
+ *
+ * `actor` is what the server can honestly assert, which is where the request
+ * came from and nothing more. There are no accounts here — a token is shared,
+ * not personal — so claiming a name would be a fiction. `local` means the
+ * loopback caller, which is the dashboard on this machine; anything else is the
+ * address it came from, which is how "I approved that from my phone" gets an
+ * answer.
+ */
+db.exec(`
+CREATE TABLE IF NOT EXISTS actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL DEFAULT '',
+  ok INTEGER NOT NULL,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_actions_at ON actions(at);
+`);
+
+export interface ActionRow {
+  id: number;
+  at: number;
+  actor: string;
+  action: string;
+  target: string;
+  ok: number;
+  detail: string | null;
+}
+
+const actionInsert = db.query(
+  `INSERT INTO actions (at, actor, action, target, ok, detail) VALUES ($at, $actor, $action, $target, $ok, $detail)`
+);
+
+/** Write one row. Never throws: a failed audit write must not fail the action
+ *  it was recording, which would be a worse outcome than a missing line. */
+export function recordAction(a: {
+  actor: string; action: string; target?: string; ok: boolean; detail?: string | null; at?: number;
+}): void {
+  try {
+    actionInsert.run({
+      $at: a.at ?? Date.now(),
+      $actor: a.actor,
+      $action: a.action,
+      $target: a.target ?? "",
+      $ok: a.ok ? 1 : 0,
+      $detail: a.detail ?? null,
+    } as any);
+  } catch { /* the action already happened; losing its record is the lesser harm */ }
+}
+
+/** Newest first. Unscoped on purpose: the question this answers is "what has
+ *  been done through this cockpit", and narrowing it by the project that
+ *  happens to be open would hide exactly the answer somebody is looking for. */
+export function actionLog(limit = 200, before?: number): ActionRow[] {
+  const n = Math.max(1, Math.min(1000, limit));
+  return before
+    ? db.query<ActionRow, [number, number]>(`SELECT * FROM actions WHERE at < ? ORDER BY at DESC, id DESC LIMIT ?`).all(before, n)
+    : db.query<ActionRow, [number]>(`SELECT * FROM actions ORDER BY at DESC, id DESC LIMIT ?`).all(n);
+}
+
+// ---------------------------------------------------------------------------
 // Control plane: gate requests.
 //
 // The gate used to live only in memory, which made the one feature whose job is
@@ -365,6 +661,54 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_pat
 //
 // `decision` NULL means still pending. `resolution` records *who* decided:
 // human, timeout, or restart (expired while the server was down).
+/**
+ * What survives the prune.
+ *
+ * Raw events are deleted at AGENTGLASS_RETENTION_DAYS, which is right for
+ * rows carrying prompts and command lines, and silently caps every question
+ * worth asking: what a project cost last month, this sprint against the last,
+ * whether a budget is being kept. The only escape was raising retention and
+ * paying for it in database size and query time.
+ *
+ * So expiring events are folded into a day-grained summary before they are
+ * deleted. One row per (day, project, session, model, provider) is small
+ * enough to keep for years — a busy month of one project is a few thousand
+ * rows against a few hundred thousand events.
+ *
+ * What does NOT survive, and cannot: percentiles. p50 and p95 do not
+ * aggregate — an average of percentiles is not a percentile of anything. The
+ * total duration and the number of timed calls are carried instead, which
+ * gives an honest mean and nothing it cannot support.
+ *
+ * The key columns COALESCE to '' rather than allowing NULL, because NULLs are
+ * distinct from each other in a UNIQUE index and the upsert would insert a
+ * new row every night instead of accumulating.
+ */
+db.exec(`
+CREATE TABLE IF NOT EXISTS daily_rollup (
+  day TEXT NOT NULL,            -- YYYY-MM-DD, UTC
+  project_path TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  source_app TEXT NOT NULL,
+  model_name TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  events INTEGER NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
+  tool_errors INTEGER NOT NULL DEFAULT 0,
+  errors INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  duration_ms_total INTEGER NOT NULL DEFAULT 0,
+  timed_calls INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, project_path, session_id, model_name, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_rollup_day ON daily_rollup(day);
+CREATE INDEX IF NOT EXISTS idx_rollup_project_day ON daily_rollup(project_path, day);
+`);
+
 // ---------------------------------------------------------------------------
 db.exec(`
 CREATE TABLE IF NOT EXISTS gates (
@@ -382,7 +726,65 @@ CREATE TABLE IF NOT EXISTS gates (
 );
 CREATE INDEX IF NOT EXISTS idx_gates_pending ON gates(decision, expires);
 CREATE INDEX IF NOT EXISTS idx_gates_created ON gates(created);
+
+/*
+ * When to tell somebody about something.
+ *
+ * The one part of the task feature that is ours. Taskwarrior owns what a task
+ * IS and has nowhere to put a reminder; we own when to speak, which is also the
+ * part that must keep working when Taskwarrior is absent, unconfigured, or
+ * being written to by an editor at the same moment. task_uuid is nullable and
+ * first-class: a reminder with no task behind it is a legitimate thing to want.
+ *
+ * title is a snapshot, not a join. It must be possible to fire a reminder on
+ * a machine where the task list cannot be read at all — and a notification that
+ * says "reminder about (unavailable)" is worse than none.
+ *
+ * civil + zone rather than an instant alone, because "Monday 9:00" is a
+ * civil time. Fixing it to an epoch at creation fires it an hour wrong on the
+ * far side of a daylight-saving change — twice a year, for anyone in Europe.
+ * due is the resolved cache, recomputed when the two disagree.
+ *
+ * fired_at is the ledger. It is written inside the claim, before any delivery
+ * is attempted: a crash between claim and send costs one missed ping, and the
+ * other order costs a duplicate. A missed ping sits red on screen until
+ * acknowledged; a duplicate at three in the morning is an uninstall.
+ */
+CREATE TABLE IF NOT EXISTS reminders (
+  id TEXT PRIMARY KEY,
+  task_uuid TEXT,
+  title TEXT NOT NULL,
+  root TEXT,
+  civil TEXT NOT NULL,
+  zone TEXT NOT NULL,
+  due INTEGER NOT NULL,
+  created INTEGER NOT NULL,
+  fired_at INTEGER,
+  acked_at INTEGER,
+  cancelled_at INTEGER,
+  snooze_of TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_live ON reminders(fired_at, due);
 `);
+/**
+ * *Which* human, not just that one of them answered.
+ *
+ * `resolution` already said what kind of thing decided — a person, the clock, a
+ * restart — and that was the whole answer while a cockpit had one door. Now a
+ * paired phone carries its own credential and its own name (devices.ts), so a
+ * gate can be approved by somebody who is not at the machine, and "a human
+ * decided" stops being an answer to "who".
+ *
+ * It lives on the gate row rather than only in `actions` because the two cannot
+ * be joined: an action line records the route and a clipped `tool · summary`,
+ * so two gates on the same tool a second apart are indistinguishable in it. The
+ * column is written by the same UPDATE that resolves the row, which is what
+ * makes it impossible for the actor and the decision to disagree.
+ *
+ * NULL when nobody decided. A timeout is not an actor, and writing "system"
+ * would invent one — the same reason `actorOf` refuses to invent a name.
+ */
+try { db.exec("ALTER TABLE gates ADD COLUMN decided_by TEXT"); } catch { /* already present */ }
 
 export interface GateRow {
   id: string;
@@ -396,6 +798,9 @@ export interface GateRow {
   reason: string | null;
   resolution: "human" | "timeout" | "restart" | null;
   decided_at: number | null;
+  /** Who, when a person decided. NULL for a timeout, a restart, and for every
+   *  row written before this column existed — an absent actor is not `local`. */
+  decided_by: string | null;
 }
 
 const gateInsert = db.query(`
@@ -404,7 +809,8 @@ const gateInsert = db.query(`
 // Only ever resolves a still-pending row: a decision already recorded wins over
 // a late timeout, so a human's approve can't be overwritten by the clock.
 const gateResolve = db.query(`
-  UPDATE gates SET decision = $decision, reason = $reason, resolution = $resolution, decided_at = $decided_at
+  UPDATE gates SET decision = $decision, reason = $reason, resolution = $resolution,
+                   decided_at = $decided_at, decided_by = $decided_by
    WHERE id = $id AND decision IS NULL`);
 const gateById = db.query<GateRow, [string]>(`SELECT * FROM gates WHERE id = ?`);
 const gatesPending = db.query<GateRow, []>(`SELECT * FROM gates WHERE decision IS NULL ORDER BY created ASC`);
@@ -427,8 +833,16 @@ export function resolveGateRow(
   reason: string,
   resolution: "human" | "timeout" | "restart",
   decided_at = Date.now(),
+  /** Only ever set for a human. The clock is not an actor. */
+  decided_by: string | null = null,
 ): void {
-  gateResolve.run({ $id: id, $decision: decision, $reason: reason, $resolution: resolution, $decided_at: decided_at } as any);
+  gateResolve.run({
+    $id: id, $decision: decision, $reason: reason, $resolution: resolution,
+    $decided_at: decided_at,
+    // Belt as well as braces: the callers pass null for a timeout, and so does
+    // this, so an actor cannot arrive attached to an outcome nobody chose.
+    $decided_by: resolution === "human" ? decided_by : null,
+  } as any);
 }
 
 export function getGate(id: string): GateRow | null {
@@ -449,18 +863,19 @@ export function gateHistory(limit = 50): GateRow[] {
 /** Coarse vendor for a model name — the provider dimension. Returns null for an
  *  unknown/absent model so a session's known provider is never overwritten.
  *  Kept in sync with the web's providerOf() in web/src/lib/format.ts. */
+/**
+ * The vendor behind a model name, as this tier wants it.
+ *
+ * The rules live in shared/models.ts, shared with the web copy — they were two
+ * hand-kept transcriptions of each other, which #282 pinned with a test after
+ * they drifted. The only difference that survives is the miss value: the web
+ * needs a string to put in a filter option, this tier writes NULL into the
+ * `provider` column, and UNKNOWN_PROVIDER below is what makes the two
+ * correspond.
+ */
 export function providerOf(model: string | null | undefined): string | null {
-  if (!model) return null;
-  const m = model.toLowerCase();
-  if (/opus|sonnet|haiku|fable|claude|anthropic/.test(m)) return "Anthropic";
-  if (/gpt|davinci|openai|\bo1\b|\bo3\b|\bo4\b/.test(m)) return "OpenAI";
-  if (/gemini|palm|bison|flash|google|vertex/.test(m)) return "Google";
-  if (/deepseek/.test(m)) return "DeepSeek";
-  if (/grok|xai/.test(m)) return "xAI";
-  if (/mistral|mixtral|codestral/.test(m)) return "Mistral";
-  if (/llama|meta-/.test(m)) return "Meta";
-  if (/command|cohere/.test(m)) return "Cohere";
-  return null;
+  const p = sharedProviderOf(model);
+  return p === UNKNOWN_MODEL ? null : p;
 }
 
 /**
@@ -636,16 +1051,40 @@ const insertStmt = db.query(`
 
 // Find the matching PreToolUse for a Post event: by tool_use_id when present,
 // otherwise the most recent unpaired Pre for the same session+tool.
-const findPreById = db.query<{ timestamp: number }, [string]>(
-  `SELECT timestamp FROM events
-   WHERE hook_event_type = 'PreToolUse' AND tool_use_id = ?
-   ORDER BY id DESC LIMIT 1`
+/**
+ * Claim a Pre, rather than merely finding one.
+ *
+ * UPDATE ... RETURNING marks and reads in one statement, so a Pre answers one
+ * Post and no more. Without the claim, two overlapping calls to the same tool
+ * both measured from the newest Pre and one of the two durations was simply
+ * lost.
+ */
+const claimPreById = db.query<{ timestamp: number }, [string]>(
+  `UPDATE events SET paired = 1
+   WHERE id = (SELECT id FROM events
+               WHERE hook_event_type = 'PreToolUse' AND tool_use_id = ? AND paired = 0
+               ORDER BY id DESC LIMIT 1)
+   RETURNING timestamp`
 );
-const findPreByTool = db.query<{ timestamp: number }, [string, string, number]>(
-  `SELECT timestamp FROM events
-   WHERE hook_event_type = 'PreToolUse' AND session_id = ? AND tool_name = ?
-     AND timestamp <= ?
-   ORDER BY id DESC LIMIT 1`
+/**
+ * The fallback, for sources with no usable tool_use_id — hook payloads that
+ * omit it, and the OTLP-logs path, which synthesises ids that never match.
+ *
+ * FIFO (`ORDER BY id ASC`), not LIFO: with three calls open, the Post that
+ * arrives first belongs to the Pre that opened first. Taking the newest meant
+ * interleaved calls reported the shortest possible duration each time.
+ *
+ * Bounded below as well as above. An orphaned Post used to reach back through
+ * all of history and pair with a Pre from hours ago; now it finds nothing and
+ * records NULL, which the percentiles already know how to skip.
+ */
+const claimPreByTool = db.query<{ timestamp: number }, [string, string, number, number]>(
+  `UPDATE events SET paired = 1
+   WHERE id = (SELECT id FROM events
+               WHERE hook_event_type = 'PreToolUse' AND session_id = ? AND tool_name = ?
+                 AND paired = 0 AND timestamp <= ? AND timestamp >= ?
+               ORDER BY id ASC LIMIT 1)
+   RETURNING timestamp`
 );
 
 interface SessionTokenRow {
@@ -669,16 +1108,39 @@ const eventByExternalId = db.query<any, [string, string, string]>(
 );
 const sessionById = db.query<Record<string, unknown>, [string]>(`SELECT * FROM sessions WHERE session_id = ?`);
 
+/**
+ * The one place an `events` row becomes a `WatchEvent`, which is why the
+ * weighted token figure is attached here.
+ *
+ * The client folds these rows into fleet cards itself and has no price table —
+ * that is deliberate, and it is exactly why `AgentCard.tokens` could only ever
+ * be `input + output`. Carrying the weighted figure on the event is the same
+ * trick `cost_usd` already uses: the arithmetic that needs prices happens where
+ * the prices are.
+ */
 function parseEventRow(r: any): WatchEvent {
   return {
     ...r,
+    equiv_tokens: equivalentTokens(r, r.model_name),
     payload: safeJson(r.payload),
   } as WatchEvent;
 }
 
+/**
+ * Every `SessionRollup` the app produces comes through here — the list, the
+ * socket frame, the fleet's roll-up lookup — which is why the one comparable
+ * token figure is added here rather than at three call sites that would drift.
+ *
+ * It is derived rather than stored. `equiv_tokens` is a pure function of the
+ * four columns and the model, all of which are on the row already, so it is
+ * exact for history written before the idea existed — no column, no migration,
+ * and no backfill that could be interrupted halfway.
+ */
 function parseSessionRow(r: Record<string, unknown>): SessionRollup {
   const { pricing_baseline_usd: _internal, ...session } = r;
-  return session as unknown as SessionRollup;
+  const s = session as unknown as SessionRollup;
+  s.equiv_tokens = equivalentTokens(s, s.model_name);
+  return s;
 }
 
 function safeJson(s: string): Record<string, unknown> {
@@ -708,16 +1170,300 @@ const isTerminal = (t: string) => t === "Stop" || t === "SessionEnd";
 // ---------------------------------------------------------------------------
 export const RETENTION_DAYS = Math.max(0, Number(process.env.AGENTGLASS_RETENTION_DAYS ?? 8));
 
-export function pruneOldRows(): { events: number; sessions: number } {
-  if (!RETENTION_DAYS) return { events: 0, sessions: 0 };
+/**
+ * Fold every event older than `cutoff` into daily_rollup.
+ *
+ * Runs inside the prune transaction, immediately before the DELETE, so a
+ * crash between the two cannot lose a day: either both happened or neither
+ * did. Accumulating rather than replacing, because a day is folded once when
+ * it expires and must not be double-counted if a prune is run twice — the
+ * DELETE that follows is what guarantees each event is folded exactly once.
+ */
+function foldExpiringEvents(cutoff: number): number {
+  const r = db.run(
+    `INSERT INTO daily_rollup (
+       day, project_path, session_id, source_app, model_name, provider,
+       events, tool_calls, tool_errors, errors,
+       input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+       cost_usd, duration_ms_total, timed_calls
+     )
+     SELECT date(timestamp / 1000, 'unixepoch'),
+            COALESCE(project_path, ''), session_id, COALESCE(source_app, ''),
+            COALESCE(model_name, ''), COALESCE(provider, ''),
+            COUNT(*),
+            SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END),
+            SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') AND is_error = 1 THEN 1 ELSE 0 END),
+            SUM(is_error),
+            SUM(COALESCE(input_tokens, 0)), SUM(COALESCE(output_tokens, 0)),
+            SUM(COALESCE(cache_creation_tokens, 0)), SUM(COALESCE(cache_read_tokens, 0)),
+            SUM(COALESCE(cost_usd, 0)),
+            SUM(COALESCE(duration_ms, 0)),
+            SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
+     FROM events WHERE timestamp < ?
+     GROUP BY 1, 2, 3, 4, 5, 6
+     ON CONFLICT(day, project_path, session_id, model_name, provider) DO UPDATE SET
+       events = events + excluded.events,
+       tool_calls = tool_calls + excluded.tool_calls,
+       tool_errors = tool_errors + excluded.tool_errors,
+       errors = errors + excluded.errors,
+       input_tokens = input_tokens + excluded.input_tokens,
+       output_tokens = output_tokens + excluded.output_tokens,
+       cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+       cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+       cost_usd = cost_usd + excluded.cost_usd,
+       duration_ms_total = duration_ms_total + excluded.duration_ms_total,
+       timed_calls = timed_calls + excluded.timed_calls`,
+    [cutoff]
+  );
+  return r.changes;
+}
+
+export function pruneOldRows(): { events: number; sessions: number; rolled: number } {
+  if (!RETENTION_DAYS) return { events: 0, sessions: 0, rolled: 0 };
   const cutoff = Date.now() - RETENTION_DAYS * 86_400_000;
-  db.run(`DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE timestamp < ?)`, [cutoff]);
-  const ev = db.run(`DELETE FROM events WHERE timestamp < ?`, [cutoff]);
-  const se = db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
-  // Resolved gates only — a pending one is a live request, never retention's
-  // business no matter how old its row looks.
-  db.run(`DELETE FROM gates WHERE decision IS NOT NULL AND created < ?`, [cutoff]);
-  return { events: ev.changes, sessions: se.changes };
+  // One transaction: the fold and the delete are the same decision, and a
+  // crash between them would delete a day nobody had summarised.
+  // The fold is the only thing that writes daily_rollup, so this is the only
+  // place its path set can change.
+  rollupPathCache = null;
+  return db.transaction(() => {
+    const rolled = foldExpiringEvents(cutoff);
+    db.run(`DELETE FROM events_fts WHERE rowid IN (SELECT id FROM events WHERE timestamp < ?)`, [cutoff]);
+    const ev = db.run(`DELETE FROM events WHERE timestamp < ?`, [cutoff]);
+    const se = db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
+    // Resolved gates only — a pending one is a live request, never retention's
+    // business no matter how old its row looks.
+    db.run(`DELETE FROM gates WHERE decision IS NOT NULL AND created < ?`, [cutoff]);
+    // Acknowledged reminders age out; a live one is never retention's business
+    // however old its row looks — the same ruling the gates line above makes.
+    db.run(`DELETE FROM reminders WHERE (acked_at IS NOT NULL OR cancelled_at IS NOT NULL) AND due < ?`, [cutoff]);
+    return { events: ev.changes, sessions: se.changes, rolled };
+  })();
+}
+
+/**
+ * Every project path the rollup itself contains.
+ *
+ * Deliberately not recordedPaths(): that reads the events table, and the whole
+ * point of the rollup is that those rows are gone. A project last touched a
+ * month ago has no path left in events at all, so scoping rollup queries by
+ * what events still remembers would hide precisely the history the rollup was
+ * built to keep — the further back you look, the more of it disappears.
+ *
+ * The prune is the only writer, so the cache is dropped there rather than
+ * timed out.
+ */
+let rollupPathCache: string[] | null = null;
+function rollupPaths(): string[] {
+  if (rollupPathCache) return rollupPathCache;
+  const rows = db.query<{ p: string }, []>("SELECT DISTINCT project_path AS p FROM daily_rollup").all();
+  return (rollupPathCache = rows.map((r) => r.p).filter(Boolean));
+}
+
+/**
+ * Scope fragment for a `daily_rollup` query — the counterpart of scopeClause().
+ *
+ * Two differences from the events version, both forced by what the fold keeps.
+ * It tests `isWithin` rather than equality against the scope roots, because
+ * `project_path` is the path the event carried and that is often a directory
+ * *inside* a checkout (a monorepo package) — an exact IN against the roots
+ * matched none of those and reported a scoped project as having no history.
+ * And there is no `cwd_path` to fall back on: the fold does not carry one, so
+ * a row whose only in-scope path was the cwd cannot be recovered here.
+ */
+function rollupScopeClause(scope: string | null = workspaceRoot()): { clause: string; args: string[] } {
+  if (!scope) return { clause: "", args: [] };
+  const roots = scopeRoots(scope);
+  const inScope = rollupPaths().filter((p) => roots.some((r) => isWithin(p, r)));
+  // Same honest answer as scopeClause: nothing folded for this project yet.
+  if (!inScope.length) return { clause: " AND 0", args: [] };
+  return { clause: ` AND project_path IN (${inScope.map(() => "?").join(",")})`, args: inScope };
+}
+
+/** The per-day aggregate shared by rollupDays() and dailyUsage(), so the two
+ *  cannot drift into answering the same question differently. */
+const DAY_TOTALS = `SELECT day,
+        SUM(events) AS events, SUM(tool_calls) AS tool_calls,
+        SUM(tool_errors) AS tool_errors, SUM(errors) AS errors,
+        SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+        SUM(cache_creation_tokens) AS cache_creation_tokens,
+        SUM(cache_read_tokens) AS cache_read_tokens,
+        SUM(cost_usd) AS cost_usd,
+        COUNT(DISTINCT session_id) AS sessions,
+        CASE WHEN SUM(timed_calls) > 0
+             THEN CAST(SUM(duration_ms_total) / SUM(timed_calls) AS INTEGER)
+             ELSE 0 END AS avg_ms`;
+
+/**
+ * Daily totals from the rollup alone, scoped like every other metric.
+ *
+ * This reads only what the prune has already folded, so it answers about the
+ * past and stops at the retention boundary. Callers wanting a series that runs
+ * up to now want dailyUsage() instead — it is this plus the live events.
+ */
+export function rollupDays(fromDay?: string, toDay?: string): UsageDay[] {
+  const scope = rollupScopeClause();
+  const where: string[] = [];
+  const args: any[] = [];
+  if (fromDay) { where.push("day >= ?"); args.push(fromDay); }
+  if (toDay) { where.push("day <= ?"); args.push(toDay); }
+  const clause = ` WHERE 1${where.length ? ` AND ${where.join(" AND ")}` : ""}${scope.clause}`;
+  return db
+    .query<UsageDay, any[]>(`${DAY_TOTALS} FROM daily_rollup${clause} GROUP BY day ORDER BY day`)
+    .all(...args, ...scope.args);
+}
+
+/**
+ * One continuous daily series, across the retention boundary.
+ *
+ * The rollup holds the days the prune has folded; `events` holds the days it
+ * has not. Neither alone can answer "what did this project cost this month" on
+ * a default install — retention is 8 days, so a 30d window read from events is
+ * eight days of data wearing a thirty-day label.
+ *
+ * The two sources are summed, not preferred, because the boundary is a
+ * *timestamp*, not a midnight: the prune folds `timestamp < now - N days`, so
+ * the day the cutoff lands in is split between the tables and is only whole
+ * when both halves are added. Every other day is in exactly one of them, where
+ * adding is the identity.
+ *
+ * Sessions are the one column that cannot be summed — a session that ran
+ * across the cutoff has a row on both sides — so the union is counted distinct
+ * over (day, session_id) instead of adding two counts that both include it.
+ *
+ * Days are UTC, matching what the fold wrote. The heatmap is the panel that
+ * needs a viewer's local clock; a day-grained cost series does not, and
+ * shifting it would put spend on a different day than the rollup recorded it.
+ */
+export function dailyUsage(fromDay?: string, toDay?: string): UsageDay[] {
+  const rs = rollupScopeClause();
+  const es = scopeClause();
+  const rWhere: string[] = [];
+  const rArgs: any[] = [];
+  const eWhere: string[] = [];
+  const eArgs: any[] = [];
+  if (fromDay) {
+    rWhere.push("day >= ?"); rArgs.push(fromDay);
+    // Bounded on `timestamp` rather than on date(timestamp), so the events half
+    // can use the timestamp index instead of computing a date per row. With
+    // retention disabled this table holds everything, and "all time" is exactly
+    // when that matters.
+    eWhere.push("timestamp >= CAST(strftime('%s', ?) AS INTEGER) * 1000"); eArgs.push(fromDay);
+  }
+  if (toDay) {
+    rWhere.push("day <= ?"); rArgs.push(toDay);
+    eWhere.push("timestamp < (CAST(strftime('%s', ?) AS INTEGER) + 86400) * 1000"); eArgs.push(toDay);
+  }
+  const rc = ` WHERE 1${rWhere.length ? ` AND ${rWhere.join(" AND ")}` : ""}${rs.clause}`;
+  const ec = ` WHERE 1${eWhere.length ? ` AND ${eWhere.join(" AND ")}` : ""}${es.clause}`;
+  return db
+    .query<UsageDay, any[]>(
+      `WITH merged AS (
+         SELECT day, session_id, events, tool_calls, tool_errors, errors,
+                input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                cost_usd, duration_ms_total, timed_calls
+         FROM daily_rollup${rc}
+         UNION ALL
+         -- Folded the same way foldExpiringEvents() folds, down to the date
+         -- expression: a day that is half here and half in the rollup has to
+         -- land on the same key in both halves or it splits into two days.
+         SELECT date(timestamp / 1000, 'unixepoch') AS day, session_id,
+                COUNT(*),
+                SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') AND is_error = 1 THEN 1 ELSE 0 END),
+                SUM(COALESCE(is_error, 0)),
+                SUM(COALESCE(input_tokens, 0)), SUM(COALESCE(output_tokens, 0)),
+                SUM(COALESCE(cache_creation_tokens, 0)), SUM(COALESCE(cache_read_tokens, 0)),
+                SUM(COALESCE(cost_usd, 0)),
+                SUM(COALESCE(duration_ms, 0)),
+                SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
+         FROM events${ec}
+         GROUP BY 1, 2
+       )
+       ${DAY_TOTALS} FROM merged GROUP BY day ORDER BY day`
+    )
+    .all(...rArgs, ...rs.args, ...eArgs, ...es.args);
+}
+
+/**
+ * What was spent, over a window, by one project and optionally one model.
+ *
+ * The same seam dailyUsage() crosses, asked a narrower question. Two things
+ * make it a separate function rather than a filter on that one.
+ *
+ * The scope is *given*, not ambient. Every other metric here answers about the
+ * project the cockpit is currently looking at; a budget answers about the
+ * project it was set for, whatever is on screen. So the scope clauses are
+ * passed a root rather than left to read `workspaceRoot()`.
+ *
+ * And cost is the one column that simply adds. dailyUsage has to count sessions
+ * distinctly because a session running across the cutoff has a row on both
+ * sides — cost does not: the prune folds `timestamp < cutoff`, so every dollar
+ * is on exactly one side of it and summing both is the whole answer. That is
+ * what makes this query short enough to be obviously right, which for the
+ * number a budget fires on is worth more than sharing code.
+ *
+ * Days are UTC, matching what the fold wrote, and `toDay` is inclusive.
+ */
+export function spendBetween(opts: {
+  fromDay: string;
+  toDay: string;
+  /** Project root, or null for the whole machine. */
+  root?: string | null;
+  /** Exact model name, or null for all of them. */
+  model?: string | null;
+}): number {
+  const root = opts.root || null;
+  const rs = rollupScopeClause(root);
+  const es = scopeClause(root);
+  const rModel = opts.model ? " AND model_name = ?" : "";
+  const eModel = opts.model ? " AND model_name = ?" : "";
+  const mArgs = opts.model ? [opts.model] : [];
+  const r = db
+    .query<{ cost: number | null }, any[]>(
+      `SELECT
+         (SELECT COALESCE(SUM(cost_usd), 0) FROM daily_rollup
+           WHERE day >= ? AND day <= ?${rModel}${rs.clause})
+       + (SELECT COALESCE(SUM(cost_usd), 0) FROM events
+           WHERE timestamp >= CAST(strftime('%s', ?) AS INTEGER) * 1000
+             AND timestamp < (CAST(strftime('%s', ?) AS INTEGER) + 86400) * 1000${eModel}${es.clause})
+         AS cost`
+    )
+    .get(opts.fromDay, opts.toDay, ...mArgs, ...rs.args,
+         opts.fromDay, opts.toDay, ...mArgs, ...es.args);
+  return r?.cost ?? 0;
+}
+
+/** Every model that has cost anything, newest activity first — so a budget can
+ *  be attached to one by picking rather than by typing its exact id. */
+export function costedModels(): string[] {
+  const rows = db
+    .query<{ m: string }, []>(
+      `SELECT model_name AS m FROM events WHERE model_name IS NOT NULL AND cost_usd > 0
+       UNION SELECT model_name AS m FROM daily_rollup WHERE cost_usd > 0
+       ORDER BY m`
+    )
+    .all();
+  return rows.map((r) => r.m).filter(Boolean);
+}
+
+/** The oldest day the rollup can speak to, or null when it is empty. Lets a
+ *  panel state the real range instead of implying it has everything. */
+export function rollupEarliestDay(): string | null {
+  const r = db.query<{ day: string | null }, []>('SELECT MIN(day) AS day FROM daily_rollup').get();
+  return r?.day ?? null;
+}
+
+/**
+ * The UTC day the retention boundary currently falls in, or null when nothing
+ * is pruned. Days before it are day-grained summaries; the boundary day itself
+ * and everything after are still whole events — which is worth saying on a
+ * chart, because it is the difference between "no spend" and "no longer known
+ * in that detail".
+ */
+export function retentionSeamDay(): string | null {
+  if (!RETENTION_DAYS) return null;
+  return new Date(Date.now() - RETENTION_DAYS * 86_400_000).toISOString().slice(0, 10);
 }
 
 export interface InsertResult {
@@ -739,8 +1485,20 @@ function duplicateResult(row: any): InsertResult {
  *  - PostToolUse latency via pre→post pairing
  *  - the updated session rollup (authoritative token/cost totals)
  */
+/** A side-channel notified of every event as it lands, live or backfilled, so a
+ *  consumer can keep a derived view (the latest event per session, for the
+ *  tab-strip "agent finished" dot) without importing this module's internals or
+ *  re-querying on a hot path. Set once at startup; a missing hook is not called.
+ *  A hook rather than a direct import so db.ts stays a leaf — the consumer reads
+ *  pane_agent, which reads db, and importing it here would close a cycle. */
+let eventHook: ((sessionId: string, type: string, ts: number) => void) | null = null;
+export function setEventHook(fn: (sessionId: string, type: string, ts: number) => void): void { eventHook = fn; }
+
 export function insertEvent(n: NormalizedEvent): InsertResult {
   const model = n.model_name;
+  // Every event, before any dedup/rollup below: the derived view keeps by max
+  // timestamp, so replaying a duplicate or an out-of-order backfill is harmless.
+  eventHook?.(n.session_id, n.hook_event_type, n.timestamp);
 
   // --- token delta computation -------------------------------------------
   let dIn = n.usage.input_tokens ?? 0;
@@ -772,8 +1530,11 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
   let duration_ms: number | null = null;
   if (isToolPost(n.hook_event_type)) {
     let pre: { timestamp: number } | null = null;
-    if (n.tool_use_id) pre = findPreById.get(n.tool_use_id) ?? null;
-    if (!pre && n.tool_name) pre = findPreByTool.get(n.session_id, n.tool_name, n.timestamp) ?? null;
+    if (n.tool_use_id) pre = claimPreById.get(n.tool_use_id) ?? null;
+    if (!pre && n.tool_name) {
+      // Same ceiling the open-tool card uses to call a call lost.
+      pre = claimPreByTool.get(n.session_id, n.tool_name, n.timestamp, n.timestamp - OPEN_TOOL_MAX_MS) ?? null;
+    }
     if (pre) duration_ms = Math.max(0, n.timestamp - pre.timestamp);
   }
 
@@ -817,9 +1578,14 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
     return { event, session, inserted: true };
   };
 
-  // A retry key makes the event row and its session rollup one atomic write.
-  // Existing no-key scanner/hook events keep their original fast path.
-  const result = n.event_id !== null ? db.transaction(write)() : write();
+  // One transaction on every path, not only the retry-key one.
+  //
+  // The Pre claim above is a write, and it has to commit or roll back with the
+  // row it is measuring — otherwise two concurrent Posts can each claim a Pre
+  // and then one of the inserts fails, leaving a Pre marked answered by an
+  // event that does not exist. It also has to be in the *same* transaction as
+  // the claim, which is why the claim is not lifted out of insertEvent.
+  const result = db.transaction(write)();
   if (!result.inserted) return result;
   const { event } = result;
 
@@ -1206,6 +1972,41 @@ function computeFilterOptions() {
 const SESSIONS_TTL_MS = 1000;
 const sessionsCache = new Map<string, { at: number; data: SessionRollup[] }>();
 
+/**
+ * What each of these sessions was first asked to do.
+ *
+ * Most sessions have no name. `custom_title` is a rename by hand and `ai_title`
+ * is one the agent generated, and both come from lines Claude Code writes into
+ * the transcript — a session that never got one shows its own uuid forever,
+ * which is why a real machine's list reads `agentglass:cd3fa401` thirty times
+ * over and cannot be scanned by eye at all.
+ *
+ * The first thing you typed is a better name than a uuid and it has been in the
+ * database the whole time: every prompt is already ingested as a
+ * `UserPromptSubmit` event. So this is a query rather than a new column, an
+ * ingest change or a backfill — and it names sessions recorded long before the
+ * idea existed.
+ *
+ * One statement for the whole page rather than one per row. SQLite's
+ * bare-column rule makes `payload` come from the row that produced `MIN(...)`,
+ * which is exactly the first prompt.
+ */
+function firstPrompts(ids: string[]): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!ids.length) return out;
+  const holes = ids.map(() => "?").join(",");
+  for (const r of db.query<{ session_id: string; payload: string }, string[]>(
+    `SELECT session_id, payload, MIN(timestamp) FROM events
+     WHERE hook_event_type = 'UserPromptSubmit' AND session_id IN (${holes})
+     GROUP BY session_id`).all(...ids)) {
+    try {
+      const p = JSON.parse(r.payload)?.prompt;
+      if (typeof p === "string" && p.trim()) out.set(r.session_id, p);
+    } catch { /* a payload we cannot read is not a name */ }
+  }
+  return out;
+}
+
 export function getSessions(limit = 100, provider?: string, account?: string): SessionRollup[] {
   const key = `${limit}|${provider ?? ""}|${account ?? ""}|${workspaceRoot() ?? ""}`;
   const hit = sessionsCache.get(key);
@@ -1227,6 +2028,16 @@ export function getSessions(limit = 100, provider?: string, account?: string): S
     )
     .all(...prov.args, ...acct.args, ...s.args, limit)
     .map(parseSessionRow);
+  // Only for the rows that need one: a session with a real title does not want
+  // its first prompt, and asking for it would be work thrown away.
+  const nameless = data.filter((d) => !d.custom_title && !d.ai_title).map((d) => d.session_id);
+  if (nameless.length) {
+    const prompts = firstPrompts(nameless);
+    for (const d of data) {
+      const p = prompts.get(d.session_id);
+      if (p) d.first_prompt = p;
+    }
+  }
   sessionsCache.set(key, { at: Date.now(), data });
   // One entry per (limit, provider, scope); the limit set is tiny and scope
   // rarely changes, so prune stale entries anyway so a long-lived server cannot
@@ -1266,11 +2077,20 @@ const statsCache = new Map<string, { at: number; data: StatsSummary }>();
 /** Full analytics summary over a rolling window (default 24h), optionally scoped
  *  to a single provider (Anthropic / OpenAI / Google / …). Always scoped to the
  *  open project, so spend, tool mix and the radar describe that project alone. */
-export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, account?: string): StatsSummary {
-  const key = `${windowMs}|${provider ?? ""}|${account ?? ""}|${workspaceRoot() ?? ""}`;
+// tz is 3rd positionally, ahead of account: it's the parameter upstream's own
+// heatmap test pins by position (db.statsSummary(window, provider, tz)), and
+// that call shape is worth keeping stable over adding a 3rd optional filter in
+// the middle of it.
+export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, tz?: string, account?: string): StatsSummary {
+  // tz belongs in the key, not only the arguments. The heatmap buckets by
+  // weekday and hour, which are only defined relative to a clock — and the
+  // viewer is often not on the server (remote access, the phone companion).
+  // Without it here, one viewer's grid is served to another in a different
+  // zone for the whole TTL.
+  const key = `${windowMs}|${provider ?? ""}|${account ?? ""}|${workspaceRoot() ?? ""}|${tz ?? ""}`;
   const hit = statsCache.get(key);
   if (hit && Date.now() - hit.at < STATS_TTL_MS) return hit.data;
-  const data = computeStatsSummary(windowMs, provider, account);
+  const data = computeStatsSummary(windowMs, provider, tz, account);
   // One entry per (window, provider, scope). The window set is fixed and small
   // (the header's chips) and scope rarely changes, so this never grows unbounded
   // in practice; prune stale entries anyway so a long-lived server can't leak.
@@ -1279,7 +2099,7 @@ export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, acc
   return data;
 }
 
-function computeStatsSummary(windowMs: number, provider?: string, account?: string): StatsSummary {
+function computeStatsSummary(windowMs: number, provider?: string, tz?: string, account?: string): StatsSummary {
   const since = Date.now() - windowMs;
   const { clause: prov, args: pa } = provAcctScope(provider, account);
   const { clause: sc, args: sa } = scopeClause();
@@ -1301,6 +2121,14 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
       `SELECT COUNT(*) AS events,
               SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END) AS tool_calls,
               SUM(is_error) AS errors,
+              -- Errors that were actually a tool failing, which is the only
+              -- numerator tool_calls can honestly serve as a denominator for.
+              -- The errors column counts every errored event, and an LLM span
+              -- or a notification can carry is_error too (otlp.ts sets it on
+              -- "Turn complete") — dividing that by tool calls produced a
+              -- health ring below zero, and insights reading "6 of 4 tool
+              -- calls failed". Both ship; each answers its own question.
+              SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') AND is_error = 1 THEN 1 ELSE 0 END) AS tool_errors,
               COUNT(DISTINCT session_id) AS sessions,
               SUM(input_tokens) AS input_tokens,
               SUM(output_tokens) AS output_tokens,
@@ -1310,7 +2138,7 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
        FROM events WHERE timestamp >= ?${pf}`
     )
     .get(...A)!;
-  const evtTotals = totals as { events: number; tool_calls: number; errors: number };
+  const evtTotals = totals as { events: number; tool_calls: number; errors: number; tool_errors: number };
   const tokTotals = totals;
 
   // Per-model breakdown (from events so it respects the window).
@@ -1327,15 +2155,78 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
        GROUP BY model_name`
     )
     .all(...A);
-  const by_model: CostByModel[] = modelRows.map((r) => ({
-    model_name: modelLabel(r.model_name),
-    input_tokens: r.input_tokens ?? 0,
-    output_tokens: r.output_tokens ?? 0,
-    cache_creation_tokens: r.cache_creation_tokens ?? 0,
-    cache_read_tokens: r.cache_read_tokens ?? 0,
-    cost_usd: r.cost_usd ?? 0,
-    sessions: r.sessions ?? 0,
-  }));
+  /**
+   * Fold the raw ids into their labels before the panel sees them.
+   *
+   * The SQL groups by `model_name`, which is the raw id, and the label is
+   * applied after — so two ids that share a label ("claude-opus-4-1" and
+   * "claude-opus-4-5" both being Opus) arrived as two rows reading "Opus",
+   * each carrying part of that model's spend, under the same name and the
+   * same colour. The donut's centre was right and no legend row was.
+   *
+   * `sessions` is the one column that cannot be summed: it is a
+   * COUNT(DISTINCT session_id) per raw id, so a session that switched model
+   * version mid-run counts once in each row and twice in the fold. It is
+   * counted over distinct pairs instead, below.
+   */
+  const sessionRows = db
+    .query<{ model_name: string | null; session_id: string }, any[]>(
+      `SELECT DISTINCT model_name, session_id FROM events
+       WHERE timestamp >= ? AND model_name IS NOT NULL${pf}`
+    )
+    .all(...A);
+  const sessionsByLabel = new Map<string, Set<string>>();
+  for (const r of sessionRows) {
+    const label = modelLabel(r.model_name);
+    const set = sessionsByLabel.get(label) ?? new Set<string>();
+    set.add(r.session_id);
+    sessionsByLabel.set(label, set);
+  }
+
+  const modelFold = new Map<string, CostByModel>();
+  for (const r of modelRows) {
+    const label = modelLabel(r.model_name);
+    const e = modelFold.get(label) ?? {
+      model_name: label,
+      input_tokens: 0, output_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0,
+      equiv_tokens: 0, cost_usd: 0, sessions: 0, unpriced: false,
+    };
+    // Any contributing id without a rate makes the whole row's cost partly a
+    // fallback — the honest reading, since the row is one number.
+    if (!hasPrice(r.model_name)) e.unpriced = true;
+    e.input_tokens += r.input_tokens ?? 0;
+    e.output_tokens += r.output_tokens ?? 0;
+    e.cache_creation_tokens += r.cache_creation_tokens ?? 0;
+    e.cache_read_tokens += r.cache_read_tokens ?? 0;
+    /*
+     * Weighted here, inside the loop, against the RAW id.
+     *
+     * Two ids can fold into one label and be priced differently — that is the
+     * whole reason the fold exists — so weighting the folded row would apply
+     * one model's ratios to another's tokens. Per raw id and then summed is
+     * exact, and keeps the identity that makes this number worth leading with:
+     * equivalent tokens times the base input rate is the cost.
+     */
+    e.equiv_tokens = (e.equiv_tokens ?? 0) + equivalentTokens(r, r.model_name);
+    e.cost_usd += r.cost_usd ?? 0;
+    modelFold.set(label, e);
+  }
+  for (const [label, e] of modelFold) e.sessions = sessionsByLabel.get(label)?.size ?? 0;
+  /*
+   * The window's one comparable number, summed from the same rows the
+   * breakdown is built from.
+   *
+   * Deliberately not a separate query. The headline and the legend under it are
+   * the two figures somebody checks against each other, and computing them from
+   * two SQL statements is how they come to disagree — `modelRows` has no
+   * `model_name IS NOT NULL` filter, so this covers events with no model too,
+   * which fall to the fallback rate exactly as their cost already does.
+   */
+  const equivTotal = [...modelFold.values()].reduce((n, e) => n + (e.equiv_tokens ?? 0), 0);
+  // Ordered on the way out: the query has no ORDER BY, and the panel renders
+  // the array in the order it arrives, so without this the donut's slices
+  // reshuffle between refreshes for no reason the viewer can see.
+  const by_model: CostByModel[] = [...modelFold.values()].sort((a, b) => b.cost_usd - a.cost_usd);
 
   // Tool latency — pull durations per tool and compute percentiles in JS.
   const durRows = db
@@ -1360,6 +2251,10 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
       return {
         tool_name,
         calls: count,
+        // The percentile sample, which is not the call count: a Post with no
+        // paired Pre is an invocation with no duration. Shipped so the panel
+        // can say when a p95 rests on two measurements.
+        timed: sorted.length,
         errors,
         p50_ms: percentile(sorted, 50),
         p95_ms: percentile(sorted, 95),
@@ -1374,18 +2269,49 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
   const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider, account).slice(0, 20);
 
   // Per-app rollup within the window.
-  const by_app: AppUsage[] = db
-    .query<AppUsage, any[]>(
-      `SELECT source_app,
+  /*
+   * Grouped by app AND model, then folded.
+   *
+   * `tokens` used to be `SUM(input_tokens + output_tokens)`, which is not a
+   * quantity: it adds a token that costs five to a token that costs a tenth and
+   * drops the cache classes entirely. Weighting needs the model, and the model
+   * is not in a group keyed on the app alone — so the group carries it and the
+   * fold puts the apps back together. The extra rows are apps × models, which
+   * is single digits times single digits.
+   */
+  const appRows = db
+    .query<any, any[]>(
+      `SELECT source_app, model_name,
               COUNT(*) AS events,
-              COUNT(DISTINCT session_id) AS sessions,
               SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END) AS tool_calls,
               SUM(cost_usd) AS cost_usd,
-              SUM(input_tokens + output_tokens) AS tokens
+              SUM(input_tokens) AS input_tokens,
+              SUM(output_tokens) AS output_tokens,
+              SUM(cache_creation_tokens) AS cache_creation_tokens,
+              SUM(cache_read_tokens) AS cache_read_tokens
        FROM events WHERE timestamp >= ?${pf}
-       GROUP BY source_app ORDER BY cost_usd DESC, events DESC`
+       GROUP BY source_app, model_name`
     )
     .all(...A);
+  // `sessions` is a COUNT(DISTINCT), which does not survive a fold: a session
+  // that used two models would be counted once per model and twice in the sum.
+  const appSessions = db
+    .query<{ source_app: string; sessions: number }, any[]>(
+      `SELECT source_app, COUNT(DISTINCT session_id) AS sessions
+       FROM events WHERE timestamp >= ?${pf} GROUP BY source_app`
+    )
+    .all(...A);
+  const appFold = new Map<string, AppUsage>();
+  for (const r of appRows) {
+    const e = appFold.get(r.source_app) ?? { source_app: r.source_app, events: 0, sessions: 0, tool_calls: 0, cost_usd: 0, tokens: 0 };
+    e.events += r.events ?? 0;
+    e.tool_calls += r.tool_calls ?? 0;
+    e.cost_usd += r.cost_usd ?? 0;
+    e.tokens += equivalentTokens(r, r.model_name);
+    appFold.set(r.source_app, e);
+  }
+  for (const r of appSessions) { const e = appFold.get(r.source_app); if (e) e.sessions = r.sessions ?? 0; }
+  const by_app: AppUsage[] = [...appFold.values()].sort((a, b) => b.cost_usd - a.cost_usd || b.events - a.events);
 
   // Event-type mix within the window.
   const by_type: TypeCount[] = db
@@ -1414,10 +2340,46 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
   }
   const tlRows = db
     .query<any, any[]>(
-      `SELECT timestamp, is_error, cost_usd, input_tokens, output_tokens FROM events WHERE timestamp >= ?${pf}`
+      // model_name and both cache columns come along so the bucket's `tokens`
+      // can be weighted per row — see the fold below and equivalentTokens().
+      `SELECT timestamp, is_error, cost_usd, model_name,
+              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+         FROM events WHERE timestamp >= ?${pf}`
     )
     .all(...A);
+  /**
+   * The heatmap is a weekday x hour grid, and neither exists without a clock.
+   *
+   * It used to bucket with getDay()/getHours(), which read the *server*
+   * process's zone, while the timeline beside it buckets UTC epochs and is
+   * rendered in the viewer's. So the cell labelled "Tue 14:00" and the tick
+   * labelled 14:00 described different real hours whenever the two clocks
+   * differed — shifted by the offset, with whole day columns moving when it
+   * crossed midnight. Remote access and the phone companion exist precisely
+   * so that the viewer is not on the server, so this was reachable rather
+   * than theoretical.
+   *
+   * The formatter is built once: formatToParts per event over a wide window
+   * is thousands of calls. An absent or unknown zone falls back to the old
+   * behaviour rather than throwing — the server's clock is still better than
+   * a 500.
+   */
   const heatmap = new Array(168).fill(0);
+  const WEEKDAY: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  let fmt: Intl.DateTimeFormat | null = null;
+  if (tz) {
+    try {
+      fmt = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", hour: "2-digit", hour12: false });
+    } catch { fmt = null; }
+  }
+  const cellOf = (ms: number): number => {
+    if (!fmt) { const d = new Date(ms); return d.getDay() * 24 + d.getHours(); }
+    const parts = fmt.formatToParts(ms);
+    const wd = WEEKDAY[parts.find((x) => x.type === "weekday")?.value ?? "Sun"] ?? 0;
+    // hour12:false spells midnight "24" in some locales.
+    const hr = Number(parts.find((x) => x.type === "hour")?.value ?? 0) % 24;
+    return wd * 24 + hr;
+  };
   for (const r of tlRows) {
     const t = Math.min(lastKey, Math.floor(r.timestamp / bucketMs) * bucketMs);
     const b = buckets.get(t);
@@ -1425,10 +2387,9 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
       b.events++;
       b.errors += r.is_error;
       b.cost_usd += r.cost_usd ?? 0;
-      b.tokens += (r.input_tokens ?? 0) + (r.output_tokens ?? 0);
+      b.tokens += equivalentTokens(r, r.model_name);
     }
-    const d = new Date(r.timestamp);
-    heatmap[d.getDay() * 24 + d.getHours()]++;
+    heatmap[cellOf(r.timestamp)]++;
   }
 
   return {
@@ -1437,11 +2398,13 @@ function computeStatsSummary(windowMs: number, provider?: string, account?: stri
       sessions: tokTotals.sessions ?? 0,
       tool_calls: evtTotals.tool_calls ?? 0,
       errors: evtTotals.errors ?? 0,
+      tool_errors: evtTotals.tool_errors ?? 0,
       cost_usd: tokTotals.cost_usd ?? 0,
       input_tokens: tokTotals.input_tokens ?? 0,
       output_tokens: tokTotals.output_tokens ?? 0,
       cache_creation_tokens: tokTotals.cache_creation_tokens ?? 0,
       cache_read_tokens: tokTotals.cache_read_tokens ?? 0,
+      equiv_tokens: equivTotal,
     },
     by_model,
     tool_latency,
@@ -1630,7 +2593,12 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
             COUNT(*) events,
             SUM(CASE WHEN hook_event_type IN ('PostToolUse','PostToolUseFailure') THEN 1 ELSE 0 END) tools,
             SUM(is_error) errors, SUM(cost_usd) cost_usd,
-            SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens
+            SUM(input_tokens) input_tokens, SUM(output_tokens) output_tokens,
+            -- Selected so the session's tokens can be weighted. Their absence
+            -- is why this pane's "Tokens" stat was input+output: not a
+            -- decision, just the two columns that happened to be here.
+            SUM(cache_creation_tokens) cache_creation_tokens,
+            SUM(cache_read_tokens) cache_read_tokens
      FROM events WHERE session_id = ?`).get(sessionId);
   if (!agg || !agg.events) return null;
 
@@ -1766,6 +2734,21 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
     session_id: sessionId,
     source_app: agg.source_app,
     model_name: agg.model_name ?? roll?.model_name ?? null,
+    /*
+     * What this session is called.
+     *
+     * The type has declared these since it was written and nothing ever filled
+     * them in, so `sessionTitle(detail)` had nothing to work with and every
+     * conversation header — on the phone and at the desk — showed a uuid, next
+     * to a list row that showed the real name. The row is right there in
+     * `roll`; it was simply never copied across.
+     */
+    custom_title: roll?.custom_title ?? null,
+    ai_title: roll?.ai_title ?? null,
+    // Same rule as the list: only when there is no title to use instead.
+    first_prompt: roll?.custom_title || roll?.ai_title
+      ? null
+      : firstPrompts([sessionId]).get(sessionId) ?? null,
     // Prefer the session row; fall back to the events for one that predates the
     // column. Without a directory the UI can't offer to resume the session.
     project_path: roll?.project_path ?? agg.project_path ?? null,
@@ -1787,6 +2770,7 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
     cost_usd: agg.cost_usd ?? 0,
     input_tokens: agg.input_tokens ?? 0,
     output_tokens: agg.output_tokens ?? 0,
+    equiv_tokens: equivalentTokens(agg, agg.model_name),
     summary,
     tool_mix: toolMix,
     subagents: subRows.map((s) => ({ agent_id: s.agent_id, agent_type: s.agent_type || "subagent", events: s.n })),
@@ -1797,8 +2781,51 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
 }
 
 /** Full-text search across every event's prompts, commands and outputs. */
+/**
+ * Turn what somebody typed into an fts5 MATCH expression.
+ *
+ * The old one-liner stripped every character that was not alphanumeric or an
+ * underscore, then prefix-starred what was left. That welds a term with an
+ * inner separator into a single token the unicode61 tokenizer can never
+ * produce, so the search returned ZERO hits for text sitting verbatim in the
+ * index:
+ *
+ *   src/db.ts       -> srcdbts*     0 hits
+ *   foo-bar         -> foobar*      0 hits
+ *   error: ENOENT   -> error* enoent*
+ *   C++             -> C*           matches nearly everything
+ *
+ * Paths, hyphenated flags, dotted symbols and email addresses are most of
+ * what anyone searches an agent's output for, so this was the common case
+ * rather than the edge.
+ *
+ * Each term becomes a quoted fts5 phrase with the prefix star OUTSIDE the
+ * quotes: `src/db.ts` -> `"src/db.ts"*`, which the tokenizer splits into the
+ * phrase src+db+ts and matches. Double quotes in the input are honoured as a
+ * phrase rather than split on whitespace, because a user who quotes means it.
+ * A term that tokenizes to nothing at all (`C++`, `--`) is dropped rather
+ * than degraded into a bare star that matches the whole table.
+ */
+export function ftsQuery(q: string): string {
+  const terms: string[] = [];
+  // "quoted phrase" | bare-run-of-non-space
+  for (const m of q.matchAll(/"([^"]*)"|(\S+)/g)) {
+    const raw = (m[1] ?? m[2] ?? "").trim();
+    if (!raw) continue;
+    // fts5 escapes a double quote inside a phrase by doubling it.
+    const phrase = raw.replace(/"/g, '""');
+    // Nothing the tokenizer can index — a run of pure punctuation. Skipping it
+    // is what stops `C++` becoming `C*`.
+    if (!/[\p{L}\p{N}]/u.test(raw)) continue;
+    // The star is a prefix operator on the last token of the phrase, and it
+    // only means that outside the quotes.
+    terms.push(`"${phrase}"*`);
+  }
+  return terms.join(" ");
+}
+
 export function searchEvents(q: string, limit = 60): import("../../shared/types.ts").SearchHit[] {
-  const match = q.trim().split(/\s+/).map((t) => t.replace(/[^a-zA-Z0-9_]/g, "")).filter(Boolean).map((t) => t + "*").join(" ");
+  const match = ftsQuery(q);
   if (!match) return [];
   const s = scopeClause();
   const scoped = s.clause.replace(/\b(project_path|cwd_path)\b/g, "e.$1");

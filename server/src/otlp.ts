@@ -4,7 +4,28 @@
 // (the `gen_ai.*` semantic conventions) into agentglass ingest events. This is
 // what makes agentglass provider-agnostic: anything that emits OTel GenAI spans
 // — the OpenAI / Google / Bedrock SDK instrumentations, LangChain, LiteLLM,
-// OpenLLMetry, even Claude Code's own OTel export — can feed the dashboard.
+// OpenLLMetry, Arize Phoenix and the other OpenInference instrumentors — can
+// feed the dashboard.
+//
+// NOT Claude Code's own OTel export, which this used to claim. That export is
+// METRICS, and there is no metrics receiver here — deliberately, not by
+// omission:
+//
+//   * everything those metrics carry about Claude Code is already in the
+//     database via the hooks, and at far higher fidelity — per-tool timings,
+//     the prompt, the arguments, the gate decision. Metrics carry totals,
+//     which is the one thing this dashboard already computes;
+//   * a second source for the same numbers is a double-counting bug waiting to
+//     happen. Attribution here is already careful work (see the cumulative-usage
+//     handling in ingest.ts and the pricing fallbacks), and feeding it a
+//     parallel stream of the same tokens would quietly inflate every total;
+//   * metrics have no per-call identity, so nothing in them can become an
+//     event. There is no mapping to write, only a sink to throw them into.
+//
+// So /v1/metrics exists and refuses, rather than 404ing. A silent 404 is how
+// somebody spends an afternoon wondering why nothing arrives — see the route
+// in index.ts, which says what this server takes and where Claude Code is
+// already covered.
 //
 // Mapping strategy:
 //   • a TOOL span (operation "execute_tool" or carrying gen_ai.tool.name) becomes
@@ -14,7 +35,9 @@
 //     carries per-call token usage in payload.usage, so cost math just works.
 // Spans with no gen_ai.* signal are ignored (this is not a general trace store).
 //
-// JSON only: point your exporter with OTEL_EXPORTER_OTLP_PROTOCOL=http/json.
+// Both OTLP/HTTP encodings are accepted — JSON and protobuf, the SDK default —
+// so no Collector is needed. (This line said "JSON only" long after the
+// protobuf decoder landed in otlp_pb.ts.)
 import type { IngestBody } from "../../shared/types.ts";
 
 interface AnyVal {
@@ -101,6 +124,13 @@ function tokenUsageFromAttributes(a: Record<string, unknown>) {
     "gen_ai.usage.cache_read_input_tokens",
     "gen_ai.usage.cache_read_tokens",
     "cached_token_count",
+    // OpenInference. `prompt_details` is a breakdown OF the prompt, so this
+    // is treated as a subset of it — the same contract every other alias in
+    // this list already has, and what the subtraction below assumes. If that
+    // turns out to be wrong for some instrumentor, the test named
+    // "cache reads are a subset of the prompt count" is the one to change,
+    // and it says so.
+    "llm.token_count.prompt_details.cache_read",
   ]);
   const cacheCreation = firstNum(a, [
     "gen_ai.usage.cache_creation.input_tokens",
@@ -115,6 +145,13 @@ function tokenUsageFromAttributes(a: Record<string, unknown>) {
     "input_tokens",
     "prompt_tokens",
     "llm.usage.prompt_tokens",
+    // OpenInference — the convention Arize Phoenix and its instrumentors
+    // emit. Missing this was silent rather than loud: the span is still
+    // recognised as GenAI (the check below accepts any `llm.` key), so the
+    // session landed, the model resolved and tool spans paired up — only the
+    // numbers were absent, which reads as "agentglass cannot price my
+    // provider" rather than "one attribute name is missing".
+    "llm.token_count.prompt",
   ]);
   return {
     input_tokens: Math.max(0, totalInput - cacheRead - cacheCreation),
@@ -125,6 +162,7 @@ function tokenUsageFromAttributes(a: Record<string, unknown>) {
       "output_tokens",
       "completion_tokens",
       "llm.usage.completion_tokens",
+      "llm.token_count.completion",
     ]),
     cache_read_tokens: cacheRead,
     cache_creation_tokens: cacheCreation,
@@ -303,12 +341,41 @@ function logRecordToEvent(rec: OtlpLogRecord, resAttrs: Record<string, unknown>)
       },
     };
   }
+  // Asked before the lifecycle patterns below, which match on loose words:
+  // "notification.idle_prompt" contains "prompt" and was read as a user
+  // prompt. Nothing in this set matches a genuine prompt or session name, so
+  // the stricter question is safe to ask first.
+  // An OTel source that really is asking for a human. Kept, because losing
+  // it would be the opposite failure — a genuine hold going unannounced.
+  if (/notification|permission|approval|awaiting|blocked|input.?required|needs.?(input|approval)/.test(eventName)) {
+    return { ...base, hook_event_type: "Notification", payload: { message: bodyText || eventName, event: eventName || undefined } };
+  }
+
   // Recognizable lifecycle events.
   if (/prompt|user.?message|user.?input/.test(eventName)) return { ...base, hook_event_type: "UserPromptSubmit", payload: { prompt: bodyText } };
   if (/session.?start|thread.?init|conversation.?start/.test(eventName)) return { ...base, hook_event_type: "SessionStart", payload: { message: bodyText } };
   if (/session.?end|thread.?end|turn.?complete|response.?complete/.test(eventName)) return { ...base, hook_event_type: "Turn complete", payload: { message: bodyText } };
-  // Any other GenAI-tagged record → a notification carrying its body.
-  if (bodyText || eventName) return { ...base, hook_event_type: "Notification", payload: { message: bodyText || eventName, event: eventName || undefined } };
+  /**
+   * Everything else GenAI-tagged: telemetry, not a request.
+   *
+   * This used to fall through to Notification, and Notification is not a
+   * neutral bucket — it is the vocabulary's word for "the agent wants you".
+   * Three consumers act on it:
+   *
+   *   web/lib/derive.ts:337  the fleet card turns to `waiting`
+   *   web/lib/derive.ts:399  the outcome ladder counts it `unanswered`
+   *   server/alerts.ts:119   a desktop notification fires, and the webhook
+   *
+   * So a Codex heartbeat, a rollout debug line, any vendor record this
+   * mapper had not learned yet, told the operator an agent was blocked on
+   * them — on their desk, on their phone, and in whatever Slack channel
+   * AGENTGLASS_WEBHOOK points at. A false "needs you" is the most expensive
+   * signal this product can emit, because the queue is the product.
+   *
+   * Telemetry is deliberately not in any of those three lists: it counts as
+   * an event and keeps its body, and claims nothing about a human.
+   */
+  if (bodyText || eventName) return { ...base, hook_event_type: "Telemetry", payload: { message: bodyText || eventName, event: eventName || undefined } };
   return null;
 }
 

@@ -6,7 +6,7 @@ import { parseControlCmd } from "../src/control.ts";
 
 describe("parseControlCmd — view", () => {
   test("accepts every real view id", () => {
-    for (const to of ["git", "diff", "pr", "docker", "term", "chat"]) {
+    for (const to of ["dash", "git", "diff", "pr", "tasks", "docker", "term", "chat", "browser", "files"]) {
       expect(parseControlCmd({ cmd: "view", to })).toEqual({ cmd: "view", to } as never);
     }
   });
@@ -103,5 +103,12 @@ describe("parseControlCmd — junk", () => {
     for (const b of [null, undefined, 42, "view", [], { cmd: "nope" }, {}]) {
       expect(parseControlCmd(b as unknown)).toBeNull();
     }
+  });
+
+  test("the browser view can be opened too — an agent driving it needs it mounted", () => {
+    expect(parseControlCmd({ cmd: "view", to: "browser" })).toEqual({ cmd: "view", to: "browser" });
+    // And the list is still a list: a view that is not on it stays off. (`dash`
+    // joined the list in 0.8, so the off-list example is a name that never will.)
+    expect(parseControlCmd({ cmd: "view", to: "settings" })).toBeNull();
   });
 });

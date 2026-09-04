@@ -4,14 +4,46 @@ import { WS_URL, IS_DEMO, hasToken, probeAuth } from "./api.ts";
 import * as demo from "./demo.ts";
 import { gitChanged } from "./gitBus.ts";
 import { emitControl } from "./controlBus.ts";
+import { emitBrowserAsk } from "./browserBus.ts";
 import { recordNote, fireDesktopAlert } from "./sysNotify.ts";
+import { ciShouldNotify } from "./ciNotifyPref.ts";
+import { raiseAlarm } from "./alarm.ts";
+import { nudgeReminders } from "./reminderStore.ts";
 
 const MAX_EVENTS = 2000;
 const FLUSH_MS = 220; // coalesce bursts into ~5 renders/sec
-// Stop hammering a server that won't come back. ~2 minutes of failed reconnects
-// (the backoff tops out at 8s) is long enough to ride out a restart but short
-// enough not to loop forever; becoming visible again resets and retries.
+// Stop *hammering* a server that won't come back. ~2 minutes of failed
+// reconnects (the backoff tops out at 8s) is long enough to ride out a restart.
 const GIVE_UP_MS = 120_000;
+/**
+ * What the retry slows to after that, rather than stopping.
+ *
+ * It used to stop outright, and the only way back was `visibilitychange` — which
+ * a tab sitting in the foreground never receives. So a tab left open and watched
+ * through an outage longer than two minutes disconnected permanently: no events,
+ * no chats, nothing, until somebody reloaded it or happened to switch tabs and
+ * back. The comment here claimed "becoming visible again resets and retries",
+ * which was true of every tab except the one being looked at.
+ *
+ * Slow enough that an unreachable server is not being hammered — one attempt a
+ * minute against a socket that fails immediately is nothing — and quick enough
+ * that a server coming back is noticed without the user doing anything.
+ */
+const IDLE_RETRY_MS = 60_000;
+
+/**
+ * How long to wait before the next reconnect attempt.
+ *
+ * Exported because the invariant worth pinning is not a number but the absence
+ * of one: this always returns a delay. It never says "stop", which is what the
+ * old code did once `failingForMs` passed the give-up window — leaving a
+ * foreground tab, the only kind that receives no `visibilitychange`, dead until
+ * it was reloaded.
+ */
+export function reconnectDelay(failingForMs: number, retry: number): number {
+  if (failingForMs > GIVE_UP_MS) return IDLE_RETRY_MS;
+  return Math.min(8000, 500 * 2 ** retry);
+}
 
 export type ConnState = "connecting" | "open" | "closed" | "unauthorized";
 
@@ -28,6 +60,23 @@ export interface LiveData {
  * Single WebSocket with auto-reconnect. Incoming events are BUFFERED and
  * flushed on a timer (not per-message) so a busy fleet causes a few renders a
  * second instead of dozens. Rendering pauses entirely while the tab is hidden.
+ *
+ * The buffer is unconditional. It used to be optional, behind a `keepEvents`
+ * parameter written for the browser companion — a second, phone-shaped page
+ * that opened this same socket and drew everything but the event stream, so it
+ * paid for two thousand rows re-set every 220ms and looked at none of them.
+ * That companion was deleted; this half of it was missed, and the parameter
+ * defaulted to true, so every path that exists took the same branch. `grep -rn
+ * "useLive(" web/src` is one call site, App.tsx's `useLive(anyPanelOpen)`, and
+ * has been for as long as the companion has been gone.
+ *
+ * The React Native app is not that companion and never was: it opens /stream
+ * through its own client (mobile/src/lib/live.ts) and reads `{type:"alert"}`
+ * off it. It has never asked this hook for anything, openTools included.
+ *
+ * The `sessionBus` comment further down was rewritten when the companion went;
+ * this was the piece left behind, and four comments here went on describing a
+ * caller that no longer existed.
  */
 export function useLive(paused = false): LiveData {
   const [events, setEvents] = useState<WatchEvent[]>([]);
@@ -126,8 +175,10 @@ export function useLive(paused = false): LiveData {
 
       setConn("closed");
       if (!firstFailAt.current) firstFailAt.current = Date.now();
-      if (Date.now() - firstFailAt.current > GIVE_UP_MS) return; // gave up — see visibility reset
-      reconnectTimer.current = setTimeout(connect, Math.min(8000, 500 * 2 ** retry.current++));
+      // Past the give-up window the backoff stops growing and simply goes
+      // quiet — it never stops. A foreground tab has no other way back.
+      const wait = reconnectDelay(Date.now() - firstFailAt.current, retry.current++);
+      reconnectTimer.current = setTimeout(connect, wait);
     };
     ws.onerror = () => ws.close();
     ws.onmessage = (msg) => {
@@ -142,11 +193,30 @@ export function useLive(paused = false): LiveData {
         gitChanged();
         return;
       }
+      if (frame.type === "browser") {
+        // An agent is driving the built-in browser. Imperative and addressed to
+        // one panel, so it goes to its own bus rather than through the control
+        // one — and it is answered even when no panel is listening, or the
+        // agent's request hangs until the server gives up on it.
+        emitBrowserAsk(frame.data);
+        return;
+      }
       if (frame.type === "control") {
         // An external controller (Stream Deck, phone) drove the UI. Imperative,
         // not data — hand it to App, which runs it through the same setters the
         // keyboard does.
         emitControl(frame.data);
+        return;
+      }
+      if (frame.type === "alert" && frame.data?.kind === "reminder" && frame.data.id) {
+        /* An alarm the user set. It does NOT go through fireDesktopAlert's list:
+           a reminder that arrives as another grey row has failed at the only job
+           it had. The card takes the screen and rings; the OS notification is
+           still sent, at critical urgency, so it survives the window being
+           behind something else. */
+        raiseAlarm({ id: frame.data.id, title: frame.data.title.replace(/^⏰\s*/, ""), when: frame.data.body, at: Date.now() });
+        fireDesktopAlert(frame.data);
+        void nudgeReminders();
         return;
       }
       if (frame.type === "alert") {
@@ -158,7 +228,43 @@ export function useLive(paused = false): LiveData {
         fireDesktopAlert(frame.data);
         return;
       }
+      if (frame.type === "card") {
+        /* A ClickUp card of yours moved. Recorded in the bell rather than fired
+           as an OS pop-up: this is news, not a blockage, and the one thing it
+           needs is somewhere to go — which it has, because the note carries the
+           card and the bell knows how to open one. */
+        const c = frame.data;
+        // Four sentences, and each says only what the API actually answered.
+        // A comment carries its author, so it names one; an assignment does
+        // not, so it never does.
+        const summary =
+          c.kind === "assigned" ? `${c.label} assigned to you`
+          : c.kind === "status" ? `${c.label} → ${c.status}`
+          : c.kind === "mention" ? `${c.who ?? "Somebody"} mentioned you on ${c.label}`
+          : `${c.who ?? "Somebody"} commented on ${c.label}`;
+        const body =
+          c.kind === "assigned" ? `${c.title}${c.status ? ` · ${c.status}` : ""}`
+          : c.kind === "status" ? `${c.title}${c.was ? ` · was ${c.was}` : ""}`
+          : c.said || c.title;
+        recordNote({
+          app: "ClickUp",
+          summary,
+          body,
+          // A mention is somebody asking you something; the rest is news.
+          urgency: c.kind === "mention" ? 2 : 1,
+          goto: { kind: "card", id: c.id, label: c.label },
+        });
+        return;
+      }
       if (frame.type === "ci") {
+        /*
+         * Only the pull requests that are about to merge, unless told
+         * otherwise. A suite finishing is news whose weight depends entirely on
+         * where the pull request is — on something half-written it is a status
+         * line, on something approved it is the last thing between you and
+         * merging. See ciNotifyPref.ts; the switch is in Settings.
+         */
+        if (!ciShouldNotify(frame.data)) return;
         // The server holds the latch, so this arrives once per verdict for a
         // whole suite. Naming the failures is the point: "1 failing" without a
         // name is what sends you to the browser.
@@ -170,16 +276,23 @@ export function useLive(paused = false): LiveData {
             ? `${v.failing.slice(0, 3).join(", ")}${v.failing.length > 3 ? ` +${v.failing.length - 3} more` : ""}\n${v.title}`
             : v.title,
           urgency: v.verdict === "red" ? 2 : 1,
+          // Clickable. The verdict has always known which pull request it is
+          // about; the note simply had nowhere to put it, so a list of PR
+          // results was a list of dead ends.
+          goto: { kind: "pr", repo: v.repo, number: v.number },
         });
         return;
       }
       if (frame.type === "initial") {
+        // openTools seeds the per-agent "running" state for sessions whose
+        // calls have already aged out of the buffer, and it rides on the same
+        // first frame — so it is read before the events, not instead of them.
+        setOpenTools(frame.openTools ?? []);
         const initial = frame.data.slice(-MAX_EVENTS);
         seen.current = new Set(initial.map((e) => e.id));
         pending.current = [];
         setEvents(initial);
         setLastEvent(initial[initial.length - 1] ?? null);
-        setOpenTools(frame.openTools ?? []);
       } else if (frame.type === "openTools") {
         // The whole list, re-read with fresh evidence. Replaces rather than
         // merges: the server's answer is authoritative about what is open, and
@@ -201,7 +314,12 @@ export function useLive(paused = false): LiveData {
           );
         }
       }
-      // "session" frames are ignored — the Sessions panel fetches its own roll-ups.
+      // `session` frames fall through on purpose. They were announced on a
+      // `sessionBus` for the browser companion, whose polls were tuned for
+      // battery rather than for truth; the cockpit's Sessions panel fetches its
+      // own roll-ups on its own clock and never subscribed. With the companion
+      // deleted the bus had one publisher and no listeners — several fan-outs a
+      // second into an empty Set on this socket's hot path — so both went.
     };
   }, [scheduleFlush]);
 
@@ -301,11 +419,28 @@ export function useLive(paused = false): LiveData {
       wsRef.current = null;
       connect();
     };
+    /**
+     * The network came back. Don't sit out a slow retry over it.
+     *
+     * Distinct from the visibility path, which covers a tab returning from the
+     * background: this covers a tab nobody has touched — laptop resumed, wifi
+     * reconnected, VPN back — where nothing about the tab has changed and the
+     * only news is that the machine can reach things again.
+     */
+    const onOnline = () => {
+      if (disposed.current || connRef.current === "open" || connRef.current === "unauthorized") return;
+      if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
+      retry.current = 0;
+      firstFailAt.current = 0;
+      connect();
+    };
     document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("online", onOnline);
     window.addEventListener("agentglass:server-changed", onServerChanged);
     return () => {
       disposed.current = true;
       document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("online", onOnline);
       window.removeEventListener("agentglass:server-changed", onServerChanged);
       if (timer.current) clearTimeout(timer.current);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);

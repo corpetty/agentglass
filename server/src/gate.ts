@@ -11,7 +11,8 @@
 // held connection is no longer the only place a pending request exists — a hook
 // whose connection dropped can re-attach with awaitGate(id).
 import type { PendingGate } from "../../shared/types.ts";
-import { pushGate } from "./alerts.ts";
+import { pushGate, describeSession } from "./alerts.ts";
+import { paneForSession } from "./panewt.ts";
 import { recordGate, resolveGateRow, undecidedGates, getGate } from "./db.ts";
 export type GateDecision = "allow" | "deny";
 export type GateOutcome = { decision: GateDecision; reason: string };
@@ -42,7 +43,16 @@ export function onGateChange(fn: () => void) { onChange = fn; }
 
 /** What a timeout resolves to, under the configured policy. */
 function timeoutOutcome(): GateOutcome {
-  if (FAIL_CLOSED) return { decision: "deny", reason: "gate timeout — no decision (fail-closed)" };
+  // Same audience as defaultReason(): a model deciding what to do next. This
+  // one is emphatically NOT a judgement about the call — nobody looked at it —
+  // and an agent that treats it as one will start avoiding a perfectly fine
+  // approach for the rest of the session.
+  if (FAIL_CLOSED) {
+    return {
+      decision: "deny",
+      reason: "Nobody answered this request in time and agentglass is configured fail-closed, so it was blocked without a human seeing it. This is not a judgement about the call. Say that you were blocked waiting for approval rather than assuming the approach was wrong.",
+    };
+  }
   // Empty reason so the hook falls through to Claude Code's own permission
   // prompt instead of force-allowing — an auto-allow shouldn't silently
   // skip the human it was meant to ask.
@@ -55,13 +65,20 @@ function timeoutOutcome(): GateOutcome {
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const validGateId = (id: unknown): id is string => typeof id === "string" && ID_RE.test(id);
 
-function finish(id: string, out: GateOutcome, resolution: "human" | "timeout" | "restart"): void {
+function finish(
+  id: string,
+  out: GateOutcome,
+  resolution: "human" | "timeout" | "restart",
+  /** Who, when a person decided. The timeout path leaves this null on purpose:
+   *  an outcome nobody chose must not arrive carrying an actor. */
+  by: string | null = null,
+): void {
   const w = waiters.get(id);
   if (w) {
     clearTimeout(w.timer);
     waiters.delete(id);
   }
-  resolveGateRow(id, out.decision, out.reason, resolution);
+  resolveGateRow(id, out.decision, out.reason, resolution, Date.now(), by);
   w?.resolve?.(out);
   onChange();
 }
@@ -99,8 +116,18 @@ export function submitGate(
   // later, the request still exists somewhere a restart can find it.
   recordGate({ id, source_app, session_id, tool_name, summary, created, expires });
   return new Promise((resolve) => {
-    waiters.set(id, { id, source_app, session_id, tool_name, summary, created, expires, resolve, timer: arm(id, expires) });
-    pushGate(`${source_app}:${session_id.slice(0, 8)}`, tool_name, summary);
+    waiters.set(id, { id, source_app, session_id, tool_name, summary, created, expires,
+      // Resolved once, here, so the dashboard and the phone say the same thing
+      // about the same request rather than each composing its own name.
+      where: describeSession(source_app, session_id), pane: paneForSession(session_id) ?? undefined, resolve, timer: arm(id, expires) });
+    // The checkout and the tmux window, not a project name and eight
+    // characters of a UUID. This is the alert that wakes a phone and expects a
+    // decision from the lock screen; it was the least readable of the lot.
+    //
+    // The gate id no longer rides along: it existed for the two buttons on a
+    // Web Push notification, and that whole path is gone. The pane does, and is
+    // a destination rather than an answer.
+    pushGate(describeSession(source_app, session_id), tool_name, summary, paneForSession(session_id) ?? undefined);
     onChange();
   });
 }
@@ -127,13 +154,60 @@ export function awaitGate(id: string): Promise<GateOutcome> | GateOutcome | null
   return { decision: row.decision, reason: row.reason || "" };
 }
 
-export function decideGate(id: string, decision: GateDecision, reason: string): boolean {
+/**
+ * What the agent is told when a human decides without typing anything.
+ *
+ * This string is not a log line. It travels to the hook, which hands it to
+ * Claude Code as `permissionDecisionReason` — so it is read by a model that
+ * has just been stopped and now has to choose what to do next.
+ *
+ * "denied from dashboard" told it nothing it could act on. The only moves it
+ * leaves are retrying the identical call, which will be denied again, or
+ * stalling — and both waste a turn and the human's next interruption. So the
+ * default says what happened, that retrying is pointless, and what to do
+ * instead.
+ *
+ * A reason typed by the human always wins; this is only the empty case.
+ */
+export function defaultReason(decision: GateDecision): string {
+  return decision === "deny"
+    ? "A human reviewed this call in agentglass and denied it. Do not retry the same call — it will be denied again. Take a different approach, or ask them what they would prefer."
+    : "A human reviewed this call in agentglass and approved it.";
+}
+
+/**
+ * `by` is who the server can honestly say answered — a paired device's name, or
+ * the address it came from. It is recorded on the row itself rather than only
+ * in the action log, because the two cannot be joined: an action line carries a
+ * clipped `tool · summary`, so two gates on the same tool a second apart are
+ * indistinguishable in it.
+ */
+export function decideGate(id: string, decision: GateDecision, reason: string, by: string | null = null): boolean {
   const row = getGate(id);
   // Decidable while pending, whether or not a connection is currently held: a
   // restored request has no waiter and must still take the operator's answer.
   if (!row || row.decision) return false;
-  finish(id, { decision, reason: reason || (decision === "deny" ? "denied from dashboard" : "approved from dashboard") }, "human");
+  finish(id, { decision, reason: reason || defaultReason(decision) }, "human", by);
   return true;
+}
+
+/**
+ * The words a person actually typed, or nothing.
+ *
+ * `decideGate` backfills an empty reason with `defaultReason`, because the
+ * string travels to a model that has just been stopped and needs something it
+ * can act on. That makes the stored reason useless to a *reader*: every gate
+ * anybody waved through carries the same paragraph, and a history quoting it
+ * back would be three lines of boilerplate per row hiding the one row where
+ * somebody explained themselves.
+ *
+ * Compared against the real function rather than a copy of its text, so the two
+ * cannot drift into a history that quotes a default it no longer recognises.
+ */
+export function typedReason(row: { decision: "allow" | "deny" | null; reason: string | null }): string {
+  const r = row.reason || "";
+  if (!r || !row.decision) return "";
+  return r === defaultReason(row.decision) ? "" : r;
 }
 
 export function pendingGates(): PendingGate[] {

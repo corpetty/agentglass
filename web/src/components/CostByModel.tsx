@@ -3,7 +3,7 @@ import { PieChart, Pie, Cell, ResponsiveContainer } from "recharts";
 import { motion } from "motion/react";
 import type { StatsSummary } from "../../../shared/types.ts";
 import { Panel } from "./Panel.tsx";
-import { fmtUsd, fmtTokens, modelColor } from "../lib/format.ts";
+import { fmtUsd, fmtEq, eqTitle, modelColor } from "../lib/format.ts";
 
 export const CostByModel = memo(function CostByModel({ stats }: { stats: StatsSummary | null }) {
   const models = (stats?.by_model ?? []).filter((m) => m.cost_usd > 0 || m.input_tokens > 0);
@@ -72,9 +72,26 @@ export const CostByModel = memo(function CostByModel({ stats }: { stats: StatsSu
               <span className="flex items-center gap-1.5 t-dim">
                 <span className="h-2.5 w-2.5 rounded-full" style={{ background: modelColor(m.model_name) }} />
                 {m.model_name}
+                {/* The table has no rate for this model, so the figure beside it is
+                    a fallback at DEFAULT_PRICE ($3/$15 per MTok) wherever the
+                    provider did not report an exact cost — and until now it was
+                    rendered with exactly the same confidence as a measured one.
+                    A model rename or a new release is all it takes, so this is
+                    the mark that says the number is a floor, not a fact. */}
+                {m.unpriced && (
+                  <span
+                    className="t-dim2"
+                    style={{ color: "var(--warning)", fontSize: 10 }}
+                    title={`agentglass has no rate for ${m.model_name}. Any cost here that the provider did not report exactly is estimated at the fallback $3/$15 per million tokens — set AGENTGLASS_PRICING to a table with this model to fix it.`}
+                  >
+                    ~
+                  </span>
+                )}
               </span>
               <span className="flex items-center gap-3 tabular-nums">
-                <span className="t-dim2">{fmtTokens(m.input_tokens + m.output_tokens)} tok</span>
+                <span className="t-dim2" title={eqTitle(m.equiv_tokens ?? m.input_tokens + m.output_tokens)}>
+                  {fmtEq(m.equiv_tokens ?? m.input_tokens + m.output_tokens)}
+                </span>
                 <span style={{ color: "var(--success)" }}>{fmtUsd(m.cost_usd)}</span>
               </span>
             </motion.div>

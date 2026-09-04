@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { partitionByWorktree, splitReadable, goneConfirmTitle, goneConfirmBody, preselected, fmtBytes, rescueKey, rescuePicks } from "../src/lib/goneCleanup.ts";
+import { partitionByWorktree, splitReadable, goneConfirmTitle, goneConfirmBody, forcedDeletePrompt, preselected, fmtBytes, rescueKey, rescuePicks } from "../src/lib/goneCleanup.ts";
 import type { GitBranch, WorktreeLeftovers, LeftoverEntry } from "../../shared/types.ts";
 
 /**
@@ -24,29 +24,29 @@ const entry = (path: string, bytes: number, vsMain: "absent" | "differs" = "abse
 
 describe("partitionByWorktree", () => {
   it("puts a branch with a worktree on the held side", () => {
-    const a = branch("PROJ-1"), b = branch("PROJ-2");
-    const { free, held } = partitionByWorktree([a, b], new Map([["PROJ-2", "/code/repo-PROJ-2"]]));
-    expect(free.map((x) => x.name)).toEqual(["PROJ-1"]);
-    expect(held.map((x) => x.name)).toEqual(["PROJ-2"]);
+    const a = branch("ORBIT-1"), b = branch("ORBIT-2");
+    const { free, held } = partitionByWorktree([a, b], new Map([["ORBIT-2", "/code/repo-ORBIT-2"]]));
+    expect(free.map((x) => x.name)).toEqual(["ORBIT-1"]);
+    expect(held.map((x) => x.name)).toEqual(["ORBIT-2"]);
   });
 
   it("an empty map means nothing is held", () => {
     // The state this map is built from is only populated by the Worktrees tab,
     // so an empty one used to be the normal case from the Branches tab — and it
     // silently sent every branch down the delete-directly path that fails.
-    const { free, held } = partitionByWorktree([branch("PROJ-1")], new Map());
+    const { free, held } = partitionByWorktree([branch("ORBIT-1")], new Map());
     expect(free).toHaveLength(1);
     expect(held).toHaveLength(0);
   });
 });
 
 describe("splitReadable", () => {
-  const b = branch("PROJ-1");
-  const map = new Map([["PROJ-1", "/code/repo-PROJ-1"]]);
+  const b = branch("ORBIT-1");
+  const map = new Map([["ORBIT-1", "/code/repo-ORBIT-1"]]);
 
   it("treats a successful report as removable", () => {
     // THE regression. A good report has no `error` field at all.
-    const { removable, refused } = splitReadable([b], map, [report("/code/repo-PROJ-1", { entries: [entry("a.env", 40)], skipped: 12 })]);
+    const { removable, refused } = splitReadable([b], map, [report("/code/repo-ORBIT-1", { entries: [entry("a.env", 40)], skipped: 12 })]);
     expect(refused).toEqual([]);
     expect(removable).toHaveLength(1);
     expect(removable[0]!.report.entries.map((e) => e.path)).toEqual(["a.env"]);
@@ -55,13 +55,13 @@ describe("splitReadable", () => {
   it("an empty checkout is still removable", () => {
     // No files and no error: nothing to lose, and it must not read as a failure
     // just because the list is empty.
-    const { removable, refused } = splitReadable([b], map, [report("/code/repo-PROJ-1")]);
+    const { removable, refused } = splitReadable([b], map, [report("/code/repo-ORBIT-1")]);
     expect(refused).toEqual([]);
     expect(removable).toHaveLength(1);
   });
 
   it("refuses a checkout that reported an error", () => {
-    const { removable, refused } = splitReadable([b], map, [report("/code/repo-PROJ-1", { error: "could not read that checkout" })]);
+    const { removable, refused } = splitReadable([b], map, [report("/code/repo-ORBIT-1", { error: "could not read that checkout" })]);
     expect(removable).toEqual([]);
     expect(refused[0]!.why).toBe("could not read that checkout");
   });
@@ -74,7 +74,7 @@ describe("splitReadable", () => {
   });
 
   it("refuses a branch whose worktree path is unknown", () => {
-    const { removable, refused } = splitReadable([b], new Map(), [report("/code/repo-PROJ-1")]);
+    const { removable, refused } = splitReadable([b], new Map(), [report("/code/repo-ORBIT-1")]);
     expect(removable).toEqual([]);
     expect(refused).toHaveLength(1);
   });
@@ -115,6 +115,41 @@ describe("goneConfirmTitle / goneConfirmBody", () => {
     for (const t of [goneConfirmTitle([branch("a")], [branch("b")], trunk), goneConfirmTitle([], [branch("a")], trunk)]) {
       expect(t).not.toContain("\n");
     }
+  });
+});
+
+/**
+ * The single-branch delete, at the moment git refuses it.
+ *
+ * The panel used to offer a way out only when the trunk provably held the work,
+ * and print the raw git error otherwise: a toast that clears itself in 2.6s,
+ * and no next step. But "we could not prove it" is not "it is not merged", and
+ * the difference has to survive in the wording, because the wording is the only
+ * safeguard between a keypress and `branch -D`.
+ */
+describe("forcedDeletePrompt", () => {
+  it("treats git's refusal as the stale answer when the trunk holds the work", () => {
+    const q = forcedDeletePrompt("fix/thing", true, "origin/main");
+    expect(q.title).toBe("git says fix/thing isn't merged");
+    expect(q.body).toContain("already in origin/main");
+    expect(q.confirmLabel).toBe("Delete");
+  });
+
+  it("says plainly that it could not prove it, and never claims the work is safe", () => {
+    const q = forcedDeletePrompt("fix/thing", false, "origin/main");
+    expect(q.title).toBe("Delete fix/thing without proof it is merged?");
+    expect(q.body).toContain("could not prove");
+    expect(q.body).toContain("last copy");
+    expect(q.body).not.toContain("already in origin/main");
+    expect(q.confirmLabel).toBe("Delete anyway");
+  });
+
+  it("still offers the delete when unproven, rather than dead-ending", () => {
+    // The whole point: an unproven branch keeps a way forward, with the reflog
+    // named as the way back.
+    const q = forcedDeletePrompt("fix/thing", false, "origin/main");
+    expect(q.confirmLabel).toMatch(/delete/i);
+    expect(q.body).toContain("reflog");
   });
 });
 

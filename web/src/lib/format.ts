@@ -1,15 +1,29 @@
 // Every formatter guards non-finite/nullish input: a single bad numeric field
 // upstream (a divide-by-zero rate, a forged event) otherwise leaks "$NaN" or
 // "Infinitys" straight into the UI.
+/**
+ * How many decimals a dollar figure needs to stop lying.
+ *
+ * Two cents needs two; four hundredths of a cent needs four, or it renders as
+ * "$0.00" and the panel claims nothing was spent. Exported because the hero
+ * KPI cannot use fmtUsd — it feeds a NumberFlow, which animates a *number* and
+ * takes Intl options rather than a formatted string — and the two renderings
+ * of the same field disagreeing is the bug this exists to prevent.
+ */
+export function usdDigits(n: number): number {
+  const a = Math.abs(n);
+  return a === 0 || a >= 1 ? 2 : a >= 0.01 ? 3 : 4;
+}
+
+// Every formatter guards non-finite/nullish input: a single bad numeric field
+// upstream (a divide-by-zero rate, a forged event) otherwise leaks "$NaN".
 export function fmtUsd(n: number | null | undefined): string {
   if (n == null || !isFinite(n)) return "—";
   const neg = n < 0 ? "-" : "";
   const a = Math.abs(n);
   if (a === 0) return "$0.00";
   if (a < 0.0001) return `${neg}<$0.0001`; // real spend that would round to $0.0000
-  if (a >= 1) return `${neg}$${a.toFixed(2)}`;
-  if (a >= 0.01) return `${neg}$${a.toFixed(3)}`;
-  return `${neg}$${a.toFixed(4)}`;
+  return `${neg}$${a.toFixed(usdDigits(a))}`;
 }
 
 // Platform-aware modifier label: ⌘ only on actual Macs, Ctrl+ elsewhere.
@@ -23,6 +37,33 @@ export function fmtTokens(n: number | null | undefined): string {
   if (a >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(Math.round(n));
 }
+
+/**
+ * What a weighted token count is called, and what it means, said once.
+ *
+ * A token is not a token: an output token on Opus costs five uncached input
+ * tokens and a cache read costs a tenth, so the "tokens" this app used to show
+ * — `input + output`, cache dropped — was not a quantity you could compare
+ * between two sessions, and the error did not even point one way.
+ *
+ * Everything spend-shaped now shows the same weighted figure, and everything
+ * says `eq` rather than `tok`, because a number that has stopped being a count
+ * of tokens should stop being labelled as one. The suffix is short enough for a
+ * chip; the sentence below is what a reader gets on hover, and it is the same
+ * sentence everywhere — eight call sites each explaining this in their own
+ * words is how three of them end up explaining it wrongly.
+ */
+export const EQ_SUFFIX = "eq";
+
+export function eqTitle(n: number | null | undefined): string {
+  const exact = n == null || !isFinite(n) ? "unknown" : Math.round(n).toLocaleString();
+  return `${exact} input-equivalent tokens — every class weighted by its own price ` +
+    `(on Opus an output token counts as 5, a cache write 1.25, a cache read 0.1), ` +
+    `so this is comparable between sessions and models in a way a raw token count is not.`;
+}
+
+/** The figure and its unit: "4.2M eq". */
+export const fmtEq = (n: number | null | undefined): string => `${fmtTokens(n)} ${EQ_SUFFIX}`;
 
 export function fmtMs(ms: number | null | undefined): string {
   if (ms == null || !isFinite(ms)) return "—";
@@ -41,6 +82,14 @@ export function fmtAgo(ts: number): string {
   return Math.floor(d / 86_400_000) + "d";
 }
 
+/** fmtAgo as a sentence. It answers "now" under a second, and "now ago" is not
+ *  English — which is exactly the value a "last seen" row shows right after the
+ *  thing it is describing happened. */
+export function since(ts: number): string {
+  const d = fmtAgo(ts);
+  return d === "now" ? "just now" : `${d} ago`;
+}
+
 export const fmtTime = (ts: number) =>
   new Date(ts).toLocaleTimeString([], { hour12: false });
 
@@ -49,35 +98,22 @@ export const fmtTime = (ts: number) =>
 export const agentKey = (e: { source_app: string; session_id: string }) =>
   `${e.source_app}:${e.session_id}`;
 
-/**
- * What to call a session on screen.
- *
- * A uuid is a correct identifier and a useless label: five agents on one repo
- * render as five near-identical hex strings, and picking the right one means
- * comparing characters. Claude Code already knows the answer — it writes an
- * `ai-title` for every session and a `custom-title` when you rename one — so
- * the fix is to use it.
- *
- * Precedence is the point: a rename is an explicit statement about what this
- * session is, so it beats the generated one even when the generated one is
- * newer. Falls back to `app:12345678` when there's no title at all, which is
- * every hook-only session (titles live in the transcript).
- */
-export const sessionTitle = (
-  s: { source_app?: string; session_id: string; custom_title?: string | null; ai_title?: string | null },
-  max = 60
-): string => {
-  const t = (s.custom_title || s.ai_title || "").trim();
-  if (t) return t.length > max ? t.slice(0, max - 1) + "…" : t;
-  return s.source_app ? `${s.source_app}:${s.session_id.slice(0, 8)}` : s.session_id.slice(0, 8);
-};
+// Naming a session moved to shared/ when the native app took the queue over: it
+// is the same rule on both surfaces, and the phone cannot import a web module.
+// Re-exported rather than relocated at the call sites, exactly as modelLabelOf
+// is below — every cockpit component already asks format.ts for its strings.
+export { sessionTitle, promptTitle, type Titled } from "../../../shared/sessionTitle.ts";
 
-// Deterministic color from a string (agent lanes, model chips).
+// Deterministic colour from a string (agent lanes, model chips). Near-neutral
+// on purpose: a whisper of hue for identity, but low enough saturation that a
+// dashboard full of them reads as greys, not a rainbow. Lightness carries most
+// of the separation.
 export function hashColor(s: string): string {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   const hue = ((h % 360) + 360) % 360;
-  return `hsl(${hue} 70% 65%)`;
+  const light = 54 + (Math.abs(h >> 8) % 22); // 54–75%
+  return `hsl(${hue} 12% ${light}%)`;
 }
 
 // Event-type accent colors.
@@ -97,46 +133,20 @@ export const TYPE_COLORS: Record<string, string> = {
 };
 export const typeColor = (t: string) => TYPE_COLORS[t] ?? "#64748b";
 
-// Map a raw model_name to a short label, across providers:
-// "claude-sonnet-5" → "Sonnet", "gpt-4o-2024-08-06" → "GPT-4o", "gemini-2.0-flash" → "Gemini Flash".
-// First substring hit wins, so order specific → general. Unknown names pass through.
-const MODEL_LABELS: [string, string][] = [
-  ["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"], ["fable", "Fable"],
-  ["gpt-4o-mini", "GPT-4o mini"], ["gpt-4o", "GPT-4o"], ["gpt-4.1", "GPT-4.1"],
-  ["gpt-4", "GPT-4"], ["gpt-3.5", "GPT-3.5"], ["gpt-5-mini", "GPT-5 mini"], ["gpt-5", "GPT-5"],
-  ["o4-mini", "o4-mini"], ["o3-mini", "o3-mini"], ["o1-mini", "o1-mini"], ["o1", "o1"], ["o3", "o3"],
-  ["flash", "Gemini Flash"], ["gemini", "Gemini"],
-  ["deepseek", "DeepSeek"], ["grok", "Grok"], ["mixtral", "Mistral"], ["mistral", "Mistral"],
-  ["codestral", "Mistral"], ["llama", "Llama"], ["command", "Command"],
-];
-export function modelLabelOf(raw: string | null | undefined): string {
-  if (!raw) return "unknown";
-  const m = raw.toLowerCase();
-  for (const [frag, label] of MODEL_LABELS) if (m.includes(frag)) return label;
-  return raw;
-}
+// Both of these used to live here in full, with a second copy of providerOf in
+// server/src/db.ts and a rival label table in server/src/pricing.ts. They are
+// one implementation now — see shared/models.ts for why the label had to stop
+// coming from the price row it matched.
+export { modelLabelOf, providerOf } from "../../../shared/models.ts";
 
-// Coarse vendor for a model name — powers the provider filter/badge. Works for
-// both Claude Code (model_name like "claude-opus-4-8") and OpenTelemetry sources.
-export function providerOf(raw: string | null | undefined): string {
-  if (!raw) return "unknown";
-  const m = raw.toLowerCase();
-  if (/opus|sonnet|haiku|fable|claude|anthropic/.test(m)) return "Anthropic";
-  if (/gpt|davinci|openai|\bo1\b|\bo3\b|\bo4\b/.test(m)) return "OpenAI";
-  if (/gemini|palm|bison|flash|google|vertex/.test(m)) return "Google";
-  if (/deepseek/.test(m)) return "DeepSeek";
-  if (/grok|xai/.test(m)) return "xAI";
-  if (/mistral|mixtral|codestral/.test(m)) return "Mistral";
-  if (/llama|meta-/.test(m)) return "Meta";
-  if (/command|cohere/.test(m)) return "Cohere";
-  return "unknown";
-}
-
+// Concrete (the cost donut is SVG, where a CSS var in `fill` would not resolve)
+// and near-neutral: models separate by lightness, not hue, so the donut and the
+// session bars stop being pink/blue/green and read as a quiet greyscale.
 export const MODEL_COLORS: Record<string, string> = {
-  Opus: "#f472b6",
-  Sonnet: "#60a5fa",
-  Haiku: "#34d399",
-  Fable: "#c084fc",
-  unknown: "#64748b",
+  Opus: "#b6b7bd",
+  Sonnet: "#8d8e95",
+  Haiku: "#6f7077",
+  Fable: "#585960",
+  unknown: "#54555c",
 };
 export const modelColor = (m: string) => MODEL_COLORS[m] ?? hashColor(m);

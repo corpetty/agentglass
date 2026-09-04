@@ -14,15 +14,17 @@
 // 3. Writes are public. A stray `gh pr merge` is not a UI bug, it is a deploy,
 //    so every mutation goes through `writeGuard` and the irreversible ones are
 //    named separately from the rest.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { gitAsync, safeAbs, repoRootOf } from "./git.ts";
+import { makeViewTempDir } from "./viewtemp.ts";
 import { inScope } from "./config.ts";
+import { recipePromptText } from "./reviewPrompts.ts";
 import type {
-  PrRepoId, PrSummary, PrDetail, PrListResponse, PrActionResult, PrCheck, PrCheckRollup,
+  PrRepoId, PrSummary, PrBranchSummary, PrDetail, PrListResponse, PrActionResult, PrCheck, PrCheckRollup,
   PrCheckState, PrThread, PrReview, PrComment, PrCommit, PrFile, PrChecklistItem, PrMergeState, CiVerdict,
-  PrAuthored, PrReaction, PrEvent, PrCheckJob,
+  PrAuthored, PrReaction, PrEvent, PrCheckJob, PrReviewer, PrMergePolicy, PrMergeMethod, PrLocalHead,
 } from "../../shared/types.ts";
 
 /** Same escape hatch the git writes use, so one variable disables both. */
@@ -34,10 +36,25 @@ const GH_TIMEOUT_MS = 25_000;
 // running gh
 // ---------------------------------------------------------------------------
 
-let ghPath: string | null | undefined;
+/**
+ * Where `gh` is, once it has been found.
+ *
+ * A hit is cached and a MISS is not, which is the whole point of the type. It
+ * used to cache both: one `Bun.which` answering null — a PATH not ready yet, a
+ * lookup that lost a race at boot — pinned "gh not found" on every call this
+ * process made for the rest of its life, with nothing on screen to suggest
+ * looking anywhere but at gh itself. Reported once, from the button that
+ * submits a review, and not reproducible from a shell, because a shell resolves
+ * it afresh every time.
+ *
+ * Retrying costs a PATH walk only in the case that is already broken, and it
+ * turns a permanent failure into a transient one.
+ */
+let ghPath: string | null = null;
 function ghBin(): string | null {
-  if (ghPath === undefined) ghPath = Bun.which("gh");
-  return ghPath ?? null;
+  if (ghPath) return ghPath;
+  ghPath = Bun.which("gh") ?? null;
+  return ghPath;
 }
 
 export interface GhResult { code: number; stdout: string; stderr: string }
@@ -77,6 +94,32 @@ async function ghJson<T>(args: string[], cwd?: string): Promise<T | null> {
   const r = await gh(args, cwd);
   if (r.code !== 0) return null;
   try { return JSON.parse(r.stdout) as T; } catch { return null; }
+}
+
+/**
+ * Every page of a list endpoint, not the first hundred.
+ *
+ * `?per_page=100` reads as "all of them" and is not: this repository has 153
+ * labels, `review:caveman` is the 106th alphabetically, and it was simply
+ * missing from the label picker — a label somebody could see on GitHub and not
+ * apply here. Measured, not guessed.
+ *
+ * `--slurp` is what makes this parseable. A bare `--paginate` concatenates the
+ * pages' bodies, so two pages of an array arrive as `[…][…]`, which is not
+ * JSON; `--slurp` wraps them in one array of arrays, and this flattens it.
+ *
+ * `pages` is a real cap rather than a formality — 894 branches is nine round
+ * trips for a dropdown nobody scrolls to the end of. Callers say how far they
+ * are willing to go.
+ */
+async function ghJsonAll<T>(path: string, pages = 4, cwd?: string): Promise<T[] | null> {
+  const r = await gh(["api", path, "--paginate", "--slurp"], cwd);
+  if (r.code !== 0) return null;
+  try {
+    const all = JSON.parse(r.stdout) as T[][];
+    if (!Array.isArray(all)) return null;
+    return all.slice(0, pages).flat();
+  } catch { return null; }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +172,304 @@ export async function ghCapability(force = false): Promise<GhCapability> {
   return cap;
 }
 
+/**
+ * How far behind its base a branch actually is.
+ *
+ * Asked separately, and asked at all, because `mergeStateStatus` does not
+ * answer it. That field reports BEHIND only where the repository REQUIRES
+ * branches to be up to date before merging; without that protection a branch
+ * 194 commits behind its base still reports CLEAN — measured on a real pull
+ * request whose branch was exactly that. Gating "Update branch" on BEHIND
+ * therefore hid the button in the one case somebody wants it.
+ *
+ * Its own endpoint rather than part of the detail: it costs about 600ms
+ * (measured), and a pull request should open at the speed it opened before.
+ * The panel asks once the detail is on screen, and the button appears a moment
+ * later — which is the right way round for something that is an offer, not
+ * information you are waiting on.
+ *
+ * `per_page=1` because only the counts are wanted; the commit list and file
+ * list are what make this call big.
+ */
+/** The two branch names a pull request is between. Shared, because everything
+ *  that acts on a pull request locally needs exactly this pair. */
+export async function prBranches(root: string, number: number): Promise<{ base: string; head: string } | null> {
+  const id = await repoIdFor(root);
+  if (!id) return null;
+  const pr = await ghJson<{ baseRefName?: string; headRefName?: string }>(
+    ["pr", "view", String(number), "--repo", `${id.owner}/${id.name}`, "--json", "baseRefName,headRefName"], root);
+  return pr?.baseRefName && pr.headRefName ? { base: pr.baseRefName, head: pr.headRefName } : null;
+}
+
+/**
+ * The open pull requests whose HEAD is this branch, and the ones whose BASE is.
+ *
+ * Asked of GitHub by branch rather than filtered out of a list this app already
+ * holds, and that is the correction rather than an optimisation. The first
+ * version read the `mine` scope and matched on head — which quietly answered
+ * "there is no pull request" for a branch that had one, because somebody ELSE
+ * had opened it. Measured on a real checkout: twelve pull requests pointed at
+ * the branch and the one FROM it belonged to a colleague, so the chip never
+ * appeared and the panel looked broken rather than narrow.
+ *
+ * Two `gh` calls with `--head` / `--base`, which are exact and cheap — a list of
+ * fifteen thousand filtered client-side is neither. `--limit` is small on
+ * purpose: one branch has one pull request out of it, and a base branch with
+ * more than twenty incoming is a number, not a list.
+ */
+export async function prsForBranch(root: string, branchIn: unknown): Promise<{
+  ok: boolean; repo?: string; from?: PrBranchSummary; into: PrBranchSummary[];
+  /** `gh` is missing or logged out. Distinct from "no pull request here", which
+   *  is what silence used to be indistinguishable from. */
+  needsAuth?: boolean; error?: string;
+}> {
+  const branch = typeof branchIn === "string" ? branchIn.trim() : "";
+  // Nothing that could be read as an option: this becomes a command argument.
+  if (!branch || branch.startsWith("-") || /\s/.test(branch)) return { ok: false, into: [], error: "no branch" };
+  const id = await repoIdFor(root);
+  if (!id) return { ok: false, into: [], error: "no GitHub remote here" };
+
+  /*
+   * The cheap field set, deliberately — and the caller has to know it.
+   *
+   * `statusCheckRollup` is a separate GraphQL walk per pull request and was
+   * measured at four times the cost of everything else together (1.5s against
+   * 5.5s on fifty pull requests). That is not a price worth paying behind a chip
+   * in a header. So there is NO `checks` on what comes back from here, and a
+   * consumer that reads one off it will throw at render — which is exactly what
+   * happened, and it took the whole Source control view to a black screen.
+   */
+  const fields = "number,title,author,state,isDraft,headRefName,baseRefName,url,updatedAt,reviewDecision";
+  /*
+   * `null` for "could not ask", `[]` for "asked, nothing there".
+   *
+   * These were the same value, so `gh` uninstalled, logged out, or killed by
+   * the 25s timeout all came back as `{ ok: true, into: [] }` — and the header
+   * drew exactly what it draws for a branch with no pull request: nothing.
+   * Measured by taking gh off the PATH: `{"ok":true,"repo":"…","into":[]}`.
+   */
+  const ask = async (flag: "--head" | "--base", limit: number) => {
+    const r = await ghJson<Record<string, unknown>[]>(
+      ["pr", "list", flag, branch, "--state", "open", "--json", fields, "--limit", String(limit)], root);
+    return Array.isArray(r) ? r : null;
+  };
+  const [out, incoming] = await Promise.all([ask("--head", 5), ask("--base", 20)]);
+  if (out === null || incoming === null) {
+    const cap = await ghCapability();
+    return { ok: false, repo: id.nameWithOwner, into: [],
+      needsAuth: !cap.available || !cap.authed,
+      error: !cap.available ? "the gh CLI is not installed"
+        : !cap.authed ? "gh is not signed in to GitHub"
+        : "GitHub did not answer" };
+  }
+  /*
+   * Built field by field, not spread and cast.
+   *
+   * Narrowing the TYPE to a `Pick<>` fixed which fields are promised; it did
+   * nothing about whether the values match. `gh` sends `reviewDecision: ""` for
+   * a pull request nobody has reviewed, and the declared type says
+   * `"APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null` — so the
+   * first consumer to write `=== null` or to switch over the three names takes
+   * the wrong arm with no type error. Exactly how `checks.failure` reached a
+   * render and blacked out the Source control view.
+   *
+   * The two other mappers of this same `gh pr list --json` payload already do
+   * `p.reviewDecision || null`. This one was the odd one out.
+   */
+  const shape = (p: Record<string, unknown>): PrBranchSummary => ({
+    number: Number(p.number ?? 0),
+    title: String(p.title ?? ""),
+    author: typeof p.author === "object" && p.author ? (p.author as { login?: string }).login ?? "" : String(p.author ?? ""),
+    state: (p.state === "CLOSED" || p.state === "MERGED" ? p.state : "OPEN") as PrBranchSummary["state"],
+    isDraft: !!p.isDraft,
+    headRefName: String(p.headRefName ?? ""),
+    baseRefName: String(p.baseRefName ?? ""),
+    url: String(p.url ?? ""),
+    updatedAt: String(p.updatedAt ?? ""),
+    reviewDecision: (p.reviewDecision || null) as PrBranchSummary["reviewDecision"],
+  });
+  /* `repo` travels with the answer so a caller can OPEN one of these rather
+     than search for it: the panel's jump is addressed by owner/name and number,
+     and without the name the only thing left to do with a number is type it
+     into a search box. */
+  return { ok: true, repo: id.nameWithOwner, from: out[0] ? shape(out[0]) : undefined, into: incoming.map(shape) };
+}
+
+/**
+ * The true rollup for ONE pull request — the latest run per check name.
+ *
+ * The list cannot have this. Its rollup is GitHub'"'"'s aggregate counts, and those
+ * count a re-run'"'"'s old attempt alongside the new one: measured on a pull
+ * request github.com calls "All checks have passed", the aggregate answers
+ * `state: FAILURE` with one FAILURE in the counts. Even their own `state` field
+ * is wrong here, because their page does not use it either — it keeps the
+ * latest run per name, which is what `latestPerName` does.
+ *
+ * So a card that claims failure can ask for the truth, one pull request at a
+ * time and only when it is on screen. One GraphQL call, the same contexts the
+ * detail view already reads.
+ */
+export async function prRollup(rootIn: unknown, numberIn: unknown): Promise<{ ok: boolean; checks?: PrCheckRollup; error?: string }> {
+  const number = Number(numberIn);
+  const repo = await repoIdFor(rootIn);
+  if (!repo || !Number.isFinite(number)) return { ok: false, error: "no GitHub remote here" };
+  const q = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){`
+    + `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){${SEL_CHECKS}}}}}}`
+    + `}}}`;
+  const r = await ghJson<any>([
+    "api", "graphql", "-f", `query=${q}`,
+    "-F", `owner=${repo.owner}`, "-F", `name=${repo.name}`, "-F", `number=${number}`,
+  ]);
+  const raw = r?.data?.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes;
+  if (!raw) return { ok: false, error: "GitHub would not list its checks" };
+  const normalised = raw.map((c: any) => ({ ...c, workflowName: c.checkSuite?.workflowRun?.workflow?.name || "" }));
+  return { ok: true, checks: rollupChecks(normalised).rollup };
+}
+
+export async function branchBehind(root: string, number: number): Promise<{ ok: boolean; behind?: number; ahead?: number; local?: PrLocalHead; error?: string }> {
+  const id = await repoIdFor(root);
+  if (!id) return { ok: false, error: "no GitHub remote here" };
+  const pr = await prBranches(root, number);
+  if (!pr) return { ok: false, error: "could not read the branches" };
+  const cmp = await ghJson<{ behind_by?: number; ahead_by?: number }>(
+    ["api", `repos/${id.owner}/${id.name}/compare/${encodeURIComponent(pr.base)}...${encodeURIComponent(pr.head)}?per_page=1`], root);
+  if (!cmp) return { ok: false, error: "GitHub would not compare those branches" };
+  // Local state rides along. It is git only — no network — so it costs a few
+  // milliseconds on a call the panel already makes, rather than a second round
+  // trip for the one thing the button was never telling anybody.
+  const local = await localHead(root, pr.head);
+  return { ok: true, behind: Number(cmp.behind_by ?? 0), ahead: Number(cmp.ahead_by ?? 0), local };
+}
+
+/** The upstream this branch tracks, as a remote name and the ref that follows
+ *  it. `@{upstream}` is asked first because a branch may track something other
+ *  than `origin/<same name>`; origin is the fallback, not the assumption. */
+async function upstreamOf(root: string, branch: string): Promise<{ remote: string; ref: string; remoteBranch: string } | null> {
+  const full = await gitAsync(root, ["rev-parse", "--symbolic-full-name", `${branch}@{upstream}`]);
+  if (full.code === 0 && full.stdout.trim().startsWith("refs/remotes/")) {
+    const ref = full.stdout.trim();
+    const cfg = await gitAsync(root, ["config", "--get", `branch.${branch}.remote`]);
+    const remote = cfg.code === 0 ? cfg.stdout.trim() : ref.slice("refs/remotes/".length).split("/")[0]!;
+    // The remote's own name for it, which is not always this branch's name.
+    const merge = await gitAsync(root, ["config", "--get", `branch.${branch}.merge`]);
+    const remoteBranch = merge.code === 0 && merge.stdout.trim().startsWith("refs/heads/")
+      ? merge.stdout.trim().slice("refs/heads/".length)
+      : ref.slice(`refs/remotes/${remote}/`.length);
+    return { remote, ref, remoteBranch };
+  }
+  // No upstream configured. A branch fetched by somebody else's tooling often
+  // has none, and origin/<branch> is still the thing it is behind.
+  const guess = await gitAsync(root, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]);
+  return guess.code === 0 ? { remote: "origin", ref: `refs/remotes/origin/${branch}`, remoteBranch: branch } : null;
+}
+
+/** Which worktree has this branch checked out, if any. */
+async function worktreeOf(root: string, branch: string): Promise<string | undefined> {
+  const r = await gitAsync(root, ["worktree", "list", "--porcelain"]);
+  if (r.code !== 0) return undefined;
+  let path = "";
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice("worktree ".length).trim();
+    else if (line.trim() === `branch refs/heads/${branch}`) return path || undefined;
+  }
+  return undefined;
+}
+
+/** Mid-merge, mid-rebase, mid-cherry-pick: a checkout in the middle of an
+ *  operation is not somewhere to fast-forward into. */
+async function midOperation(dir: string): Promise<boolean> {
+  for (const head of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]) {
+    if ((await gitAsync(dir, ["rev-parse", "--verify", "--quiet", head])).code === 0) return true;
+  }
+  for (const d of ["rebase-merge", "rebase-apply"]) {
+    const p = await gitAsync(dir, ["rev-parse", "--git-path", d]);
+    if (p.code === 0 && existsSync(resolve(dir, p.stdout.trim()))) return true;
+  }
+  return false;
+}
+
+/**
+ * The local copy of a branch, and what may safely be done to it.
+ *
+ * Read-only, and deliberately pessimistic: the only verdict that leads to a
+ * write is `ff`, and everything else is a sentence for the person to act on.
+ * The machine this runs on has a dozen worktrees with agents working in them,
+ * so "probably fine" is not a good enough reason to move somebody's HEAD.
+ */
+export async function localHead(root: string, branch: string): Promise<PrLocalHead> {
+  const none: PrLocalHead = { branch, exists: false, ahead: 0, behind: 0, dirty: false, sync: "absent" };
+  if (!branch) return none;
+  const has = await gitAsync(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+  if (has.code !== 0) return none;
+
+  const up = await upstreamOf(root, branch);
+  let ahead = 0, behind = 0;
+  if (up) {
+    // left = ours, right = theirs. Ahead is what GitHub has not got, which is
+    // the one that makes a fast-forward impossible once GitHub merges.
+    const counts = await gitAsync(root, ["rev-list", "--left-right", "--count", `${branch}...${up.ref}`]);
+    if (counts.code === 0) {
+      const [a, b] = counts.stdout.trim().split(/\s+/).map((n) => Number(n) || 0);
+      ahead = a ?? 0; behind = b ?? 0;
+    }
+  }
+
+  const worktree = await worktreeOf(root, branch);
+  const dirty = worktree ? (await gitAsync(worktree, ["status", "--porcelain"])).stdout.trim().length > 0 : false;
+  const busy = worktree ? await midOperation(worktree) : false;
+
+  // Order matters: a checkout in the middle of something is the most specific
+  // "leave it alone", and divergence outranks dirtiness because no amount of
+  // committing turns it back into a fast-forward.
+  const sync: PrLocalHead["sync"] = busy ? "busy" : ahead > 0 ? "diverged" : dirty ? "dirty" : "ff";
+  return { branch, exists: true, worktree, ahead, behind, dirty, sync };
+}
+
+// ---------------------------------------------------------------------------
+// what is left of GitHub's rate limit
+// ---------------------------------------------------------------------------
+
+/**
+ * How much of GitHub's hourly budget is left.
+ *
+ * Worth surfacing because this app is made of `gh`: every pull-request list,
+ * every check, every review is a call against a budget that is invisible until
+ * it runs out — and when it does, the panel does not say "rate limited", it
+ * says nothing, twice, and then a list that is a minute stale.
+ *
+ * Three budgets rather than one, because they are separate pots and the small
+ * one is the one that bites: Search is 30 a minute against REST's 5,000 an
+ * hour, and searching is exactly what "find the pull requests for this card"
+ * does.
+ *
+ * Never cached here. It is asked for by a settings page somebody is looking at,
+ * which is the one moment a stale answer is worse than a slow one — and the
+ * call itself does not count against any of the budgets it reports.
+ */
+export interface RateBudget {
+  /** `core` | `search` | `graphql`, as GitHub names them. */
+  id: string;
+  label: string;
+  limit: number;
+  remaining: number;
+  /** Epoch seconds, as GitHub sends it. */
+  reset: number;
+}
+
+export async function ghRateLimit(): Promise<{ ok: boolean; error?: string; budgets?: RateBudget[] }> {
+  const cap = await ghCapability();
+  if (!cap.available) return { ok: false, error: cap.reason ?? "the GitHub CLI (gh) is not installed" };
+  if (!cap.authed) return { ok: false, error: cap.reason ?? "not logged in — run `gh auth login`" };
+  const r = await ghJson<{ resources?: Record<string, { limit: number; remaining: number; reset: number }> }>(
+    ["api", "rate_limit"]);
+  if (!r?.resources) return { ok: false, error: "GitHub did not answer with a budget" };
+  const NAMED: [string, string][] = [["core", "REST"], ["search", "Search"], ["graphql", "GraphQL"]];
+  const budgets = NAMED
+    .filter(([id]) => r.resources![id])
+    .map(([id, label]) => ({ id, label, ...r.resources![id]! }));
+  return { ok: true, budgets };
+}
+
 // ---------------------------------------------------------------------------
 // repo identity
 // ---------------------------------------------------------------------------
@@ -178,6 +519,15 @@ const ID_TTL_MS = 5 * 60_000;
  * upstream and a panel pointed at the fork shows an empty list forever. That is
  * three lines here and confusing to retrofit later.
  */
+/**
+ * Single-flighted as well as cached, because `gitwork`'s base ladder asks this
+ * once per checkout and launches all of them in one `Promise.all` — twenty-two
+ * on a worktree-heavy repo, every one of them missing an empty cache before any
+ * has filled it. Two `git remote get-url` each is nothing on its own and forty
+ * of them at once, five minutes apart, is not nothing.
+ */
+const idInflight = new Map<string, Promise<PrRepoId | null>>();
+
 export async function repoIdFor(rootIn: unknown): Promise<PrRepoId | null> {
   const abs = safeAbs(rootIn);
   if (!abs) return null;
@@ -185,15 +535,25 @@ export async function repoIdFor(rootIn: unknown): Promise<PrRepoId | null> {
   if (!root) return null;
   const hit = idCache.get(root);
   if (hit && Date.now() - hit.at < ID_TTL_MS) return hit.id;
-  let id: PrRepoId | null = null;
-  for (const remote of ["upstream", "origin"]) {
-    const r = await gitAsync(root, ["remote", "get-url", remote]);
-    if (r.code !== 0) continue;
-    id = parseRemote(r.stdout.trim());
-    if (id) break;
-  }
-  idCache.set(root, { at: Date.now(), id });
-  return id;
+  const flying = idInflight.get(root);
+  if (flying) return flying;
+  const p = (async () => {
+    try {
+      let id: PrRepoId | null = null;
+      for (const remote of ["upstream", "origin"]) {
+        const r = await gitAsync(root, ["remote", "get-url", remote]);
+        if (r.code !== 0) continue;
+        id = parseRemote(r.stdout.trim());
+        if (id) break;
+      }
+      idCache.set(root, { at: Date.now(), id });
+      return id;
+    } finally {
+      idInflight.delete(root);
+    }
+  })();
+  idInflight.set(root, p);
+  return p;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,10 +590,39 @@ function checkState(c: RawCheck): { state: PrCheckState; done: boolean } {
   return { state: "failure", done: true };
 }
 
+/**
+ * One run per check name — the newest.
+ *
+ * A re-run does not replace the run it repeats: GitHub keeps both, so a check
+ * that failed and was re-run comes back twice, once FAILURE and once
+ * IN_PROGRESS. Measured on a real pull request: their aggregate answered
+ * `FAILURE: 1, IN_PROGRESS: 2` while github.com'"'"'s own page said "Some checks
+ * haven'"'"'t completed yet" and listed no failures — because their UI keeps the
+ * latest run per name and the aggregate does not.
+ *
+ * Counting both put a pull request in Blocked over a suite that was busy and
+ * green, and no amount of refreshing could move it: the number was real and its
+ * meaning was not. Later in the list wins, which is the order GitHub returns
+ * them in; a run still going wins outright, because a check cannot be finished
+ * and running at the same time and the running one is the attempt that counts.
+ */
+export function latestPerName(raw: RawCheck[]): RawCheck[] {
+  const by = new Map<string, RawCheck>();
+  for (const c of raw) {
+    const name = `${c.workflowName || ""}\u0001${c.name || c.context || "check"}`;
+    const had = by.get(name);
+    if (!had) { by.set(name, c); continue; }
+    const hadRunning = !checkState(had).done;
+    const isRunning = !checkState(c).done;
+    if (isRunning || !hadRunning) by.set(name, c);
+  }
+  return [...by.values()];
+}
+
 export function rollupChecks(raw: RawCheck[] | null | undefined): { rollup: PrCheckRollup; all: PrCheck[] } {
   const all: PrCheck[] = [];
   let success = 0, failure = 0, skipped = 0, pending = 0;
-  for (const c of raw || []) {
+  for (const c of latestPerName(raw || [])) {
     const { state, done } = checkState(c);
     const check: PrCheck = {
       name: c.name || c.context || "check",
@@ -267,6 +656,23 @@ export function rollupChecks(raw: RawCheck[] | null | undefined): { rollup: PrCh
 
 /** What we last told the user about each PR, so we tell them once. */
 const latch = new Map<string, "green" | "red">();
+/**
+ * PRs whose suite we have actually watched running.
+ *
+ * The latch alone made every first observation an announcement, so starting the
+ * app told you the standing state of everything you have a stake in — seventeen
+ * "checks green" in one burst, about runs that finished days ago. That is not a
+ * notification, it is an inventory, and it is what makes people stop reading
+ * the ones that matter.
+ *
+ * A notification is for something that happened while you were watching. So a
+ * verdict counts as news only for a PR we saw with checks still running: that
+ * is the difference between "this just went green" and "this was already
+ * green when I arrived". Everything else is recorded silently and reported the
+ * moment it CHANGES, which covers the re-run, the flip from green to red, and
+ * every case anyone actually wants to be interrupted for.
+ */
+const watched = new Set<string>();
 const ciListeners = new Set<(v: CiVerdict) => void>();
 
 export function subscribeCi(fn: (v: CiVerdict) => void): () => void {
@@ -289,14 +695,24 @@ export function subscribeCi(fn: (v: CiVerdict) => void): () => void {
  */
 export function noteCi(repo: PrRepoId, pr: PrSummary): void {
   const key = `${repo.key}#${pr.number}`;
-  if (!pr.checks.allDone) { latch.delete(key); return; }
+  // Seeing it run is what earns the announcement when it lands.
+  if (!pr.checks.allDone) { latch.delete(key); watched.add(key); return; }
   const verdict = pr.checks.verdict;
   if (!verdict) return;
-  if (latch.get(key) === verdict) return;
+  const prev = latch.get(key);
   latch.set(key, verdict);
+  if (prev === verdict) return;
+  // First sight of a suite we never saw running: this is the state of the world
+  // as we found it, not something that happened. Remembered, not announced —
+  // any later change from here is news and does get through.
+  if (prev === undefined && !watched.has(key)) return;
   const v: CiVerdict = {
     repo: repo.nameWithOwner, number: pr.number, title: pr.title, verdict,
     failing: pr.checks.failing.map((c) => c.name), url: pr.url,
+    // The poll has this and the notification path does not, so it travels with
+    // the verdict rather than being looked up again later against a list that
+    // may never have been fetched.
+    approved: pr.reviewDecision === "APPROVED",
   };
   for (const fn of ciListeners) { try { fn(v); } catch { /* a listener must not break the poll */ } }
 }
@@ -362,7 +778,54 @@ const inflight = new Set<string>();
  * already read), but it is scoped to the user's own cache directory all the
  * same, and a corrupt or unreadable file is simply ignored.
  */
-const CACHE_FILE = join(homedir(), ".cache", "agentglass", "pr-list.json");
+/**
+ * The base branch an open pull request declares for this head.
+ *
+ * Read straight off the list cache — the rows are already fetched with
+ * `baseRefName` in them (`LIST_FIELDS_FAST`), and that cache survives restarts
+ * on disk, so the answer is usually there before anything has refreshed. No
+ * `gh`, no network: the only subprocess this can reach is `repoIdFor`'s
+ * `git remote get-url`, itself cached for five minutes.
+ *
+ * This exists for `gitwork`'s base ladder, which otherwise has to guess what a
+ * branch was cut from by the shape of history — ambiguous exactly when branches
+ * are stacked, which is exactly when it matters. Null whenever there is nothing
+ * to say (no repo id, cold cache, no pull request for this branch); the caller
+ * falls back to inference.
+ *
+ * An open pull request wins over a closed or merged one: the same branch can
+ * have been proposed twice, and the live proposal is the one whose base is
+ * still being merged into.
+ */
+export async function prBaseOf(rootIn: string, branch: string): Promise<string | null> {
+  if (!branch) return null;
+  const id = await repoIdFor(rootIn);
+  if (!id) return null;
+  const mine = `${id.key}\u0000`;
+  let fallback: string | null = null;
+  for (const [k, e] of listCache) {
+    if (!k.startsWith(mine)) continue;
+    for (const p of e.prs) {
+      if (p.headRefName !== branch || !p.baseRefName) continue;
+      if (p.state === "OPEN") return p.baseRefName;
+      fallback ??= p.baseRefName;
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Where the three pull-request caches live.
+ *
+ * An environment override, and not for configurability: the suite writes to
+ * these the moment it exercises a code path that caches, and without a seam
+ * that write lands in the developer's own `~/.cache/agentglass`. The ClickUp
+ * module learned this the hard way — its test read the real config file, so a
+ * toggle flipped in the app decided whether a test passed. One env var, set by
+ * the tests, keeps every one of these inside its own temporary directory.
+ */
+const CACHE_DIR = process.env.AGENTGLASS_CACHE_DIR || join(homedir(), ".cache", "agentglass");
+const CACHE_FILE = join(CACHE_DIR, "pr-list.json");
 const CACHE_MAX_ENTRIES = 24;
 let cacheWriteTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -409,6 +872,9 @@ export function mapSummary(p: any, withChecks: boolean): PrSummary {
   return {
     number: p.number,
     title: p.title || "",
+    // `gh pr list` gives this straight; anything it does not recognise is
+    // UNKNOWN rather than assumed mergeable — see the field's own comment.
+    mergeable: p.mergeable === "CONFLICTING" || p.mergeable === "MERGEABLE" ? p.mergeable : "UNKNOWN",
     author: p.author?.login || "",
     state: (p.state || "OPEN") as PrSummary["state"],
     isDraft: !!p.isDraft,
@@ -430,16 +896,51 @@ export function mapSummary(p: any, withChecks: boolean): PrSummary {
   };
 }
 
+/**
+ * `reviewRequests` as the Reviewers column reads them.
+ *
+ * A requested reviewer is a User or a Team, and the two are drawn differently:
+ * a team has a `name` and no face, so it is flagged rather than sent to the
+ * avatar proxy, which would 404 and fall back to initials that look like a
+ * person. Anything else GitHub might add to that union is dropped rather than
+ * rendered as a blank face. The picture itself is derived from the login by the
+ * Avatar component, so no URL travels with the row.
+ */
+export function mapReviewers(nodes: any[] | null | undefined): PrReviewer[] {
+  const out: PrReviewer[] = [];
+  for (const n of nodes ?? []) {
+    const r = n?.requestedReviewer;
+    if (!r) continue;
+    if (typeof r.login === "string" && r.login) out.push({ login: r.login });
+    else if (typeof r.name === "string" && r.name) out.push({ login: r.name, isTeam: true });
+  }
+  return out;
+}
+
 /** One page of the list, and everything the rows need, in a single request. */
 const LIST_PAGE = 25;
 
+/**
+ * The rows, and nothing that costs more than a row is worth.
+ *
+ * `additions`, `deletions`, `changedFiles` and `reviewDecision` used to travel
+ * here, and they are why the panel took two seconds to show anything. Measured
+ * against a repository with 25 open PRs: this query costs ~0.70s without them and
+ * ~1.85s with them — the four fields make GitHub compute a diff stat per PR
+ * before it will answer with any of the list. Three of them are not even drawn
+ * on a row (only `reviewDecision` is, as the review chip); they were paying a
+ * 2.6x first-paint tax for the detail view's benefit.
+ *
+ * They now ride on SEARCH_CHECKS, which runs beside this one and is the slower
+ * of the pair — measured, adding them there costs nothing at all.
+ */
 const SEARCH_ROWS = `query($q:String!,$first:Int!,$after:String){
   search(query:$q, type:ISSUE, first:$first, after:$after){
     issueCount
     pageInfo{hasNextPage endCursor}
     nodes{ ... on PullRequest {
       number title url state isDraft createdAt updatedAt
-      additions deletions changedFiles baseRefName headRefName reviewDecision
+      baseRefName headRefName
       author{login}
       labels(first:10){nodes{name color}}
       assignees(first:5){nodes{login}}
@@ -449,19 +950,29 @@ const SEARCH_ROWS = `query($q:String!,$first:Int!,$after:String){
 }`;
 
 /**
- * The same page, but only its check rollups.
+ * The same page, but only what the rows can afford to wait for.
  *
  * Measured against this repo: the row fields cost ~730ms and `statusCheckRollup`
  * adds ~410ms on top when they travel together. Asked for separately the two
  * run at the same time, so the whole thing costs what the slower one costs
  * (~810ms) instead of their sum — and, more to the point, the rows can be put
  * on screen the moment they land rather than waiting for the checks.
+ *
+ * The diff stats and `reviewDecision` live here rather than on SEARCH_ROWS for
+ * the same reason, and because it is free: measured on that same repo this query
+ * costs ~1.00s either way, while carrying them on the rows query costs it an
+ * extra ~1.15s. This is the slower half of the pair, so the four fields land in
+ * the shadow of work that was happening anyway.
  */
 const SEARCH_CHECKS = `query($q:String!,$first:Int!,$after:String){
   search(query:$q, type:ISSUE, first:$first, after:$after){
     nodes{ ... on PullRequest {
-      number
-      commits(last:1){nodes{commit{statusCheckRollup{
+      number additions deletions changedFiles reviewDecision mergeable
+      reviewRequests(first:5){nodes{requestedReviewer{
+        ... on User{login}
+        ... on Team{name}
+      }}}
+      commits(last:1){nodes{commit{oid statusCheckRollup{
         state
         contexts(first:0){checkRunCountsByState{state count} statusContextCountsByState{state count}}
       }}}}
@@ -590,16 +1101,60 @@ async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after
   onRows?.({ rows: bare, ...meta });
 
   const checksRes = await checksP;
-  const rollups = new Map<number, PrCheckRollup>();
+  // The second pass carries the costly row fields as well as the rollups, so a
+  // row is complete the moment this lands. A PR missing from the answer keeps
+  // the first-pass row: `checksLoaded` stays false, the review chip stays off,
+  // and the stats stay at zero — all of which read as "not yet", which is true.
+  type SecondPass = { rollup: PrCheckRollup; stats: Pick<PrSummary, "additions" | "deletions" | "changedFiles" | "reviewDecision" | "reviewers" | "headSha" | "mergeable"> };
+  const second = new Map<number, SecondPass>();
   for (const n of checksRes?.data?.search?.nodes ?? []) {
     if (!n?.number) continue;
-    const roll = n.commits?.nodes?.[0]?.commit?.statusCheckRollup;
+    const head = n.commits?.nodes?.[0]?.commit;
+    const roll = head?.statusCheckRollup;
     const ctx = roll?.contexts;
-    rollups.set(n.number, rollupFromCounts(ctx?.checkRunCountsByState, ctx?.statusContextCountsByState, roll?.state));
+    second.set(n.number, {
+      rollup: rollupFromCounts(ctx?.checkRunCountsByState, ctx?.statusContextCountsByState, roll?.state),
+      stats: {
+        additions: n.additions ?? 0,
+        deletions: n.deletions ?? 0,
+        changedFiles: n.changedFiles ?? 0,
+        reviewDecision: n.reviewDecision ?? null,
+        reviewers: mapReviewers(n.reviewRequests?.nodes),
+        /* The commit the rollup above belongs to, read off the same node rather
+           than asked for separately — which is the whole reason it can be
+           trusted as a merge precondition. A row says "green"; that word is
+           about THIS commit, and a merge sent without it lands on whatever the
+           tip is by then. See mergePr's --match-head-commit. */
+        headSha: typeof head?.oid === "string" ? head.oid : undefined,
+        /*
+         * Mergeability rides with the checks, in the same node, for the same
+         * reason the head SHA does: the board files a row by what it needs, and
+         * "it conflicts" is a different fact from "a check is red". It used to
+         * live only on `PrDetail`, so the board could not see it and filed a
+         * conflicting pull request as green — which is what it looked like.
+         *
+         * `UNKNOWN` is passed through rather than smoothed to MERGEABLE: GitHub
+         * answers it while it is still working the merge out, and a caller that
+         * cannot tell "no conflict" from "not computed yet" would show a
+         * conflict flashing on and off.
+         */
+        mergeable: n.mergeable === "CONFLICTING" || n.mergeable === "MERGEABLE" ? n.mergeable : "UNKNOWN",
+      },
+    });
   }
   const rows: PrSummary[] = bare.map((r) => {
-    const rollup = rollups.get(r.number);
-    return rollup ? { ...r, checks: rollup, checksLoaded: true } : r;
+    const hit = second.get(r.number);
+    /*
+     * `false`, spelled out, for a row the second pass has not reached.
+     *
+     * It used to be left off entirely, and `undefined` reads as "this caller
+     * never had two passes" — which is exactly what the panel treats as a
+     * complete answer. So every guard built on it was dead on real data: the
+     * board painted half-loaded rows on every refresh, filed the approved and
+     * green ones under "yours, in flight" for four seconds, and put them back.
+     * Reported as the app looking broken.
+     */
+    return hit ? { ...r, ...hit.stats, checks: hit.rollup, checksLoaded: true } : { ...r, checksLoaded: false };
   });
   return { rows, ...meta };
 }
@@ -685,6 +1240,33 @@ export function rollupFromCounts(checkRun: StateCount[] | undefined, statusCtx: 
  * absent from the answer (or a failed call) is simply left out, and its row
  * keeps saying "checks…" rather than claiming "no checks".
  */
+/**
+ * What the fast pass cannot answer, kept from the answer before it.
+ *
+ * Measured, not guessed — sampling the running server through a forced refresh,
+ * the early rows come back with exactly these fields emptied: the review
+ * decision, mergeability, the reviewers, the check rollup and the diff stats.
+ * Everything else
+ * (title, state, labels, assignees, `updatedAt`) IS fresher in the new row and
+ * is taken from it.
+ */
+function carryOver(old: PrSummary | undefined, next: PrSummary): PrSummary {
+  if (!old || next.checksLoaded) return next;
+  return {
+    ...next,
+    checks: next.checksLoaded ? next.checks : old.checks,
+    checksLoaded: old.checksLoaded,
+    additions: next.additions || old.additions,
+    deletions: next.deletions || old.deletions,
+    changedFiles: next.changedFiles || old.changedFiles,
+    reviewDecision: next.reviewDecision ?? old.reviewDecision,
+    mergeable: next.mergeable === "UNKNOWN" ? old.mergeable : next.mergeable,
+    /* Measured the same way: the early rows come back with nobody on them, and
+       the card's reviewer chip blinked out and back on every refresh. */
+    reviewers: next.reviewers?.length ? next.reviewers : old.reviewers,
+  };
+}
+
 async function fetchCheckRollups(repo: PrRepoId, numbers: number[]): Promise<Map<number, PrCheckRollup>> {
   const out = new Map<number, PrCheckRollup>();
   if (!numbers.length) return out;
@@ -743,7 +1325,7 @@ function refreshChecks(repo: PrRepoId, filter: PrFilter, state: PrState, rows: P
       // newer list may have replaced it while the fetch was in flight.
       const cur = listCache.get(key);
       if (!cur) return;
-      const next = cur.prs.map((p) => (rollups.has(p.number) ? { ...p, checks: rollups.get(p.number)!, checksLoaded: true } : p));
+      const next = cur.prs.map((p) => (rollups.has(p.number) ? { ...p, checks: rollups.get(p.number)!, checksLoaded: true } : { ...p, checksLoaded: p.checksLoaded ?? false }));
       listCache.set(key, { ...cur, prs: next, checksPending: false });
       // Notify only for the filters the user has a stake in (never the
       // passively-warmed `all`, see #244). The latch dedupes, so a cache hit with
@@ -784,8 +1366,25 @@ function refreshList(repo: PrRepoId, filter: PrFilter, state: PrState, after?: s
       // Put the rows on screen the moment they arrive; the checks land a beat
       // later and only fill in the dots.
       const page = await fetchList(repo, filter, state, after, (early) => {
+        /*
+         * The early rows, with the last full answer laid underneath them.
+         *
+         * Measured against the running app: for about a second and a half of
+         * every refresh this pass publishes rows where `reviewDecision` is
+         * null, `mergeable` is UNKNOWN, the rollup is empty and the diff stats
+         * are zero — and the board, which files a pull request mostly by those,
+         * moved every approved and green card into "yours, in flight" and moved
+         * it back when the second pass landed. Reported twice as the app
+         * looking broken.
+         *
+         * A refresh may add and it may correct. It may not un-know. So where
+         * this pass has no answer for a pull request we already had one for,
+         * the previous answer stands until a real one replaces it.
+         */
+        const before = new Map((listCache.get(key)?.prs ?? []).map((p) => [p.number, p]));
         listCache.set(key, {
-          at: Date.now(), prs: early.rows, loading: false, checksPending: true,
+          at: Date.now(), prs: early.rows.map((r) => carryOver(before.get(r.number), r)),
+          loading: false, checksPending: true,
           total: early.total, hasNext: early.hasNext, cursor: early.cursor,
         });
       }, query);
@@ -928,8 +1527,11 @@ export async function facetOptions(rootIn: unknown): Promise<{ ok: boolean; data
   const [contribs, assignees, labels, milestones, branches] = await Promise.all([
     ghJson<any[]>(["api", `repos/${r}/contributors?per_page=100`]),
     ghJson<any[]>(["api", `repos/${r}/assignees?per_page=100`]),
-    ghJson<any[]>(["api", `repos/${r}/labels?per_page=100`]),
-    ghJson<any[]>(["api", `repos/${r}/milestones?state=all&per_page=100`]),
+    /* Every label, however many there are: this is a picker of the whole set,
+       and the one that was missing sat at number 106. Capped at four pages —
+       four hundred labels is already a repository with a problem of its own. */
+    ghJsonAll<any>(`repos/${r}/labels?per_page=100`, 4),
+    ghJsonAll<any>(`repos/${r}/milestones?state=all&per_page=100`, 2),
     ghJson<any[]>(["api", `repos/${r}/branches?per_page=100`]),
   ]);
   const data: PrFacetOptions = {
@@ -1123,53 +1725,141 @@ export function parseChecklist(body: string): PrChecklistItem[] {
 // Note `comments(last:…)`: GraphQL's `first:` is oldest-first, so a PR with
 // more comments than the page size lost its NEWEST ones — the opposite of what
 // anyone wants from a conversation. `last:` keeps the recent end.
-const DETAIL_QUERY = `query($owner:String!,$name:String!,$number:Int!){
-  repository(owner:$owner,name:$name){ pullRequest(number:$number){
-    id number title url state isDraft createdAt updatedAt closedAt mergedAt
-    additions deletions changedFiles totalCommentsCount
-    baseRefName headRefName body
-    mergeable mergeStateStatus reviewDecision viewerDidAuthor viewerCanUpdate
-    author{login}
-    mergedBy{login}
-    reactionGroups{content viewerHasReacted users{totalCount}}
-    labels(first:50){nodes{name color}}
-    milestone{title}
-    closingIssuesReferences(first:10){nodes{number title url state}}
-    participants(first:30){nodes{login}}
-    autoMergeRequest{enabledBy{login} mergeMethod}
-    assignees(first:20){nodes{login}}
-    reviewRequests(first:20){nodes{requestedReviewer{... on User{login} ... on Team{name}}}}
-    reviews(last:60){nodes{
+/**
+ * The rest of a connection, page by page.
+ *
+ * One follow-up query per page, asking for the same fields the first page asked
+ * for — see the SEL_ constants. A page that fails ends the walk rather than the
+ * request: what is already in hand is a better answer than none, and the
+ * `truncated` counts say what is missing either way.
+ */
+async function morePages(
+  repo: PrRepoId,
+  number: number,
+  conn: { key: string; arg: string; dir: "back" | "fwd"; sel: string; pages: number },
+  start: string,
+): Promise<unknown[]> {
+  const out: unknown[] = [];
+  const cursorArg = conn.dir === "back" ? "before" : "after";
+  const query = `query($owner:String!,$name:String!,$number:Int!,$cursor:String!){`
+    + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
+    + `${conn.key}(${conn.arg}, ${cursorArg}:$cursor){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${conn.sel}}`
+    + `}}}`;
+  let cursor: string | null = start;
+  for (let page = 0; page < conn.pages && cursor; page++) {
+    const r: any = await ghJson<any>([
+      "api", "graphql",
+      "-f", `query=${query}`,
+      "-F", `owner=${repo.owner}`,
+      "-F", `name=${repo.name}`,
+      "-F", `number=${number}`,
+      "-f", `cursor=${cursor}`,
+    ]);
+    const got: any = r?.data?.repository?.pullRequest?.[conn.key];
+    if (!got?.nodes?.length) break;
+    // Backwards walks hand back older pages, so they go in FRONT: every reader
+    // downstream assumes one list in the order it happened.
+    if (conn.dir === "back") out.unshift(...got.nodes);
+    else out.push(...got.nodes);
+    cursor = conn.dir === "back"
+      ? (got.pageInfo?.hasPreviousPage ? got.pageInfo.startCursor : null)
+      : (got.pageInfo?.hasNextPage ? got.pageInfo.endCursor : null);
+  }
+  return out;
+}
+
+/**
+ * Top every list on this pull request up to the cap, in parallel.
+ *
+ * Parallel across connections and sequential within one, because a cursor is
+ * only known once the page before it has answered. Most pull requests pay
+ * nothing here: the walk only starts where GitHub said there was another page.
+ */
+/** The check contexts, which hang two levels down and so need their own walk. */
+async function fillChecks(p: any, repo: PrRepoId, number: number): Promise<void> {
+  const conn = p?.statusCheckRollup?.nodes?.[0]?.commit?.statusCheckRollup?.contexts;
+  if (!conn?.pageInfo?.hasNextPage) return;
+  const query = `query($owner:String!,$name:String!,$number:Int!,$cursor:String!){`
+    + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
+    + `commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100, after:$cursor){pageInfo{hasNextPage endCursor} ${SEL_CHECKS}}}}}}`
+    + `}}}`;
+  let cursor: string | null = conn.pageInfo.endCursor;
+  for (let page = 0; page < 3 && cursor; page++) {
+    const r: any = await ghJson<any>([
+      "api", "graphql", "-f", `query=${query}`,
+      "-F", `owner=${repo.owner}`, "-F", `name=${repo.name}`, "-F", `number=${number}`,
+      "-f", `cursor=${cursor}`,
+    ]);
+    const got: any = r?.data?.repository?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts;
+    if (!got?.nodes?.length) break;
+    conn.nodes = [...(conn.nodes || []), ...got.nodes];
+    cursor = got.pageInfo?.hasNextPage ? got.pageInfo.endCursor : null;
+  }
+  conn.pageInfo = { hasNextPage: !!cursor };
+}
+
+async function fillPages(p: any, repo: PrRepoId, number: number): Promise<void> {
+  await Promise.all([fillChecks(p, repo, number), ...CONNECTIONS.map(async (conn) => {
+    const got = p?.[conn.key];
+    const info = got?.pageInfo;
+    const cursor = conn.dir === "back"
+      ? (info?.hasPreviousPage ? info.startCursor : null)
+      : (info?.hasNextPage ? info.endCursor : null);
+    if (!cursor) return;
+    const rest = await morePages(repo, number, conn, cursor);
+    got.nodes = conn.dir === "back" ? [...rest, ...(got.nodes || [])] : [...(got.nodes || []), ...rest];
+    /* Whether the cap was reached, for the counts below. A walk that ran out of
+       pages has everything; one that ran out of budget has not, and that is the
+       only case worth a sentence on screen. */
+    got.pageInfo = { ...info, capped: rest.length >= conn.pages * Number(conn.arg.replace(/\D+/g, "")) };
+  })]);
+}
+
+/*
+ * Every list on a pull request is a page, and every one has been the wrong
+ * answer at least once.
+ *
+ * GitHub caps each connection — 100 commits, 80 comments, 80 threads, 100 check
+ * contexts — and the panel took the first page as the whole thing. Reported
+ * from a real branch: "Showing the most recent 100 commits", on one with more,
+ * right after the same bug had been fixed for files.
+ *
+ * The node selections live here rather than inline in the query, because the
+ * follow-up that fetches page two has to ask for exactly the same fields. Two
+ * copies of a field list is two field lists that drift, and a row from page two
+ * missing a field is worse than a row nobody fetched: it renders, and it is
+ * quietly wrong.
+ */
+const SEL_REVIEWS = `nodes{
       id author{login} state body submittedAt url lastEditedAt authorAssociation viewerDidAuthor
+      commit{oid}
       reactionGroups{content viewerHasReacted users{totalCount}}
-    }}
-    comments(last:80){nodes{
+    }`;
+const SEL_COMMENTS = `nodes{
       id databaseId author{login} body createdAt url lastEditedAt authorAssociation viewerDidAuthor
       reactionGroups{content viewerHasReacted users{totalCount}}
-    }}
-    commits(last:100){nodes{commit{
+    }`;
+const SEL_COMMITS = `nodes{commit{
       oid message committedDate parents{totalCount}
       author{user{login} name}
       authors(first:8){nodes{user{login} name}}
       signature{isValid state}
       statusCheckRollup{state}
-    }}}
-    files(first:100){nodes{path additions deletions changeType viewerViewedState}}
-    reviewThreads(first:80){nodes{
+    }}`;
+const SEL_FILES = `nodes{path additions deletions changeType viewerViewedState}`;
+/* `state` is PENDING or SUBMITTED, and it is the only thing that tells a
+   comment somebody posted from one you have written and not sent: GitHub hands
+   your own unsubmitted comments back inside their threads, exactly like the
+   rest. See `threadsFrom` for what that costs when it is not asked for. */
+const SEL_THREADS = `nodes{
       id isResolved isOutdated path line startLine
       comments(first:50){nodes{
         id databaseId author{login} body createdAt url diffHunk originalLine
-        lastEditedAt authorAssociation viewerDidAuthor
+        state lastEditedAt authorAssociation viewerDidAuthor
         reactionGroups{content viewerHasReacted users{totalCount}}
       }}
-    }}
-    timelineItems(last:80, itemTypes:[
-      HEAD_REF_FORCE_PUSHED_EVENT, RENAMED_TITLE_EVENT, LABELED_EVENT, UNLABELED_EVENT,
-      ASSIGNED_EVENT, UNASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT,
-      READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT,
-      CROSS_REFERENCED_EVENT, MILESTONED_EVENT, DEMILESTONED_EVENT, HEAD_REF_DELETED_EVENT,
-      AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT
-    ]){nodes{
+    }`;
+const SEL_TIMELINE = `nodes{
       __typename
       ... on HeadRefForcePushedEvent{createdAt actor{login} beforeCommit{oid} afterCommit{oid}}
       ... on RenamedTitleEvent{createdAt actor{login} previousTitle currentTitle}
@@ -1192,12 +1882,63 @@ const DETAIL_QUERY = `query($owner:String!,$name:String!,$number:Int!){
       ... on HeadRefDeletedEvent{createdAt actor{login} headRefName}
       ... on AutoMergeEnabledEvent{createdAt actor{login}}
       ... on AutoMergeDisabledEvent{createdAt actor{login} reason}
-    }}
-    statusCheckRollup:commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
+    }`;
+const SEL_CHECKS = `nodes{
       __typename
       ... on CheckRun{name status conclusion detailsUrl checkSuite{workflowRun{workflow{name}}}}
       ... on StatusContext{context state targetUrl}
-    }}}}}}
+    }`;
+const TIMELINE_TYPES = `[
+      HEAD_REF_FORCE_PUSHED_EVENT, RENAMED_TITLE_EVENT, LABELED_EVENT, UNLABELED_EVENT,
+      ASSIGNED_EVENT, UNASSIGNED_EVENT, REVIEW_REQUESTED_EVENT, REVIEW_REQUEST_REMOVED_EVENT,
+      READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT,
+      CROSS_REFERENCED_EVENT, MILESTONED_EVENT, DEMILESTONED_EVENT, HEAD_REF_DELETED_EVENT,
+      AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT
+    ]`;
+
+/**
+ * Each connection, and which way to walk it when there is more.
+ *
+ * `back` for the ones the query asks for with `last:` — the newest page is the
+ * one worth having, so a cap keeps the recent end rather than the ancient one.
+ * `pages` is that cap: the round trips are sequential and hold the detail open,
+ * and a branch with four thousand commits is a history nobody reads here.
+ */
+const CONNECTIONS = [
+  { key: "reviews", arg: "last:60", dir: "back", pages: 4, sel: SEL_REVIEWS },
+  { key: "comments", arg: "last:80", dir: "back", pages: 4, sel: SEL_COMMENTS },
+  { key: "commits", arg: "last:100", dir: "back", pages: 10, sel: SEL_COMMITS },
+  { key: "files", arg: "first:100", dir: "fwd", pages: 8, sel: SEL_FILES },
+  { key: "reviewThreads", arg: "first:80", dir: "fwd", pages: 5, sel: SEL_THREADS },
+  { key: "timelineItems", arg: `last:80, itemTypes:${TIMELINE_TYPES}`, dir: "back", pages: 4, sel: SEL_TIMELINE },
+] as const;
+
+export const DETAIL_QUERY = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed deleteBranchOnMerge
+    pullRequest(number:$number){
+    id number title url state isDraft createdAt updatedAt closedAt mergedAt
+    additions deletions changedFiles totalCommentsCount
+    baseRefName headRefName body
+    headRepositoryOwner{login}
+    mergeable mergeStateStatus reviewDecision viewerDidAuthor viewerCanUpdate
+    author{login}
+    mergedBy{login}
+    reactionGroups{content viewerHasReacted users{totalCount}}
+    labels(first:50){nodes{name color}}
+    milestone{title}
+    closingIssuesReferences(first:10){nodes{number title url state}}
+    participants(first:30){nodes{login}}
+    autoMergeRequest{enabledBy{login} mergeMethod}
+    assignees(first:20){nodes{login}}
+    reviewRequests(first:20){nodes{requestedReviewer{... on User{login} ... on Team{name}}}}
+    reviews(last:60){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_REVIEWS}}
+    comments(last:80){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_COMMENTS}}
+    commits(last:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_COMMITS}}
+    files(first:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_FILES}}
+    reviewThreads(first:80){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_THREADS}}
+    timelineItems(last:80, itemTypes:${TIMELINE_TYPES}){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_TIMELINE}}
+    statusCheckRollup:commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_CHECKS}}}}}}
   } } }`;
 
 /** The reaction tallies, "edited", standing and ownership that ride on
@@ -1289,6 +2030,82 @@ function mapTimeline(nodes: any[]): PrEvent[] {
 const detailCache = new Map<string, { at: number; detail: PrDetail }>();
 const DETAIL_TTL_MS = 45_000;
 
+/**
+ * The detail cache, kept across restarts — the same trade the list already
+ * makes, for the same reason.
+ *
+ * The list survives a restart and the detail did not, so opening the pull
+ * request you were reading five minutes ago cost the full round trip again:
+ * ~280ms before GitHub does anything, and the detail query a good deal more.
+ * Every restart started from nothing on the one page you were most likely to
+ * open first.
+ *
+ * Past its TTL the cached copy is now handed back AT ONCE, marked stale, and a
+ * refresh runs behind it — rows you can read beat a spinner you cannot, and the
+ * panel already says how old what it is showing is. The one thing that must not
+ * act on a stale copy is the merge, and it does not: `gh pr merge` carries
+ * `--match-head-commit`, so a merge aimed at a head that has moved is refused
+ * by GitHub rather than landing on the wrong commit.
+ */
+const DETAIL_FILE = join(CACHE_DIR, "pr-detail.json");
+/** Enough for a day's reading, not a mirror of the repository. Each entry is a
+ *  few tens of KB — comments, reviews, threads, files, checks. */
+const DETAIL_MAX_ENTRIES = 24;
+let detailWriteTimer: ReturnType<typeof setTimeout> | null = null;
+/** Refreshes already running, so ten glances at a stale card make one call. */
+const detailInflight = new Set<string>();
+
+function loadDetailCache(): void {
+  try {
+    if (!existsSync(DETAIL_FILE)) return;
+    const raw = JSON.parse(readFileSync(DETAIL_FILE, "utf8")) as Record<string, { at: number; detail: PrDetail }>;
+    for (const [k, e] of Object.entries(raw)) {
+      // `at` is kept as it was: the age on screen stays honest and the first
+      // read is a stale hit, which is what triggers the refresh.
+      if (e && typeof e.at === "number" && e.detail && typeof e.detail.number === "number") detailCache.set(k, e);
+    }
+  } catch { /* unreadable or from an older shape — start empty */ }
+}
+
+function saveDetailCache(): void {
+  if (detailWriteTimer) clearTimeout(detailWriteTimer);
+  detailWriteTimer = setTimeout(() => {
+    try {
+      const entries = [...detailCache.entries()].sort((a, b) => b[1].at - a[1].at).slice(0, DETAIL_MAX_ENTRIES);
+      mkdirSync(dirname(DETAIL_FILE), { recursive: true });
+      writeFileSync(DETAIL_FILE, JSON.stringify(Object.fromEntries(entries)));
+    } catch { /* a cache that cannot be written is not an error worth raising */ }
+  }, 1_000);
+}
+
+loadDetailCache();
+
+/** GitHub's own precedence. Its merge button arrives checked on the first of
+ *  these the repository allows, which is what somebody means when they say
+ *  "we just press the blue button". */
+const METHOD_FIELD: [PrMergeMethod, string][] = [
+  ["merge", "mergeCommitAllowed"],
+  ["squash", "squashMergeAllowed"],
+  ["rebase", "rebaseMergeAllowed"],
+];
+
+/**
+ * What the repository allows, asked rather than assumed.
+ *
+ * When the repository node carries none of the flags — an older cached shape,
+ * a host that does not answer them — the fallback is all three rather than
+ * none. An empty menu would take away methods that do work; offering one the
+ * repository forbids only costs the error gh already returns.
+ */
+export function mergePolicyOf(r: any): PrMergePolicy {
+  const allowed = METHOD_FIELD.filter(([, f]) => r?.[f] === true).map(([m]) => m);
+  return {
+    allowed: allowed.length ? allowed : METHOD_FIELD.map(([m]) => m),
+    auto: r?.autoMergeAllowed === true,
+    deletesBranch: r?.deleteBranchOnMerge === true,
+  };
+}
+
 function mergeStateOf(s: string | undefined, isDraft: boolean): PrMergeState {
   if (isDraft) return "DRAFT";
   const v = (s || "").toUpperCase();
@@ -1296,7 +2113,55 @@ function mergeStateOf(s: string | undefined, isDraft: boolean): PrMergeState {
   return (known as string[]).includes(v) ? (v as PrMergeState) : "UNKNOWN";
 }
 
-export async function prDetail(rootIn: unknown, numberIn: unknown, force = false): Promise<{ ok: boolean; detail?: PrDetail; error?: string }> {
+/**
+ * The review threads, made of only what has actually been said.
+ *
+ * A line comment you drafted into a pending review comes back inside its
+ * thread, indistinguishable from a posted one except for `state`. Kept, it
+ * draws as a thread that exists: an OPEN marker, a Reply box and a Resolve
+ * button over a comment nobody else can see and GitHub holds no conversation
+ * for — and counted twice besides, because the panel already draws what is
+ * unsent from the pending-review endpoint, under "drafted on GitHub". So the
+ * unsent ones leave here, and a thread that was nothing but unsent comments
+ * leaves with them.
+ *
+ * Its own function so that rule can be tested: everything around it needs a
+ * pull request and the network to reach.
+ */
+export function threadsFrom(nodes: unknown): PrThread[] {
+  return (Array.isArray(nodes) ? nodes : []).flatMap((t: any) => {
+    const said = (t?.comments?.nodes || []).filter((c: any) => c?.state !== "PENDING");
+    if (!said.length) return [];
+    return [{
+      id: t.id,
+      path: t.path || "",
+      line: t.line ?? null,
+      startLine: t.startLine ?? null,
+      isResolved: !!t.isResolved,
+      isOutdated: !!t.isOutdated,
+      // The hunk GitHub stored with the comment, not one reconstructed from the
+      // pull request's diff. It arrives with the thread, so the code a comment is
+      // about is on screen without the diff having been fetched at all — and it
+      // is the same few lines GitHub shows, including on an outdated thread whose
+      // hunk no longer exists in the current diff.
+      diffHunk: said[0]?.diffHunk || "",
+      originalLine: said[0]?.originalLine ?? null,
+      url: said[0]?.url || "",
+      comments: said.map((c: any) => ({
+        id: c.id,
+        databaseId: c.databaseId ?? null,
+        author: c.author?.login || "",
+        isBot: isBotLogin(c.author?.login || ""),
+        body: c.body || "",
+        createdAt: c.createdAt || "",
+        url: c.url || "",
+        ...authoredOf(c),
+      })),
+    }] as PrThread[];
+  });
+}
+
+export async function prDetail(rootIn: unknown, numberIn: unknown, force = false): Promise<{ ok: boolean; detail?: PrDetail; error?: string; stale?: boolean }> {
   const number = Number(numberIn);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "invalid pull request number" };
   const repo = await repoIdFor(rootIn);
@@ -1304,6 +2169,25 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
   const key = `${repo.key}#${number}`;
   const hit = detailCache.get(key);
   if (!force && hit && Date.now() - hit.at < DETAIL_TTL_MS) return { ok: true, detail: hit.detail };
+  /*
+   * Stale, but on screen now.
+   *
+   * Past the TTL there IS an answer — it is simply old — and handing it back
+   * while a refresh runs behind it is the difference between a page that paints
+   * instantly and one that waits on the internet. This is what makes the disk
+   * cache worth keeping: after a restart the first read is always past the TTL,
+   * and without this the whole thing would be a file nobody ever reads from.
+   *
+   * `stale` travels with it so the caller knows to come back for the fresh one
+   * rather than trusting a five-minute-old merge state indefinitely.
+   */
+  if (!force && hit) {
+    if (!detailInflight.has(key)) {
+      detailInflight.add(key);
+      void prDetail(rootIn, number, true).catch(() => {}).finally(() => detailInflight.delete(key));
+    }
+    return { ok: true, detail: hit.detail, stale: true };
+  }
 
   const cap = await ghCapability();
   if (!cap.available || !cap.authed) return { ok: false, error: cap.reason };
@@ -1318,6 +2202,10 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
   ]);
   const p = data?.data?.repository?.pullRequest;
   if (!p) return { ok: false, error: "pull request not found, or gh could not reach the host" };
+  const mergePolicy = mergePolicyOf(data?.data?.repository);
+  // Everything GitHub cut into pages, topped up before a single reader below
+  // reads a length and believes it. See fillPages.
+  await fillPages(p, repo, number);
 
   const rawChecks = p.statusCheckRollup?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [];
   const normalised = rawChecks.map((c: any) => ({
@@ -1334,6 +2222,10 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     submittedAt: r.submittedAt || "",
     url: r.url || "",
     nodeId: r.id || "",
+    /* Which commit this review was written against. Free — it rides the same
+       query — and it is the only honest answer to "what has changed since I
+       last looked", which a timestamp can only approximate. */
+    commit: r.commit?.oid || "",
     ...authoredOf(r),
   }));
 
@@ -1353,32 +2245,7 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     };
   });
 
-  const threads: PrThread[] = (p.reviewThreads?.nodes || []).map((t: any) => ({
-    id: t.id,
-    path: t.path || "",
-    line: t.line ?? null,
-    startLine: t.startLine ?? null,
-    isResolved: !!t.isResolved,
-    isOutdated: !!t.isOutdated,
-    // The hunk GitHub stored with the comment, not one reconstructed from the
-    // pull request's diff. It arrives with the thread, so the code a comment is
-    // about is on screen without the diff having been fetched at all — and it
-    // is the same few lines GitHub shows, including on an outdated thread whose
-    // hunk no longer exists in the current diff.
-    diffHunk: t.comments?.nodes?.[0]?.diffHunk || "",
-    originalLine: t.comments?.nodes?.[0]?.originalLine ?? null,
-    url: t.comments?.nodes?.[0]?.url || "",
-    comments: (t.comments?.nodes || []).map((c: any) => ({
-      id: c.id,
-      databaseId: c.databaseId ?? null,
-      author: c.author?.login || "",
-      isBot: isBotLogin(c.author?.login || ""),
-      body: c.body || "",
-      createdAt: c.createdAt || "",
-      url: c.url || "",
-      ...authoredOf(c),
-    })),
-  }));
+  const threads = threadsFrom(p.reviewThreads?.nodes);
 
   const commits: PrCommit[] = (p.commits?.nodes || []).map((n: any) => {
     const c = n.commit || {};
@@ -1415,7 +2282,24 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
   const openByPath = new Map<string, number>();
   for (const t of threads) if (!t.isResolved) openByPath.set(t.path, (openByPath.get(t.path) ?? 0) + 1);
 
-  const files: PrFile[] = (p.files?.nodes || []).map((f: any) => ({
+  /*
+   * The rest of the file list, for a pull request bigger than one page.
+   *
+   * GraphQL hands back 100 files at a time and the panel took the first page as
+   * the whole answer, so a 275-file pull request arrived as 100 files and a line
+   * saying the other 175 were on github.com. That is the exact case somebody
+   * needs this panel for: a review that big is one you want a tree and a filter
+   * for, not a browser tab.
+   *
+   * Paged here, in the detail fetch, because the detail is cached on disk — the
+   * cost is two extra requests once per pull request, not per look. Capped
+   * rather than unbounded: a 4,000-file branch is a merge of a vendor directory,
+   * and forty sequential round trips to list it would hold the panel open on a
+   * question nobody is asking. Past the cap the count still says what is
+   * missing, which is what `truncated.files` has always been for.
+   */
+
+  const files: PrFile[] = ((p.files?.nodes || []) as any[]).map((f: any) => ({
     path: f.path,
     additions: f.additions ?? 0,
     deletions: f.deletions ?? 0,
@@ -1459,7 +2343,7 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     mergeable: p.mergeable || "UNKNOWN",
     mergeState: mergeStateOf(p.mergeStateStatus, !!p.isDraft),
     checklist: parseChecklist(p.body || ""),
-    reviewers: (p.reviewRequests?.nodes || []).map((n: any) => n.requestedReviewer?.login || n.requestedReviewer?.name).filter(Boolean),
+    reviewers: mapReviewers(p.reviewRequests?.nodes),
     assignees: (p.assignees?.nodes || []).map((n: any) => n.login),
     reviews, comments, threads, commits, files,
     forcePushedSinceReview,
@@ -1489,6 +2373,8 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     closedAt: p.closedAt || null,
     createdAt: p.createdAt || "",
     viewerCanUpdate: !!p.viewerCanUpdate,
+    mergePolicy,
+    headRepoOwner: p.headRepositoryOwner?.login || "",
     // Say what a page size cut off, rather than letting it disappear. The file
     // list disagreeing with the header count is how nobody noticed for months.
     // Only claim truncation when a page came back FULL — that is the one
@@ -1496,29 +2382,220 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     // different things (totalCommentsCount includes review bodies) invents a
     // "1 more comment" that does not exist, and a lying badge is worse than
     // none. `files` is the exception: `changedFiles` is an exact total.
+    /*
+     * What is still missing after the paging, which is almost always nothing.
+     *
+     * These used to mean "the first page came back full", which was the only
+     * signal there was when a page was all anybody fetched. Now the lists are
+     * walked to a cap, so the honest question is whether the WALK ran out of
+     * budget — `capped`, set by fillPages — and the number is what we hold
+     * rather than a page size. `files` keeps its own answer because
+     * `changedFiles` is an exact total and subtraction beats a flag.
+     */
     truncated: {
       files: Math.max(0, (p.changedFiles ?? 0) - files.length) || undefined,
-      commits: (p.commits?.nodes || []).length >= 100 ? 100 : undefined,
-      comments: comments.length >= 80 ? 80 : undefined,
-      threads: (p.reviewThreads?.nodes || []).length >= 80 ? 80 : undefined,
-      checks: rawChecks.length >= 100 ? 100 : undefined,
+      commits: p.commits?.pageInfo?.capped ? (p.commits?.nodes || []).length : undefined,
+      comments: p.comments?.pageInfo?.capped ? comments.length : undefined,
+      threads: p.reviewThreads?.pageInfo?.capped ? threads.length : undefined,
+      checks: p.statusCheckRollup?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage
+        ? rawChecks.length : undefined,
     },
   };
 
   detailCache.set(key, { at: Date.now(), detail });
+  saveDetailCache();
   return { ok: true, detail };
 }
 
 /** The unified diff, straight into the diff renderer the app already has. */
-export async function prDiff(rootIn: unknown, numberIn: unknown): Promise<{ ok: boolean; text?: string; error?: string }> {
+/*
+ * The diff of a pull request, which was the last thing here still fetched from
+ * nothing every single time.
+ *
+ * `gh pr diff` is another round trip to GitHub, and opening a pull request you
+ * read ten minutes ago paid it again — for bytes that, on a merged or quiet
+ * branch, cannot have changed at all. The list has been cached across restarts
+ * for exactly this reason and the detail now is too; this is the same trade,
+ * one layer down.
+ *
+ * Bounded by BYTES rather than by entries, and that is the whole reason the
+ * cache is here rather than in the browser: a diff is not a row, it is however
+ * large somebody's pull request happens to be, and twelve of them chosen by
+ * count could be sixty megabytes chosen by accident. A single diff past the
+ * budget is served and not kept — caching it would evict everything else to
+ * hold one thing nobody re-opens.
+ */
+type DiffEntry = { at: number; text: string };
+const diffCache = new Map<string, DiffEntry>();
+const diffInflight = new Map<string, Promise<{ ok: boolean; text?: string; error?: string }>>();
+/** Long, because a diff only changes when somebody pushes — and when they do,
+ *  the list poll notices and the panel re-reads. */
+const DIFF_TTL_MS = 5 * 60_000;
+const DIFF_BUDGET = 24 * 1024 * 1024;
+const DIFF_MAX_ONE = 6 * 1024 * 1024;
+
+/**
+ * The diffs, kept across restarts — a much smaller shelf than the memory one.
+ *
+ * In memory this holds 24MB because it can. On disk it holds a few of the most
+ * recent, because the point is narrow: the pull request you were reading when
+ * you closed the app is the one you open when you reopen it, and reading its
+ * Files tab should not start with a `gh pr diff` on a cold process. Anything
+ * beyond that is a mirror of the repository nobody asked for.
+ *
+ * Written debounced and never on the read path, so a slow disk cannot make a
+ * diff arrive later than it would have.
+ */
+const DIFF_FILE = join(CACHE_DIR, "pr-diff.json");
+const DIFF_DISK_BUDGET = 4 * 1024 * 1024;
+let diffWriteTimer: ReturnType<typeof setTimeout> | null = null;
+
+function loadDiffCache(): void {
+  try {
+    if (!existsSync(DIFF_FILE)) return;
+    const raw = JSON.parse(readFileSync(DIFF_FILE, "utf8")) as Record<string, DiffEntry>;
+    for (const [k, e] of Object.entries(raw)) {
+      if (e && typeof e.at === "number" && typeof e.text === "string") diffCache.set(k, e);
+    }
+  } catch { /* unreadable or from an older shape — start empty */ }
+}
+
+function saveDiffCache(): void {
+  if (diffWriteTimer) clearTimeout(diffWriteTimer);
+  diffWriteTimer = setTimeout(() => {
+    try {
+      const out: Record<string, DiffEntry> = {};
+      let held = 0;
+      // Newest first, and stop at the budget rather than trimming afterwards:
+      // the file should be small by construction, not by cleanup.
+      for (const [k, e] of [...diffCache.entries()].sort((a, b) => b[1].at - a[1].at)) {
+        if (held + e.text.length > DIFF_DISK_BUDGET) break;
+        out[k] = e;
+        held += e.text.length;
+      }
+      mkdirSync(dirname(DIFF_FILE), { recursive: true });
+      writeFileSync(DIFF_FILE, JSON.stringify(out));
+    } catch { /* a cache that cannot be written is not an error worth raising */ }
+  }, 2_000);
+}
+
+loadDiffCache();
+
+function keepDiff(key: string, text: string): void {
+  if (text.length > DIFF_MAX_ONE) return;
+  diffCache.delete(key);
+  diffCache.set(key, { at: Date.now(), text });
+  let held = 0;
+  for (const e of diffCache.values()) held += e.text.length;
+  // Oldest first, which is insertion order — and re-reading re-inserts, so the
+  // one you keep coming back to is the last to go.
+  for (const k of diffCache.keys()) {
+    if (held <= DIFF_BUDGET) break;
+    held -= diffCache.get(k)!.text.length;
+    diffCache.delete(k);
+  }
+  saveDiffCache();
+}
+
+/**
+ * GitHub refusing to render a diff at all, which it does on the big ones.
+ *
+ * Measured on a real 275-file pull request: `gh pr diff` exits non-zero with
+ * "HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)".
+ * That is the whole-pull-request diff endpoint having a hard cap, not a network
+ * failure and not something a retry fixes.
+ */
+const DIFF_TOO_BIG = /exceeded the maximum number of lines|too_large|HTTP 406/i;
+
+/**
+ * The same diff, rebuilt one file at a time.
+ *
+ * The per-file endpoint has no such cap: it hands back each file's own patch,
+ * a hundred files a page. Stitched back into ordinary unified diff text so
+ * everything downstream — the parser, the file rail, line comments, the
+ * suggestion applier — carries on reading exactly what it always read. The
+ * alternative was a second diff format in the client, which is a second set of
+ * bugs.
+ *
+ * A file GitHub sends without a `patch` (binary, or one file so large it
+ * refuses that too) gets its header and no hunks, so it still appears in the
+ * tree and says nothing rather than vanishing.
+ */
+async function diffFromFiles(nameWithOwner: string, number: number): Promise<string | null> {
+  const parts: string[] = [];
+  // Nine pages, the same 900 files the name list is capped at — see CONNECTIONS.
+  for (let page = 1; page <= 9; page++) {
+    const rows = await ghJson<any[]>([
+      "api", `repos/${nameWithOwner}/pulls/${number}/files?per_page=100&page=${page}`,
+    ]);
+    if (!rows?.length) break;
+    for (const f of rows) {
+      const to = String(f.filename || "");
+      if (!to) continue;
+      const from = String(f.previous_filename || to);
+      parts.push(`diff --git a/${from} b/${to}`);
+      if (f.status === "added") parts.push("new file mode 100644");
+      else if (f.status === "removed") parts.push("deleted file mode 100644");
+      else if (f.status === "renamed") parts.push(`rename from ${from}`, `rename to ${to}`);
+      if (typeof f.patch !== "string" || !f.patch) continue;
+      parts.push(`--- ${f.status === "added" ? "/dev/null" : `a/${from}`}`, `+++ ${f.status === "removed" ? "/dev/null" : `b/${to}`}`);
+      parts.push(f.patch.replace(/\n$/, ""));
+    }
+    if (rows.length < 100) break;
+  }
+  return parts.length ? `${parts.join("\n")}\n` : null;
+}
+
+function fetchDiff(key: string, number: number, nameWithOwner: string) {
+  const running = diffInflight.get(key);
+  if (running) return running;
+  const p = gh(["pr", "diff", String(number), "-R", nameWithOwner])
+    .then(async (r) => {
+      if (r.code !== 0) {
+        if (!DIFF_TOO_BIG.test(r.stderr)) return { ok: false as const, error: r.stderr.trim() || "gh pr diff failed" };
+        const stitched = await diffFromFiles(nameWithOwner, number);
+        if (!stitched) return { ok: false as const, error: "GitHub will not render this diff, and its file list came back empty" };
+        keepDiff(key, stitched);
+        return { ok: true as const, text: stitched };
+      }
+      keepDiff(key, r.stdout);
+      return { ok: true as const, text: r.stdout };
+    })
+    .finally(() => { diffInflight.delete(key); });
+  diffInflight.set(key, p);
+  return p;
+}
+
+export async function prDiff(rootIn: unknown, numberIn: unknown, force = false): Promise<{ ok: boolean; text?: string; error?: string }> {
   const number = Number(numberIn);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "invalid pull request number" };
   const repo = await repoIdFor(rootIn);
   if (!repo) return { ok: false, error: "no GitHub remote on this repository" };
-  const r = await gh(["pr", "diff", String(number), "-R", repo.nameWithOwner]);
-  if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "gh pr diff failed" };
-  return { ok: true, text: r.stdout };
+  const key = `${repo.nameWithOwner}#${number}`;
+  /*
+   * "Force" here means what it means on the detail: skip what is held, ask
+   * GitHub. The caller that uses it knows something this cache cannot — that
+   * the head commit moved — and stale-while-revalidate answers that with the
+   * text from before the push, refreshing in the background for a second
+   * request that nobody makes.
+   *
+   * It still goes through `fetchDiff`, so a forced read joins an in-flight one
+   * rather than starting a second `gh pr diff` beside it.
+   */
+  const hit = force ? undefined : diffCache.get(key);
+  if (hit) {
+    // Stale-while-revalidate: hand back what we have, and go and check only if
+    // it has aged. A diff on screen a moment sooner is worth more than one that
+    // is guaranteed current, because the thing that makes it wrong — a push —
+    // is rare and announces itself through the list.
+    if (Date.now() - hit.at > DIFF_TTL_MS) void fetchDiff(key, number, repo.nameWithOwner).catch(() => {});
+    return { ok: true, text: hit.text };
+  }
+  return fetchDiff(key, number, repo.nameWithOwner);
 }
+
+/** For a test, and for a Refresh that means it. */
+export function __clearDiffCache(): void { diffCache.clear(); diffInflight.clear(); }
 
 // ---------------------------------------------------------------------------
 // asset proxy
@@ -1578,7 +2655,7 @@ let tokenCache: { at: number; token: string } | null = null;
  * subprocess buys nothing. It stays as the fallback for the case the token
  * cannot be read (an unusual `gh` setup, a keyring that will not answer).
  */
-async function ghGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T | null> {
+export async function ghGraphql<T>(query: string, variables: Record<string, unknown>): Promise<T | null> {
   const token = await ghToken();
   if (!token) return ghJson<T>(["api", "graphql", "-f", `query=${query}`,
     ...Object.entries(variables).flatMap(([k, v]) => ["-F", `${k}=${String(v)}`])]);
@@ -1668,7 +2745,9 @@ async function runPr(rootIn: unknown, number: number, args: string[], stdin?: st
   const r = await gh([...args, "-R", repo.nameWithOwner], undefined, stdin);
   invalidate(repo, number);
   if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "gh failed" };
-  return { ok: true, detail: r.stdout.trim() || undefined };
+  // The first line, the same as the error path above. This is shown in a toast
+  // — a phone-width one — and some of these commands print a paragraph.
+  return { ok: true, detail: r.stdout.trim().split("\n")[0] || undefined };
 }
 
 const REVIEW_FLAG = { approve: "--approve", request_changes: "--request-changes", comment: "--comment" } as const;
@@ -1821,6 +2900,38 @@ export async function deleteComment(rootIn: unknown, nodeId: unknown, kind: unkn
  * what an image diff needs, in the other shape: the raw bytes of a binary file
  * on each side, which the unified diff cannot represent at all.
  */
+/**
+ * A pull request's version of one file, on disk, read-only.
+ *
+ * The working tree cannot answer this: a pull request from somebody else is on
+ * a branch that is not checked out here, so the path either does not exist or
+ * holds a different version of itself — and opening that while calling it the
+ * pull request's file is the quiet kind of wrong.
+ *
+ * Fetched at the head commit into a temp file. Deliberately NOT `git fetch`:
+ * bringing the branch down would write refs into somebody's repository to
+ * satisfy a look, and this needs no repository at all.
+ */
+export async function prFileToTemp(rootIn: unknown, numberIn: unknown, pathIn: unknown): Promise<{ ok: true; file: string; sha: string } | { ok: false; error: string }> {
+  const n = Number(numberIn);
+  const path = typeof pathIn === "string" ? pathIn : "";
+  if (!Number.isInteger(n) || n <= 0 || !path) return { ok: false, error: "invalid file" };
+  const repo = await repoIdFor(rootIn);
+  if (!repo) return { ok: false, error: "no GitHub remote on this repository" };
+  const pr = await ghJson<any>(["api", `repos/${repo.nameWithOwner}/pulls/${n}`]);
+  const sha = pr?.head?.sha;
+  const from = pr?.head?.repo?.full_name || repo.nameWithOwner;
+  if (!sha) return { ok: false, error: "could not resolve the pull request's head" };
+  const r = await gh(["api", `repos/${from}/contents/${encodeURI(path)}?ref=${sha}`, "-H", "Accept: application/vnd.github.raw"]);
+  if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "GitHub would not return that file" };
+  // Named for what it is, and kept out of the repository: a stray file inside a
+  // checkout would show up in somebody's `git status` an hour later.
+  const dir = makeViewTempDir("pr");
+  const file = join(dir, `${sha.slice(0, 7)}-${path.split("/").pop() || "file"}`);
+  writeFileSync(file, r.stdout);
+  return { ok: true, file, sha };
+}
+
 export async function fileSlice(rootIn: unknown, numberIn: unknown, args: {
   path?: unknown; side?: unknown; from?: unknown; to?: unknown;
 }): Promise<{ ok: boolean; lines?: string[]; start?: number; total?: number; binary?: boolean; url?: string; error?: string }> {
@@ -2007,7 +3118,7 @@ export async function setDraft(rootIn: unknown, number: unknown, draft: unknown)
 
 /** Merge the base into the PR branch — the button whose absence is why half a
  *  branch list carries hand-made "Merge origin/master into …" commits. */
-export async function updateBranch(rootIn: unknown, number: unknown): Promise<PrActionResult> {
+export async function updateBranch(rootIn: unknown, number: unknown, syncLocal?: unknown): Promise<PrActionResult> {
   const r = await runPr(rootIn, Number(number), ["pr", "update-branch", String(Number(number))]);
   // The merge runs on GitHub's side, so there is never a half-merged local tree
   // to clean up — but when base and head conflict the API refuses, and gh's raw
@@ -2017,7 +3128,88 @@ export async function updateBranch(rootIn: unknown, number: unknown): Promise<Pr
   if (!r.ok && /conflict|mergeable/i.test(r.error || "")) {
     return { ok: false, error: "can't update automatically — this branch conflicts with its base. pull the base branch and resolve the merge locally, then push." };
   }
-  return r;
+  // A locked or protected branch, or no write access: gh returns "not
+  // authorized"/"locked"/403, and the raw text is another dead end. The button
+  // is gated on BEHIND + viewerCanUpdate so this should rarely surface, but the
+  // two can race — the branch locks between the read and the click — and a bare
+  // "failed to update branch" is exactly the confusing error we are trying to
+  // avoid here.
+  if (!r.ok && /lock|protect|not authoriz|forbidden|permission|\b403\b/i.test(r.error || "")) {
+    return { ok: false, error: "can't update this branch — it is locked or protected, or you do not have write access. update it on GitHub, or ask someone who can." };
+  }
+  if (!r.ok || !(syncLocal === true || syncLocal === "true")) return r;
+  const abs = safeAbs(rootIn);
+  const root = abs ? repoRootOf(abs) : null;
+  if (!root) return r;
+  /* "Synced" first, because what somebody wants to know is whether it worked;
+     the two halves follow, in the order they happened. The old wording opened
+     with "updated on GitHub", which reads as a report rather than an answer. */
+  return { ...r, detail: `Synced — updated on GitHub, and ${await syncLocalHead(root, Number(number))}` };
+}
+
+/**
+ * The second half of "Update branch": bring this machine's copy along.
+ *
+ * The merge itself happens on GitHub, which is why this button never had a
+ * local half — and why the branch on your disk quietly became a commit stale
+ * every time you pressed it. Everything here either fast-forwards or explains
+ * itself; there is no path that merges, rebases, checks out or stashes.
+ *
+ * Two shapes of fast-forward, because they are genuinely different:
+ *
+ *   * not checked out anywhere — `fetch <remote> <branch>:<branch>` moves the
+ *     ref with no working tree involved at all, and git itself refuses if it
+ *     would not be a fast-forward. Nobody's editor sees anything move.
+ *   * checked out and clean — a plain `merge --ff-only` in that worktree, which
+ *     is what a pull would have done.
+ *
+ * Returns the sentence to show, never throws: the GitHub half already
+ * succeeded by the time this runs, and no local outcome may be reported in a
+ * way that reads as if it had not.
+ */
+async function syncLocalHead(root: string, number: number): Promise<string> {
+  const pr = await prBranches(root, number);
+  if (!pr) return "could not read the branch to sync it here";
+  const st = await localHead(root, pr.head);
+  if (st.sync === "absent") return "no local copy of this branch";
+  if (st.sync === "busy") return `left your local copy alone — ${st.worktree} is mid-merge or mid-rebase`;
+  if (st.sync === "diverged") return `left your local copy alone — it has ${st.ahead} commit${st.ahead === 1 ? "" : "s"} GitHub does not have`;
+  if (st.sync === "dirty") return `left your local copy alone — uncommitted changes in ${st.worktree}`;
+
+  return fastForwardLocal(root, st);
+}
+
+/**
+ * Move a local branch up to what its remote now has, and say what happened.
+ *
+ * Split out from the button so it can be tested against real repositories:
+ * everything above this line needs `gh`, and none of the decisions worth
+ * getting right do.
+ *
+ * The two shapes are not the same operation. A branch nobody has checked out
+ * moves by refspec — `fetch <remote> <branch>:<branch>` — which git will only
+ * do as a fast-forward and which no working tree ever notices. A branch that
+ * IS checked out gets the `merge --ff-only` a pull would have done, in its own
+ * worktree. Neither can rewrite anything: without `+` in the refspec and with
+ * `--ff-only` on the merge, git refuses rather than moving history sideways.
+ */
+export async function fastForwardLocal(root: string, st: PrLocalHead): Promise<string> {
+  const up = await upstreamOf(root, st.branch);
+  if (!up) return "left your local copy alone — it tracks no remote";
+  const fetched = await gitAsync(root, ["fetch", up.remote, up.remoteBranch]);
+  if (fetched.code !== 0) return `could not fetch ${up.remote} — pull it yourself`;
+  const last = (r: { stderr: string; stdout: string }) =>
+    (r.stderr || r.stdout || "").trim().split("\n").pop() || "git refused";
+  if (!st.worktree) {
+    const moved = await gitAsync(root, ["fetch", up.remote, `${up.remoteBranch}:${st.branch}`]);
+    return moved.code === 0
+      ? `your local ${st.branch} moved up too`
+      : `your local ${st.branch} did not move: ${last(moved)}`;
+  }
+  const ff = await gitAsync(st.worktree, ["merge", "--ff-only", up.ref]);
+  return ff.code === 0
+    ? `your checkout of ${st.branch} moved up too`
+    : `your checkout did not move: ${last(ff)}`;
 }
 
 /** Re-run the failed jobs on the PR's head — the usual answer to a red run,
@@ -2192,7 +3384,12 @@ export async function closePr(rootIn: unknown, number: unknown, reopen = false):
 // review this pull request with Claude
 // ---------------------------------------------------------------------------
 
-export interface ReviewPromptPlan { ok: boolean; cwd?: string; prompt?: string; branch?: string; error?: string }
+/** Either a plan that can be run, or the reason there isn't one. A union
+ *  rather than one bag of optionals, so a caller that has checked `ok` gets a
+ *  cwd and a prompt that are strings — the shape it is about to execute. */
+export type ReviewPromptPlan =
+  | { ok: true; cwd: string; prompt: string; branch?: string; error?: undefined }
+  | { ok: false; error: string; cwd?: undefined; prompt?: undefined; branch?: undefined };
 
 /**
  * Hand back the prompt to review a pull request, and nothing else.
@@ -2216,7 +3413,47 @@ export interface ReviewPromptPlan { ok: boolean; cwd?: string; prompt?: string; 
  * fetches any file exactly as the PR leaves it when the diff is not enough.
  * That last one is also what makes a fork work without a remote for it.
  */
-export async function prepareReviewPrompt(rootIn: unknown, numberIn: unknown): Promise<ReviewPromptPlan> {
+/**
+ * The chat's opening line for a pull request, kept as a function of the
+ * situation alone.
+ *
+ * It is now a thin read of the catalogue — `recipePromptText` with no id, which
+ * is "give me the one this pull request calls for". Left here, and left
+ * exported, because the wording is a contract with the agent and this is where
+ * the suite asserts it without a `gh` round trip.
+ */
+export function reviewPromptText(pr: {
+  number: number;
+  repo: string;
+  head: string;
+  viewerDidAuthor: boolean;
+  reviewDecision: string | null;
+  viewerRequested: boolean;
+  branch?: string;
+  title?: string;
+  author?: string;
+  url?: string;
+  since?: string;
+  card?: string;
+}): string {
+  return recipePromptText({
+    id: "",
+    pr: {
+      number: pr.number, repo: pr.repo, head: pr.head,
+      branch: pr.branch ?? "", title: pr.title ?? "", author: pr.author ?? "",
+      url: pr.url ?? "", since: pr.since ?? "", card: pr.card ?? "",
+    },
+    situation: {
+      viewerDidAuthor: pr.viewerDidAuthor,
+      reviewDecision: pr.reviewDecision,
+      viewerRequested: pr.viewerRequested,
+      movedSinceMyReview: !!pr.since && pr.since !== pr.head,
+      card: pr.card ?? "",
+    },
+  });
+}
+
+export async function prepareReviewPrompt(rootIn: unknown, numberIn: unknown, recipeId?: unknown, cardIn?: unknown): Promise<ReviewPromptPlan> {
   const number = Number(numberIn);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "invalid pull request number" };
   const abs = safeAbs(rootIn);
@@ -2237,29 +3474,62 @@ export async function prepareReviewPrompt(rootIn: unknown, numberIn: unknown): P
   // review to a sha rather than a branch name means a push mid-review does not
   // quietly swap the code underneath it.
   const head = pr.commits[pr.commits.length - 1]?.oid || pr.headRefName;
-  const openThreads = pr.threads.filter((t) => !t.isResolved);
-  const prompt = [
-    `Review pull request #${pr.number} of ${repo.nameWithOwner}: "${pr.title}".`,
-    ``,
-    `Read-only: do not change any files, do not commit, do not push, and do not post anything to GitHub. Report back here.`,
-    ``,
-    `Base branch: ${pr.baseRefName}. Head: ${pr.headRefName} at ${head}. ${pr.changedFiles} files, +${pr.additions} −${pr.deletions}.`,
-    ``,
-    `The diff:  gh pr diff ${pr.number}`,
-    `A file as the pull request leaves it:  gh api "repos/${repo.nameWithOwner}/contents/<path>?ref=${head}" -H "Accept: application/vnd.github.raw"`,
-    ``,
-    `This working directory is the same project, but not this pull request: it is on whatever you have checked out, and may be behind. Use it for the surroundings rather than for the change itself — other callers of a helper the diff touches, the tests that cover the path, the convention the change is meant to follow — and read the changed code from the two commands above.`,
-    ``,
-    `## What the author says`,
-    pr.body.slice(0, 4000) || "(no description)",
-    ``,
-    openThreads.length ? `## Review comments still open\n${openThreads.map((t) => `- ${t.path}${t.line ? `:${t.line}` : ""} — ${t.comments[0]?.body.slice(0, 200) ?? ""}`).join("\n")}` : "",
-    ``,
-    `## What I want`,
-    `Find real defects: incorrect logic, unhandled cases, race conditions, missing test coverage for the behaviour being changed.`,
-    `Check whether changed helpers have other callers, and whether the tests actually exercise the new path.`,
-    `Report each finding as: file:line, one sentence on the defect, and a concrete failure case. Say plainly if you find nothing serious.`,
-  ].filter((l) => l !== "").join("\n");
+
+  /*
+   * The number, and what to do with it.
+   *
+   * This used to paste the whole pull request into the chat: title, base and
+   * head, file and line counts, four thousand characters of description, every
+   * open review thread, and a specification of the report format. It filled the
+   * panel — a wall of text you had to scroll past to reach the answer, all of it
+   * describing something the agent can read for itself in one command.
+   *
+   * So it says which pull request and gets out of the way. `gh pr view` carries
+   * the title, the body and the threads; `gh pr diff` carries the change. The
+   * two things worth stating are the ones the agent cannot find out on its own:
+   * that this is read-only, and that the checkout it is sitting in is not this
+   * pull request.
+   */
+  /*
+   * Which prompt, and what it is allowed to know.
+   *
+   * The menu asks for one by id; without one, the situation picks the opener it
+   * always picked. `since` is the commit MY last review was written against —
+   * the difference between "read this pull request" and "read what happened
+   * since I read it", and the only field here GitHub does not put in front of
+   * you. It is deliberately the last review of mine, not the last review: what
+   * somebody else has already seen is their problem.
+   */
+  const mine = [...pr.reviews].reverse().find((r) => r.viewerDidAuthor && r.state !== "PENDING");
+  /* The base branch when you have never reviewed it. Measured on a real pull
+     request: an empty `since` rendered as `compare/...abc123` and a sentence
+     asking what changed "since ", which is a prompt that has to be read twice
+     to be ignored. The base is the honest answer to "where does the part I
+     have not seen start" for somebody arriving new — it is the whole change. */
+  const since = mine?.commit || pr.baseRefName;
+  const prompt = recipePromptText({
+    id: typeof recipeId === "string" ? recipeId : "",
+    pr: {
+      number: pr.number,
+      repo: repo.nameWithOwner,
+      head,
+      branch: pr.headRefName,
+      title: pr.title,
+      author: pr.author,
+      url: pr.url,
+      since,
+      card: typeof cardIn === "string" ? cardIn : "",
+    },
+    situation: {
+      viewerDidAuthor: pr.viewerDidAuthor,
+      reviewDecision: pr.reviewDecision,
+      viewerRequested: pr.viewerRequested,
+      movedSinceMyReview: !!since && since !== head,
+      reviewsSoFar: pr.reviews.filter((r) => r.state !== "PENDING").length,
+      blocked: pr.mergeable === "CONFLICTING" || pr.checks.failure > 0,
+      card: typeof cardIn === "string" ? cardIn : "",
+    },
+  });
 
   return { ok: true, cwd: root, prompt, branch: pr.headRefName };
 }
@@ -2379,6 +3649,89 @@ export async function addLineComment(rootIn: unknown, numberIn: unknown, c: {
   return { ok: true, detail: `commented on ${path}:${payload.start_line ? `${payload.start_line}-${line}` : line}` };
 }
 
+/** A line comment sitting in a pending review on GitHub, not yet submitted. */
+export interface PendingLineComment {
+  path: string;
+  /** Where it sits in the current diff, or where it was written if that line is
+   *  gone. Null when GitHub reports neither. */
+  line: number | null;
+  startLine: number | null;
+  body: string;
+  /**
+   * The comment's own page on GitHub.
+   *
+   * A pending comment cannot be edited from here — it belongs to a review
+   * GitHub is holding, and there is no endpoint that changes one without
+   * submitting. So the honest affordance is to hand the reader the place where
+   * it CAN be edited, which is one click and no round trip.
+   */
+  url: string;
+}
+
+/**
+ * Your own pending review on a pull request, with whatever it already holds.
+ *
+ * GitHub keeps at most one per pull request per person and shows it only to
+ * its author, so what comes back is always ours. It is what exists after
+ * queueing line comments in GitHub's review UI without pressing Submit —
+ * the state agentglass used to delete on sight.
+ *
+ * Fetched through GraphQL rather than REST because `reviews(states:[PENDING])`
+ * returns the comments in the same round trip, and the decision the caller has
+ * to make depends on whether there are any: an empty pending review really is
+ * a leftover, one with comments is somebody's unfinished work.
+ */
+export async function pendingReview(nameWithOwner: string, n: number): Promise<{ id: string; restId: number | null; comments: PendingLineComment[] } | null> {
+  const [owner, name] = nameWithOwner.split("/");
+  if (!owner || !name) return null;
+  /*
+   * `databaseId` alongside `id`, and the difference is not cosmetic.
+   *
+   * GraphQL answers with a node id — `PRR_kwDO…` — and every REST endpoint that
+   * takes a review wants the NUMBER. Submitting a review that GitHub was
+   * holding therefore posted to
+   * `/pulls/{n}/reviews/PRR_kwDO…/events` and got `gh: Not Found (HTTP 404)`,
+   * on the one path that exists to finish a review started in the browser.
+   * Measured on a real pull request: node id `PRR_kwDOAjkAGs8…`, databaseId
+   * 4925096670, same review.
+   */
+  const q = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviews(states:[PENDING],first:1){nodes{id databaseId comments(first:100){nodes{url path line originalLine startLine body}}}}}}}`;
+  const r = await gh(["api", "graphql", "-f", `query=${q}`, "-F", `o=${owner}`, "-F", `r=${name}`, "-F", `n=${n}`]);
+  if (r.code !== 0) return null;
+  try {
+    const node = JSON.parse(r.stdout)?.data?.repository?.pullRequest?.reviews?.nodes?.[0];
+    if (!node?.id) return null;
+    const comments: PendingLineComment[] = (node.comments?.nodes ?? [])
+      .filter((c: any) => c?.path)
+      /* `line` is null on a comment whose line no longer exists in the current
+         diff — an outdated one. `originalLine` is where it was written, which
+         is the only honest thing to show for it. */
+      .map((c: any) => ({
+        path: String(c.path), line: c.line ?? c.originalLine ?? null,
+        startLine: c.startLine ?? null, body: String(c.body ?? ""),
+        url: typeof c.url === "string" ? c.url : "",
+      }));
+    return { id: String(node.id), restId: Number.isSafeInteger(node.databaseId) ? Number(node.databaseId) : null, comments };
+  } catch { return null; }
+}
+
+/**
+ * The pending review on a pull request, for the panel to draw.
+ *
+ * Read-only and cheap enough to ask on opening the Review tab: without it the
+ * tab says "no line comments queued" while GitHub is holding three, which is
+ * the same wrong answer the submit path used to act on.
+ */
+export async function pendingReviewFor(rootIn: unknown, numberIn: unknown): Promise<{ ok: true; id: string | null; comments: PendingLineComment[] }> {
+  const root = String(rootIn ?? "");
+  const n = Number(numberIn);
+  if (!root || !Number.isSafeInteger(n) || n <= 0) return { ok: true, id: null, comments: [] };
+  const repo = await repoIdFor(root);
+  if (!repo) return { ok: true, id: null, comments: [] };
+  const p = await pendingReview(repo.nameWithOwner, n);
+  return { ok: true, id: p?.id ?? null, comments: p?.comments ?? [] };
+}
+
 export async function submitReviewWith(
   rootIn: unknown, numberIn: unknown, verb: unknown, body: unknown, commentsIn: unknown,
 ): Promise<PrActionResult> {
@@ -2420,6 +3773,57 @@ export async function submitReviewWith(
 
   const repo = await repoIdFor(rootIn);
   if (!repo) return { ok: false, error: "no GitHub remote on this repository" };
+
+  /*
+   * GitHub allows one pending review per pull request, so a leftover one makes
+   * every fresh review 422 "Unprocessable Entity" — the wall this used to hit.
+   * It discarded whatever it found, on the reasoning that agentglass keeps its
+   * own drafts locally and therefore a pending review holds nothing this submit
+   * needs.
+   *
+   * That reasoning was wrong in the case that matters. A pending review is
+   * exactly what you have after queueing line comments in GitHub's own review
+   * UI, and this deleted them: three comments written on a real pull request,
+   * gone on a button press, with nothing on screen to say so. The empty ones it
+   * was written for are still discarded, because those really do hold nothing.
+   */
+  const pending = await pendingReview(repo.nameWithOwner, n);
+  if (pending && pending.comments.length) {
+    /* Both sides have drafts. There is no API that folds locally-queued
+       comments into somebody else's pending review, so the honest answer is to
+       do nothing and say which is which — a merge we cannot perform must not
+       become a deletion we can. */
+    if (comments.length) {
+      return { ok: false, error: `GitHub already holds ${pending.comments.length} line comment${pending.comments.length === 1 ? "" : "s"} in a pending review here, and ${comments.length} ${comments.length === 1 ? "is" : "are"} queued in agentglass. Submit or discard one of them first — merging them would lose comments.` };
+    }
+    /* Its own comments and nothing queued here: submit the review GitHub is
+       already holding rather than replacing it. This is what makes a review
+       started in the browser finishable from here. */
+    /* The numeric id, never the node id — see pendingReview. Without one there
+       is nothing safe to do: submitting would need an id we do not have, and
+       falling through to "create a review" would leave GitHub's drafts behind
+       and 422 on top of it. */
+    if (pending.restId == null) {
+      return { ok: false, error: "GitHub is holding a pending review here but did not give it an id we can submit — finish it on GitHub." };
+    }
+    const ev = await gh(
+      ["api", "--method", "POST", `repos/${repo.nameWithOwner}/pulls/${n}/reviews/${pending.restId}/events`, "--input", "-"],
+      undefined, JSON.stringify({ event, ...(text ? { body: text } : {}) }),
+    );
+    invalidate(repo, n);
+    if (ev.code !== 0) {
+      const msg = (ev.stderr || ev.stdout).trim().split("\n").find((l) => l.trim()) || "the review was not accepted";
+      return { ok: false, error: msg };
+    }
+    const k = pending.comments.length;
+    return { ok: true, detail: `review submitted with ${k} line comment${k === 1 ? "" : "s"} drafted on GitHub` };
+  }
+  /* An empty pending review, discarded so the create below is not refused:
+     GitHub allows one per pull request. The numeric id again — the DELETE was
+     404ing on the node id too, silently, since nothing reads its result. */
+  if (pending?.restId != null) {
+    await gh(["api", "--method", "DELETE", `repos/${repo.nameWithOwner}/pulls/${n}/reviews/${pending.restId}`]);
+  }
 
   const payload = JSON.stringify({ event, ...(text ? { body: text } : {}), ...(comments.length ? { comments } : {}) });
   const r = await gh(

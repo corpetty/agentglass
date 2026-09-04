@@ -6,6 +6,7 @@
 // find. Environment variables still win, so a one-off `AGENTGLASS_…=x bun run`
 // overrides the file without editing it.
 
+import type { Budget } from "../../shared/types.ts";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, dirname, sep, delimiter } from "node:path";
@@ -70,6 +71,45 @@ interface Config {
   /** The account registry — source of truth for per-account meters, config
    *  dirs, and desktop instances. See accounts.ts. */
   accounts?: RawAccount[];
+  /** Spending limits somebody set. See budget.ts. Hand-edited freely like the
+   *  rest of this file, so every field is checked on read. */
+  budgets?: Budget[];
+  /** Projects the picker should stop offering. Absolute paths. See
+   *  hiddenProjects(). */
+  hiddenProjects?: string[];
+  /** Which tmux binary the pane engine runs. "auto" (default) prefers the
+   *  bundled static tmux and falls back to the system one; "system" skips the
+   *  bundle; "custom" uses `tmuxPath`. See tmuxbin.ts — AGENTGLASS_TMUX_PATH
+   *  overrides all of this when set. */
+  tmuxSource?: "auto" | "bundled" | "system" | "custom";
+  /** Absolute path to a tmux binary, used when `tmuxSource` is "custom". */
+  tmuxPath?: string;
+  /** How agentglass's own tmux server gets its config: "append" runs the
+   *  generated base conf then the user's override; "replace" uses a user file
+   *  wholesale. Either way the user's ~/.tmux.conf is never loaded. See
+   *  tmuxconf.ts. */
+  tmuxConfMode?: "append" | "replace";
+  /** The user's extra config lines for agentglass's tmux server (Level 1).
+   *  Plain text, validated before it is ever applied. */
+  tmuxOverride?: string;
+  /** Restore the pane layout (windows, splits, scrollback) at boot, after a
+   *  reboot took the tmux server down. Off by default. See tmuxrestore.ts. */
+  tmuxRestore?: boolean;
+  /** How restored agent panes relaunch their CLI: "lazy" restores the layout
+   *  and waits for the chat to be reopened before resuming the session;
+   *  "all" resumes every recorded session at restore time. */
+  tmuxResume?: "lazy" | "all";
+  /** The engine's prefix key in tmux's spelling (`C-a`, `M-Space`). Empty or
+   *  absent leaves tmux's own default. Written from the settings panel because
+   *  it is the one binding everybody changes, and it goes into a config file
+   *  the engine runs — so it is validated, never escaped. */
+  tmuxPrefix?: string;
+  /** Which tmux the terminal VIEW opens on: the engine's server, or the tmux on
+   *  this machine resumed where it was left. Absent means the engine. */
+  tmuxTerminal?: "engine" | "desk";
+  /** Set when the validation gate rejected the generated conf. The pane
+   *  engine degrades (chat still works) and the settings panel shows why. */
+  tmuxConfBroken?: { broken: boolean; reason: string };
 }
 
 /** A configured Claude account, as it lives on disk in config.json. The `id`
@@ -133,6 +173,160 @@ function config(): Config {
 }
 
 const expand = (p: string) => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+
+/**
+ * The budgets on disk, with anything unusable dropped.
+ *
+ * Checked field by field rather than trusted, for the same reason `root` is:
+ * this file is hand-edited, and a budget is a *denominator*. A limit that
+ * arrives as a string turns every percentage into NaN, and a period nobody
+ * recognises would silently be evaluated as a month. Both are the kind of wrong
+ * that shows up as a number on a dashboard rather than as an error.
+ *
+ * A row that cannot be used is skipped and said about, never coerced into
+ * something plausible — a limit of `"40"` meaning forty is a guess, and
+ * guessing on a spending limit is how somebody finds out at the end of a month.
+ */
+export function readBudgets(): Budget[] {
+  const raw = config().budgets;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    console.error(`[config] ignoring "budgets" in ${configPath()}: expected an array`);
+    return [];
+  }
+  const out: Budget[] = [];
+  for (const b of raw) {
+    if (!b || typeof b !== "object" || Array.isArray(b)) continue;
+    const r = b as Partial<Budget>;
+    if (typeof r.limit !== "number" || !Number.isFinite(r.limit) || r.limit <= 0) {
+      console.error(`[config] ignoring a budget with a limit that is not a positive number`);
+      continue;
+    }
+    if (r.period !== "day" && r.period !== "week" && r.period !== "month") {
+      console.error(`[config] ignoring a budget with an unknown period: ${String(r.period)}`);
+      continue;
+    }
+    out.push({
+      root: typeof r.root === "string" ? expand(r.root) : "",
+      model: typeof r.model === "string" ? r.model : "",
+      limit: r.limit,
+      period: r.period,
+    });
+  }
+  return out;
+}
+
+/**
+ * Projects the picker has been told not to offer again.
+ *
+ * A found repo is not the same thing as a project somebody wants: the sweep
+ * turns up scratch checkouts, a clone made once to read something, the vendored
+ * copy under a tool's cache. There was no way to say so, and a list you cannot
+ * prune stops being read.
+ *
+ * Hidden, not forgotten, and certainly not deleted: nothing here touches the
+ * filesystem. The path is remembered so the sweep can go on finding it and this
+ * can go on leaving it out — anything else would mean the entry coming back on
+ * the next sweep, which is how "remove" turns into a button that does nothing.
+ *
+ * Every row is checked on read, like the rest of this hand-editable file.
+ */
+export function hiddenProjects(): string[] {
+  const raw = config().hiddenProjects;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    console.error(`[config] ignoring "hiddenProjects" in ${configPath()}: expected an array`);
+    return [];
+  }
+  const out: string[] = [];
+  for (const p of raw) {
+    if (typeof p !== "string" || !p.trim()) continue;
+    out.push(resolve(expand(p.trim())));
+  }
+  return out;
+}
+
+/**
+ * Hide one, or put it back.
+ *
+ * Per-path rather than whole-set, because the two callers are one row's ✕ and
+ * one row's undo — handing the whole list back and forth would let two windows
+ * open at once overwrite each other's answer with a stale copy.
+ */
+export function setProjectHidden(pathIn: unknown, hidden: boolean): { ok: boolean; hidden: string[]; persisted: boolean; error?: string } {
+  const fail = (error: string) => ({ ok: false as const, hidden: hiddenProjects(), persisted: false, error });
+  if (typeof pathIn !== "string" || !pathIn.trim() || pathIn.includes("\0")) return fail("invalid path");
+  const target = resolve(expand(pathIn.trim()));
+  const next = hiddenProjects().filter((p) => p !== target);
+  if (hidden) next.push(target);
+
+  const file = configPath();
+  if (realConfigOffLimits(file)) {
+    // Applied in memory is not possible here — this is read from the file every
+    // time — so say plainly that it did not take rather than report success.
+    return { ok: false, hidden: hiddenProjects(), persisted: false, error: "not persisted: tests write settings only under os.tmpdir()" };
+  }
+  let existing: Record<string, unknown> = {};
+  try {
+    if (existsSync(file)) {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return fail(`config file is malformed — fix ${file} to change this`);
+      }
+      existing = parsed as Record<string, unknown>;
+    }
+  } catch (e) {
+    return fail(`config file is malformed — fix ${file} to change this (${e instanceof Error ? e.message : e})`);
+  }
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    const merged: Record<string, unknown> = { ...existing };
+    if (next.length) merged.hiddenProjects = next; else delete merged.hiddenProjects;
+    writeFileSync(file, JSON.stringify(merged, null, 2) + "\n");
+    cached = null; // so the next read sees what was just written
+  } catch (e) {
+    return fail(`could not save to ${file}: ${e instanceof Error ? e.message : e}`);
+  }
+  return { ok: true, hidden: next, persisted: true };
+}
+
+/**
+ * Replace the whole set.
+ *
+ * Whole-set rather than per-row: budgets are edited as a list in one pane, and
+ * a partial update needs an identity for a row that has none — two budgets can
+ * differ only by a limit somebody is halfway through typing.
+ *
+ * Written through the same path as the workspace root, and refusing the same
+ * two things: a config file it could not parse, which would be overwritten
+ * wholesale, and any path outside the scratch directory under test.
+ */
+export function writeBudgets(budgets: Budget[]): { ok: boolean; persisted: boolean; error?: string } {
+  const path = configPath();
+  if (realConfigOffLimits(path)) {
+    return { ok: true, persisted: false, error: "not persisted: tests write settings only under os.tmpdir()" };
+  }
+  let existing: Record<string, unknown> = {};
+  try {
+    if (existsSync(path)) {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save budgets` };
+      }
+      existing = parsed as Record<string, unknown>;
+    }
+  } catch (e) {
+    return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save budgets (${e instanceof Error ? e.message : e})` };
+  }
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ ...existing, budgets }, null, 2) + "\n");
+    cached = null; // so the next read sees what was just written
+    return { ok: true, persisted: true };
+  } catch (e) {
+    return { ok: false, persisted: false, error: `could not write ${path}: ${e instanceof Error ? e.message : e}` };
+  }
+}
 
 /**
  * Where to look for repos, most explicit source first.
@@ -217,6 +411,30 @@ export function inScope(path: string | null | undefined, scope = workspaceRoot()
   // subprocess, including the container-folder scope where the family is moot.
   if (isWithin(p, scope)) return true;
   return worktreeFamily(scope).some((r) => isWithin(p, r));
+}
+
+/**
+ * Is this session's work part of the open project?
+ *
+ * `inScope` asks it of a path; a session carries two, and either one answers
+ * yes. That is the same rule `scopeClause()` puts in SQL — `project_path IN
+ * (...) OR cwd_path IN (...)` — kept here so the live seam and the stored reads
+ * cannot drift apart.
+ *
+ * They had drifted. Every read was scoped and the WebSocket push was not, so a
+ * cockpit opened for one project showed that project's history and then filled
+ * up with whatever else on the machine happened to emit while you watched.
+ * Reloading swept those away and the next event brought them back — one window
+ * disagreeing with itself about which fleet it was showing. It surfaced where it
+ * was least deniable: an alert from another project taking the top bar of a
+ * cockpit scoped somewhere else.
+ */
+export function sessionInScope(
+  s: { project_path?: string | null; cwd_path?: string | null },
+  scope = workspaceRoot(),
+): boolean {
+  if (!scope) return true; // whole-machine: nothing to filter
+  return inScope(s.project_path, scope) || inScope(s.cwd_path, scope);
 }
 
 /** The directories a scoped instance is about: the project plus its linked
@@ -408,5 +626,137 @@ export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?:
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// --- tmux engine settings ---------------------------------------------------
+// Read one field at a time, each checked on read: config.json is hand-editable,
+// and every one of these reaches a spawned binary or a filesystem path.
+
+const TMUX_SOURCES = new Set(["auto", "bundled", "system", "custom"]);
+export function tmuxSource(): "auto" | "bundled" | "system" | "custom" {
+  const v = config().tmuxSource;
+  return v !== undefined && TMUX_SOURCES.has(v) ? v : "auto";
+}
+
+export function tmuxPathSetting(): string {
+  const v = config().tmuxPath;
+  return typeof v === "string" && v.trim() && !v.includes("\0") ? v.trim() : "";
+}
+
+export function tmuxConfMode(): "append" | "replace" {
+  const v = config().tmuxConfMode;
+  return v === "replace" ? "replace" : "append";
+}
+
+export function tmuxOverride(): string {
+  const v = config().tmuxOverride;
+  return typeof v === "string" ? v.slice(0, 128_000) : "";
+}
+
+/** Was the generated conf rejected by the validation gate? Persisted so the
+ *  reason survives a restart — a broken config is a property of what is on
+ *  disk, not of this process. */
+export function tmuxConfBroken(): { broken: boolean; reason: string } {
+  const v = config().tmuxConfBroken;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { broken: false, reason: "" };
+  return { broken: v.broken === true, reason: typeof v.reason === "string" ? v.reason.slice(0, 500) : "" };
+}
+export function setTmuxConfBroken(broken: boolean, reason = ""): void {
+  writeTmuxSettings(broken ? { tmuxConfBroken: { broken, reason } } : { tmuxConfBroken: undefined });
+}
+
+export function tmuxRestoreEnabled(): boolean {
+  return config().tmuxRestore === true;
+}
+
+export function tmuxResume(): "lazy" | "all" {
+  const v = config().tmuxResume;
+  return v === "all" ? "all" : "lazy";
+}
+
+/**
+ * The engine's prefix key, in tmux's own spelling — `C-b`, `C-a`, `M-x`.
+ *
+ * A setting rather than something to be typed into the override, because it is
+ * the one tmux binding everybody changes and asking for three lines of config
+ * to move a keystroke is a wall in front of the commonest edit there is. Empty
+ * means "leave tmux's default alone".
+ *
+ * Validated on the way in as well as here: this string is interpolated into a
+ * config file the engine runs, so it may only ever be a key name.
+ */
+/**
+ * Which tmux the TERMINAL VIEW opens on.
+ *
+ * "engine" — agentglass's own server: its config, its prefix, its restore, and
+ * a session per checkout. "desk" — the tmux on this machine, resumed where it
+ * was left, which is what the app did before there was an engine to offer.
+ *
+ * The two never mix. Whichever is not chosen goes on running untouched, so the
+ * switch is reversible in both directions and nothing is migrated by flipping
+ * it: a tmux session cannot move between servers, by anybody.
+ */
+export function tmuxTerminal(): "engine" | "desk" {
+  return config().tmuxTerminal === "desk" ? "desk" : "engine";
+}
+
+export function tmuxPrefix(): string {
+  const v = config().tmuxPrefix;
+  return typeof v === "string" && validTmuxPrefix(v) ? v : "";
+}
+
+/**
+ * A key name and nothing else.
+ *
+ * `C-a`, `M-Space`, `F5`. No spaces, no quotes, no semicolons — the value goes
+ * into `set -g prefix <key>` in a file tmux executes, so anything that could
+ * end the command and start another one is refused rather than escaped.
+ */
+export function validTmuxPrefix(v: string): boolean {
+  return /^(C-|M-|C-M-)?[A-Za-z0-9]{1,10}$/.test(v);
+}
+
+/** Persist any subset of the tmux settings, preserving everything else in the
+ *  file. Same write path and same guard as writeBudgets: a config it cannot
+ *  parse is refused, not overwritten; tests write only under scratch. */
+export function writeTmuxSettings(fields: {
+  tmuxSource?: "auto" | "bundled" | "system" | "custom";
+  tmuxPath?: string;
+  tmuxConfMode?: "append" | "replace";
+  tmuxOverride?: string;
+  tmuxRestore?: boolean;
+  tmuxResume?: "lazy" | "all";
+  tmuxPrefix?: string;
+  tmuxTerminal?: "engine" | "desk";
+  tmuxConfBroken?: { broken: boolean; reason: string } | undefined;
+}): { ok: boolean; persisted: boolean; error?: string } {
+  const path = configPath();
+  if (realConfigOffLimits(path)) {
+    return { ok: false, persisted: false, error: "not persisted: tests write settings only under os.tmpdir()" };
+  }
+  let existing: Record<string, unknown> = {};
+  try {
+    if (existsSync(path)) {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save tmux settings` };
+      }
+      existing = parsed as Record<string, unknown>;
+    }
+  } catch (e) {
+    return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save tmux settings (${e instanceof Error ? e.message : e})` };
+  }
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const merged: Record<string, unknown> = { ...existing };
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === undefined) delete merged[k]; else merged[k] = v;
+    }
+    writeFileSync(path, JSON.stringify(merged, null, 2) + "\n");
+    cached = null; // the file changed under us; next read picks it up
+    return { ok: true, persisted: true };
+  } catch (e) {
+    return { ok: false, persisted: false, error: `could not write ${path}: ${e instanceof Error ? e.message : e}` };
   }
 }

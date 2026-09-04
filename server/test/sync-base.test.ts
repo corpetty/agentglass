@@ -66,9 +66,201 @@ describe("base branch", () => {
     expect((await gw.baseOf(repo, "CARD-1"))).toBe("main");
   });
 
+  /*
+   * A branch stacked on another feature branch, which is most of them here.
+   *
+   * Reported with three screenshots: the base picker offered "origin/master —
+   * current base" on a worktree cut from another card's branch, while the
+   * header two centimetres away read "tracking origin/<that branch>". Both were
+   * reading the same repository; only one of them was asking git what the
+   * branch says about itself.
+   *
+   * Inference cannot answer this. `for-each-ref --merged <branch>` only matches
+   * a base the branch still contains, so the moment the base picks up a commit
+   * of its own it stops being an ancestor, drops out of the candidates, and the
+   * ladder falls through to the trunk. Tracking is written down at checkout
+   * time and stays true.
+   */
+  it("takes what the branch tracks over a guess at the shape of history", async () => {
+    run(repo, "branch", "feature-lane");
+    run(repo, "worktree", "add", "-q", "-b", "CARD-2", `${repo}-CARD-2`, "feature-lane");
+    run(`${repo}-CARD-2`, "branch", "--set-upstream-to=feature-lane", "CARD-2");
+    // The base moves on, which is what puts it out of reach of inference.
+    run(repo, "checkout", "-q", "feature-lane");
+    writeFileSync(join(repo, "lane.txt"), "lane\n");
+    run(repo, "add", "-A"); run(repo, "commit", "-qm", "on the lane");
+    run(repo, "checkout", "-q", "main");
+    expect(await gw.baseOf(repo, "CARD-2")).toBe("feature-lane");
+    rmSync(`${repo}-CARD-2`, { recursive: true, force: true });
+    run(repo, "worktree", "prune");
+  });
+
+  it("does not call a branch its own base when tracking is just where it pushes", async () => {
+    /* Every pushed branch tracks a copy of ITSELF. Read as a base that would
+       measure a branch against itself and report zero for ever — and zero is
+       exactly what a wrong base usually reports. */
+    run(repo, "branch", "CARD-3", "main");
+    run(repo, "branch", "--set-upstream-to=CARD-3", "CARD-3");
+    expect(await gw.baseOf(repo, "CARD-3")).not.toBe("CARD-3");
+  });
+
+  it("treats clearing an override that was never set as done, not as an error", async () => {
+    // `git config --unset` exits 5 on a missing key. Taken literally, the
+    // picker's "work it out for me" would fail on every branch that never had
+    // an override — which is most of them — and report it as a broken action.
+    expect(gw.setBase(repo, "CARD-1", null).ok).toBe(true);
+    expect(gw.setBase(repo, "CARD-1", "").ok).toBe(true);
+    expect((await gw.baseOf(repo, "CARD-1"))).toBe("main");
+  });
+
   it("counts what the base has and the branch does not", async () => {
     expect(await gw.behindBase(repo, "CARD-1", "main")).toBe(2);
     expect(await gw.behindBase(repo, "main", "main")).toBe(0);
+  });
+});
+
+/**
+ * A stack with a real remote, because the failure this covers only exists once
+ * there are two copies of the base: the one on the server that has moved on,
+ * and the one on this disk that has not.
+ *
+ * Nothing here was reachable by the fixture above — it has no remote at all, so
+ * every base it can name is one this checkout is already level with, and
+ * "behind" is zero by construction. That is exactly why the panel showed
+ * nothing for months while a pull request page said "126 commits behind".
+ */
+let stack: string, originDir: string, stackWt: string;
+
+describe("a base that has moved on", () => {
+  beforeAll(() => {
+    originDir = mkdtempSync(join(tmpdir(), "agx-origin-"));
+    run(originDir, "init", "-q", "--bare", "-b", "master");
+
+    stack = mkdtempSync(join(tmpdir(), "agx-stack-"));
+    run(stack, "init", "-q", "-b", "master");
+    run(stack, "config", "user.email", "t@example.com");
+    run(stack, "config", "user.name", "t");
+    run(stack, "remote", "add", "origin", originDir);
+    const c = (f: string, msg: string) => {
+      writeFileSync(join(stack, f), `${msg}\n`);
+      run(stack, "add", "-A");
+      run(stack, "commit", "-qm", msg);
+    };
+    c("m1.txt", "trunk one");
+    run(stack, "push", "-q", "-u", "origin", "master");
+
+    // The branch a stack is built on — a release train, an epic branch.
+    run(stack, "checkout", "-q", "-b", "feature-base");
+    c("f1.txt", "base one");
+    c("f2.txt", "base two");
+    run(stack, "push", "-q", "-u", "origin", "feature-base");
+    const cutFrom = run(stack, "rev-parse", "HEAD").stdout.trim();
+
+    // A card cut from it, with its own work on top.
+    run(stack, "checkout", "-q", "-b", "card");
+    c("k1.txt", "card one");
+    c("k2.txt", "card two");
+    run(stack, "push", "-q", "-u", "origin", "card");
+
+    // The base moves on: three commits the card has never seen. This is the
+    // whole point of the chip, and the case nothing used to cover.
+    run(stack, "checkout", "-q", "feature-base");
+    c("f3.txt", "base three");
+    c("f4.txt", "base four");
+    c("f5.txt", "base five");
+    run(stack, "push", "-q", "origin", "feature-base");
+
+    // ...and this checkout has not pulled since, so its *local* copy of the
+    // base is three behind the copy the pull request is measured against.
+    // Rewound off HEAD, or the working tree would disagree with the branch.
+    run(stack, "checkout", "-q", "master");
+    run(stack, "update-ref", "refs/heads/feature-base", cutFrom);
+
+    stackWt = `${stack}-card`;
+    run(stack, "worktree", "add", "-q", stackWt, "card");
+  });
+
+  afterAll(() => {
+    gw.setPrBaseHook(null);
+    for (const d of [stackWt, stack, originDir]) { try { rmSync(d, { recursive: true, force: true }); } catch { /* fine */ } }
+  });
+
+  it("measures the base as it is on the remote, not the stale copy on this disk", async () => {
+    // The regression this whole change exists for. Inference can only ever name
+    // a copy of the base the branch is already level with, so measuring the ref
+    // it returns reported zero and the panel drew nothing.
+    gw.invalidateMerged();
+    const base = await gw.baseOf(stack, "card");
+    expect(base).toBe("origin/feature-base");
+    expect(await gw.behindBase(stack, "card", base!)).toBe(3);
+    // And the local copy is genuinely the one that would have lied.
+    expect(await gw.behindBase(stack, "card", "feature-base")).toBe(0);
+  });
+
+  it("does not mistake a leftover review ref for the branch's base", async () => {
+    // `--merged` matches any ref that happens to be an ancestor, and a working
+    // repo is full of them: the pr1042-review someone left after reading a
+    // diff sits a commit back, wins the fewest-commits test, and becomes a
+    // "base" the branch was never cut from.
+    run(stack, "branch", "pr9-review", "card~1");
+    gw.invalidateMerged();
+    expect(await gw.baseOf(stack, "card")).toBe("origin/feature-base");
+    run(stack, "branch", "-qD", "pr9-review");
+  });
+
+  it("takes the base a pull request declares over anything read off history", async () => {
+    gw.setPrBaseHook(async () => "master");
+    gw.invalidateMerged();
+    expect(await gw.baseOf(stack, "card")).toBe("origin/master");
+    gw.setPrBaseHook(null);
+  });
+
+  it("ignores a declared base the remote does not have", async () => {
+    // A stale row naming a deleted branch must not leave the panel measuring
+    // against nothing; it falls back to what history can still show.
+    gw.setPrBaseHook(async () => "branch-that-was-deleted");
+    gw.invalidateMerged();
+    expect(await gw.baseOf(stack, "card")).toBe("origin/feature-base");
+    gw.setPrBaseHook(null);
+  });
+
+  it("lets a written-down override outrank even the pull request", async () => {
+    run(stack, "config", "branch.card.agentglassbase", "master");
+    gw.setPrBaseHook(async () => "feature-base");
+    gw.invalidateMerged();
+    // `master`, not `origin/master`: the local copy is level with the remote, so
+    // there is no fresher one to prefer and the ref is left as written.
+    expect(await gw.baseOf(stack, "card")).toBe("master");
+    gw.setPrBaseHook(null);
+    run(stack, "config", "--unset", "branch.card.agentglassbase");
+  });
+});
+
+describe("a stack with no remote at all", () => {
+  // The published-only filter must not leave a purely local repo with no base
+  // to name: there, every branch is local and the distinction does not exist.
+  let solo: string;
+  beforeAll(() => {
+    solo = mkdtempSync(join(tmpdir(), "agx-solo-"));
+    run(solo, "init", "-q", "-b", "main");
+    run(solo, "config", "user.email", "t@example.com");
+    run(solo, "config", "user.name", "t");
+    const c = (f: string, msg: string) => {
+      writeFileSync(join(solo, f), `${msg}\n`);
+      run(solo, "add", "-A");
+      run(solo, "commit", "-qm", msg);
+    };
+    c("m.txt", "trunk");
+    run(solo, "checkout", "-q", "-b", "epic");
+    c("e.txt", "epic work");
+    run(solo, "checkout", "-q", "-b", "card");
+    c("c.txt", "card work");
+  });
+  afterAll(() => { try { rmSync(solo, { recursive: true, force: true }); } catch { /* fine */ } });
+
+  it("still infers the branch it was stacked on", async () => {
+    gw.invalidateMerged();
+    expect(await gw.baseOf(solo, "card")).toBe("epic");
   });
 });
 

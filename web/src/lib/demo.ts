@@ -12,6 +12,9 @@ import type {
   WalkthroughResult, WalkthroughInputFile, GitRepoRef, WorkingTree, GitFileChange, GitActionResult,
   GitBranch, GitCommit, GitStash, GitGraphLine, GitWorktree, DockerOverview, DockerStat, DockerActionResult,
   PrRepoId, PrSummary, PrDetail, PrThread, PrCheck, PrCheckRollup, PrCheckState, PrListResponse,
+  UsageDay, UsageHistory, ActionRecord, ProviderUsage,
+  IssueRow, IssueDetail, IssuesReport, IssueWork, FileEntry, TreeReport, FindReport,
+  PortsReport, PortEntry, ResourceReport, ProcEntry, SpaceReport, SpaceDir,
 } from "../../../shared/types.ts";
 import { modelLabelOf, providerOf } from "./format.ts";
 import { ctxLimitOf } from "./contextWindow.ts";
@@ -227,7 +230,7 @@ function scopeStats(s: StatsSummary, provider: string): StatsSummary {
       cache_read_tokens: i(s.totals.cache_read_tokens),
     },
     by_model,
-    tool_latency: s.tool_latency.map((t) => ({ ...t, calls: i(t.calls), errors: i(t.errors) })),
+    tool_latency: s.tool_latency.map((t) => ({ ...t, calls: i(t.calls), timed: t.timed === undefined ? undefined : i(t.timed), errors: i(t.errors) })),
     timeline: s.timeline.map((b) => ({ ...b, events: i(b.events), errors: i(b.errors), cost_usd: Number((b.cost_usd * r).toFixed(3)), tokens: i(b.tokens) })),
     top_skills: provider === "Anthropic" ? s.top_skills : [],
     by_app: s.by_app.filter((a) => apps.has(a.source_app)),
@@ -251,20 +254,21 @@ export function stats(windowMs: number, provider?: string): StatsSummary {
     return { t, events: rint(0, Math.round(40 * busy)), errors: random() < 0.1 ? rint(1, 3) : 0, cost_usd: Number(rnd(0, 12 * busy).toFixed(3)), tokens: rint(0, Math.round(60000 * busy)) };
   });
   const summary: StatsSummary = {
-    totals: { events: si(12840) + streamed.events, sessions: si(41), tool_calls: si(6210) + streamed.tools, errors: Math.round(34 * f), cost_usd: Number((sc(4498.08) + streamed.cost).toFixed(2)), input_tokens: Math.round(9_100_000 * f), output_tokens: Math.round(640_000 * f), cache_creation_tokens: Math.round(1_200_000 * f), cache_read_tokens: Math.round(78_000_000 * f) },
+    totals: { events: si(12840) + streamed.events, sessions: si(41), tool_calls: si(6210) + streamed.tools, errors: Math.round(34 * f), cost_usd: Number((sc(4498.08) + streamed.cost).toFixed(2)), input_tokens: Math.round(9_100_000 * f), output_tokens: Math.round(640_000 * f), cache_creation_tokens: Math.round(1_200_000 * f), cache_read_tokens: Math.round(78_000_000 * f), equiv_tokens: Math.round(21_100_000 * f) },
     by_model: [
-      { model_name: "Opus", input_tokens: Math.round(4_100_000 * f), output_tokens: Math.round(300_000 * f), cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: sc(2350.0), sessions: si(14) },
-      { model_name: "GPT-5", input_tokens: Math.round(3_200_000 * f), output_tokens: Math.round(240_000 * f), cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: sc(1180.3), sessions: si(11) },
-      { model_name: "Sonnet", input_tokens: Math.round(900_000 * f), output_tokens: Math.round(80_000 * f), cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: sc(430.2), sessions: si(6) },
-      { model_name: "Gemini Flash", input_tokens: Math.round(2_400_000 * f), output_tokens: Math.round(180_000 * f), cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: sc(320.44), sessions: si(7) },
-      { model_name: "GPT-5 mini", input_tokens: Math.round(1_800_000 * f), output_tokens: Math.round(120_000 * f), cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: sc(217.14), sessions: si(3) },
+      { model_name: "Opus", input_tokens: Math.round(4_100_000 * f), output_tokens: Math.round(300_000 * f), cache_creation_tokens: Math.round(420_000 * f), cache_read_tokens: Math.round(31_000_000 * f), equiv_tokens: Math.round(9_225_000 * f), cost_usd: sc(2350.0), sessions: si(14) },
+      { model_name: "GPT-5", input_tokens: Math.round(3_200_000 * f), output_tokens: Math.round(240_000 * f), cache_creation_tokens: Math.round(300_000 * f), cache_read_tokens: Math.round(24_000_000 * f), equiv_tokens: Math.round(6_320_000 * f), cost_usd: sc(1180.3), sessions: si(11) },
+      { model_name: "Sonnet", input_tokens: Math.round(900_000 * f), output_tokens: Math.round(80_000 * f), cache_creation_tokens: Math.round(160_000 * f), cache_read_tokens: Math.round(11_000_000 * f), equiv_tokens: Math.round(2_600_000 * f), cost_usd: sc(430.2), sessions: si(6) },
+      { model_name: "Gemini Flash", input_tokens: Math.round(2_400_000 * f), output_tokens: Math.round(180_000 * f), cache_creation_tokens: Math.round(220_000 * f), cache_read_tokens: Math.round(8_000_000 * f), equiv_tokens: Math.round(2_075_000 * f), cost_usd: sc(320.44), sessions: si(7) },
+      { model_name: "GPT-5 mini", input_tokens: Math.round(1_800_000 * f), output_tokens: Math.round(120_000 * f), cache_creation_tokens: Math.round(100_000 * f), cache_read_tokens: Math.round(4_000_000 * f), equiv_tokens: Math.round(880_000 * f), cost_usd: sc(217.14), sessions: si(3) },
     ],
     tool_latency: [
-      { tool_name: "Bash", calls: si(2179), errors: Math.round(22 * f), p50_ms: 186, p95_ms: 8630, max_ms: 21620, avg_ms: 640, total_ms: Math.round(1_394_560 * f) },
-      { tool_name: "Read", calls: si(876), errors: 0, p50_ms: 117, p95_ms: 181, max_ms: 900, avg_ms: 130, total_ms: Math.round(113_880 * f) },
-      { tool_name: "Edit", calls: si(421), errors: Math.round(3 * f), p50_ms: 149, p95_ms: 214, max_ms: 415, avg_ms: 160, total_ms: Math.round(67_360 * f) },
-      { tool_name: "Write", calls: si(122), errors: 0, p50_ms: 139, p95_ms: 218, max_ms: 400, avg_ms: 150, total_ms: Math.round(18_300 * f) },
-      { tool_name: "mcp__tracker__get_issue", calls: si(33), errors: 0, p50_ms: 813, p95_ms: 12180, max_ms: 12180, avg_ms: 1100, total_ms: Math.round(36_300 * f) },
+      { tool_name: "Bash", calls: si(2179), timed: si(2174), errors: Math.round(22 * f), p50_ms: 186, p95_ms: 8630, max_ms: 21620, avg_ms: 640, total_ms: Math.round(1_394_560 * f) },
+      { tool_name: "Read", calls: si(876), timed: si(876), errors: 0, p50_ms: 117, p95_ms: 181, max_ms: 900, avg_ms: 130, total_ms: Math.round(113_880 * f) },
+      { tool_name: "Edit", calls: si(421), timed: si(421), errors: Math.round(3 * f), p50_ms: 149, p95_ms: 214, max_ms: 415, avg_ms: 160, total_ms: Math.round(67_360 * f) },
+      { tool_name: "Write", calls: si(122), timed: si(122), errors: 0, p50_ms: 139, p95_ms: 218, max_ms: 400, avg_ms: 150, total_ms: Math.round(18_300 * f) },
+      // An OTLP-logs source: every call is an invocation, none carries a start.
+      { tool_name: "mcp__tracker__get_issue", calls: si(33), timed: 0, errors: 0, p50_ms: 0, p95_ms: 0, max_ms: 0, avg_ms: 0, total_ms: 0 },
     ],
     timeline: buckets,
     top_skills: SKILL_NAMES.map((skill, i) => ({ skill, calls: si(8 - i), cost_usd: sc(rnd(90, 820)), last_used: Date.now() - i * 3_600_000, buckets: Array.from({ length: 12 }, () => rint(0, 3)) })),
@@ -272,12 +276,57 @@ export function stats(windowMs: number, provider?: string): StatsSummary {
     by_type: [["PreToolUse", 4069], ["PostToolUse", 4057], ["SessionStart", 1402], ["UserPromptSubmit", 436], ["Stop", 395], ["SubagentStop", 336], ["Notification", 216], ["SessionEnd", 42]].map(([hook_event_type, count]) => ({ hook_event_type: hook_event_type as string, count: si(count as number) })),
     heatmap,
     window_ms: windowMs,
+    // The showcase runs the default retention, so the long-window chips carry
+    // their asterisk here exactly as they would on a real install.
+    retention_days: 8,
   };
   for (const m of summary.by_model) {
     const extra = streamed.byModel.get(m.model_name);
     if (extra) m.cost_usd = Number((m.cost_usd + extra).toFixed(2));
   }
   return provider ? scopeStats(summary, provider) : summary;
+}
+
+/**
+ * A daily series with a seam in it, because the seam is the point.
+ *
+ * The showcase's retention is the default 8 days, so days before that are what
+ * the fold kept and days after are still whole events — and the chart is only
+ * worth having if it shows the first group at all.
+ */
+export function usageDaily(days = 90): UsageHistory {
+  const DAY = 86_400_000;
+  const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  const retention = 8;
+  const series: UsageDay[] = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const at = Date.now() - i * DAY;
+    const dow = new Date(at).getUTCDay();
+    // Weekends are quiet; the fleet ramps up over the quarter.
+    const busy = (dow === 0 || dow === 6 ? 0.18 : 1) * (0.45 + 0.55 * ((days - i) / days));
+    const events = rint(0, Math.round(900 * busy));
+    const tool_calls = Math.round(events * 0.48);
+    series.push({
+      day: utcDay(at),
+      events,
+      tool_calls,
+      tool_errors: Math.round(tool_calls * rnd(0, 0.02)),
+      errors: Math.round(events * rnd(0, 0.01)),
+      input_tokens: Math.round(events * rnd(400, 900)),
+      output_tokens: Math.round(events * rnd(40, 90)),
+      cache_creation_tokens: Math.round(events * rnd(20, 60)),
+      cache_read_tokens: Math.round(events * rnd(3000, 7000)),
+      cost_usd: Number((events * rnd(0.04, 0.09)).toFixed(2)),
+      sessions: Math.max(events ? 1 : 0, Math.round(events / rnd(90, 180))),
+      avg_ms: rint(140, 900),
+    });
+  }
+  return {
+    days: series,
+    seam_day: utcDay(Date.now() - retention * DAY),
+    retention_days: retention,
+    rollup_from: series[0]?.day ?? null,
+  };
 }
 
 export function sessions(provider?: string): SessionRollup[] {
@@ -287,7 +336,12 @@ export function sessions(provider?: string): SessionRollup[] {
     started_at: now - rint(20, 180) * 60_000, ended_at: i % 3 === 0 ? null : now - rint(1, 20) * 60_000,
     last_seen: now - rint(0, 10) * 60_000, event_count: rint(20, 900), tool_count: rint(10, 500),
     error_count: rint(0, 6), input_tokens: rint(50_000, 1_500_000), output_tokens: rint(5000, 120_000),
-    cache_creation_tokens: 0, cache_read_tokens: 0, cost_usd: Number(rnd(0, 600).toFixed(2)),
+    // Cache reads dominate a real session by an order of magnitude, and the
+    // weighted figure is what the fleet card shows — a demo with both at zero
+    // would demonstrate the one thing this number exists to make visible by
+    // showing none of it.
+    cache_creation_tokens: rint(20_000, 300_000), cache_read_tokens: rint(2_000_000, 40_000_000),
+    equiv_tokens: rint(400_000, 6_000_000), cost_usd: Number(rnd(0, 600).toFixed(2)),
   }));
 }
 
@@ -399,7 +453,7 @@ export function gitGraph(): { lines: GitGraphLine[] } {
 export function gitWorktrees(): { worktrees: GitWorktree[] } {
   return { worktrees: [
     { path: "/home/you/code/shop-api", branch: "main", head: "9f2c1a7", current: true, bare: false, locked: false },
-    { path: "/home/you/code/shop-api-PROJ-42", branch: "feat/PROJ-42-callbacks", head: "3b7d0e2", current: false, bare: false, locked: false },
+    { path: "/home/you/code/shop-api-ORBIT-42", branch: "feat/ORBIT-42-callbacks", head: "3b7d0e2", current: false, bare: false, locked: false },
     { path: "/home/you/code/shop-api-hotfix", branch: "hotfix/cache-ttl", head: "a1c9f34", current: false, bare: false, locked: true },
   ] };
 }
@@ -430,7 +484,7 @@ export function gitStashes(): { stashes: GitStash[] } {
 // --- docker panel (demo is read-only) ---
 export function dockerOverview(): DockerOverview {
   const c = (id: string, name: string, image: string, state: string, status: string, service: string, ports = "") =>
-    ({ id, name, image, state, status, ports, project: "shop", service, runningFor: status, size: "" });
+    ({ id, name, image, state, status, ports, project: "shop", service, workingDir: "/home/demo/code/shop", runningFor: status, size: "" });
   return {
     available: true, writeEnabled: false, version: "27.0.3",
     containers: [
@@ -547,6 +601,38 @@ export function session(id: string): SessionDetail {
   };
 }
 
+/** The demo has no machine behind it, so these are illustrative numbers
+ *  rather than a live reading — chosen to demonstrate what the feature looks
+ *  like when it has something to say, not to claim a real account behind it.
+ *  Anthropic and Codex both get plausible numbers; Antigravity stays
+ *  unavailable, because that gap is a designed part of the feature and the
+ *  demo should show it rather than paper over it. */
+export const providerUsage = (): ProviderUsage[] => {
+  const now = Date.now();
+  return [
+    {
+      provider: "anthropic", label: "Claude", available: true,
+      windows: [
+        { label: "5h", minutes: 300, usedPercent: 34, resetsAt: new Date(now + 2 * 3600_000).toISOString() },
+        { label: "weekly", minutes: 10080, usedPercent: 61, resetsAt: new Date(now + 3 * 86400_000).toISOString() },
+      ],
+      // Anthropic's reading is live, so the demo's is "now" too.
+      observedAt: now,
+    },
+    {
+      provider: "codex", label: "Codex", available: true, plan: "plus",
+      windows: [
+        { label: "weekly", minutes: 10080, usedPercent: 42, resetsAt: new Date(now + 4 * 86400_000).toISOString() },
+      ],
+      // Codex's reading is only as fresh as its last turn — a few hours old
+      // here on purpose, so the age label has something to demonstrate.
+      observedAt: now - 3 * 3600_000,
+    },
+    { provider: "antigravity", label: "Antigravity", available: false, windows: [],
+      note: "Quota not reported." },
+  ];
+};
+
 export function usage() {
   return { available: true, five_hour: { utilization: 34, remaining: 66, resets_at: new Date(Date.now() + 2 * 3600_000).toISOString() }, seven_day: { utilization: 61, remaining: 39, resets_at: new Date(Date.now() + 3 * 86400_000).toISOString() }, fetched_at: Date.now() };
 }
@@ -565,6 +651,40 @@ export function eventsExportUri(fmt: "csv" | "json"): string {
   };
   const rows = evs.map((e) => cols.map((c) => cell((e as unknown as Record<string, unknown>)[c])).join(","));
   return dataUri("text/csv", [cols.join(","), ...rows].join("\n"));
+}
+
+/** The same daily series the chart draws, as a downloadable file. */
+export function dailyExportUri(fmt: "csv" | "json"): string {
+  const h = usageDaily(120);
+  if (fmt === "json") return dataUri("application/json", JSON.stringify(h, null, 2));
+  const cols: (keyof UsageDay)[] = [
+    "day", "events", "tool_calls", "tool_errors", "errors",
+    "input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens",
+    "cost_usd", "sessions", "avg_ms",
+  ];
+  const rows = h.days.map((d) => cols.map((c) => String(d[c])).join(","));
+  return dataUri("text/csv", [cols.join(","), ...rows].join("\n"));
+}
+
+/** A plausible afternoon of writes, for the showcase. */
+export function actions(): { actions: ActionRecord[] } {
+  const now = Date.now();
+  const rows: [string, string, string, boolean, string | null][] = [
+    ["local", "/gate/deny", "Bash · rm -rf ./dist ./node_modules", true, null],
+    ["192.168.1.42", "/prs/merge", "shop-api #482", true, null],
+    ["192.168.1.42", "/gate/allow", "Write · src/checkout/index.ts", true, null],
+    ["local", "/git/discard", "shop-api src/pay.ts", true, null],
+    ["local", "/docker/rm", "shop-api-redis-1", true, null],
+    ["local", "/git/branch-delete", "shop-api feat/coupon-table", true, null],
+    ["local", "/git/push", "agentglass", false, "rejected — remote has commits you do not"],
+    ["local", "/prs/review", "shop-api #468", true, null],
+    ["local", "/git/commit-staged", "agentglass round prices at the cart boundary", true, null],
+  ];
+  return {
+    actions: rows.map(([actor, action, target, ok, detail], i) => ({
+      id: rows.length - i, at: now - i * rnd(4, 40) * 60_000, actor, action, target, ok, detail,
+    })),
+  };
 }
 
 export function skillsExportUri(): string {
@@ -635,6 +755,7 @@ const chk = (name: string, state: PrCheckState, workflow = "CI"): PrCheck =>
 
 const PR_SUMMARIES: PrSummary[] = [
   {
+    mergeable: "MERGEABLE" as const,
     number: 482, title: "Round prices at the cart boundary, not per line",
     author: "rmoreno", state: "OPEN", isDraft: false,
     headRefName: "fix/rounding-boundary", baseRefName: "main",
@@ -645,6 +766,7 @@ const PR_SUMMARIES: PrSummary[] = [
     checks: rollup({ ok: 3, bad: ["e2e (checkout)"], skipped: 1 }), checksLoaded: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 479, title: "Cache the price table per request",
     author: "jkwan", state: "OPEN", isDraft: false,
     headRefName: "perf/price-cache", baseRefName: "main",
@@ -655,6 +777,7 @@ const PR_SUMMARIES: PrSummary[] = [
     checks: rollup({ ok: 5 }), checksLoaded: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 476, title: "Bump bun to 1.1.38",
     author: "acme-bot", state: "OPEN", isDraft: false,
     headRefName: "deps/bun-1.1.38", baseRefName: "main",
@@ -665,6 +788,7 @@ const PR_SUMMARIES: PrSummary[] = [
     checks: rollup({ ok: 5 }), checksLoaded: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 471, title: "Otel spans around the approval gate",
     author: "you", state: "OPEN", isDraft: true,
     headRefName: "feat/gate-spans", baseRefName: "main",
@@ -675,6 +799,7 @@ const PR_SUMMARIES: PrSummary[] = [
     checks: rollup({ ok: 2, pending: 3 }), checksLoaded: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 468, title: "Stabilise the checkout test under load",
     author: "jkwan", state: "OPEN", isDraft: false,
     headRefName: "test/checkout-flake", baseRefName: "main",
@@ -685,6 +810,7 @@ const PR_SUMMARIES: PrSummary[] = [
     checks: rollup({ ok: 2, bad: ["integration (postgres)"], skipped: 1 }), checksLoaded: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 465, title: "Retry the charge before failing the order",
     author: "you", state: "OPEN", isDraft: false,
     headRefName: "fix/charge-retry", baseRefName: "main",
@@ -696,6 +822,7 @@ const PR_SUMMARIES: PrSummary[] = [
     isCurrentBranch: true,
   },
   {
+    mergeable: "MERGEABLE" as const,
     number: 461, title: "Drop the legacy coupon table",
     author: "t-okafor", state: "OPEN", isDraft: false,
     headRefName: "chore/drop-coupons-v1", baseRefName: "main",
@@ -775,7 +902,7 @@ const PR_482_DETAIL: PrDetail = {
     { checked: true, text: "Backfill script for `orders_2024`" },
     { checked: false, text: "Soak on staging for 24h" },
   ],
-  reviewers: ["you", "jkwan"], assignees: ["rmoreno"],
+  reviewers: [{ login: "you" }, { login: "jkwan" }], assignees: ["rmoreno"],
   reviews: [
     { author: "rmoreno", isBot: false, state: "CHANGES_REQUESTED", submittedAt: ago(118),
       body: "One blocker on legacy carts — see the thread on `pricing.ts`. Everything else reads well." },
@@ -818,7 +945,7 @@ const PR_EXTRA: Record<number, Partial<PrDetail>> = {
   479: {
     body: "Memoises the price table for the life of a request. p95 on `/checkout` goes 73ms → 41ms on staging.",
     mergeable: "MERGEABLE", mergeState: "CLEAN",
-    reviewers: ["rmoreno"],
+    reviewers: [{ login: "rmoreno" }],
     reviews: [{ author: "rmoreno", isBot: false, state: "APPROVED", submittedAt: ago(50), body: "Nice. Ship it." }],
     files: [
       { path: "src/services/pricing.ts", additions: 28, deletions: 9, status: "modified", comments: 0 },
@@ -846,7 +973,7 @@ const PR_EXTRA: Record<number, Partial<PrDetail>> = {
   468: {
     body: "The checkout e2e fails about one run in nine under parallel load. Serialises the fixture teardown.",
     mergeable: "MERGEABLE", mergeState: "UNSTABLE",
-    reviewers: ["you"],
+    reviewers: [{ login: "you" }],
     reviews: [{ author: "t-okafor", isBot: false, state: "CHANGES_REQUESTED", submittedAt: ago(280),
       body: "Serialising teardown hides it rather than fixing it — the fixture leaks a connection." }],
     files: [
@@ -1008,4 +1135,184 @@ export function prDetail(n: number): { ok: boolean; detail?: PrDetail; error?: s
 }
 export function prDiff(n: number): { ok: boolean; text?: string; error?: string } {
   return n === 482 ? { ok: true, text: PR_482_DIFF } : { ok: true, text: "" };
+}
+
+// --- Tasks: GitHub issues, fabricated for the demo -------------------------
+const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+const ISSUES: IssueDetail[] = [
+  {
+    number: 214, title: "Cart total is a cent low on 3-for-2 bundles", state: "OPEN", author: "mira",
+    labels: [{ name: "bug", color: "d73a4a" }, { name: "pricing", color: "0e8a16" }], assignees: ["you"], comments: 4,
+    updatedAt: isoAgo(2 * 3600_000), url: "https://github.com/acme/shop-api/issues/214",
+    createdAt: isoAgo(2 * 86400_000), milestone: "Checkout hardening", work: null,
+    body: "Rounding runs per line and again on the subtotal. Repro: three of SKU-8841 under the 3-for-2 promo — the total lands a cent low. Round once, on the order total.",
+  },
+  {
+    number: 209, title: "Idempotency keys on the payments webhook", state: "OPEN", author: "you",
+    labels: [{ name: "reliability", color: "1d76db" }], assignees: [], comments: 1,
+    updatedAt: isoAgo(6 * 3600_000), url: "https://github.com/acme/payments-svc/issues/209",
+    createdAt: isoAgo(4 * 86400_000), milestone: null,
+    work: { number: 209, repo: "payments-svc", branch: "209-webhook-idempotency", path: "/home/dev/code/payments-svc-209", mode: "worktree", startedAt: Date.now() - 3600_000 },
+    body: "A retried Stripe event double-credits the wallet. Store the event id and short-circuit a repeat inside the same transaction.",
+  },
+  {
+    number: 198, title: "Inventory count drifts after a partial refund", state: "OPEN", author: "ana",
+    labels: [{ name: "bug", color: "d73a4a" }, { name: "inventory", color: "5319e7" }], assignees: ["you"], comments: 7,
+    updatedAt: isoAgo(26 * 3600_000), url: "https://github.com/acme/inventory-svc/issues/198",
+    createdAt: isoAgo(9 * 86400_000), milestone: "Checkout hardening", work: null,
+    body: "A partial refund restocks the full quantity. The restock should mirror the refunded lines, not the original order.",
+  },
+  {
+    number: 187, title: "Skeleton the product grid while it loads", state: "OPEN", author: "you",
+    labels: [{ name: "ux", color: "fbca04" }, { name: "good first issue", color: "7057ff" }], assignees: [], comments: 0,
+    updatedAt: isoAgo(3 * 86400_000), url: "https://github.com/acme/shop-web/issues/187",
+    createdAt: isoAgo(5 * 86400_000), milestone: null, work: null,
+    body: "The grid pops in. A skeleton for the first paint would settle the layout.",
+  },
+  {
+    number: 176, title: "Checkout 500s on an empty cart instead of redirecting", state: "OPEN", author: "sam",
+    labels: [{ name: "bug", color: "d73a4a" }], assignees: [], comments: 2,
+    updatedAt: isoAgo(4 * 86400_000), url: "https://github.com/acme/shop-web/issues/176",
+    createdAt: isoAgo(7 * 86400_000), milestone: null, work: null,
+    body: "Hitting /checkout with nothing in the cart throws. It should bounce to the cart with a note.",
+  },
+];
+export function issues(state = "open", q = "", assignee = ""): IssuesReport {
+  const t = q.trim().toLowerCase();
+  const rows = ISSUES
+    .filter((i) => state === "all" || i.state.toLowerCase() === state)
+    .filter((i) => !t || i.title.toLowerCase().includes(t))
+    .filter((i) => !assignee || i.assignees.includes("you"))
+    .map((i): IssueRow => ({
+      number: i.number, title: i.title, state: i.state, author: i.author,
+      labels: i.labels, assignees: i.assignees, comments: i.comments, updatedAt: i.updatedAt, url: i.url,
+    }));
+  return { ok: true, issues: rows };
+}
+export function issueDetail(n: number): { ok: boolean; issue?: IssueDetail; error?: string } {
+  const d = ISSUES.find((i) => i.number === n);
+  return d ? { ok: true, issue: d } : { ok: false, error: "no such issue in the demo" };
+}
+export function issuesWork(): { work: IssueWork[] } {
+  return { work: ISSUES.map((i) => i.work).filter((w): w is IssueWork => !!w) };
+}
+
+// --- Files: a checkout's tree, fabricated for the demo ---------------------
+export function filesTree(rel = ""): TreeReport {
+  const e = (name: string, dir: boolean, status?: string, size?: number): FileEntry => ({ name, rel: rel ? `${rel}/${name}` : name, dir, status, size });
+  const T: Record<string, FileEntry[]> = {
+    "": [e("src", true), e("public", true), e("tests", true), e("package.json", false, "M", 1240), e("README.md", false, undefined, 3810), e("tsconfig.json", false, undefined, 410), e("vite.config.ts", false, undefined, 690), e(".gitignore", false, undefined, 120)],
+    "src": [e("components", true), e("lib", true), e("routes", true), e("App.tsx", false, "M", 4102), e("main.tsx", false, undefined, 620), e("index.css", false, "?", 1840)],
+    "src/components": [e("Cart.tsx", false, "M", 5211), e("Checkout.tsx", false, "A", 3980), e("ProductCard.tsx", false, undefined, 2140), e("Header.tsx", false, undefined, 1180)],
+    "src/lib": [e("pricing.ts", false, "M", 2960), e("api.ts", false, undefined, 5320), e("format.ts", false, undefined, 880)],
+  };
+  return { ok: true, root: "/home/dev/code/shop-web", rel, entries: T[rel] ?? T[""] };
+}
+/**
+ * A markdown document, so the demo can show the viewer at all.
+ *
+ * It used to answer "not available in the demo" for every file, which made the
+ * rendered face — the headings, the tables, the reading width, the find bar —
+ * invisible in the one build that exists to show what this app looks like. The
+ * text is fabricated for the same reason every other fixture here is: a real
+ * one would be somebody's Tuesday.
+ */
+export function filesRead(rel: string): { ok: boolean; rel: string; text: string; bytes: number; error?: string } {
+  if (!/\.(md|markdown|mdx)$/i.test(rel)) {
+    return { ok: false, rel, text: "", bytes: 0, error: "only markdown is readable in the demo" };
+  }
+  const text = [
+    "# Checkout rebuild — status",
+    "",
+    "Living document. Fixed structure; updated on a weekly review cadence.",
+    "",
+    "## 1. Where the work stands",
+    "",
+    "The cart rewrite landed behind a flag and the **risk** of a silent regression is",
+    "carried by the checkout suite, which now runs on every push.",
+    "",
+    "| Area | Owner | State |",
+    "| --- | --- | --- |",
+    "| Cart | Dana | done |",
+    "| Checkout | Priya | in review |",
+    "| Pricing | Sam | at risk |",
+    "",
+    "## 2. Open risks",
+    "",
+    "1. A coupon applied twice is not rejected — see `src/lib/pricing.ts`.",
+    "2. The receipt email renders the old total when a discount is removed.",
+    "3. Session expiry during payment leaves the order in `pending` forever.",
+    "",
+    "## 3. What happens next",
+    "",
+    "- Land the idempotency key on the charge endpoint.",
+    "- Re-run the upgrade suite against the staging tier.",
+    "- Decide whether the legacy plan mapping stays for another release.",
+  ].join("\n");
+  return { ok: true, rel, text, bytes: text.length };
+}
+
+export function filesFind(q: string): FindReport {
+  const all = ["src/components/Cart.tsx", "src/components/Checkout.tsx", "src/lib/pricing.ts", "src/routes/checkout.ts", "package.json", "README.md"];
+  // Folders too, and derived the same way the git fallback derives them: every
+  // prefix of every path. A demo that answered with files only would be showing
+  // a search this app no longer has.
+  const dirsAll = [...new Set(all.flatMap((f) => {
+    const parts = f.split("/");
+    return parts.slice(0, -1).map((_, n) => parts.slice(0, n + 1).join("/"));
+  }))].sort();
+  const t = q.trim().toLowerCase();
+  return {
+    ok: true,
+    files: t ? all.filter((f) => f.toLowerCase().includes(t)) : all,
+    dirs: t ? dirsAll.filter((d) => d.toLowerCase().includes(t)) : dirsAll,
+    truncated: false, via: "demo",
+  };
+}
+
+// --- Ports: what is listening on this (fictional) dev machine ---------------
+const GB = 1024 ** 3, MB = 1024 ** 2;
+export function machinePorts(): PortsReport {
+  const ports: PortEntry[] = [
+    { port: 5173, addr: "127.0.0.1", proc: "vite", pid: 48213, cwd: "/home/dev/code/shop-web", mine: true, ageSec: 5400, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 48090, name: "bun" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 3000, addr: "127.0.0.1", proc: "bun", pid: 48090, cwd: "/home/dev/code/shop-api", mine: true, ageSec: 5460, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 8080, addr: "0.0.0.0", proc: "node", pid: 47771, cwd: "/home/dev/code/inventory-svc", mine: true, ageSec: 12600, fromAgent: true, cwdGone: false, publicBind: true, exeGone: false, ancestry: [{ pid: 46050, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 4317, addr: "127.0.0.1", proc: "otelcol", pid: 4102, cwd: null, mine: true, ageSec: 86400, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, ancestry: [] },
+    { port: 5432, addr: "127.0.0.1", proc: "postgres", pid: 1893, cwd: null, mine: false, ageSec: 259200, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, ancestry: [] },
+    { port: 9229, addr: "127.0.0.1", proc: "node", pid: 41220, cwd: "/home/dev/code/payments-svc-209", mine: true, ageSec: 640, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 41100, name: "bash" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 4173, addr: "127.0.0.1", proc: "node", pid: 30112, cwd: "/home/dev/code/shop-web-old", mine: true, ageSec: 46800, fromAgent: true, cwdGone: true, publicBind: false, exeGone: false, ancestry: [{ pid: 30000, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+  ];
+  return { ports, mine: ports.filter((p) => p.mine).length, external: ports.filter((p) => p.addr === "0.0.0.0").length };
+}
+
+// --- Resources: this machine's load and the processes that are ours ---------
+export function machineResources(_limit = 40): ResourceReport {
+  const P = (pid: number, ppid: number, comm: string, cmd: string, cpu: number, rssMB: number, cwd: string | null, ours: boolean): ProcEntry =>
+    ({ pid, ppid, comm, cmd, cpu, rss: Math.round(rssMB * MB), cwd, ours });
+  const procs: ProcEntry[] = [
+    P(48213, 48090, "node", "vite dev --host 127.0.0.1", 41.2, 512, "/home/dev/code/shop-web", true),
+    P(48090, 1, "bun", "bun run --hot src/index.ts", 22.8, 288, "/home/dev/code/shop-api", true),
+    P(41220, 1, "node", "node --inspect dist/server.js", 63.4, 421, "/home/dev/code/payments-svc-209", true),
+    P(47771, 1, "node", "node build/index.js", 8.1, 196, "/home/dev/code/inventory-svc", true),
+    P(46001, 1, "claude", "claude --dangerously-skip-permissions", 4.7, 174, "/home/dev/code/shop-web", true),
+    P(1893, 1, "postgres", "postgres -D /var/lib/postgres/data", 2.3, 640, null, false),
+    P(9931, 1, "chrome", "chrome --type=renderer", 17.9, 903, null, false),
+  ];
+  const oursRss = procs.filter((p) => p.ours).reduce((s, p) => s + p.rss, 0);
+  const oursCpu = procs.filter((p) => p.ours).reduce((s, p) => s + (p.cpu ?? 0), 0);
+  return {
+    procs, totalRss: procs.reduce((s, p) => s + p.rss, 0), totalCpu: procs.reduce((s, p) => s + (p.cpu ?? 0), 0),
+    oursRss, oursCpu, seen: procs.length, rated: true,
+    machine: { cpu: 38.6, cores: 16, memUsed: Math.round(18.4 * GB), memTotal: 32 * GB, swapUsed: Math.round(1.2 * GB), swapTotal: 8 * GB, tempC: 57, load1: 3.7, diskFree: Math.round(411.5 * GB), diskTotal: 1024 * GB },
+  };
+}
+export function machineSpace(root = "/home/dev/code/shop-web"): SpaceReport {
+  const dirs: SpaceDir[] = [
+    { path: `${root}/node_modules`, name: "node_modules", bytes: Math.round(1.42 * GB), reclaimable: true },
+    { path: `${root}/dist`, name: "dist", bytes: Math.round(210 * MB), reclaimable: true },
+    { path: `${root}/.vite`, name: ".vite", bytes: Math.round(96 * MB), reclaimable: true },
+    { path: `${root}/src`, name: "src", bytes: Math.round(18 * MB), reclaimable: false },
+    { path: `${root}/public`, name: "public", bytes: Math.round(7 * MB), reclaimable: false },
+  ];
+  return { root, bytes: dirs.reduce((s, d) => s + d.bytes, 0), freeable: dirs.filter((d) => d.reclaimable).reduce((s, d) => s + d.bytes, 0), dirs };
 }

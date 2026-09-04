@@ -9,7 +9,10 @@ import { api, ChatStreamError } from "./api.ts";
 import { loadChats, saveChats } from "./chatPersist.ts";
 import { chatEnginePref } from "./chatEnginePref.ts";
 import { paneStillAsking } from "./paneScreen.ts";
-import type { ChatImage, WatchEvent, ChatEngine, ChatEffort } from "../../../shared/types.ts";
+import { mergeReplayed } from "./chatReplay.ts";
+import { applyCodexFrame } from "./codexFrames.ts";
+import { applyAntigravityFrame } from "./antigravityFrames.ts";
+import type { ChatImage, WatchEvent, ChatEngine, ChatEffort, SessionDetail } from "../../../shared/types.ts";
 
 /** A pasted image waiting in the composer. `url` is an object URL for the
  *  thumbnail; it is revoked when the attachment is dropped or sent, since
@@ -114,6 +117,18 @@ export type ChatUsage = {
 /** A message typed during someone else's turn, waiting for its own. */
 export type QueuedTurn = { id: string; text: string; images: ChatImage[] };
 
+/** The agents this panel can drive, and everything that differs between them.
+ *  Defined in agents.ts so chatPersist.ts can share it without a cycle, and
+ *  re-exported here because this is where the rest of the app already looks. */
+import { AGENTS, DEFAULT_MODEL, DEFAULT_MODE } from "./agents.ts";
+import type { AgentKind } from "./agents.ts";
+export {
+  AGENTS, asAgent,
+  DEFAULT_MODEL, DEFAULT_MODE, DEFAULT_CODEX_MODEL, DEFAULT_CODEX_MODE,
+  DEFAULT_ANTIGRAVITY_MODEL, DEFAULT_ANTIGRAVITY_MODE,
+} from "./agents.ts";
+export type { AgentKind, AgentSpec } from "./agents.ts";
+
 /** Press one key in a chat's pane and take in what it drew next.
  *
  *  Lives here rather than in the panel because two things call it: the buttons
@@ -155,14 +170,24 @@ export async function answerPane(id: string, key: string): Promise<void> {
  *
  *  Shared by the send path and the header so the two can never disagree — the
  *  header claiming one engine while the turn used the other is the bug this
- *  whole function exists to end. */
-export function engineFor(chat: Pick<Chat, "sessionId" | "engine">): ChatEngine | undefined {
+ *  whole function exists to end.
+ *
+ *  An agent that cannot run in a pane answers `process` whatever the preference
+ *  says. The preference is global and the send path already ignores it for
+ *  anything but Claude, so without this the header spoke for a pane the turn
+ *  was never going to open: a Codex chat offering to copy an attach command,
+ *  and a "⧉ tmux on send" chip that was simply not true. `agent` is optional so
+ *  a caller holding a bare `{sessionId, engine}` — the tests, and any older
+ *  call site — still reads as Claude, which is what it was. */
+export function engineFor(chat: Pick<Chat, "sessionId" | "engine"> & { agent?: AgentKind }): ChatEngine | undefined {
+  if (chat.agent && !AGENTS[chat.agent].canPane) return "process";
   return chat.sessionId ? chat.engine : (chatEnginePref() ?? undefined);
 }
 
 export type Chat = {
   id: string;
   cwd: string;
+  agent: AgentKind;
   /** What we ask for: the dropdown's pick, sent with every turn. */
   model: string;
   /** What the CLI reported running, off the `init` frame. Differs from `model`
@@ -220,6 +245,18 @@ export type Chat = {
    *  `claude` that has never been logged in. Distinct from a failed turn:
    *  retrying changes nothing until the command is run. */
   setupNeeded?: { command: string; why: string };
+  /** Keep this chat's pane through any amount of idleness.
+   *
+   *  The engine reclaims a warm CLI after 30 idle minutes, which is right for
+   *  the four chats you opened to ask one question each and wrong for the one
+   *  you are living in — step away for lunch and the session you care about is
+   *  exactly the one reclaimed. Server-side state (see tmuxpane.ts); this is the
+   *  client's copy of it, so the toggle can render without a round trip.
+   *
+   *  Never persisted with the chat: it is a statement about a process that is
+   *  running now, and a pin restored for a pane that no longer exists is a
+   *  switch that is on and does nothing. */
+  panePinned?: boolean;
   /** An interactive prompt waiting in this chat's pane — a `/model` picker and
    *  the like. Held as state rather than left as text in the reply, because it
    *  is a thing to answer, not a thing to read: the screen redraws as keys are
@@ -235,9 +272,6 @@ export type Chat = {
 const chats = new Map<string, Chat>();
 const subs = new Set<() => void>();
 let seq = 0;
-
-export const DEFAULT_MODEL = "claude-opus-5";
-export const DEFAULT_MODE = "default";
 
 // A cached snapshot, rebuilt only when something actually changes.
 //
@@ -280,7 +314,15 @@ export function setActiveChatId(id: string) {
   if (id === activeChatId) return;
   activeChatId = id;
   persistSoon();
+  // Surfaces outside the panel (the notch's quota gauge) need to hear about
+  // this too, not just disk. Without it a subscriber sees the old active
+  // chat until some unrelated chat event happens to fire an emit.
+  emit();
 }
+
+/** Which chat the panel is showing. Exported so surfaces outside the panel —
+ *  the notch's quota gauge — can tell which agent you are actually driving. */
+export const getActiveChatId = (): string => activeChatId;
 
 /**
  * Ask the panel to bring a chat to the front.
@@ -297,6 +339,36 @@ export function setActiveChatId(id: string) {
  */
 let focusReq = { id: "", n: 0 };
 export function requestChatFocus(id: string) { focusReq = { id, n: focusReq.n + 1 }; emit(); }
+
+/**
+ * Put a prompt in front of Claude, from a panel that is not the chat.
+ *
+ * Three calls, and missing any one of them fails differently. `newChat` and
+ * `update` fill the tab in; `setActiveChatId` records the selection; and
+ * `requestChatFocus` is the one that actually moves the panel — the chat panel
+ * owns its own selection in component state and reads the stored id only once,
+ * at mount, then writes its own back over it. A caller that set the id and
+ * stopped there opened the chat view on whatever tab was already there, and its
+ * seeded prompt sat in a tab nobody was looking at, so the button read as doing
+ * nothing at all. That was exactly the git panel's conflict handoff.
+ *
+ * It lives here rather than in one of the panels because the sequence is the
+ * knowledge, and the third caller to reinvent it would get it wrong the same
+ * way the second did.
+ *
+ * A seeded tab that was never sent is REUSED rather than duplicated: pressing
+ * the button twice means "show me that again", not "make another one". Nothing
+ * is sent — starting a run that costs real tokens because a button was clicked
+ * one pane over is not a decision this should make for anybody.
+ */
+export function seedChat(cwd: string, prompt: string, title: string): Chat {
+  const spare = listChats().find((c) => c.cwd === cwd && c.title === title && !c.messages.length && !c.sending);
+  const chat = spare ?? newChat(cwd);
+  update(chat.id, (c) => { c.draft = prompt; c.title = title; });
+  setActiveChatId(chat.id);
+  requestChatFocus(chat.id);
+  return chat;
+}
 export const chatFocusRequest = () => focusReq;
 
 // Restored synchronously, at module load, on purpose. The panel seeds a blank
@@ -335,10 +407,11 @@ export function newChat(
   model = DEFAULT_MODEL,
   mode = DEFAULT_MODE,
   resume?: { sessionId: string; title?: string },
+  agent: AgentKind = "claude",
 ): Chat {
   const id = `c${++seq}-${Date.now().toString(36)}`;
   const chat: Chat = {
-    id, cwd, model, mode,
+    id, cwd, agent, model, mode,
     // Chosen once, at birth. The engine decides where this chat's session lives,
     // so switching it later would either strand a warm CLI or a live turn — the
     // preference is a default for new chats, never a control over old ones.
@@ -371,7 +444,23 @@ export function newChat(
  *  still has the real context either way. */
 async function hydrate(chatId: string, sessionId: string) {
   try {
-    const s = await api.session(sessionId);
+    // Where a resumed thread's history comes from. Claude Code's is in this
+    // app's own store, put there by hooks. Codex reaches the fleet over
+    // OpenTelemetry instead, and those records carry the tool calls but not a
+    // word of the conversation — replaying from them would hand you a resumed
+    // thread with every sentence missing. Codex keeps its own rollout on disk,
+    // which has both, so that is what the server reads for it. Same timeline
+    // shape either way, which is why nothing below has to know.
+    //
+    // Antigravity has neither: its conversations are protobuf blobs inside a
+    // SQLite database on an undocumented internal schema, so there is nothing
+    // here to replay from. It never reaches this path in practice — nothing
+    // lists an Antigravity session to adopt — but a chat carrying an id from
+    // somewhere else must not ask Claude's endpoint about it.
+    const agent = chats.get(chatId)?.agent ?? "claude";
+    if (!AGENTS[agent].hasTranscript) return;
+    const s: { timeline?: SessionDetail["timeline"]; conversation?: SessionDetail["conversation"] } | null =
+      agent === "codex" ? await api.codexTranscript(sessionId) : await api.session(sessionId);
     if (!s) return;
     /*
      * The same timeline the session modal renders — messages *and* the tools
@@ -425,8 +514,11 @@ async function hydrate(chatId: string, sessionId: string) {
     if (!msgs.length) return;
     update(chatId, (c) => {
       // Anything typed while this was in flight stays last — the reply to a
-      // resumed thread must not end up above the thread it replies to.
-      c.messages = [...msgs, ...c.messages];
+      // resumed thread must not end up above the thread it replies to. Anything
+      // older than the replay is a second copy of a turn the transcript already
+      // carries, and the transcript is the one you can check by attaching to
+      // the pane, so it is the one that wins.
+      c.messages = mergeReplayed(msgs, c.messages);
       // Everything up to here is now drawn, so the live stream picks up from
       // the far side of it rather than replaying it back on top.
       c.liveFrom = Math.max(c.liveFrom ?? 0, msgs[msgs.length - 1]?.ts ?? 0);
@@ -454,6 +546,20 @@ const APPLIED_MAX = 8000;
  * `UserPromptSubmit` has the prompt, `Stop` the assistant's reply, and the
  * tool pair the call and its output — so this is a matter of routing, not of
  * new plumbing. Called from the one place `useLive` is consumed.
+ *
+ * That last paragraph is true of Claude Code and only partly true of Codex, and
+ * the difference is worth stating rather than discovering. Codex reaches this
+ * app over OpenTelemetry rather than over hooks, and its log records carry the
+ * shape of a turn but not its words: `logRecordToEvent` in server/src/otlp.ts
+ * can build `PreToolUse` / `PostToolUse` / `Turn complete` out of them, and
+ * there is nothing there to build `UserPromptSubmit` or `Stop` from. So a Codex
+ * session watched from here fills in its tool rows and stays silent between
+ * them.
+ *
+ * It matters less than it sounds. A chat's own turns are drawn from the
+ * `/codex/send` response, which carries everything; this path only covers a
+ * session *adopted* from the fleet, and for those the conversation is replayed
+ * from Codex's own rollout on disk when the chat opens (`hydrate`).
  */
 export function applyLiveEvent(ev: WatchEvent) {
   if (applied.has(ev.id)) return;
@@ -586,6 +692,28 @@ export function clearAttention(id: string) {
 export const chatResuming = (sessionId: string): Chat | undefined =>
   [...chats.values()].find((c) => c.sessionId === sessionId);
 
+/** Whether this chat can still change agent: it holds no thread and has said
+ *  nothing, so nothing about it is bound to a particular CLI yet. */
+export const isFresh = (c: Chat): boolean => !c.sessionId && c.messages.length === 0 && !c.sending;
+
+/**
+ * Point a not-yet-started chat at the other CLI.
+ *
+ * The model and the mode go with it. Both are that agent's own vocabulary —
+ * `claude-opus-5` means nothing to `codex exec -m`, and `acceptEdits` is not
+ * one of its sandboxes — so carrying them across would leave the dropdowns
+ * displaying a choice the server would quietly replace with its default. A
+ * control that lies about what is about to run is worse than no control.
+ */
+export function switchAgent(id: string, agent: AgentKind) {
+  const c = chats.get(id);
+  if (!c || c.agent === agent || !isFresh(c)) return;
+  update(id, (x) => {
+    x.agent = agent;
+    x.model = AGENTS[agent].defaultModel;
+    x.mode = AGENTS[agent].defaultMode;
+  });
+}
 
 /** Name a chat by hand. The derived title is a fallback for chats you never
  *  named; once you have, nothing should quietly replace it. */
@@ -633,6 +761,43 @@ export function update(id: string, fn: (c: Chat) => void) {
   emit();
 }
 
+/**
+ * Pin or unpin a chat's pane, and remember what the server said.
+ *
+ * Optimistic, then corrected: the toggle is the kind of control that has to
+ * move under the thumb, and a pin that fails is a pane that gets reclaimed
+ * half an hour later rather than anything immediate.
+ */
+export async function setPanePinned(id: string, pinned: boolean): Promise<void> {
+  const chat = chats.get(id);
+  if (!chat?.sessionId) return;
+  update(id, (c) => { c.panePinned = pinned; });
+  const r = await api.chatPanePin(chat.sessionId, pinned).catch(() => null);
+  if (!r?.ok) update(id, (c) => { c.panePinned = !pinned; });
+}
+
+/**
+ * Ask the server which panes are actually pinned, and adopt the answer.
+ *
+ * The pin lives on the server, and deliberately does not persist with the chat
+ * — it is a statement about a process that is running now. So after a reload
+ * the client knows nothing about it, and a button showing "not pinned" over a
+ * pane that is pinned is the same lie as the reverse. This is the one read that
+ * makes the toggle tell the truth.
+ */
+export async function hydratePanePins(): Promise<void> {
+  const ids = [...chats.values()].map((c) => c.sessionId).filter(Boolean);
+  if (!ids.length) return;
+  const r = await api.chatPanes(ids).catch(() => null);
+  if (!r) return;
+  const on = new Set(r.panes.filter((p) => p.pinned).map((p) => p.name));
+  for (const c of chats.values()) {
+    if (!c.sessionId) continue;
+    const want = on.has(c.sessionId);
+    if (c.panePinned !== want) update(c.id, (x) => { x.panePinned = want; });
+  }
+}
+
 const titleOf = (s: string) => {
   const t = s.trim().split("\n")[0].slice(0, 48);
   return t.length ? t : "new chat";
@@ -644,6 +809,41 @@ const titleOf = (s: string) => {
  * `activeId` decides whether the reply counts as unread — a chat answering in
  * the background should say so, and the one on screen shouldn't.
  */
+/**
+ * Sessions the server says are mid-turn, refreshed by the panel.
+ *
+ * A session has exactly one writer. This browser knows about its own turns
+ * (`chat.sending`) and nothing about a turn started from the phone or from a
+ * terminal — and sending into one of those interrupts it and loses both
+ * answers. The server spawned the process, so it is the one that knows; see
+ * server/src/chat.ts and GET /chat/active.
+ */
+let activeElsewhere = new Set<string>();
+
+export function setActiveTurns(ids: string[]): void {
+  const next = new Set(ids);
+  // Only wake the UI when the answer actually changed: this is polled.
+  if (next.size === activeElsewhere.size && [...next].every((i) => activeElsewhere.has(i))) return;
+  const freed = [...activeElsewhere].filter((i) => !next.has(i));
+  activeElsewhere = next;
+  emit();
+  // Somebody else's turn just ended. Anything held for that session goes now —
+  // without this the queue would wait for a turn of ours that never comes.
+  for (const sid of freed) {
+    for (const c of chats.values()) {
+      if (c.sessionId !== sid || c.sending || !c.queued.length) continue;
+      const q = c.queued[0]!;
+      update(c.id, (x) => { x.queued = x.queued.filter((t) => t.id !== q.id); });
+      void send(c.id, q.text, () => activeChatId === c.id, [], q.images);
+    }
+  }
+}
+
+/** Is this chat's session being written by someone other than this tab? */
+export function busyElsewhere(chat: Pick<Chat, "sessionId" | "sending">): boolean {
+  return !!chat.sessionId && !chat.sending && activeElsewhere.has(chat.sessionId);
+}
+
 export async function send(id: string, text: string, isActive: () => boolean, allowedTools: string[] = [], queuedImages?: ChatImage[]) {
   const chat = chats.get(id);
   const msg = text.trim();
@@ -655,6 +855,16 @@ export async function send(id: string, text: string, isActive: () => boolean, al
   // is being written next.
   const images: ChatImage[] = queuedImages ?? (chat ? chat.attachments.map((a) => ({ mediaType: a.mediaType, data: a.data })) : []);
   if (!chat || (!msg && !images.length) || chat.sending || !chat.cwd) return;
+
+  // Someone else is mid-turn on this session — the phone, a terminal, another
+  // tab. Sending now interrupts their turn and loses this message with it, so
+  // it goes in the queue and leaves when the session is free. The server would
+  // refuse it anyway (409 turn_in_flight); this is the same answer without the
+  // round trip and without a message disappearing on the way.
+  if (busyElsewhere(chat)) {
+    enqueue(id, msg);
+    return;
+  }
 
   update(id, (c) => {
     // A name you chose outranks one derived from the first message.
@@ -676,6 +886,57 @@ export async function send(id: string, text: string, isActive: () => boolean, al
 
   const ac = new AbortController();
   update(id, (c) => { c.abort = ac; });
+
+  /** How a turn that never started, or one the server had to give up on,
+   *  reaches the chat. Shared by both agents: `agx_error` is this server's own
+   *  frame, wrapped around whichever CLI it was driving, so the handling is the
+   *  same on either side. */
+  const onAgxError = (o: Record<string, unknown>) => {
+    update(id, (c) => {
+      const last = c.messages[c.messages.length - 1];
+      if (last?.role === "assistant") { last.text += `\n[error] ${String(o.error)}`; last.streaming = false; }
+      // A setup failure isn't a turn that went wrong — it's a turn that never
+      // started, and it will fail identically every time until you do the one
+      // thing it names. Raise it as attention so the chat says it needs you
+      // rather than just going quiet.
+      // A picker in the pane is answerable from here, so it is raised as
+      // something to act on rather than appended to the reply as prose. The
+      // screen the server sent is the starting frame; each key sent back
+      // returns the next one.
+      if (o.errorType === "pane_needs_you") {
+        const text = String(o.error ?? "");
+        const screen = text.slice(text.indexOf("\n\n") + 2);
+        c.paneNeedsYou = { screen: screen.slice(screen.indexOf("\n\n") + 2) || screen };
+        c.attention = "blocked";
+        const last = c.messages[c.messages.length - 1];
+        // The prose above the screen is worth keeping; the screen itself is
+        // about to be drawn properly, so it does not belong in the text too.
+        if (last?.role === "assistant") last.text = last.text.split("\n\n")[0];
+        return;
+      }
+      if (typeof o.setupCommand === "string") {
+        c.setupNeeded = { command: o.setupCommand, why: String(o.error ?? "") };
+        c.attention = "blocked";
+      }
+    });
+  };
+
+  /** Codex's and Antigravity's frames, whose whole translations live in
+   *  codexFrames.ts and antigravityFrames.ts. Every concern around them — the
+   *  queue, `sending`, abort, attention — is shared with the Claude path below
+   *  and stays here.
+   *
+   *  `agx_error` is this server's own frame rather than either CLI's, so it is
+   *  peeled off before the translator sees it. */
+  const framed = (apply: (c: Chat, o: Record<string, unknown>) => void) => (o: Record<string, unknown>) => {
+    if (o.type === "agx_error") { onAgxError(o); return; }
+    update(id, (c) => {
+      apply(c, o);
+      if (!isActive()) c.unread = true;
+    });
+  };
+  const onCodexEvent = framed(applyCodexFrame);
+  const onAntigravityEvent = framed(applyAntigravityFrame);
 
   const toolNames = new Map<string, string>();
   const onEvent = (o: Record<string, unknown>) => {
@@ -801,33 +1062,7 @@ export async function send(id: string, text: string, isActive: () => boolean, al
         if (tool) update(id, (c) => { c.blockedTool = tool; c.attention = "blocked"; });
       }
     } else if (t === "agx_error") {
-      update(id, (c) => {
-        const last = c.messages[c.messages.length - 1];
-        if (last?.role === "assistant") { last.text += `\n[error] ${String(o.error)}`; last.streaming = false; }
-        // A setup failure isn't a turn that went wrong — it's a turn that never
-        // started, and it will fail identically every time until you do the one
-        // thing it names. Raise it as attention so the chat says it needs you
-        // rather than just going quiet.
-        // A picker in the pane is answerable from here, so it is raised as
-        // something to act on rather than appended to the reply as prose. The
-        // screen the server sent is the starting frame; each key sent back
-        // returns the next one.
-        if (o.errorType === "pane_needs_you") {
-          const text = String(o.error ?? "");
-          const screen = text.slice(text.indexOf("\n\n") + 2);
-          c.paneNeedsYou = { screen: screen.slice(screen.indexOf("\n\n") + 2) || screen };
-          c.attention = "blocked";
-          const last = c.messages[c.messages.length - 1];
-          // The prose above the screen is worth keeping; the screen itself is
-          // about to be drawn properly, so it does not belong in the text too.
-          if (last?.role === "assistant") last.text = last.text.split("\n\n")[0];
-          return;
-        }
-        if (typeof o.setupCommand === "string") {
-          c.setupNeeded = { command: o.setupCommand, why: String(o.error ?? "") };
-          c.attention = "blocked";
-        }
-      });
+      onAgxError(o);
     }
   };
 
@@ -851,7 +1086,19 @@ export async function send(id: string, text: string, isActive: () => boolean, al
 
   let broke = false;
   try {
-    await api.chatStream({ cwd: chat.cwd, message: msg, model: chat.model, mode: chat.mode, effort: chat.effort, resumeId: chat.sessionId, allowedTools, images, engine }, onEvent, ac.signal);
+    // Neither of the other two takes an allowlist (Codex draws its line around
+    // the filesystem, Antigravity decides per call with its own modes) or pasted
+    // images (both attach them as file paths), so neither is sent rather than
+    // being sent and ignored. The pane engine is Claude's too — a Codex or
+    // Antigravity turn is always the streamed subprocess.
+    const turn = { cwd: chat.cwd, message: msg, model: chat.model, mode: chat.mode, resumeId: chat.sessionId };
+    if (chat.agent === "codex") {
+      await api.codexStream(turn, onCodexEvent, ac.signal);
+    } else if (chat.agent === "antigravity") {
+      await api.antigravityStream(turn, onAntigravityEvent, ac.signal);
+    } else {
+      await api.chatStream({ ...turn, effort: chat.effort, allowedTools, images, engine }, onEvent, ac.signal);
+    }
   } catch (e) {
     // A queue must not keep firing into a turn that failed or one you just
     // interrupted — the rest of it stays put, visible, for you to decide on.
@@ -866,8 +1113,11 @@ export async function send(id: string, text: string, isActive: () => boolean, al
       });
     }
   } finally {
-    // Read before the update, because draining pops it.
-    const next = broke ? undefined : chats.get(id)?.queued[0];
+    // Read before the update, because draining pops it. A session that is now
+    // being written from somewhere else keeps its queue: the next turn goes out
+    // when that writer is done, not on top of it.
+    const nowBusy = (() => { const c = chats.get(id); return !!c && busyElsewhere({ sessionId: c.sessionId, sending: false }); })();
+    const next = broke || nowBusy ? undefined : chats.get(id)?.queued[0];
     update(id, (c) => {
       c.sending = false;
       c.abort = null;

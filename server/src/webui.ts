@@ -63,13 +63,36 @@ const DIST: string | null = resolveDist();
 
 export const WEB_UI_ENABLED = DIST !== null;
 
+/**
+ * WHICH build is being served, for the line that says so at boot.
+ *
+ * It used to print the literal string "web/dist" whatever it had resolved, and
+ * that cost an afternoon: a server started inside the desktop app inherits
+ * `AGENTGLASS_WEB_DIR` pointing at the INSTALLED bundle, so a dev server
+ * launched from a worktree cheerfully serves somebody else's build while
+ * announcing it is serving this one. Three rounds of "the change is not in the
+ * page" later, the answer was in an environment variable the log was hiding.
+ */
+export const distPath = (): string | null => DIST;
+
 /** The single-port marker. The bundle checks for it before falling back to the
  *  conventional :4000 — see SERVER in web/src/lib/api.ts. */
 const MARKER = "<script>window.__AGENTGLASS_SAME_ORIGIN__=true</script>";
 
-/** Plant the marker in index.html on its way out. Injected at serve time, not
- *  build time, so the SAME build still works under vite preview or the desktop
- *  shell's static server — pages those serve never carry the marker. */
+/**
+ * Plant the marker in index.html on its way out. Injected at serve time, not
+ * build time, so the SAME build still works under vite preview or the desktop
+ * shell's static server — pages those serve never carry the marker.
+ *
+ * There was a second marker here, `__AGENTGLASS_REMOTE__`, planted when the
+ * request did not come from loopback. It existed because the browser then chose
+ * between two applications and could not be trusted to choose: a phone asking
+ * for the desktop site, or held sideways, measured as a laptop. There is one
+ * application now (see web/src/main.tsx), so the server has nothing to tell it
+ * — and a marker nothing reads is a fact the next reader has to disprove.
+ * Whether a device may use what it reaches was never this file's answer anyway:
+ * the token's DeviceScope is checked per route, on every request.
+ */
 export function injectSameOrigin(html: string): string {
   const head = html.indexOf("</head>");
   return head >= 0 ? html.slice(0, head) + MARKER + html.slice(head) : MARKER + html;

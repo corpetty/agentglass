@@ -6,19 +6,46 @@
 // shipped a bug where the suite reached into a real home directory. The socket
 // name and the state directory are both redirected below so that even a call
 // that slipped through could not reach anything real.
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, afterAll, beforeAll } from "bun:test";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-process.env.AGENTGLASS_TMUX_SOCKET = "agentglass-test-never-started";
+// Unique per run, like the state dirs below. A fixed socket name is not a
+// private server — it is a path, and anything already listening there is what
+// the suite ends up talking to.
+const SOCKET = `agx-pane-test-${process.pid}`;
+process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
 process.env.AGENTGLASS_STATE_DIR = join(tmpdir(), `agx-pane-test-${process.pid}`);
 process.env.AGENTGLASS_CLAUDE_HOME = join(tmpdir(), `agx-claude-home-${process.pid}`);
+
+/* A unique NAME still leaves the socket in the developer's DIRECTORY, which is
+ * where a `-L` with no TMUX_TMPDIR goes: measured with a recording tmux on
+ * PATH, two of this file's `list-sessions` resolved to
+ * /tmp/tmux-<uid>/agx-pane-test-<pid>. Nothing was created — `list-sessions`
+ * starts no server — so this is the mild end of it, and it is here for the same
+ * reason the comment above gives about names: "nothing is listening there" is
+ * an assumption, and `tmuxSockets()` hands every server in that directory to
+ * `listPanes`. */
+const TMPDIR = join(tmpdir(), `agx-tmux-chatpane-${process.pid}`);
+const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 
 let mod: typeof import("../src/chatpane.ts");
 let pane: typeof import("../src/tmuxpane.ts");
 beforeAll(async () => {
+  // In the hook, not at module scope: `bun test` shares one process across
+  // files, so a module-scope write to a variable other tmux files also own
+  // would outlive this one.
+  mkdirSync(TMPDIR, { recursive: true });
+  process.env.TMUX_TMPDIR = TMPDIR;
   mod = await import("../src/chatpane.ts");
   pane = await import("../src/tmuxpane.ts");
+});
+
+afterAll(() => {
+  if (REAL_TMPDIR === undefined) delete process.env.TMUX_TMPDIR;
+  else process.env.TMUX_TMPDIR = REAL_TMPDIR;
+  try { rmSync(TMPDIR, { recursive: true, force: true }); } catch { /* never made */ }
 });
 
 test("a working directory maps to the transcript directory Claude Code actually uses", () => {
@@ -52,7 +79,7 @@ test("the attach command names our socket, not the user's default server", () =>
   const cmd = pane.attachCommand("6f1c9b52-0000-4000-8000-0123456789ab");
   // The `-L` is the whole reason the user's own tmux (and their resurrect saves)
   // are untouched. A command without it would attach to their server.
-  expect(cmd).toContain("-L agentglass-test-never-started");
+  expect(cmd).toContain(`-L ${SOCKET}`);
   expect(cmd).toContain("attach -t 6f1c9b52-0000-4000-8000-0123456789ab");
 });
 
@@ -260,4 +287,127 @@ test("a genuinely swallowed Enter is still retried", () => {
 
 test("an emptied box is taken as sent", () => {
   expect(mod.__submitVerdict("● thinking…\n❯ \n────────", "write me a test")).toBe("sent");
+});
+
+// The pane's command must not be run by the user's login shell.
+//
+// tmux executes a bare command string with the login shell, and the string
+// below is POSIX — `$?`, `exec`, `;`. On a machine whose shell is fish that is
+// a syntax error ("In fish, please use $status"), so the command died on the
+// spot, the session died with it, and the tmux server exited leaving an
+// orphaned socket. The chat reported "the pane never became ready in 45s" over
+// an empty screen, because by the time anything looked there was nothing to
+// look at — a message that points nowhere near a shell.
+//
+// Asserted on the argv rather than by starting a pane: reproducing it for real
+// needs a machine whose login shell is not POSIX, which CI is not.
+test("the pane command is handed to sh, not to whatever the user's shell is", () => {
+  const argv = pane.newSessionArgv("6f1c9b52-0000-4000-8000-0123456789ab", "/tmp", ["claude", "--model", "opus"]);
+  const i = argv.indexOf("sh");
+  expect(i).toBeGreaterThan(-1);
+  expect(argv[i + 1]).toBe("-c");
+  // The command is the argument to `sh -c`, and the last word, so nothing can
+  // be appended after it and end up interpreted by something else.
+  expect(argv[i + 2]).toBe(argv[argv.length - 1]);
+  expect(argv[argv.length - 1]).toContain("$?");
+});
+
+test("the session is still named, placed and sized as before", () => {
+  const argv = pane.newSessionArgv("6f1c9b52-0000-4000-8000-0123456789ab", "/some/dir", ["claude"]);
+  expect(argv.slice(0, 2)).toEqual(["new-session", "-d"]);
+  expect(argv[argv.indexOf("-s") + 1]).toBe("6f1c9b52-0000-4000-8000-0123456789ab");
+  expect(argv[argv.indexOf("-c") + 1]).toBe("/some/dir");
+  expect(argv[argv.indexOf("-x") + 1]).toBe("200");
+});
+
+test("an argument with a quote in it cannot break out of the command", () => {
+  const argv = pane.newSessionArgv("6f1c9b52-0000-4000-8000-0123456789ab", "/tmp", ["claude", "--say", "it's; rm -rf /"]);
+  const cmd = argv[argv.length - 1]!;
+  // Single-quoted with the POSIX '\'' escape, so the `;` stays inside the word.
+  expect(cmd).toContain(`'it'\\''s; rm -rf /'`);
+});
+
+// --- a prompt sent while the CLI is busy -------------------------------------
+// Typing into Claude Code mid-turn does not fail and does not interrupt: the
+// prompt is queued and runs when the current turn ends. The engine had no name
+// for that state and read it as two different wrong ones, so two prompts that
+// were accepted — and that ran — were both reported to the user as errors.
+
+/** Captured from a live pane whose network had dropped mid-turn. The CLI is
+ *  still working on the first prompt, two prompts sent from the chat since are
+ *  queued behind it, and the input box shows the hint it draws while it holds
+ *  them. Note that the queued prompts carry the box's own `❯` glyph at column
+ *  zero, exactly as the live box does. */
+const QUEUED = [
+  "❯ why does the release build fail on a clean checkout?",
+  "",
+  "✳ Unable to connect to API (ENOTIMP) · Retrying in 8s · attempt 5/10",
+  "",
+  "❯ continue",
+  "❯ continue",
+  "                              ✗ Auto-update failed · Run claude doctor",
+  "",
+  "❯ Press up to edit queued messages",
+].join("\n");
+
+test("the input box's hint is not something the user typed", () => {
+  // The whole bug in one assertion. Read as content, the hint is text that is
+  // neither empty nor the prompt we pasted — which is the exact signature of a
+  // picker having opened, and is what got reported as one.
+  expect(mod.inputBox(QUEUED)?.trim()).toBe("");
+  expect(mod.inputBox('❯ Try "edit config.ts to add a flag"')?.trim()).toBe("");
+});
+
+test("but a prompt that merely starts like a hint is still a prompt", () => {
+  // The cost of getting this wrong is silent and total: a box holding real text
+  // that reads as empty is one waitPasted never sees the paste land in, so the
+  // turn spends its deadline pressing Enter and then reports a pane that would
+  // not accept the prompt. A hint owns its whole row; a prompt carries on past
+  // it, which is what both anchors are for.
+  for (const typed of [
+    'Try "npm test" first, then look at the failures',
+    'Try "bun run build" and tell me what breaks',
+    "Try the other approach",
+  ]) {
+    expect(mod.inputBox(`❯ ${typed}`)?.trim(), typed).toBe(typed);
+  }
+  // And the same on the other hint, so neither can be loosened alone.
+  expect(mod.inputBox("❯ Press up to edit queued messages, then rerun")?.trim())
+    .toBe("Press up to edit queued messages, then rerun");
+});
+
+test("a queued prompt is accepted, not diverted into a picker", () => {
+  // Reported as: "This opened an interactive prompt in the chat's tmux pane."
+  // Nothing had opened. The prompt was queued, and it ran.
+  expect(mod.__submitVerdict(QUEUED, "continue")).toBe("queued");
+  expect(mod.__isQueued(QUEUED)).toBe(true);
+});
+
+test("a second prompt is not compared against the hint left by the first", () => {
+  // Reported as: "the chat pane would not accept the prompt." With the hint
+  // already on screen before the paste, the old box reader handed it back as
+  // though it were our text, and every Enter afterwards compared it against
+  // itself and looked swallowed — so the turn pressed Enter into a live pane
+  // until it timed out. An empty-reading box keeps the paste wait waiting.
+  expect(mod.__submitVerdict(QUEUED, "Press up to edit queued messages")).toBe("queued");
+  expect(mod.inputBox(QUEUED)?.trim()).not.toBe("Press up to edit queued messages");
+});
+
+test("a queued pane is not mistaken for a menu, or for one gone idle", () => {
+  // The two states either side of it. Reading queued as `needsYou` would send
+  // the user to their terminal to finish a prompt that does not exist; reading
+  // it as idle would end the turn ~8s in, because the box reads empty and
+  // nothing says "esc to interrupt" while the CLI waits.
+  expect(mod.__needsYou(QUEUED)).toBe(false);
+  expect(mod.__isRunning(QUEUED)).toBe(false);
+  expect(mod.__isQueued(NORMAL)).toBe(false);
+  expect(mod.__isQueued(IDLE_AFTER_LOCAL_COMMAND)).toBe(false);
+  expect(mod.__isQueued(MODEL_PICKER)).toBe(false);
+});
+
+test("a picker still wins over a queue, so Enter is never pressed into a menu", () => {
+  // Ordering, again: the queue check sits below the picker check. Enter in a
+  // `/model` or `/effort` menu writes the user's real settings.json, and no
+  // other state may be allowed to reach past that guard.
+  expect(mod.__submitVerdict(`${MODEL_PICKER}\n❯ Press up to edit queued messages`, "/model")).toBe("diverted");
 });

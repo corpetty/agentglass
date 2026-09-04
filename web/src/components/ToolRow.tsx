@@ -71,8 +71,10 @@ export const ToolRow = memo(function ToolRow({ e, sub = [], nested = false }: To
         )}
       </div>
 
+      {/* Three different kinds of thing stacked — what it was for, what ran,
+          what came back — so 8px apart, not 4: packed, they read as one dump. */}
       {open && detail && (
-        <div className={`${indent} mt-0.5 pl-2 space-y-1`} style={{ borderLeft: RULE }}>
+        <div className={`${indent} mt-1 pl-2 space-y-2`} style={{ borderLeft: RULE }}>
           {/* The tool's own account of what it was for — a Bash `description`.
               Worth showing once you have asked, and never worth a line of its
               own on a row you are only skimming past. */}
@@ -80,9 +82,13 @@ export const ToolRow = memo(function ToolRow({ e, sub = [], nested = false }: To
           {target.length > firstLine.length && (
             <div className="whitespace-pre-wrap break-all" style={{ ...MONO, color: "var(--text3)" }}>{target}</div>
           )}
+          {/* Bounded and scrollable. The server already clips what it stores,
+              but a clipped output is still thousands of characters, and opening
+              one row to check a command should not push the rest of the
+              conversation off the screen. It scrolls inside itself instead. */}
           {out && (
-            <div className="whitespace-pre-wrap break-all"
-              style={{ ...MONO, color: e.is_error ? "var(--error)" : "var(--text4)" }}>{out}</div>
+            <div className="whitespace-pre-wrap break-all agx-scroll"
+              style={{ ...MONO, color: e.is_error ? "var(--error)" : "var(--text4)", maxHeight: 300, overflowY: "auto" }}>{out}</div>
           )}
           {e.output_clipped && <div className="t-dim2">…output trimmed</div>}
         </div>

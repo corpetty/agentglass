@@ -5,13 +5,15 @@
 // every mutating op is gated by AGENTGLASS_GIT_WRITE_DISABLED=1.
 
 import { resolve, basename, relative, dirname, sep, delimiter, join } from "node:path";
-import { statSync, readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from "node:fs";
+import { statSync, readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, rmSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { git, gitAsync, safeAbs, repoRootOfAsync, currentBranch } from "./git.ts";
 import { configuredRepoDirs, workspaceRoot, inScope } from "./config.ts";
 import { worktreeParent, gitDir } from "./worktree.ts";
+import { observe, noteResolved, noteReopened, stopFor, forget } from "./mergesession.ts";
 import { entered, backoff } from "./loopwatch.ts";
 import type {
-  ConflictBlock, BlockChoice,
+  ConflictBlock, ConflictFile, ConflictSegment, MergeSessionView, BlockChoice, MergeInfo, MergeSide,
   GitFileChange, GitBranchInfo, WorkingTree, GitRepoRef, GitActionResult, DiffHunk, GitFileStatus,
   GitBranch, GitCommit, GitStash, GitWorktree, GitGraphLine, GitTreeState,
   GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, WorktreeLeftovers, LeftoverEntry, BlockedByOwner,
@@ -54,12 +56,19 @@ function inRepo(root: string, rel: string): string | null {
   return abs;
 }
 
-// Strip a/ b/ prefixes, /dev/null, and C-style git quoting from a diff path.
+// Strip the diff prefix, /dev/null, and C-style git quoting from a diff path.
+//
+// The prefix is normally `a/` and `b/`, and git.ts pins the config that decides
+// so on every call. This also accepts the mnemonic set — `c/` commit, `i/`
+// index, `w/` worktree, `o/` object — because that is what a repo with
+// `diff.mnemonicPrefix` emits, and a path that keeps its prefix does not merely
+// look wrong: it is passed back to `git add`, which then fails with "did not
+// match any files" on a file that is sitting right there.
 function pathFrom(s: string): string {
   s = s.trim().replace(/\t.*$/, "");
   if (s === "/dev/null") return "/dev/null";
   if (s.startsWith('"') && s.endsWith('"')) { try { s = JSON.parse(s); } catch { /* keep raw */ } }
-  if (s.startsWith("a/") || s.startsWith("b/")) s = s.slice(2);
+  if (/^[abciwo]\//.test(s)) s = s.slice(2);
   return s;
 }
 
@@ -232,6 +241,37 @@ export async function workingTree(rootIn: unknown): Promise<WorkingTree> {
     clean: staged.length === 0 && unstaged.length === 0,
     writeEnabled: GIT_WRITE_ENABLED,
   };
+}
+
+/** Git's empty-tree hash, to diff a repo's very first commit (which has no
+ *  parent to diff against) as an all-added change. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/**
+ * The last commit's changes — its subject and the files it touched.
+ *
+ * The "committed" side of File changes: what you just committed, and only that,
+ * so your three files survive being committed instead of vanishing into the
+ * working tree's absence. Deliberately one commit, not the branch: the branch
+ * is hundreds of files of a whole ticket's work and its merged-in base, none of
+ * which "what did I just commit" is asking about.
+ */
+export async function lastCommitChanges(rootIn: unknown): Promise<{ subject: string; changes: GitFileChange[] }> {
+  const root = repoRoot(rootIn);
+  if (!root) return { subject: "", changes: [] };
+  // The last NON-MERGE commit, not HEAD: a "merge master into branch" is one
+  // commit that touches every file the merge brought — 161 files on a real
+  // branch here, none of them yours — and `git diff HEAD^ HEAD` of it froze the
+  // whole view. Skipping merges lands on the actual last piece of work.
+  const commit = (await gitAsync(root, ["rev-list", "--no-merges", "--max-count=1", "HEAD"])).stdout.trim();
+  if (!commit) return { subject: "", changes: [] };
+  const [subjectOut, parentOut] = await Promise.all([
+    gitAsync(root, ["log", "-1", "--format=%s", commit]),
+    gitAsync(root, ["rev-parse", "--verify", "--quiet", `${commit}^`]),
+  ]);
+  const from = parentOut.stdout.trim() ? `${commit}^` : EMPTY_TREE;
+  const diff = await gitAsync(root, ["-c", "core.quotePath=false", "diff", from, commit]);
+  return { subject: subjectOut.stdout.trim(), changes: parseDiff(root, diff.stdout, false) };
 }
 
 /** How deep to look for repos below a configured root. Projects are commonly
@@ -665,8 +705,7 @@ function validRels(root: string, rels: unknown): string[] | null {
 let onGitChange: (() => void) | null = null;
 export function setGitChangeHook(fn: (() => void) | null): void { onGitChange = fn; }
 
-function run(root: string, args: string[]): GitActionResult {
-  const r = git(root, args);
+function afterMutation(root: string): void {
   // Every mutating path goes through here, so this is the one place that has to
   // know the merged-set may have moved — rather than each of the twenty callers
   // remembering to say so.
@@ -685,6 +724,11 @@ function run(root: string, args: string[]): GitActionResult {
   // One signal out to every panel. Without it each of them discovered the
   // change on its own clock — 5s, 90s, or not until it was remounted.
   try { onGitChange?.(); } catch { /* a broken listener must not fail the op */ }
+}
+
+function run(root: string, args: string[]): GitActionResult {
+  const r = git(root, args);
+  afterMutation(root);
   if (r.code !== 0) return { ok: false, error: r.stderr.trim() || r.stdout.trim() || `git ${args[0]} failed`, output: (r.stdout + r.stderr).trim() };
   return { ok: true, output: (r.stdout + r.stderr).trim() };
 }
@@ -754,15 +798,67 @@ export function commitStaged(rootIn: string, title: string, body: string): GitAc
 }
 
 // Network ops — bounded and gated. pull is --ff-only to avoid surprise merges.
-export function push(rootIn: string): GitActionResult {
+
+/** Branches the guardrails treat as shared — the default list, plus whatever
+ *  the repo's own config says on top of it. Stored as a comma-joined config
+ *  value (`git config agx.protectedbranches`), so a terminal user can see and
+ *  edit it with plain git, and it travels with the repo, not the panel. */
+export function protectedBranches(rootIn: unknown): { ok: boolean; branches?: string[]; error?: string } {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, error: "not a git repository root" };
+  const set = new Set<string>(["main", "master"]);
+  const raw = git(root, ["config", "--get", "agx.protectedbranches"]).stdout.trim();
+  for (const name of raw.split(",")) {
+    const n = name.trim();
+    if (n) set.add(n);
+  }
+  return { ok: true, branches: [...set] };
+}
+
+/** Replace the protected list with exactly these names (main/master always
+ *  survive — unprotecting the default trunk is the user shooting their own
+ *  foot, and they can do it in a terminal if they really mean it). */
+export function setProtectedBranches(rootIn: unknown, namesIn: unknown): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
-  return run(root, ["push"]);
+  const names = Array.isArray(namesIn)
+    ? namesIn.filter((n): n is string => typeof n === "string" && validRef(n.trim()))
+    : [];
+  const joined = [...new Set(["main", "master", ...names.map((n) => n.trim())])].join(",");
+  return run(root, ["config", "agx.protectedbranches", joined]);
+}
+
+/** Is this branch on the protected list? (List read fresh each call — the
+ *  guard is a config read, not a cache that can go stale.) */
+function isProtected(root: string, branch: string): boolean {
+  if (!branch) return false;
+  return (protectedBranches(root).branches ?? []).includes(branch);
+}
+
+export function push(rootIn: string, optsIn?: { force?: boolean }): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const force = optsIn?.force === true;
+  // The refspec is explicit: a bare `git push` reads push.default and can
+  // resolve to nothing ("src refspec main does not match any") or to more
+  // than one branch. "Push the current branch to its own upstream" is the
+  // only reading this panel ever means.
+  const branch = git(root, ["symbolic-ref", "--short", "HEAD"]).stdout.trim();
+  const remote = git(root, ["config", "--get", `branch.${branch}.remote`]).stdout.trim() || "origin";
+  if (!branch) return { ok: false, error: "not on a branch (detached HEAD) — nothing to push" };
+  // A force-push from the panel is ALWAYS --force-with-lease: it refuses to
+  // overwrite a remote that has moved since the last fetch, which is the
+  // only thing that protects the work of whoever else shares the branch.
+  // Plain `--force` is what "a colleague's push got clobbered" is made of,
+  // and no panel button is worth that.
+  return run(root, force ? ["push", "--force-with-lease", remote, branch] : ["push", remote, branch]);
 }
 export function pull(rootIn: string): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
-  return run(root, ["pull", "--ff-only"]);
+  // Dirty tree + --ff-only fails; auto-stash makes the pull go through and
+  // restores the changes after, or leaves them safely stashed on conflict.
+  return withAutoStash(root, () => run(root, ["pull", "--ff-only"]));
 }
 /**
  * Keep ahead/behind honest, in the background.
@@ -788,6 +884,19 @@ export function pull(rootIn: string): GitActionResult {
  * remote refs, so a single fetch updates the counts for all of them.
  */
 const AUTO_FETCH_MS = Number(process.env.AGENTGLASS_AUTOFETCH_SECONDS ?? 60) * 1000;
+/** How long a background fetch may run before we take it to be hung. Generous
+ *  on purpose — see the note where it is used. */
+const AUTO_FETCH_CEILING_MS = 10 * 60_000;
+/**
+ * Every fetch this app runs, and the flags it may never lose.
+ *
+ * Exported so a test can hold `--atomic` in place. It is one word standing
+ * between an interrupted fetch and a repository that has to be repaired by
+ * hand — the kind of thing that gets dropped in a refactor by someone tidying
+ * "redundant" flags, on the reasonable-sounding grounds that fetches normally
+ * finish.
+ */
+export const FETCH_ARGV = ["fetch", "--all", "--prune", "--atomic"] as const;
 let fetching = false;
 
 async function autoFetchOnce(): Promise<void> {
@@ -808,12 +917,38 @@ async function autoFetchOnce(): Promise<void> {
     // squash-merged branch was ever recognised. Most fetches change nothing.
     const refsOf = () => git(root, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"]).stdout;
     const before = refsOf();
-    const proc = Bun.spawn(["git", "-C", root, "fetch", "--all", "--prune", "--quiet"], {
+    // --atomic, and this is the important word in the line.
+    //
+    // Without it, `git fetch` updates remote-tracking refs one at a time, and a
+    // fetch killed part-way leaves the ones it was mid-write on as ZERO-BYTE
+    // files. Git then cannot even resolve them to delete them ("reference
+    // broken"), and — worse — the repository starts claiming to have objects it
+    // does not, so the next fetch negotiates from a lie and the server answers
+    // "did not send all necessary objects". Every fetch, pull and sync fails
+    // until someone finds and removes the empty files by hand.
+    //
+    // That is not hypothetical. On a repo with 852 remote branches this timer
+    // killed the fetch EVERY time — it cannot finish in twenty seconds — and it
+    // left seven broken refs written inside the same millisecond, on a
+    // repository shared with a team. With --atomic the refs move in one
+    // transaction: all of them or none, whatever happens to the process.
+    const proc = Bun.spawn(["git", "-C", root, ...FETCH_ARGV, "--quiet"], {
       stdout: "ignore",
       stderr: "ignore",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never" },
     });
-    const timer = setTimeout(() => proc.kill(), 20_000);
+    // A backstop for a wedged process, not a routine deadline.
+    //
+    // Twenty seconds was chosen as "a fetch should be quick", which is true of
+    // small repos and false of the ones this feature matters most on. Nothing
+    // needed that deadline: `fetching` above already stops fetches piling up, so
+    // a slow one costs a skipped tick and nothing else. The ceiling now only
+    // exists to release a process that has genuinely hung, and it is far beyond
+    // any honest fetch.
+    //
+    // SIGTERM rather than a kill: it gives git the chance to unwind its ref
+    // transaction rather than being shot between two writes.
+    const timer = setTimeout(() => { try { proc.kill("SIGTERM"); } catch { /* already gone */ } }, AUTO_FETCH_CEILING_MS);
     await proc.exited;
     clearTimeout(timer);
     // A fetch that MOVED origin/* changes what "merged into the trunk" means.
@@ -836,11 +971,12 @@ export function startAutoFetch(): void {
 export function fetch(rootIn: string): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
-  return run(root, ["fetch", "--all", "--prune"]);
+  return run(root, [...FETCH_ARGV]);
 }
 
 // --- branches / log / stash --------------------------------------------------
 const US = "\x1f"; // field separator
+const RS = "\x1e"; // record separator (same convention as gitinsights)
 const validRef = (n: string) => typeof n === "string" && /^(?!-)(?!.*\.\.)[A-Za-z0-9._\/-]+$/.test(n) && !n.endsWith("/") && !n.endsWith(".lock");
 const validHash = (h: string) => typeof h === "string" && /^[0-9a-fA-F]{4,40}$/.test(h);
 
@@ -948,18 +1084,18 @@ const mergedCache = new Map<string, { at: number; set: Set<string> }>();
  * histories in it, and "no merge base" means there is nothing to compare, not
  * that the work is safe to delete.
  */
-function isSquashMerged(root: string, ref: string, name: string): boolean {
-  const base = git(root, ["merge-base", ref, name]);
+async function isSquashMerged(root: string, ref: string, name: string): Promise<boolean> {
+  const base = await gitAsync(root, ["merge-base", ref, name]);
   const mergeBase = base.stdout.trim();
   if (base.code !== 0 || !mergeBase) return false;
-  const tree = git(root, ["rev-parse", `${name}^{tree}`]).stdout.trim();
+  const tree = (await gitAsync(root, ["rev-parse", `${name}^{tree}`])).stdout.trim();
   if (!tree) return false;
   // A branch holding nothing the base didn't already have has no patch to find,
   // and would otherwise look "merged" on the strength of an empty diff.
-  if (tree === git(root, ["rev-parse", `${mergeBase}^{tree}`]).stdout.trim()) return false;
-  const dangling = git(root, ["commit-tree", tree, "-p", mergeBase, "-m", "_"]);
+  if (tree === (await gitAsync(root, ["rev-parse", `${mergeBase}^{tree}`])).stdout.trim()) return false;
+  const dangling = await gitAsync(root, ["commit-tree", tree, "-p", mergeBase, "-m", "_"]);
   if (dangling.code !== 0) return false;
-  const cherry = git(root, ["cherry", ref, dangling.stdout.trim()]);
+  const cherry = await gitAsync(root, ["cherry", ref, dangling.stdout.trim()]);
   return cherry.code === 0 && cherry.stdout.trim().startsWith("-");
 }
 
@@ -991,8 +1127,8 @@ function isSquashMerged(root: string, ref: string, name: string): boolean {
  * resolution upstream with it — so the gap is narrow enough to be worth the
  * branches it frees. It is the only gap.
  */
-function isRebaseMerged(root: string, ref: string, name: string): boolean {
-  const r = git(root, ["cherry", ref, name]);
+async function isRebaseMerged(root: string, ref: string, name: string): Promise<boolean> {
+  const r = await gitAsync(root, ["cherry", ref, name]);
   if (r.code !== 0) return false;
   const lines = r.stdout.split("\n").filter(Boolean);
   return lines.length > 0 && lines.every((l) => l.startsWith("-"));
@@ -1059,11 +1195,17 @@ function applyMemo(root: string, key: string, set: Set<string>): void {
   }
 }
 
+/** The key every merged-set cache is filed under: one repo, one trunk.
+ *
+ *  `\u0000` rather than a raw NUL byte: written literally it makes the whole
+ *  file `data` to grep, which then skips it silently — you get no matches and
+ *  no warning. Same separator, same keys, still greppable. Written once here
+ *  rather than at each use, so `sweepInFlight` cannot drift from the key the
+ *  sweep is actually filed under and answer "no sweep is running" forever. */
+const mergedKey = (root: string, ref: string) => `${root}\u0000${ref}`;
+
 async function mergedInto(root: string, ref: string): Promise<Set<string>> {
-  // \u0000 rather than a raw NUL byte: written literally it makes the whole
-  // file `data` to grep, which then skips it silently — you get no matches
-  // and no warning. Same separator, same keys, still greppable.
-  const key = `${root}\u0000${ref}`;
+  const key = mergedKey(root, ref);
   const hit = mergedCache.get(key);
   if (hit && Date.now() - hit.at < MERGED_TTL_MS) return hit.set;
   // 644ms on a repo with a long history — the single most expensive call in
@@ -1071,11 +1213,63 @@ async function mergedInto(root: string, ref: string): Promise<Set<string>> {
   // a ref moves. Awaited so that miss costs wall clock rather than a terminal.
   const r = await gitAsync(root, ["for-each-ref", "--merged", ref, "refs/heads", "--format=%(refname:short)"]);
   const set = new Set(r.stdout.split("\n").filter(Boolean));
+  /*
+   * The cheap half of the same question, and it removes most of the expensive
+   * one. Measured on a 52-branch repository, both read-only:
+   *
+   *   20 `git cherry` probes (one sweep)          10327ms
+   *   1 `rev-list --branches --not --remotes`       194ms
+   *
+   * 53× apart, and the single command answers for EVERY branch rather than the
+   * twenty the sweep budget reaches. A branch is clean exactly when its tip is
+   * absent from that walk — an ancestor cannot be missing from a remote that
+   * has the tip. What is left for the probes is the narrow case this cannot
+   * see: a branch whose commits were squashed and whose local copy was never
+   * pushed anywhere.
+   *
+   * It also fixes the answer, not only the cost: work integrated through an
+   * epic branch was reported "not merged" because only the trunk was asked.
+   */
+  for (const name of await mergedAnywhere(root)) set.add(name);
   applyMemo(root, key, set);
   mergedCache.set(key, { at: Date.now(), set });
   sweepProbes(root, ref, key, set);
   return set;
 }
+
+
+/**
+ * Every branch whose commits already exist somewhere on the remote.
+ *
+ * One walk for all of them — see the numbers where this is called. `gitAsync`
+ * rather than `git`, because `git` is spawnSync and this server has one thread:
+ * a blocking spawn here is the terminal sockets and the docked console stopping
+ * with it, which is exactly what a per-branch version of this did before it was
+ * reverted.
+ *
+ * Cached on the same clock as the ancestry answer it extends.
+ */
+async function mergedAnywhere(root: string): Promise<Set<string>> {
+  const key = `${root}\u0000anywhere`;
+  const hit = anywhereCache.get(key);
+  if (hit && Date.now() - hit.at < MERGED_TTL_MS) return hit.set;
+  const [tips, loose] = await Promise.all([
+    gitAsync(root, ["for-each-ref", "refs/heads", `--format=%(refname:short)${US}%(objectname)`]),
+    gitAsync(root, ["rev-list", "--branches", "--not", "--remotes"]),
+  ]);
+  const off = new Set(loose.stdout.split("\n").filter(Boolean));
+  const set = new Set<string>();
+  for (const line of tips.stdout.split("\n")) {
+    if (!line) continue;
+    const [name, sha] = line.split(US);
+    if (name && sha && !off.has(sha)) set.add(name);
+  }
+  anywhereCache.set(key, { at: Date.now(), set });
+  return set;
+}
+
+/** Same clock as the ancestry answer it extends. */
+const anywhereCache = new Map<string, { at: number; set: Set<string> }>();
 
 /**
  * Recover the merges ancestry can't see — squashed and rebased — off the
@@ -1091,9 +1285,22 @@ async function mergedInto(root: string, ref: string): Promise<Set<string>> {
  * absent: the UI reads that as "we don't know" and keeps the delete
  * confirmation, which is the safe direction to be wrong in. So the list goes
  * out immediately and the sweep fills the very Set the cache entry holds, in
- * place, so the next poll serves the fuller answer with no extra request — and
- * records each verdict in probeMemo, which is what carries it past the moment
- * that Set is thrown away and rebuilt.
+ * place, and records each verdict in probeMemo, which is what carries it past
+ * the moment that Set is thrown away and rebuilt.
+ *
+ * Filling the Set is not enough on its own, and that was the bug: the answer
+ * this endpoint serves is a JSON string cached against a fingerprint of every
+ * ref, so it is only rebuilt when a ref MOVES. A sweep moves no refs. On a
+ * repository nobody is committing to, which is exactly the repository you sit
+ * down to tidy, the pre-sweep answer was served forever, and a branch whose PR
+ * was squash-merged read "not merged, kept" until something unrelated happened
+ * to move a ref. Measured on this repo: a branch merged 17 hours earlier, still
+ * reported unmerged, two forced fingerprint changes needed to see the truth.
+ *
+ * So a sweep that changes a verdict says so. The hook clears that cached body
+ * and nudges the clients, which is the one thing the sweep could not do for
+ * itself. Fired once, when the sweep finishes, and only when it actually proved
+ * something: a sweep that learns nothing must not cost a rebuild.
  *
  * Newest first: that's the order for-each-ref gives with this sort, and the
  * order that spends the probe budget where deletes actually happen.
@@ -1116,8 +1323,16 @@ function sweepProbes(root: string, ref: string, key: string, set: Set<string>): 
   let idx = 0;
   let probes = 0;
   let started = false;
+  let proved = 0;
   let all: [string, string][] = [];
-  const step = () => {
+  const finish = () => {
+    probeRunning.delete(key);
+    // Only when the sweep changed the answer. Announcing an empty sweep would
+    // invalidate a cached response and wake every open panel to redraw the
+    // identical list, on a five-minute clock, forever.
+    if (proved) { try { onMergedVerdicts?.(root); } catch { /* a listener must not break the sweep */ } }
+  };
+  const step = async () => {
     try {
       if (!started) { all = [...branchTips(root)]; started = true; }
       while (idx < all.length) {
@@ -1126,59 +1341,100 @@ function sweepProbes(root: string, ref: string, key: string, set: Set<string>): 
         if (probes++ >= PROBE_MAX) { idx = all.length; break; }
         // Cheapest test first: one spawn, and it answers for every branch the
         // trunk took by rebase. The squash probe's five only run when it can't.
-        if (isRebaseMerged(root, ref, name) || isSquashMerged(root, ref, name)) {
+        if (await isRebaseMerged(root, ref, name) || await isSquashMerged(root, ref, name)) {
           // Mutates the Set the cache entry already holds, so the next read
           // sees the fuller answer without another sweep — and the memo keeps
           // it once that Set expires.
           set.add(name);
+          proved++;
           let memo = probeMemo.get(key);
           if (!memo) probeMemo.set(key, (memo = new Map()));
           memo.set(name, sha);
         }
-        setTimeout(step, 0); // one probe per turn of the loop
+        setTimeout(() => { void step(); }, 0); // one probe per turn of the loop
         return;
       }
       probedAt.set(key, Date.now());
-      probeRunning.delete(key);
+      finish();
     } catch {
       // A failed sweep just leaves the ancestry answer standing.
-      probeRunning.delete(key);
+      finish();
     }
   };
-  setTimeout(step, 0);
+  setTimeout(() => { void step(); }, 0);
+}
+
+/**
+ * Told when a sweep proved something ancestry could not see.
+ *
+ * A hook for the same reason `setGitChangeHook` is one: this module must not
+ * import the HTTP layer. What the listener does with it (drop the cached
+ * `/git/branches` body, nudge the clients) is the server's business, and both
+ * of those are things only the server can do.
+ */
+let onMergedVerdicts: ((root: string) => void) | null = null;
+export function setMergedVerdictHook(fn: ((root: string) => void) | null): void { onMergedVerdicts = fn; }
+
+/**
+ * Is a sweep still running for this root's trunk?
+ *
+ * A flag like this was tried once and removed, because it was asked from inside
+ * `branches()`, which is the very call that schedules the sweep, so it always
+ * answered yes and the label it drove never went away. Two things make it
+ * honest now: a completed sweep is remembered for PROBE_TTL_MS, so this reads
+ * false for minutes at a time; and the sweep now announces itself when it ends,
+ * so whatever the flag explains stops being true on screen without a poll.
+ *
+ * The panel uses it for one thing only: not calling a branch "not merged"
+ * while the check that could clear it is still running.
+ */
+export function sweepInFlight(root: string, ref: string): boolean {
+  return probeRunning.has(mergedKey(root, ref));
 }
 
 
 /** Drop the cache after anything that can change what's merged, so the panel
  *  reflects your own action immediately rather than up to a TTL later. */
 export function invalidateMerged(root?: string): void {
-  // All three, always. The sweep stamp has a far longer TTL than the ancestry
-  // entry, so clearing only the latter would hand the rebuilt entry a "swept
-  // recently" mark and skip the probe pass for minutes — exactly the window
-  // after a merge, when the answer has just changed. The memo goes with them,
-  // or a verdict recorded before the merge is re-applied to the rebuilt set and
-  // outlives the very event that invalidated it.
+  /*
+   * All four, always — the sweep stamp included, and that is deliberate even
+   * though restarting the sweep is what used to make the fan run.
+   *
+   * The stamp has a far longer TTL than the ancestry entry, so clearing only
+   * the latter would hand the rebuilt entry a "swept recently" mark and skip
+   * the probe pass for minutes — exactly the window after a merge, when the
+   * answer has just changed. There is a test for that, and it is describing a
+   * bug somebody had.
+   *
+   * What made restarting expensive was that the sweep probed every branch:
+   * 10.3s of `git cherry` on a 52-branch repository. It does not any more —
+   * the walk (194ms, one command, every branch) fills the set first, and the
+   * sweep skips everything already in it. What is left to probe is the narrow
+   * case the walk cannot see: a squashed branch whose local copy never reached
+   * a remote. On this machine that is a handful, not fifty.
+   */
   // The trunk and per-branch base go with them: both are keyed off refs, which
   // is exactly what a write or a ref-moving fetch changed, and this is the one
   // path both of those reach.
   if (!root) {
-    mergedCache.clear(); probedAt.clear(); probeMemo.clear();
-    defaultBranchCache.clear(); baseCache.clear();
+    mergedCache.clear(); probedAt.clear(); probeMemo.clear(); anywhereCache.clear();
+    defaultBranchCache.clear(); baseCache.clear(); publishedCache.clear();
     return;
   }
   const mine = `${root}\u0000`;
-  for (const m of [mergedCache, probedAt, probeMemo] as Map<string, unknown>[]) {
+  for (const m of [mergedCache, probedAt, probeMemo, anywhereCache] as Map<string, unknown>[]) {
     for (const k of m.keys()) if (k.startsWith(mine)) m.delete(k);
   }
   // `mine` (root + separator) is the prefix of the per-branch base keys too.
   defaultBranchCache.delete(root);
+  publishedCache.delete(root);
   for (const k of baseCache.keys()) if (k.startsWith(mine)) baseCache.delete(k);
 }
 
 
-export async function branches(rootIn: unknown): Promise<{ current: string; branches: GitBranch[]; trunk: string | null }> {
+export async function branches(rootIn: unknown): Promise<{ current: string; branches: GitBranch[]; trunk: string | null; checking: boolean }> {
   const root = repoRoot(rootIn);
-  if (!root) return { current: "", branches: [], trunk: null };
+  if (!root) return { current: "", branches: [], trunk: null, checking: false };
   const fmt = `%(refname:short)${US}%(HEAD)${US}%(upstream:short)${US}%(upstream:track)${US}%(committerdate:relative)${US}%(contents:subject)`;
   // The ref list and the trunk lookup are independent; run them together and
   // off the loop (this recomputes on /git/branches whenever a ref moves).
@@ -1199,13 +1455,19 @@ export async function branches(rootIn: unknown): Promise<{ current: string; bran
       ...(merged ? { mergedIntoTrunk: merged.has(name) } : {}),
     });
   }
-  // No "still sweeping" flag here, deliberately. mergedInto() above is what
-  // schedules the sweep, so asking whether one is running always answered yes:
-  // the sweep is a setTimeout and cannot have run yet within this call. The
-  // flag was a question asked immediately after switching it on. The count
-  // settling a beat later is the honest behaviour, and a permanent label
-  // explaining it was worse than the thing it explained.
-  return { current: await currentBranch(root), branches: list, trunk };
+  // A "still sweeping" flag lived here once and was taken out, because
+  // mergedInto() above is what schedules the sweep: asked immediately after
+  // switching it on, it always answered yes, and the label it drove never went
+  // away. What was missing then was the other half: nothing ever told the
+  // panel the sweep had finished, so the flag had no end and the count it
+  // qualified never settled on screen either.
+  //
+  // Both halves exist now. The sweep announces itself when it proves something
+  // (setMergedVerdictHook), and a finished sweep is remembered for
+  // PROBE_TTL_MS, so this reads false for minutes at a time rather than always.
+  // It says one thing: "not merged" is not the final answer yet. The panel uses
+  // it for exactly that and nothing else.
+  return { current: await currentBranch(root), branches: list, trunk, checking: trunk ? sweepInFlight(root, trunk) : false };
 }
 
 // lazygit-style branch ops
@@ -1227,12 +1489,250 @@ export function renameBranch(rootIn: string, name: string, to: string): GitActio
   if (!validRef(name) || !validRef(to)) return { ok: false, error: "invalid branch name" };
   return run(root, ["branch", "-m", name, to]);
 }
-export function resetTo(rootIn: string, ref: string, mode: "soft" | "mixed" | "hard"): GitActionResult {
+/** Hard-reset a protected branch: refused unless `force` — the escape hatch
+ *  the reflog's own "reset here" uses (that path already double-confirms). */
+export function resetTo(rootIn: string, ref: string, mode: "soft" | "mixed" | "hard", force = false): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
   if (!validHash(ref) && !validRef(ref)) return { ok: false, error: "invalid ref" };
   if (!["soft", "mixed", "hard"].includes(mode)) return { ok: false, error: "invalid reset mode" };
+  // Hard resetting a protected branch rewrites its history — the same act a
+  // force-push then ships. The guardrails refuse the act outright; an
+  // unprotect in the Branches tab is the way around it, not a louder confirm.
+  if (mode === "hard" && !force) {
+    const branch = git(root, ["symbolic-ref", "--short", "HEAD"]).stdout.trim();
+    if (isProtected(root, branch)) return { ok: false, error: `${branch} is protected — unprotect it in the Branches tab to hard-reset it` };
+  }
   return run(root, ["reset", `--${mode}`, ref]);
+}
+
+/**
+ * Replay commits onto the current branch.
+ *
+ * One call for the whole set: `git cherry-pick h1 h2 h3` is a single sequencer
+ * run, so a conflict pauses the whole thing mid-series instead of each commit
+ * being an independent attempt that has to be undone before the next. The
+ * existing conflict machinery already knows how to finish it — `treeState()`
+ * reports `cherry-picking`, `mergeInfo()` names the two sides, and
+ * `mergeContinue`/`mergeAbort` already branch on that state.
+ *
+ * Refuses to start while anything else is in progress: a repo mid-merge must
+ * not begin a second sequencer run, and the message names the state so the
+ * panel can point at the banner instead of making the user guess.
+ */
+export function cherryPick(rootIn: string, hashesIn: unknown, noCommitIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const state = treeState(root);
+  if (state !== "clean") return { ok: false, error: `this checkout is mid-${state.replace(/ing$/, "")} — finish or abandon it before cherry-picking` };
+  // Hashes only, never refs: the sequencer resolves each argument itself, and
+  // letting "HEAD" or a branch name through would replay something that moves
+  // with the run it is part of.
+  const hashes = Array.isArray(hashesIn) ? hashesIn.filter((h): h is string => validHash(h)) : [];
+  if (!hashes.length) return { ok: false, error: "no valid commit hashes to cherry-pick" };
+  const args = ["cherry-pick"];
+  if (noCommitIn === true) args.push("-n");
+  // Preserve the caller's order: the sequencer picks oldest-first, and the
+  // panel sends them that way already. Sorting here would only create a
+  // second place to get the direction wrong.
+  args.push(...hashes);
+  return withAutoStash(root, () => run(root, args));
+}
+
+/** Finish a paused cherry-pick once every conflict is resolved. */
+export function cherryPickContinue(rootIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  if (treeState(root) !== "cherry-picking") return { ok: false, error: "nothing to continue" };
+  // The shared path already knows the editor trap: plain `--continue` can open
+  // an editor when a conflict was resolved, so it passes `-c core.editor=true`.
+  return mergeContinue(root);
+}
+
+/** Abandon the paused cherry-pick and put the tree back. */
+export function cherryPickAbort(rootIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  if (treeState(root) !== "cherry-picking") return { ok: false, error: "nothing to abort" };
+  return mergeAbort(root);
+}
+
+/**
+ * Undo a commit with a new commit, keeping history.
+ *
+ * The conflict path rides the existing machinery exactly as cherry-picks do:
+ * `treeState()` reports `reverting`, `mergeAbort()` runs `git revert --abort`,
+ * and `mergeContinue()` commits the staged resolution with `--no-edit`.
+ * `--no-edit` on the way in too: the panel has no message editor for a revert,
+ * and an interactive editor opening out of a web request is a hang.
+ */
+export function revertCommit(rootIn: unknown, hashIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const hash = typeof hashIn === "string" && validHash(hashIn) ? hashIn : "";
+  if (!hash) return { ok: false, error: "no valid commit hash to revert" };
+  const state = treeState(root);
+  if (state !== "clean") return { ok: false, error: `this checkout is mid-${state.replace(/ing$/, "")} — finish or abandon it before reverting` };
+  return run(root, ["-c", "core.editor=true", "revert", "--no-edit", hash]);
+}
+
+/**
+ * Fold the staged changes into the previous commit.
+ *
+ * Refuses while anything else is in progress, and requires the working tree to
+ * be clean besides what is staged — `--amend` with stray unstaged changes would
+ * silently leave them out of the commit they look like they belong to.
+ */
+export function amendCommit(rootIn: unknown, titleIn: unknown, bodyIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const title = typeof titleIn === "string" ? titleIn.trim() : "";
+  if (!title) return { ok: false, error: "commit title required" };
+  const state = treeState(root);
+  if (state !== "clean") return { ok: false, error: `this checkout is mid-${state.replace(/ing$/, "")} — finish or abandon it before amending` };
+  const staged = git(root, ["diff", "--cached", "--name-only"]).stdout.trim();
+  const stray = git(root, ["diff", "--name-only"]).stdout.trim();
+  if (!staged && !stray) return { ok: false, error: "nothing staged to amend" };
+  // Checked before the "nothing staged" branch above can hide it: a tree with
+  // only unstaged changes must not be told to stage before being told it is
+  // about to lose them.
+  if (stray) return { ok: false, error: `unstaged changes in ${stray.split("\n")[0]} — stage or discard them first, or the amend will silently drop them` };
+  const args = ["commit", "--amend", "-m", title];
+  const body = typeof bodyIn === "string" ? bodyIn.trim() : "";
+  if (body) args.push("-m", body);
+  return run(root, args);
+}
+
+/**
+ * Fold a contiguous run of commits into one, tree preserved.
+ *
+ * Soft-reset to just before the oldest picked commit, then a single commit.
+ * The old tip is left in ORIG_HEAD, which is the undo point the panel can offer
+ * ("I meant to keep three commits"). `oldest`/`newest` are the span's ends; the
+ * whole range is verified contiguous BEFORE anything moves, so a gap cannot
+ * silently swallow commits that were never picked.
+ */
+export function squashCommits(rootIn: unknown, oldestIn: unknown, newestIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const oldest = typeof oldestIn === "string" && validHash(oldestIn) ? oldestIn : "";
+  const newest = typeof newestIn === "string" && validHash(newestIn) ? newestIn : "";
+  if (!oldest || !newest) return { ok: false, error: "no valid commit hashes to squash" };
+  const state = treeState(root);
+  if (state !== "clean") return { ok: false, error: `this checkout is mid-${state.replace(/ing$/, "")} — finish or abandon it before squashing` };
+  // The picked range must sit at the tip of this branch and be contiguous.
+  if (git(root, ["merge-base", "--is-ancestor", newest, "HEAD"]).code !== 0)
+    return { ok: false, error: `${newest} is not in this branch's history — squash only commits on the current branch` };
+  const count = git(root, ["rev-list", "--count", `${oldest}^..${newest}`]).stdout.trim();
+  const span = git(root, ["rev-list", "--count", `${oldest}^..HEAD`]).stdout.trim();
+  if (count !== span) return { ok: false, error: `${oldest}..${newest} is not a contiguous run to HEAD — pick a consecutive span ending at the tip` };
+  const msg = git(root, ["log", "-1", "--format=%s", newest]).stdout.trim();
+  const headBefore = git(root, ["rev-parse", "HEAD"]).stdout.trim();
+  // Two steps, each observable: the soft reset stops with the tree intact and
+  // everything the run touched staged, so a failure cannot lose work — the
+  // index is the squash's contents either way.
+  const reset = run(root, ["reset", "--soft", `${oldest}^`]);
+  if (!reset.ok) return reset;
+  const commit = run(root, ["commit", "-m", `squash! ${msg}`]);
+  if (!commit.ok) return { ...commit, error: `${commit.error} — the changes are staged at ${oldest}^; commit them to finish the squash` };
+  const undone = git(root, ["rev-parse", "ORIG_HEAD"]).stdout.trim();
+  if (undone !== headBefore) {
+    // Should not happen: reset --soft writes ORIG_HEAD. Refuse silently losing
+    // the tip rather than claim a clean squash.
+    return { ok: false, error: `squash completed but the undo point is missing — the old tip was ${headBefore}` };
+  }
+  return { ...commit, output: `${commit.output} — old tip saved at ORIG_HEAD (${headBefore.slice(0, 7)})` };
+}
+
+// --- interactive rebase ------------------------------------------------------
+/** One line of an interactive-rebase todo list. `newMessage` is set only for
+ *  reword steps; the engine turns those into `exec git commit --amend` lines,
+ *  because git's own `reword` opens an editor we have no way to drive. */
+export interface RebaseStep {
+  action: "pick" | "squash" | "fixup" | "drop" | "reword" | "edit";
+  hash: string;
+  subject: string;
+  newMessage?: string;
+}
+
+/** The commits `base..HEAD`, oldest first — the list an interactive rebase
+ *  starts from. Read-only; the caller edits it and passes it back to
+ *  `runRebase`. */
+export function rebaseSteps(rootIn: unknown, baseIn: unknown): { ok: boolean; steps?: RebaseStep[]; error?: string } {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, error: "not a git repository root" };
+  const base = typeof baseIn === "string" && validRef(baseIn) ? baseIn : "";
+  if (!base) return { ok: false, error: "invalid base ref" };
+  if (git(root, ["merge-base", "--is-ancestor", base, "HEAD"]).code !== 0)
+    return { ok: false, error: `${base} is not an ancestor of HEAD — pick the point this branch forked` };
+  const out = git(root, ["log", "--reverse", "--format=%H%x1f%s", `${base}..HEAD`]).stdout;
+  const steps: RebaseStep[] = [];
+  for (const line of out.split("\n")) {
+    const [hash, subject] = line.split(US);
+    if (hash && subject) steps.push({ action: "pick", hash, subject });
+  }
+  if (!steps.length) return { ok: false, error: `nothing to rebase — ${base} is already an ancestor with no commits in between` };
+  return { ok: true, steps };
+}
+
+const REBASE_ACTIONS = new Set(["pick", "squash", "fixup", "drop", "reword", "edit"]);
+/** One `sh`-safe single-quoted argument, for the exec lines. */
+const shq = (s: string) => `'${s.replace(/\\/g, "\\\\").replace(/'/g, "'\\''")}'`;
+
+/**
+ * Run the todo list `steps` as ONE `git rebase -i` — the whole edit in one
+ * sequencer run, so a conflict stops the series and `mergeContinue`/abort
+ * (which already branch on `rebasing`) finish or abandon it.
+ *
+ * The todo file is handed to git through `sequence.editor`, which is the whole
+ * trick: git invokes that command with the path of the todo it just wrote, so
+ * `cp` of our prepared file over it is all an "editor" has to do. No pty, no
+ * keystrokes, nothing interactive. Every commit in `base..HEAD` must appear in
+ * the list exactly once, and every hash must be one of them — otherwise a
+ * stale or tampered list could drop or invent commits silently.
+ */
+export function runRebase(rootIn: unknown, baseIn: unknown, stepsIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const base = typeof baseIn === "string" && validRef(baseIn) ? baseIn : "";
+  if (!base) return { ok: false, error: "invalid base ref" };
+  const state = treeState(root);
+  if (state !== "clean") return { ok: false, error: `this checkout is mid-${state.replace(/ing$/, "")} — finish or abandon it before rebasing` };
+  if (!Array.isArray(stepsIn) || !stepsIn.length) return { ok: false, error: "empty rebase plan" };
+
+  const todo: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of stepsIn) {
+    const s = raw as RebaseStep;
+    if (!REBASE_ACTIONS.has(s.action) || !validHash(s.hash)) return { ok: false, error: "invalid rebase step" };
+    if (seen.has(s.hash)) return { ok: false, error: `commit ${s.hash.slice(0, 7)} appears more than once in the plan` };
+    seen.add(s.hash);
+    if (s.action === "reword") {
+      const msg = typeof s.newMessage === "string" && s.newMessage.trim() ? s.newMessage.trim() : s.subject;
+      todo.push(`pick ${s.hash} ${s.subject}`);
+      todo.push(`exec git commit --amend -m ${shq(msg)}`);
+    } else if (s.action === "drop") {
+      todo.push(`drop ${s.hash} ${s.subject}`);
+    } else {
+      todo.push(`${s.action} ${s.hash} ${s.subject}`);
+    }
+  }
+  // Every commit between base and HEAD is accounted for, exactly once.
+  const span = git(root, ["rev-list", "--format=%H", base + "..HEAD"]).stdout.split("\n").filter((l) => /^[0-9a-f]{40}$/.test(l));
+  const spanSet = new Set(span);
+  for (const h of seen) if (!spanSet.has(h)) return { ok: false, error: `commit ${h.slice(0, 7)} is not in ${base}..HEAD — the plan no longer matches the branch` };
+  if (span.some((h) => !seen.has(h))) return { ok: false, error: "the plan is missing commits from the branch — every commit must appear exactly once" };
+
+  // A temp dir owned by this call: the todo file is consumed by the sequence
+  // editor, and must not collide with a rebase running at the same time.
+  const td = mkdtempSync(join(tmpdir(), "agx-rebase-"));
+  const todoFile = join(td, "todo");
+  writeFileSync(todoFile, todo.join("\n") + "\n");
+  try {
+    return withAutoStash(root, () => run(root, ["-c", "core.editor=true", "-c", `sequence.editor=cp ${todoFile}`, "rebase", "-i", base]));
+  } finally {
+    try { rmSync(td, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }
 
 /**
@@ -1254,19 +1754,25 @@ export async function logGraph(rootIn: unknown, limit = 400, scope: "head" | "al
   const n = Math.max(1, Math.min(2000, limit | 0));
   // NUL can't go in an argv string (execve truncates at it), so use the same
   // \x1f unit-separator the branch code uses — safe in args, absent from commits.
-  const fmt = `${US}%h${US}%an${US}%ar${US}%s${US}%D`;
-  // Awaited: measured at 761ms on a large repo, and the cost is `--graph`'s
-  // topological walk rather than the row count — asking for 60 commits instead
-  // of 500 saves nothing (762ms vs 761ms). So the only thing that helps is not
-  // holding the loop while it runs.
-  const r = await gitAsync(root, ["-c", "core.quotePath=false", "log", "--graph", ...(scope === "all" ? ["--all"] : []), "--date=relative", `-n${n}`, `--format=${fmt}`]);
+  // `%p` — the parents — is the whole graph, and it is what the client draws
+  // lanes from. `--graph` itself is gone: its ASCII art was rendered as text in
+  // a monospace column, so a repository with twenty-seven live branches drew
+  // forty characters of `| | * | \ \` before the subject and truncated the
+  // message to "fix(pr-revi…". Dropping it also drops its cost — the 761ms this
+  // used to measure was `--graph`'s topological walk, not the row count.
+  const fmt = `${US}%h${US}%p${US}%an${US}%ar${US}%s${US}%D`;
+  const r = await gitAsync(root, ["-c", "core.quotePath=false", "log", ...(scope === "all" ? ["--all"] : []), "--date=relative", `-n${n}`, `--format=${fmt}`]);
   const lines: GitGraphLine[] = [];
   for (const raw of r.stdout.split("\n")) {
     if (!raw) continue;
     const i = raw.indexOf(US);
     if (i === -1) { lines.push({ graph: raw }); continue; }
-    const [hash, author, date, subject, refs] = raw.slice(i + 1).split(US);
-    lines.push({ graph: raw.slice(0, i), hash, author, date, subject, refs });
+    const [hash, parents, author, date, subject, refs] = raw.slice(i + 1).split(US);
+    lines.push({
+      graph: raw.slice(0, i), hash,
+      parents: (parents ?? "").split(" ").filter(Boolean),
+      author, date, subject, refs,
+    });
   }
   // Named so the pane can say whose history it is showing rather than leaving
   // the user to infer it from the commits.
@@ -1297,6 +1803,176 @@ export async function logGraph(rootIn: unknown, limit = 400, scope: "head" | "al
  *  write (including setBase, the only thing that changes an override) passes
  *  through. Same TTL as the trunk it mostly returns. */
 const baseCache = new Map<string, { at: number; base: string | null }>();
+
+/**
+ * Every branch name `origin` publishes, as short names.
+ *
+ * Cached and single-flighted for the same reason `defaultBranch` is: `baseOf`
+ * asks for it once per checkout and `worktrees()` launches all of those in one
+ * `Promise.all`, so a plain TTL cache would be missed by all twenty-two of them
+ * before any had filled it. One `for-each-ref` per minute per repo, shared.
+ *
+ * Cleared by `invalidateMerged`, which every write passes through, and by a
+ * fetch that actually moved refs — so a branch pushed for the first time is a
+ * candidate base within the same poll that notices it.
+ */
+const PUBLISHED_TTL_MS = 60_000;
+const publishedCache = new Map<string, { at: number; refs: Set<string> }>();
+const publishedInflight = new Map<string, Promise<Set<string>>>();
+
+async function publishedRefs(root: string): Promise<Set<string>> {
+  const hit = publishedCache.get(root);
+  if (hit && Date.now() - hit.at < PUBLISHED_TTL_MS) return hit.refs;
+  const flying = publishedInflight.get(root);
+  if (flying) return flying;
+  const p = (async () => {
+    try {
+      const out = await gitAsync(root, ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin/"]);
+      const refs = new Set(
+        out.stdout.split("\n").map((s) => s.trim().replace(/^origin\//, "")).filter((s) => s && s !== "HEAD"),
+      );
+      if (publishedCache.size > 200) publishedCache.clear();
+      publishedCache.set(root, { at: Date.now(), refs });
+      return refs;
+    } finally {
+      publishedInflight.delete(root);
+    }
+  })();
+  publishedInflight.set(root, p);
+  return p;
+}
+
+/**
+ * The published copy of a base, when that is the one worth comparing against.
+ *
+ * A base branch is usually checked out *somewhere* — the trunk of a stack often
+ * sits in the family's main checkout — and a checkout nobody has pulled goes
+ * stale while the branch it names keeps moving on the server. Comparing against
+ * the stale local copy is how "126 commits behind" renders as nothing at all:
+ * the local `orbit-WEB-1042` was itself 126 behind `origin/orbit-WEB-1042`, so
+ * `branch..base` came out zero and the panel had nothing to show.
+ *
+ * So once a base has a *name*, the ref we actually measure and merge is the
+ * freshest copy of that name: `origin/<short>` when it exists and carries
+ * commits the local copy does not. Not "whenever the remote exists" — a base
+ * whose local copy is ahead is one somebody is actively building, and pointing
+ * at the remote would under-report it.
+ *
+ * `syncFromBase` merges whatever this returns, which is the intended behaviour:
+ * "Update branch" on a pull request page brings in the *remote* base, not
+ * whatever happens to be on this disk.
+ */
+async function freshest(root: string, ref: string): Promise<string> {
+  const short = ref.replace(/^origin\//, "");
+  if (ref.startsWith("origin/") || !validRef(short)) return ref;
+  if (!(await publishedRefs(root)).has(short)) return ref; // no remote copy to prefer
+  // One spawn covers both questions. A range whose left side does not exist
+  // fails rather than counting, and that failure is itself the answer: there is
+  // no local copy, so the remote is the only copy there is.
+  const r = await gitAsync(root, ["rev-list", "--count", `refs/heads/${short}..refs/remotes/origin/${short}`]);
+  if (r.code !== 0) return `origin/${short}`;
+  const n = Number(r.stdout.trim());
+  return Number.isFinite(n) && n > 0 ? `origin/${short}` : ref;
+}
+
+/**
+ * The branch this one was cut from, when nobody recorded it — read off the shape
+ * of history rather than guessed.
+ *
+ * A base is a branch whose TIP is an ancestor of this branch (it was built on
+ * top of it) but which is NOT already in the trunk — a feature branch this one
+ * is stacked on. `git` does that filter in a single pass (`--merged <branch>
+ * --no-merged <trunk>`), so a repo with hundreds of refs still returns only the
+ * handful in the stacking chain. The closest of them — fewest commits between
+ * its tip and the branch — is the direct base.
+ *
+ * **Only published branches are candidates**, when the repo has an `origin` at
+ * all. `--merged <branch>` matches *any* ref that happens to be an ancestor,
+ * and a working repository is full of refs that are ancestors by accident: the
+ * `pr1042-review`, `pr1039`, `pr998-review` someone left behind after
+ * reading a diff. Those sit a commit or two back, so they win the
+ * fewest-commits test outright and become the "base" — a scratch ref this
+ * branch was never cut from. Having a counterpart on the remote is what tells a
+ * branch somebody is stacked on from a bookmark somebody made. Repos with no
+ * remote keep the unfiltered set, because there the distinction does not exist.
+ *
+ * What comes back is a *name*, not the ref to measure. `--merged` can only ever
+ * match a copy of the base this branch is already level with, so measuring the
+ * ref it returns is guaranteed to report zero — see `freshest`, which `baseOf`
+ * applies to the answer.
+ *
+ * Relative to `branch`, never to `HEAD`: `worktrees()` resolves every sibling's
+ * base from the family's MAIN checkout, so `HEAD` there is the main branch, not
+ * the sibling being asked about — reading `--merged HEAD` made every worktree
+ * infer the main branch's base and fall through to the trunk. `<branch>` names
+ * the tip we actually mean regardless of which checkout runs the query.
+ *
+ * Returns null when there is nothing between the branch and the trunk, so
+ * `baseOf` falls back to the trunk. A branch's own upstream (`origin/<self>`)
+ * and the trunk itself are never candidates.
+ */
+async function inferBase(root: string, branch: string, trunk: string | null): Promise<string | null> {
+  if (!trunk) return null;
+  const trunkShort = trunk.replace(/^origin\//, "");
+  const out = await gitAsync(root, [
+    "for-each-ref", "--merged", branch, "--no-merged", trunk,
+    "--format=%(refname:short)", "refs/heads/", "refs/remotes/origin/",
+  ]);
+  const cands = out.stdout.split("\n").map((s) => s.trim()).filter((r) => {
+    if (!r) return false;
+    const short = r.replace(/^origin\//, "");
+    return short !== branch && short !== trunkShort; // never self (local or its remote), never the trunk
+  });
+  // Checked against the shared published set in memory rather than a `rev-parse`
+  // per candidate. A repo with no origin refs at all has no way to tell a
+  // stacked branch from a bookmark, so it keeps every candidate rather than none.
+  const published = await publishedRefs(root);
+  const eligible = published.size ? cands.filter((r) => published.has(r.replace(/^origin\//, ""))) : cands;
+  let best: string | null = null;
+  let bestN = Infinity;
+  for (const r of eligible) {
+    const n = Number((await gitAsync(root, ["rev-list", "--count", `${r}..${branch}`])).stdout.trim());
+    if (Number.isFinite(n) && n > 0 && n < bestN) { bestN = n; best = r; }
+  }
+  return best;
+}
+
+/**
+ * The base branch a pull request declares for this head — the authoritative
+ * answer, from whoever is already holding it.
+ *
+ * Git does not record what a branch was cut from, so everything else here is
+ * inference off the shape of history, and inference is ambiguous exactly when
+ * branches are stacked: on a real repo four sibling card branches and a
+ * leftover review ref all scored within two commits of each other, and the
+ * wrong one won. The pull request is not ambiguous. It names its base, and that
+ * name is what GitHub's own "N commits behind" is measured against — so taking
+ * it is what makes this panel agree with the check on the pull request page.
+ *
+ * The pull-request list is already fetched and cached with `baseRefName` in it,
+ * so this costs a map lookup: no `gh`, no network, nothing on the poll path.
+ *
+ * A hook for the same reason `setGitChangeHook` is one: this module must not
+ * import the pull-request layer, which spawns `gh` and knows about auth. It
+ * answers null whenever it cannot answer — cache still cold, no `gh`, no PR for
+ * this branch — and the ladder falls through to inference, so a repo that has
+ * never seen a pull request behaves exactly as it did before.
+ */
+type PrBaseLookup = (root: string, branch: string) => Promise<string | null>;
+let prBaseFor: PrBaseLookup | null = null;
+export function setPrBaseHook(fn: PrBaseLookup | null): void { prBaseFor = fn; }
+
+/**
+ * What this branch is measured against, in order of how much the answer is
+ * actually *known*: an override somebody wrote down, then the base its pull
+ * request declares, then what the branch tracks, then the shape of history,
+ * then the trunk.
+ *
+ * Whatever wins, what comes back is the freshest copy of that branch (see
+ * `freshest`). That is not a detail — it is the difference between a number and
+ * nothing at all. A base is worth showing precisely when it has moved on, and
+ * the copy sitting on this disk is the one that has not.
+ */
 export async function baseOf(root: string, branch: string): Promise<string | null> {
   if (!branch || branch === "(detached)") return null;
   const key = `${root}\u0000${branch}`;
@@ -1308,12 +1984,54 @@ export async function baseOf(root: string, branch: string): Promise<string | nul
   const cfg = (await gitAsync(root, ["config", "--get", `branch.${branch}.agentglassbase`])).stdout.trim();
   let base: string | null;
   if (cfg && validRef(cfg) && (await gitAsync(root, ["rev-parse", "--verify", "--quiet", cfg])).code === 0) {
-    base = cfg;
+    base = cfg; // an answer somebody wrote down beats every guess below it
   } else {
-    const trunk = await defaultBranch(root);
-    // A branch is not its own base; the trunk checkout simply has none.
-    base = !trunk || trunk === branch || trunk.replace(/^origin\//, "") === branch ? null : trunk;
+    // Only asked once the override has lost, so a branch with an explicit base
+    // costs nothing here.
+    const declared = (await prBaseFor?.(root, branch))?.trim() || "";
+    if (declared && declared !== branch && validRef(declared) && (await publishedRefs(root)).has(declared)) {
+      // Named against the remote, because that is where a pull request's base
+      // lives: the name GitHub reports may have no local copy here at all, and
+      // when it does have one, that copy is routinely the stale half of the
+      // very problem this is measuring.
+      base = `origin/${declared}`;
+    } else {
+      /*
+       * What the branch says it tracks, before anything is inferred from the
+       * shape of history.
+       *
+       * `git worktree add -b card --track origin/other` and `git checkout -b
+       * card origin/other` both write `branch.card.merge`, so this is not a
+       * guess: somebody said what this was cut from and git wrote it down. The
+       * inference below cannot see it — `--merged <branch>` only matches a base
+       * this branch still contains, and the moment the base picks up a commit
+       * of its own it stops being an ancestor and drops out of the candidates,
+       * leaving the trunk. Which is the report: a branch stacked on another
+       * feature branch showed "origin/master" as its base while the header
+       * beside it correctly read "tracking origin/<that branch>".
+       *
+       * Skipped when the upstream is this branch's own remote copy, which is
+       * what tracking means for every branch that has simply been pushed —
+       * `sameBranch` because `origin/card` and `card` are one branch under two
+       * names.
+       */
+      const up = (await gitAsync(root, ["rev-parse", "--symbolic-full-name", `${branch}@{upstream}`])).stdout
+        .trim().replace(/^refs\/remotes\//, "").replace(/^refs\/heads\//, "");
+      const tracked = up && validRef(up) && !(await sameBranch(root, up, branch)) ? up : "";
+      if (tracked) {
+        base = tracked;
+      } else {
+        const trunk = await defaultBranch(root);
+        // No base recorded anywhere: infer the branch this one was stacked on (its
+        // base is THAT, not the trunk). Falls back to the trunk when there is
+        // nothing between HEAD and it. A branch is not its own base; the trunk
+        // checkout simply has none.
+        const inferred = await inferBase(root, branch, trunk);
+        base = inferred ?? (!trunk || trunk === branch || trunk.replace(/^origin\//, "") === branch ? null : trunk);
+      }
+    }
   }
+  if (base) base = await freshest(root, base);
   if (baseCache.size > 400) baseCache.clear();
   baseCache.set(key, { at: Date.now(), base });
   return base;
@@ -1349,7 +2067,16 @@ export function setBase(rootIn: unknown, branch: unknown, base: unknown): GitAct
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
   if (typeof branch !== "string" || !validRef(branch)) return { ok: false, error: "invalid branch" };
-  if (base === null || base === "") return run(root, ["config", "--unset", `branch.${branch}.agentglassbase`]);
+  if (base === null || base === "") {
+    const key = `branch.${branch}.agentglassbase`;
+    // Clearing an override that was never set changes nothing, so say so rather
+    // than handing it to git: `--unset` exits 5 on a missing key, which would
+    // turn "work it out for me" into an error toast on every branch that never
+    // had an override — which is most of them. Nothing goes stale by skipping
+    // the write either: with no override, the base already was the inferred one.
+    if (!git(root, ["config", "--get", key]).stdout.trim()) return { ok: true };
+    return run(root, ["config", "--unset", key]);
+  }
   if (typeof base !== "string" || !validRef(base)) return { ok: false, error: "invalid base" };
   return run(root, ["config", `branch.${branch}.agentglassbase`, base]);
 }
@@ -1424,7 +2151,9 @@ export function resolveWith(rootIn: unknown, relIn: unknown, side: unknown): Git
   if (!rels?.length) return { ok: false, error: "invalid path" };
   const co = run(root, ["checkout", `--${side}`, "--", ...rels]);
   if (!co.ok) return co;
-  return run(root, ["add", "--", ...rels]);
+  const added = run(root, ["add", "--", ...rels]);
+  if (added.ok) noteResolved(root, sessionOp(mergeInfo(root)), rels);
+  return added;
 }
 
 /** Abandon the merge and put the tree back exactly as it was. The only move
@@ -1436,21 +2165,89 @@ export function mergeAbort(rootIn: unknown): GitActionResult {
   if (state === "rebasing") return run(root, ["rebase", "--abort"]);
   if (state === "cherry-picking") return run(root, ["cherry-pick", "--abort"]);
   if (state === "reverting") return run(root, ["revert", "--abort"]);
+  // A bisect is not a merge, and the fallthrough treated it as one: this ran
+  // `git merge --abort` and came back with "There is no merge to abort", so a
+  // repository left mid-bisect was a dead end on every surface — treeState()
+  // named the state, the header showed it, and nothing could leave it.
+  if (state === "bisecting") return run(root, ["bisect", "reset"]);
   return run(root, ["merge", "--abort"]);
 }
 
 /** Finish once every conflict is staged. Refuses while any remain rather than
  *  letting git fail with a message nobody reads. */
-export function mergeContinue(rootIn: unknown): GitActionResult {
+export function mergeContinue(rootIn: unknown, anywayIn?: unknown): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
   const left = git(root, ["diff", "--name-only", "--diff-filter=U"]).stdout.trim();
   if (left) return { ok: false, error: `still conflicted: ${left.split("\n").length} file(s) to resolve` };
+
+  /*
+   * The gap the unmerged list cannot see.
+   *
+   * Anything can stage a file with markers still in it — an agent that stopped
+   * halfway, an editor, a stray `git add -A` — and from that moment git counts
+   * it as resolved and will commit `<<<<<<<` into the branch without a word.
+   * Scoped to this stop's own files, because a sweep of the index would trip
+   * over every test fixture whose committed content is conflict markers.
+   */
+  // Read before continuing: MERGE_HEAD and rebase-merge/ are gone the instant
+  // it succeeds, so neither the stop nor which commit it was can be named
+  // afterwards.
+  const before = mergeInfo(root);
+  const op = sessionOp(before);
+  const step0 = stepLabel(before);
+  if (anywayIn !== true) {
+    const dirty = markersLeft(root, stopFor(root, op)?.files ?? []);
+    if (dirty.length) {
+      const many = dirty.length > 1;
+      return {
+        ok: false,
+        error: `${dirty.join(", ")} ${many ? "are" : "is"} staged but still ${many ? "have" : "has"} conflict markers in ${many ? "them" : "it"} — resolve ${many ? "them" : "it"}, or put the conflict back and start again.`,
+      };
+    }
+  }
+
   const state = treeState(root);
-  if (state === "rebasing") return run(root, ["-c", "core.editor=true", "rebase", "--continue"]);
-  if (state === "cherry-picking") return run(root, ["-c", "core.editor=true", "cherry-pick", "--continue"]);
-  // `merge --continue` needs an editor; --no-edit keeps git's own message.
-  return run(root, ["commit", "--no-edit"]);
+  const r = state === "rebasing" ? run(root, ["-c", "core.editor=true", "rebase", "--continue"])
+    : state === "cherry-picking" ? run(root, ["-c", "core.editor=true", "cherry-pick", "--continue"])
+    : state === "reverting" ? run(root, ["-c", "core.editor=true", "revert", "--continue"])
+    // `merge --continue` needs an editor; --no-edit keeps git's own message.
+    : run(root, ["commit", "--no-edit"]);
+
+  /*
+   * A rebase that stops again has not failed — it has advanced.
+   *
+   * `git rebase --continue` exits NON-ZERO when it commits the current step
+   * and the next commit conflicts, which for a branch of any size is the
+   * ordinary case rather than the exception. Taking that exit code at face
+   * value reported the most normal outcome in the world as an error: the
+   * screen showed a failure toast and stayed on the review of a commit that
+   * had in fact just landed, over a repository already stopped on the next
+   * one. Found by driving a three-commit rebase; git's own message says
+   * "Rebasing (2/3)" in the middle of the text it fails with.
+   *
+   * So the verdict comes from where the repository ENDED UP, not from the exit
+   * code: the operation is either over, or somewhere new, or exactly where it
+   * was — and only the last of those is a failure.
+   */
+  const after = mergeInfo(root);
+  const moved = sessionOp(after) !== op;
+  if (r.ok || moved) {
+    forget(root, op);
+    if (after.state === "clean") return { ok: true, output: r.output || "done" };
+    const where = stepLabel(after);
+    return {
+      ok: true,
+      output: `committed${step0 ? ` ${step0}` : ""} — stopped again${where ? ` on ${where}` : ""}, ${after.state === "rebasing" ? "the rebase continues" : "there is more to resolve"}`,
+    };
+  }
+  return r;
+}
+
+/** "commit 2 of 5", or null when the operation happens once. Mirrors the
+ *  client's own wording so the toast and the screen say the same thing. */
+function stepLabel(i: MergeInfo): string | null {
+  return i.step && i.total && i.total > 1 ? `commit ${i.step} of ${i.total}` : null;
 }
 
 /**
@@ -1694,8 +2491,135 @@ export function addWorktree(rootIn: string, pathIn: unknown, branch: string, new
     if (git(root, ["rev-parse", "--verify", "--quiet", startPoint]).code !== 0) return { ok: false, error: `${startPoint} does not exist here — fetch first` };
     from = [startPoint];
   }
-  return run(root, newBranch ? ["worktree", "add", "-b", branch, abs, ...from] : ["worktree", "add", abs, branch]);
+  const r = run(root, newBranch ? ["worktree", "add", "-b", branch, abs, ...from] : ["worktree", "add", abs, branch]);
+  // Record what the new branch was cut from, so a later "sync" merges from its
+  // REAL base instead of falling back to the trunk. Without this a card stacked
+  // on another feature branch (base = ORBIT-…, not master) synced against master
+  // and pulled in changes that never belonged on it — the exact failure this
+  // config exists to prevent. Only for a genuinely new branch off a start point;
+  // `git worktree add <path> <existing-branch>` adopts a branch whose base, if
+  // any, is already recorded. `branch.*` config is shared across worktrees, so
+  // writing it from the main root is visible from the new checkout.
+  if (r.ok && newBranch && from.length) {
+    run(root, ["config", `branch.${branch}.agentglassbase`, from[0]!]);
+  }
+  return r;
 }
+/**
+ * Put a pull request's conflict somewhere you can actually work on it.
+ *
+ * GitHub only ever PREDICTS the conflict: "this branch has conflicts with the
+ * base". Nothing has been merged anywhere, so there is nothing for a conflict
+ * resolver — ours or anyone's — to resolve. This does the merge for real, and
+ * it does it in a worktree of its own.
+ *
+ * A worktree rather than the checkout you are standing in, and that is the
+ * whole safety story: your branch, your uncommitted work and your place in the
+ * repository are untouched, a second attempt is idempotent, and if it goes
+ * wrong the remedy is deleting a directory. A button that rewrites the tree you
+ * are working in is a button people learn not to press.
+ *
+ * What comes back is where it happened and which files are in conflict — which
+ * is exactly what the resolver already takes.
+ */
+export interface ConflictPrep {
+  ok: boolean;
+  /** The worktree the merge was done in. */
+  root?: string;
+  /** Relative paths, as git reports them. Empty with `ok` means the merge went
+   *  through cleanly — the branch was only behind, not conflicting. */
+  conflicts?: string[];
+  /** The merge left nothing to resolve; the worktree holds a finished merge
+   *  waiting to be pushed. */
+  clean?: boolean;
+  error?: string;
+}
+
+export function prepareConflictMerge(rootIn: string, branch: string, base: string): ConflictPrep {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return { ok: false, error: g.error };
+  if (!validRef(branch) || !validRef(base)) return { ok: false, error: "invalid branch name" };
+
+  // Fresh refs first: merging a base the checkout last saw a week ago produces
+  // a conflict that is nobody's, or hides one that is real.
+  git(root, [...FETCH_ARGV]);
+
+  /*
+   * The checkout that already has this branch, when there is one.
+   *
+   * The first version refused here — "already checked out at …" — which is a
+   * fact, not an instruction, and left somebody staring at a button that could
+   * not work. It is also the wrong answer: a checkout of that branch is exactly
+   * where the merge belongs, and it is where they would have done it by hand.
+   *
+   * Only when it is CLEAN. Merging into somebody's half-finished work is the one
+   * thing this whole design exists to avoid, so a dirty one is refused with the
+   * two words that fix it.
+   */
+  const held = worktreeList(root).find((w) => w.branch === branch && w.path !== root);
+  if (held) {
+    // Our own half-done merge first. Conflict markers ARE uncommitted changes,
+    // so checking "is it dirty" before this refuses on the work the first
+    // button just did — which it did, and the tests are why this order exists.
+    const standing = unmerged(held.path);
+    if (standing.length) return { ok: true, root: held.path, conflicts: standing };
+    // Then somebody else's. Not left to git: it only refuses when the merge
+    // would touch the same files, so unrelated work in that checkout would have
+    // been merged around silently — a branch quietly given a merge commit in a
+    // tree somebody is using.
+    const dirty = git(held.path, ["status", "--porcelain"]).stdout.trim();
+    if (dirty) {
+      return { ok: false, error: `${branch} is checked out at ${held.path}, and it has uncommitted changes — commit or stash them there and press again` };
+    }
+    return mergeInto(held.path, base);
+  }
+
+  // Beside the repo, named for the pull request's branch — the same shape the
+  // worktree guard already allows, so this cannot write outside it.
+  const abs = `${root}-conflict-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 60)}`;
+  const already = worktreeList(root).find((w) => w.path === abs);
+  if (!already) {
+    const local = git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).code === 0;
+    // Adopt the local branch when there is one; otherwise cut it from the
+    // remote. `-b` against an existing branch is an error, and adopting a
+    // branch that only exists on the remote is not possible.
+    const add = local
+      ? run(root, ["worktree", "add", abs, branch])
+      : run(root, ["worktree", "add", "-b", branch, abs, `origin/${branch}`]);
+    if (!add.ok) return { ok: false, error: add.error ?? "could not cut a worktree" };
+  }
+  return mergeInto(abs, base);
+}
+
+/** The files git has marked as unmerged — the resolver's whole input. */
+function unmerged(where: string): string[] {
+  return git(where, ["diff", "--name-only", "--diff-filter=U"]).stdout
+    .split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
+/**
+ * The merge itself, wherever it is happening.
+ *
+ * `--no-edit` so it cannot sit waiting on an editor nobody can see, and
+ * `origin/<base>` rather than `<base>` because the local copy of the base is
+ * exactly what tends to be stale.
+ */
+function mergeInto(where: string, base: string): ConflictPrep {
+  // Already mid-merge from a previous press: report where it stands rather than
+  // running `git merge` again, which refuses and says nothing useful.
+  const standing = unmerged(where);
+  if (standing.length) return { ok: true, root: where, conflicts: standing };
+
+  const merged = git(where, ["merge", "--no-edit", `origin/${base}`]);
+  const conflicts = unmerged(where);
+  if (conflicts.length) return { ok: true, root: where, conflicts };
+  if (merged.code === 0) return { ok: true, root: where, conflicts: [], clean: true };
+  // Merged badly and left nothing marked: not a conflict, something else — a
+  // hook, an unrelated history. Say what git said rather than inventing a
+  // conflict that is not there.
+  return { ok: false, root: where, error: (merged.stderr || merged.stdout || "the merge did not complete").trim().slice(0, 300) };
+}
+
 /**
  * Ignored paths that are output, not work — safe to leave out of "here is what
  * you lose", because deleting them costs a rebuild and nothing else.
@@ -2225,6 +3149,66 @@ export function commitDiff(rootIn: unknown, hash: string): GitFileChange[] {
   return parseDiff(root, r.stdout, false);
 }
 
+/**
+ * The difference between two refs, in the shape a branch-comparison dialog
+ * wants: how far ahead/behind each side is, and the diff between the two
+ * tips. A three-dot range — `other...base` — compares the merge-base, so
+ * the diff is "what your side changed", not the full downstream drift.
+ */
+export function compareRefs(rootIn: unknown, baseIn: unknown, otherIn: unknown): { ok: boolean; ahead?: GitCommit[]; behind?: GitCommit[]; diff?: GitFileChange[]; error?: string } {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, error: "not a git repository root" };
+  const base = typeof baseIn === "string" ? baseIn.trim() : "";
+  const other = typeof otherIn === "string" ? otherIn.trim() : "";
+  if (!base || !other) return { ok: false, error: "two refs are required" };
+  // git log is silent about refs it cannot resolve — an empty ahead/behind is
+  // indistinguishable from a real \"nothing to compare\" unless we ask.
+  if (git(root, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]).code !== 0) return { ok: false, error: `${base} is not a commit` };
+  if (git(root, ["rev-parse", "--verify", "--quiet", `${other}^{commit}`]).code !== 0) return { ok: false, error: `${other} is not a commit` };
+  const fmt = `%H${US}%h${US}%s${US}%an${US}%ar${US}%D`;
+  // Ahead: commits base has that other lacks (other..base).
+  const aheadOut = git(root, ["log", "--pretty=format:" + fmt, `${other}..${base}`]);
+  // Behind: commits other has that base lacks (base..other).
+  const behindOut = git(root, ["log", "--pretty=format:" + fmt, `${base}..${other}`]);
+  const parse = (text: string): GitCommit[] => text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [hash, shortHash, subject, author, date, refs] = line.split(US);
+      return { hash, shortHash, subject: subject || "", author: author || "", date: date || "", refs: refs || "" };
+    });
+  const diffOut = git(root, ["-c", "core.quotePath=false", "diff", `${other}...${base}`, "--no-color", "--unified=3"]);
+  return {
+    ok: true,
+    ahead: parse(aheadOut.stdout),
+    behind: parse(behindOut.stdout),
+    diff: parseDiff(root, diffOut.stdout, false),
+  };
+}
+
+/**
+ * Every ref a compare dialog could pick: local branches, tags, then remote
+ * branches. Short names, roughly grouped, so a ref menu reads like a menu.
+ */
+export function refs(rootIn: unknown): { ok: boolean; refs?: string[]; error?: string } {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, error: "not a git repository root" };
+  const out: string[] = [];
+  for (const [prefix, re] of [
+    ["refs/heads", null],
+    ["refs/tags", null],
+    ["refs/remotes", /\/HEAD$/],
+  ] as const) {
+    const r = git(root, ["for-each-ref", "--format=%(refname:short)", prefix]);
+    for (const line of r.stdout.split("\n")) {
+      if (!line) continue;
+      if (re && re.test(line)) continue;
+      out.push(line);
+    }
+  }
+  return { ok: true, refs: out };
+}
+
 /** Configured remotes, with a branch count each so the list says something
  *  before you drill into it. `remote -v` lists fetch and push separately, and
  *  they differ on a fork setup (push to yours, fetch from upstream). */
@@ -2365,6 +3349,510 @@ export async function tags(rootIn: unknown, limit = 300): Promise<GitTag[]> {
   return out;
 }
 
+// --- Tags power-ups ---------------------------------------------------------
+
+/** Create a tag. Lightweight by default; `annotated` adds `-a -m`, `signed`
+ *  adds `-s` (which is annotated too and so also needs the message — a signed
+ *  tag without one would open an editor nobody can drive). The target is HEAD
+ *  unless `target` is given. Refuses names that already exist locally. */
+export function createTag(rootIn: unknown, nameIn: unknown, optsIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const name = String(nameIn ?? "").trim();
+  if (!validRef(name)) return { ok: false, error: "invalid tag name" };
+  if (git(root, ["rev-parse", "--verify", "--quiet", `refs/tags/${name}`]).code === 0) {
+    return { ok: false, error: `tag ${name} already exists` };
+  }
+  const opts = (optsIn ?? {}) as { annotated?: boolean; message?: string; signed?: boolean; target?: string };
+  const args = ["tag"];
+  if (opts.signed) args.push("-s");
+  else if (opts.annotated) args.push("-a");
+  const message = String(opts.message ?? "").trim();
+  if (opts.signed || opts.annotated) {
+    if (!message) return { ok: false, error: "an annotated tag needs a message" };
+    args.push("-m", message);
+  }
+  args.push(name);
+  const target = String(opts.target ?? "").trim();
+  if (target) args.push(target);
+  return run(root, args);
+}
+
+/** Delete a local tag. `tag -d` refuses tags that are not stored in
+ *  `refs/tags` (i.e. on a branch or remote), which is the ownership check the
+ *  plan wants: it never touches a tag you don't have locally. */
+export function deleteTag(rootIn: unknown, nameIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const name = String(nameIn ?? "").trim();
+  if (!validRef(name)) return { ok: false, error: "invalid tag name" };
+  if (git(root, ["rev-parse", "--verify", "--quiet", `refs/tags/${name}`]).code !== 0) {
+    return { ok: false, error: `no local tag ${name}` };
+  }
+  return run(root, ["tag", "-d", name]);
+}
+
+function tagRemote(root: string, remoteIn?: unknown): string | null {
+  const remote = String(remoteIn ?? "").trim() || "origin";
+  return git(root, ["remote"]).stdout.split("\n").includes(remote) ? remote : null;
+}
+
+/** Push a tag to the remote. */
+export function pushTag(rootIn: unknown, nameIn: unknown, remoteIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const name = String(nameIn ?? "").trim();
+  if (!validRef(name)) return { ok: false, error: "invalid tag name" };
+  if (git(root, ["rev-parse", "--verify", "--quiet", `refs/tags/${name}`]).code !== 0) {
+    return { ok: false, error: `no local tag ${name}` };
+  }
+  const remote = tagRemote(root, remoteIn);
+  if (!remote) return { ok: false, error: "no such remote" };
+  return run(root, ["push", remote, name]);
+}
+
+/** Delete a tag on the remote (`push <remote> :refs/tags/<name>`). */
+export function deleteRemoteTag(rootIn: unknown, nameIn: unknown, remoteIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const name = String(nameIn ?? "").trim();
+  if (!validRef(name)) return { ok: false, error: "invalid tag name" };
+  const remote = tagRemote(root, remoteIn);
+  if (!remote) return { ok: false, error: "no such remote" };
+  return run(root, ["push", remote, `:refs/tags/${name}`]);
+}
+
+// --- Blame + file history ---------------------------------------------------
+
+/** A line of blame: the final line number, the commit that wrote it, and the
+ *  content. `sha` is empty for lines not yet committed (working-tree edits). */
+export type BlameLine = {
+  line: number;
+  sha: string;
+  author: string;
+  time: number;
+  subject: string;
+  content: string;
+};
+
+export type FileHistoryEntry = {
+  hash: string;      // short
+  fullHash: string;
+  author: string;
+  time: number;
+  subject: string;
+};
+
+/** `git blame --line-porcelain`: every group of consecutive lines from one
+ *  commit carries its own header block, then the content lines (tab-prefixed).
+ *  The header fields we keep are `author`, `author-time` and `summary`. */
+export function blameFile(rootIn: unknown, pathIn: unknown, refIn: unknown): { ok: boolean; lines?: BlameLine[]; error?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const pathStr = String(pathIn ?? "").trim();
+  if (!pathStr || pathStr.startsWith("-")) return { ok: false, error: "invalid path" };
+  const abs = inRepo(root, pathStr);
+  if (!abs) return { ok: false, error: "invalid path" };
+  const path = relative(root, abs);
+  const ref = typeof refIn === "string" && refIn.trim() && refIn.trim() !== "HEAD" ? refIn.trim() : null;
+  const inTree = git(root, ["cat-file", "-e", `${ref ?? "HEAD"}:${path}`]);
+  if (inTree.code !== 0) return { ok: false, error: `${path} is not in ${ref ?? "HEAD"} — nothing to blame` };
+  // Only pass the revision when there is one. With a rev git blames the file
+  // CONTENT at that rev — which is exactly what "reblame as of this commit"
+  // wants — while without one it blames the working tree, where the lines not
+  // yet committed come out as zero-sha "local" entries. Measured on 2.55.0.
+  const r = git(root, ["blame", "--line-porcelain", ...(ref ? [ref] : []), "--", path]);
+  if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "blame failed" };
+  const lines: BlameLine[] = [];
+  let cur: BlameLine | null = null;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("\t")) {
+      // Content line: completes the current header block.
+      const c = cur ?? { line: 0, sha: "", author: "", time: 0, subject: "", content: "" };
+      c.content = line.slice(1);
+      lines.push(c);
+      cur = null;
+      continue;
+    }
+    // `sha orig final [count] [boundary]` — the count only appears on the
+    // FIRST line of a commit's group; later lines of the same group carry
+    // just `sha orig final`. (Measured on 2.55.0.)
+    const m = /^([0-9a-f]{40})\s+(\d+)\s+(\d+)(?:\s+\d+)?(?:\s+boundary)?$/.exec(line);
+    if (m) {
+      const zero = m[1].replace(/0/g, "").length === 0;
+      cur = { line: Number(m[3]), sha: zero ? "" : m[1], author: "", time: 0, subject: "", content: "" };
+      continue;
+    }
+    if (!cur) continue;
+    const colon = line.indexOf(" ");
+    if (colon === -1) continue;
+    const key = line.slice(0, colon);
+    const value = line.slice(colon + 1);
+    if (key === "author") cur.author = value;
+    else if (key === "author-time") cur.time = Number(value) || 0;
+    // Zero-sha groups carry a placeholder like "Version of a.txt from a.txt"
+    // as their summary; a local edit has no commit, so it gets no subject.
+    else if (key === "summary") cur.subject = cur.sha ? value : "";
+  }
+  return { ok: true, lines };
+}
+
+/** A file's commit history, following renames. `--follow` only accepts a
+ *  single path, which is exactly what this takes. */
+export function fileHistory(rootIn: unknown, pathIn: unknown): { ok: boolean; entries?: FileHistoryEntry[]; error?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const pathStr = String(pathIn ?? "").trim();
+  if (!pathStr || pathStr.startsWith("-")) return { ok: false, error: "invalid path" };
+  const abs = inRepo(root, pathStr);
+  if (!abs) return { ok: false, error: "invalid path" };
+  const path = relative(root, abs);
+  const r = git(root, ["log", "--follow", `--format=%H${US}%an${US}%at${US}%s${RS}`, "--", path]);
+  if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "git log failed" };
+  const entries: FileHistoryEntry[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    const [hash, author, at, subject] = line.split(US);
+    if (!hash) continue;
+    entries.push({ hash: hash.slice(0, 7), fullHash: hash, author: author || "", time: Number(at) || 0, subject: (subject || "").replace(/\x1e$/, "") });
+  }
+  return { ok: true, entries };
+}
+
+// --- Guided bisect ----------------------------------------------------------
+
+/** The shape of a `git bisect` session, parsed from the replayed `bisect log`
+ *  (BISECT_LOG in the git dir — `git bisect status` does not exist on 2.55,
+ *  and the log carries every mark plus the verdict). When `bisecting` is true
+ *  the repo is mid-run (or finished but not reset — git keeps the state until
+ *  `bisect reset`): `current` is the candidate checked out at HEAD, `firstBad`
+ *  the verdict once the run has converged. */
+export type GitBisectStatus = {
+  ok: boolean;
+  bisecting: boolean;
+  error?: string;
+  /** How many candidate commits the current good/bad bounds still contain.
+   *  git's own "N left to test" display does different arithmetic, so this is
+   *  the honest range count rather than a re-parse of its wording. */
+  remaining?: number;
+  steps?: number;
+  current?: { sha: string; subject: string };
+  firstBad?: { sha: string; subject: string };
+};
+
+function headInfo(root: string, ref: string): { sha: string; subject: string } | null {
+  const r = git(root, ["log", "-1", `--format=%H${US}%s`, ref]);
+  if (r.code !== 0) return null;
+  const [sha, subject] = r.stdout.trim().split(US);
+  if (!sha) return null;
+  return { sha, subject: (subject || "").replace(/\x1e$/, "") };
+}
+
+export function bisectStatus(rootIn: unknown): GitBisectStatus {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, bisecting: false, error: "not a git repository root" };
+  const dir = gitDir(root);
+  if (!dir || !existsSync(join(dir, "BISECT_LOG"))) return { ok: true, bisecting: false };
+  const log = readFileSync(join(dir, "BISECT_LOG"), "utf8");
+  const st: GitBisectStatus = { ok: true, bisecting: true };
+  st.current = headInfo(root, "HEAD") ?? undefined;
+  // Converged: "# first <term> commit: [<sha>] <subject>" (terms are quoted
+  // with the default bad/good — "first 'bad' commit" — so accept any term).
+  const verdict = /^# first .* commit: \[([0-9a-f]{7,40})\] (.+)$/m.exec(log);
+  if (verdict) {
+    st.firstBad = headInfo(root, verdict[1]) ?? { sha: verdict[1], subject: verdict[2] };
+    return st;
+  }
+  // Mid-run: the latest bad and good marks bound the remaining suspects.
+  const bads = [...log.matchAll(/^# bad: \[([0-9a-f]{7,40})\]/gm)];
+  const goods = [...log.matchAll(/^# good: \[([0-9a-f]{7,40})\]/gm)];
+  if (bads.length && goods.length) {
+    const n = git(root, ["rev-list", "--count", bads[bads.length - 1][1], `^${goods[goods.length - 1][1]}`]);
+    if (n.code === 0) {
+      st.remaining = Math.max(0, Number(n.stdout.trim()) || 0);
+      st.steps = Math.max(0, Math.ceil(Math.log2(st.remaining + 1)));
+    }
+  }
+  return st;
+}
+
+function bisectRef(root: string, refIn: unknown, label: string): { ok: boolean; ref?: string; error?: string } {
+  const ref = String(refIn ?? "").trim();
+  if (!ref || ref.startsWith("-")) return { ok: false, error: `invalid ${label} ref` };
+  // Refnames like "HEAD~4" legitimately reach a commit; git's own
+  // rev-parse --verify is the judge of whether that is true.
+  if (git(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]).code !== 0) {
+    return { ok: false, error: `${label} ${ref} is not a commit` };
+  }
+  return { ok: true, ref };
+}
+
+export function bisectStart(rootIn: unknown, badIn: unknown, goodIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const bad = bisectRef(root, badIn, "bad");
+  if (!bad.ok) return bad;
+  const good = bisectRef(root, goodIn, "good");
+  if (!good.ok) return good;
+  return run(root, ["bisect", "start", bad.ref!, good.ref!]);
+}
+
+export function bisectMark(rootIn: unknown, markIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const mark = String(markIn ?? "").trim();
+  if (mark !== "good" && mark !== "bad") return { ok: false, error: "mark must be good or bad" };
+  return run(root, ["bisect", mark]);
+}
+
+export function bisectReset(rootIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  return run(root, ["bisect", "reset"]);
+}
+
+// --- Commit + code search ---------------------------------------------------
+
+export type GitGrepHit = {
+  path: string;
+  line: number;
+  text: string;
+};
+
+/** Commits whose message matches the query (case-insensitive substring), plus
+ *  the commit itself when the query looks like a sha prefix. Reuses the
+ *  FileHistoryEntry shape, so commit rows render one way across the UI. */
+export function searchCommits(rootIn: unknown, qIn: unknown, authorIn?: unknown, sinceIn?: unknown): { ok: boolean; entries: FileHistoryEntry[]; error?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, entries: [], error: "not a git repository root" };
+  const q = String(qIn ?? "").trim();
+  if (!q || q.startsWith("-")) return { ok: false, entries: [], error: "empty or invalid query" };
+  const args = ["log", "--all", "-i", "-F", `--grep=${q}`, `--format=%H${US}%an${US}%at${US}%s${RS}`];
+  if (authorIn) { const a = String(authorIn).trim(); if (a) args.push(`--author=${a}`); }
+  if (sinceIn) { const s = String(sinceIn).trim(); if (s) args.push(`--since=${s}`); }
+  const r = git(root, args);
+  if (r.code !== 0) return { ok: false, entries: [], error: r.stderr.trim() || "git log failed" };
+  const entries: FileHistoryEntry[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    const [hash, author, at, subject] = line.split(US);
+    if (!hash) continue;
+    entries.push({ hash: hash.slice(0, 7), fullHash: hash, author: author || "", time: Number(at) || 0, subject: (subject || "").replace(/\x1e$/, "") });
+  }
+  // A sha prefix is not a message. Resolve it directly and prepend it.
+  if (/^[0-9a-f]{4,40}$/i.test(q) && git(root, ["rev-parse", "--verify", "--quiet", q]).code === 0) {
+    const r2 = git(root, ["log", "-1", `--format=%H${US}%an${US}%at${US}%s${RS}`, q]);
+    if (r2.code === 0) {
+      const [hash, author, at, subject] = r2.stdout.trim().split(US);
+      if (hash && !entries.some((e) => e.fullHash === hash)) {
+        entries.unshift({ hash: hash.slice(0, 7), fullHash: hash, author: author || "", time: Number(at) || 0, subject: (subject || "").replace(/\x1e$/, "") });
+      }
+    }
+  }
+  return { ok: true, entries };
+}
+
+/** Grep the working tree. Exit 1 is "no matches", not an error. */
+export function grepWorkingTree(rootIn: unknown, qIn: unknown, optsIn?: unknown): { ok: boolean; hits: GitGrepHit[]; error?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, hits: [], error: "not a git repository root" };
+  const q = String(qIn ?? "").trim();
+  if (!q) return { ok: false, hits: [], error: "empty query" };
+  const opts = (optsIn ?? {}) as { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean };
+  const args = ["grep", "-n", "-I"];
+  if (opts.wholeWord) args.push("-w");
+  if (!opts.regex) args.push("-F");
+  if (!opts.caseSensitive) args.push("-i");
+  args.push("--", q);
+  const r = git(root, args);
+  if (r.code === 1) return { ok: true, hits: [] };
+  if (r.code !== 0) return { ok: false, hits: [], error: r.stderr.trim() || "git grep failed" };
+  const hits: GitGrepHit[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    const i = line.indexOf(":");
+    const j = i === -1 ? -1 : line.indexOf(":", i + 1);
+    if (i === -1 || j === -1) continue;
+    hits.push({ path: line.slice(0, i), line: Number(line.slice(i + 1, j)) || 0, text: line.slice(j + 1) });
+  }
+  return { ok: true, hits };
+}
+
+/** Pickaxe: which commits added/removed a string (`-S`, exact) or matched a
+ *  regex in the patch (`-G`). */
+export function searchHistory(rootIn: unknown, qIn: unknown, typeIn?: unknown): { ok: boolean; entries: FileHistoryEntry[]; error?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, entries: [], error: "not a git repository root" };
+  const q = String(qIn ?? "").trim();
+  if (!q || q.startsWith("-")) return { ok: false, entries: [], error: "empty or invalid query" };
+  const pickaxe = String(typeIn ?? "").trim() === "G" ? "G" : "S";
+  const r = git(root, ["log", "--all", `-${pickaxe}${q}`, `--format=%H${US}%an${US}%at${US}%s${RS}`]);
+  if (r.code !== 0) return { ok: false, entries: [], error: r.stderr.trim() || "git log failed" };
+  const entries: FileHistoryEntry[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    const [hash, author, at, subject] = line.split(US);
+    if (!hash) continue;
+    entries.push({ hash: hash.slice(0, 7), fullHash: hash, author: author || "", time: Number(at) || 0, subject: (subject || "").replace(/\x1e$/, "") });
+  }
+  return { ok: true, entries };
+}
+
+// --- Submodules -------------------------------------------------------------
+/** A submodule as the panel shows it: the gitlink the index pins (the source
+ *  of truth for what this repo expects), the URL from .gitmodules, and the
+ *  checked-out state from `git submodule status`. */
+export type GitSubmodule = {
+  name: string;
+  path: string;
+  url: string;
+  sha: string;
+  branch?: string;
+  status: "clean" | "modified" | "uninitialized" | "conflict";
+};
+
+/** Merge three sources: the .gitmodules sections (name → path/url/branch),
+ *  the index gitlinks (mode 160000 — what this repo pins), and `submodule
+ *  status` (where the checkout actually is: "-" uninitialized, "+" ahead of
+ *  the pin, "U" conflicted). */
+export function submodules(rootIn: unknown): GitSubmodule[] {
+  const root = repoRoot(rootIn);
+  if (!root) return [];
+  // .gitmodules sections: submodule.<name>.path / .url / .branch. The path is
+  // the stable join key with the index gitlinks below.
+  const byName = new Map<string, { name: string; path: string; url: string; branch: string }>();
+  const cfg = git(root, ["config", "-f", ".gitmodules", "--null", "--list"]);
+  // --null emits "<key>\n<value>\0" per entry — the parts split on \0 and the
+  // key/value pair is joined by the first \n.
+  for (const part of cfg.stdout.split("\0")) {
+    if (!part) continue;
+    const nl = part.indexOf("\n");
+    if (nl === -1) continue;
+    const m = /^submodule\.([^.\s]+)\.(path|url|branch)$/.exec(part.slice(0, nl));
+    if (!m) continue;
+    const e = byName.get(m[1]) ?? { name: m[1], path: "", url: "", branch: "" };
+    if (m[2] === "path") e.path = part.slice(nl + 1);
+    else if (m[2] === "url") e.url = part.slice(nl + 1);
+    else e.branch = part.slice(nl + 1);
+    byName.set(m[1], e);
+  }
+  const byPath2 = new Map<string, GitSubmodule>();
+  for (const e of byName.values()) {
+    if (!e.path) continue;
+    byPath2.set(e.path, { name: e.name, path: e.path, url: e.url, sha: "", branch: e.branch, status: "uninitialized" });
+  }
+  // Gitlinks in the index (mode 160000) — the authoritative submodule set.
+  // The index rather than HEAD: `submodule add` only stages, and a remove only
+  // un-stages; reading HEAD would ghost in or out entries that never moved.
+  const ls = git(root, ["ls-files", "-s"]);
+  for (const line of ls.stdout.split("\n")) {
+    const m = /^160000 ([0-9a-f]{40}) \d+\t(.+)$/.exec(line.trim());
+    if (!m) continue;
+    const path = m[2];
+    const existing = byPath2.get(path);
+    byPath2.set(path, existing
+      ? { ...existing, sha: m[1], status: existing.status === "uninitialized" ? "uninitialized" : "clean" }
+      : { name: path, path, url: "", sha: m[1], status: "uninitialized" });
+  }
+  // The checkout state from `git submodule status` — "-" uninitialized, "+"
+  // checked-out differs from the pin, "U" conflicted.
+  const st = git(root, ["submodule", "status"]);
+  for (const line of st.stdout.split("\n")) {
+    const m = /^([-+U]?)([0-9a-f]{40})\s+(.+?)(?:\s+\((.*)\))?$/.exec(line.trim());
+    if (!m) continue;
+    const [_, flag, sha, path, describe] = m;
+    const e = byPath2.get(path);
+    if (!e) continue;
+    e.sha = sha;
+    if (flag === "-") e.status = "uninitialized";
+    else if (flag === "+") e.status = "modified";
+    else if (flag === "U") e.status = "conflict";
+    else e.status = "clean";
+    if (describe) e.branch = describe;
+  }
+  return [...byPath2.values()];
+}
+
+function submodulePath(root: string, pathIn: unknown): string | null {
+  if (typeof pathIn !== "string" || !pathIn.trim()) return null;
+  const p = pathIn.trim();
+  return submodules(root).some((s) => s.path === p) ? p : null;
+}
+
+/** Add a submodule: clone `url` into `path` and record the gitlink. A network
+ *  op like pull, so it is bounded by the same machinery. */
+export function submoduleAdd(rootIn: unknown, urlIn: unknown, pathIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const url = String(urlIn ?? "").trim();
+  if (!url || url.startsWith("-")) return { ok: false, error: "invalid submodule URL" };
+  const path = String(pathIn ?? "").trim();
+  if (!path || path.startsWith("-") || path.includes("..") || !validRef(path.replace(/\//g, "-"))) {
+    return { ok: false, error: "invalid submodule path" };
+  }
+  if (git(root, ["ls-files", "--error-unmatch", "--", path]).code === 0) {
+    return { ok: false, error: `${path} is already tracked` };
+  }
+  return run(root, ["submodule", "add", url, path]);
+}
+
+/** Initialize and check out submodules (optionally one). A network op —
+ *  async so the terminal's loop never blocks on it. */
+export async function submoduleUpdate(rootIn: unknown, pathIn: unknown): Promise<GitActionResult> {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const args = ["submodule", "update", "--init", "--recursive"];
+  const path = submodulePath(root, pathIn);
+  if (path) args.push("--", path);
+  const r = await gitAsync(root, args);
+  afterMutation(root);
+  return { ok: r.code === 0, error: r.code !== 0 ? (r.stderr.trim() || r.stdout.trim() || "submodule update failed") : undefined, output: (r.stdout + r.stderr).trim() };
+}
+
+/** Re-write the submodule URLs from .gitmodules into the checkouts (and into
+ *  .git/config) — what you run after the remote URL moves. */
+export function submoduleSync(rootIn: unknown, pathIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const args = ["submodule", "sync", "--recursive"];
+  const path = submodulePath(root, pathIn);
+  if (path) args.push("--", path);
+  return run(root, args);
+}
+
+/** Detach a submodule's checkout: the directory goes, the gitlink and the
+ *  .gitmodules section stay. */
+export function submoduleDeinit(rootIn: unknown, pathIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const path = submodulePath(root, pathIn);
+  if (!path) return { ok: false, error: "pick a submodule from the list" };
+  return run(root, ["submodule", "deinit", "-f", "--", path]);
+}
+
+/** Remove a submodule for good: deinit (directory goes), drop the gitlink,
+ *  strip its .gitmodules section (and the file itself if it empties). */
+export function submoduleRemove(rootIn: unknown, pathIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const path = submodulePath(root, pathIn);
+  if (!path) return { ok: false, error: "pick a submodule from the list" };
+  const sm = submodules(root).find((s) => s.path === path);
+  const name = sm?.name || path;
+  let r = run(root, ["submodule", "deinit", "-f", "--", path]);
+  if (!r.ok) return r;
+  r = run(root, ["rm", "--cached", "-f", "--", path]);
+  if (!r.ok) return r;
+  // deinit only empties the directory; the shell of it can survive, and a
+  // stale checkout directory at the gitlink path would shadow the next add.
+  const absPath = inRepo(root, path);
+  if (absPath && existsSync(absPath)) rmSync(absPath, { recursive: true, force: true });
+  r = run(root, ["config", "-f", ".gitmodules", "--remove-section", `submodule.${name}`]);
+  if (!r.ok) return r;
+  const modulesFile = join(root, ".gitmodules");
+  const remaining = existsSync(modulesFile) ? readFileSync(modulesFile, "utf8").trim() : "";
+  if (!remaining) {
+    r = run(root, ["rm", "-f", "--", ".gitmodules"]);
+  } else {
+    r = run(root, ["add", "-A", "--", ".gitmodules"]);
+  }
+  return r;
+}
+
 /**
  * Where HEAD has been — the trail that makes a bad reset or rebase recoverable.
  *
@@ -2424,6 +3912,244 @@ export const stashApply = (r: string, i: number) => stashOp(r, "apply", i);
 export const stashPop = (r: string, i: number) => stashOp(r, "pop", i);
 export const stashDrop = (r: string, i: number) => stashOp(r, "drop", i);
 
+/** The stash is a reflog: `logs/refs/stash`, oldest entry first, so entry i is
+ *  `lines[len - 1 - i]`. Each line is "<sha> <sha> <name> <email> <ts> <tz>\t
+ *  <subject>" and the subject is what `git stash list` shows. */
+function stashReflog(root: string): string {
+  const common = git(root, ["rev-parse", "--git-common-dir"]).stdout.trim();
+  return join(resolve(root, common), "logs", "refs", "stash");
+}
+
+/** Rename a stash, keeping the "On <branch>: " / "WIP on <branch>: " prefix so
+ *  the row still says which branch it belongs to. There is no porcelain for
+ *  this — `update-ref` can only append entries — so the reflog file is
+ *  rewritten in place, preserving identity, timestamp and every other field. */
+export function stashRename(rootIn: unknown, indexIn: unknown, messageIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const index = Number(indexIn);
+  if (!Number.isInteger(index) || index < 0 || index > 999) return { ok: false, error: "invalid stash index" };
+  const message = String(messageIn ?? "").trim();
+  if (!message) return { ok: false, error: "stash message required" };
+  const file = stashReflog(root);
+  if (!existsSync(file)) return { ok: false, error: "no stashes to rename" };
+  const lines = readFileSync(file, "utf8").split("\n");
+  const pos = lines.length - 2 - index; // -1 for the trailing newline, -index for the entry
+  if (pos < 0 || pos >= lines.length - 1) return { ok: false, error: `no stash@{${index}}` };
+  const line = lines[pos];
+  const tab = line.indexOf("\t");
+  if (tab === -1) return { ok: false, error: `stash@{${index}} has no message to rename` };
+  const subject = line.slice(tab + 1);
+  // Prefix = everything through the first ": " ("On main: ", "WIP on main: ").
+  // Branch names cannot contain ":", so the first colon is always the split.
+  const colon = subject.indexOf(":");
+  const prefix = colon === -1 ? "" : subject.slice(0, colon + 2);
+  lines[pos] = line.slice(0, tab + 1) + prefix + message;
+  try {
+    writeFileSync(file, lines.join("\n"));
+  } catch (e) {
+    return { ok: false, error: `could not rewrite the stash reflog: ${String(e)}` };
+  }
+  afterMutation(root);
+  return { ok: true, output: `renamed ${message}` };
+}
+
+/** Split a stash off onto its own branch: `git stash branch` checks out a new
+ *  branch at the stash's base, applies the stash onto it, and drops the stash
+ *  on success (on a conflict it keeps the stash and says so). */
+export function stashToBranch(rootIn: unknown, indexIn: unknown, branchIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const index = Number(indexIn);
+  if (!Number.isInteger(index) || index < 0 || index > 999) return { ok: false, error: "invalid stash index" };
+  const branch = String(branchIn ?? "").trim();
+  if (!validRef(branch)) return { ok: false, error: "invalid branch name" };
+  if (git(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).code === 0) {
+    return { ok: false, error: `a branch called ${branch} already exists` };
+  }
+  return run(root, ["stash", "branch", branch, `stash@{${index}}`]);
+}
+
+/** Stash only the given paths (with an optional keep-index). Untracked files
+ *  among them come along, matching the panel's "stash all" behavior. */
+export function stashPartial(rootIn: unknown, pathsIn: unknown, keepIndexIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const v = validRels(root, pathsIn); if (!v || !v.length) return { ok: false, error: "no valid paths" };
+  const keep = keepIndexIn === true;
+  // "stash & keep" means the picked files stay in the working tree, staged and
+  // ready to commit. --keep-index only preserves changes that are in the
+  // index, so the picked paths are staged first.
+  if (keep) {
+    const r = run(root, ["add", "-A", "--", ...v]);
+    if (!r.ok) return r;
+  }
+  const args = ["stash", "push", "--include-untracked"];
+  if (keep) args.push("--keep-index");
+  args.push("--", ...v);
+  return run(root, args);
+}
+
+/** Apply a stash even when the working tree has moved on at the stashed paths:
+ *  delete the colliding working-tree versions first, then apply. The deleted
+ *  content is replaced by the stash's — which is why the panel confirms this
+ *  before calling it. */
+export function stashApplyOverwrite(rootIn: unknown, indexIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const index = Number(indexIn);
+  if (!Number.isInteger(index) || index < 0 || index > 999) return { ok: false, error: "invalid stash index" };
+  const sha = git(root, ["rev-parse", "--verify", "--quiet", `refs/stash@{${index}}`]).stdout.trim();
+  if (!sha) return { ok: false, error: `no stash@{${index}}` };
+  // Paths the working tree currently differs on, plus untracked files that the
+  // stash's tree contains (a plain apply dies on both with "already exists" /
+  // "local changes would be overwritten"). The stash's tree is tracked-only;
+  // its untracked files live in the third parent, which exists exactly when
+  // the stash was taken with --include-untracked.
+  const differ = git(root, ["diff", "--name-only", sha, "--", "."]).stdout.split("\n").filter(Boolean);
+  const inStash = new Set(git(root, ["ls-tree", "-r", "--name-only", sha]).stdout.split("\n").filter(Boolean));
+  const hasUntrackedParent = git(root, ["rev-parse", "--verify", "--quiet", `${sha}^3`]).code === 0;
+  if (hasUntrackedParent) {
+    for (const p of git(root, ["ls-tree", "-r", "--name-only", `${sha}^3`]).stdout.split("\n").filter(Boolean)) inStash.add(p);
+  }
+  const untracked = git(root, ["ls-files", "--others", "--exclude-standard"]).stdout.split("\n").filter(Boolean);
+  const doomed = [...new Set([...differ, ...untracked.filter((p) => inStash.has(p))])];
+  for (const p of doomed) {
+    const abs = inRepo(root, p);
+    if (abs) rmSync(abs, { force: true });
+  }
+  return run(root, ["stash", "apply", `stash@{${index}}`]);
+}
+
+// --- WIP snapshots ----------------------------------------------------------
+/**
+ * A named full-tree snapshot: `git stash create` makes a commit that touches
+ * NOTHING in the working tree, and `update-ref` hangs it off
+ * `refs/agx/wip/<timestamp>` where it is visible, listable and deletable
+ * without ever disturbing the working tree. Restore applies that commit's
+ * tree back — the same machinery a stash apply uses, without the stash stack
+ * bookkeeping.
+ *
+ * Cap at 30, pruning the oldest on create: a safety net that grows forever
+ * is a leak, and anything older than the 30 most recent is no longer a
+ * "quick undo" anyway.
+ */
+
+const WIP_CAP = 30;
+
+export type WipSnapshot = { sha: string; ref: string; time: string; label: string };
+
+/** `stash create` mangles its -m into "On <branch>: -m <label>", so the label
+ *  lives in the ref name instead: refs/agx/wip/<ts>-<label>. Sanitised so a
+ *  ref can never be smuggled in via a label. */
+function wipRef(ts: number, label: string): string {
+  const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return `refs/agx/wip/${ts}${slug ? "-" + slug : ""}`;
+}
+function wipLabelFromRef(ref: string): string {
+  const m = /^refs\/agx\/wip\/\d+-(.+)$/.exec(ref);
+  return m ? m[1]!.replace(/-/g, " ") : "";
+}
+/** The timestamp a snapshot ref was created at — embedded in the name because
+ *  `for-each-ref`'s creatordate is the commit's committer date, which the
+ *  stash commits all share to the second. */
+function wipTs(ref: string): number {
+  const m = /^refs\/agx\/wip\/(\d+)/.exec(ref);
+  return m ? Number(m[1]) : 0;
+}
+
+/** All snapshots, newest first. */
+export function listSnapshots(rootIn: unknown): { ok: boolean; snapshots?: WipSnapshot[]; error?: string } {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, error: "not a git repository root" };
+  const fmt = `%(refname)${US}%(objectname)${US}%(creatordate:iso8601)`;
+  const r = git(root, ["for-each-ref", `--format=${fmt}`, "refs/agx/wip"]);
+  const snapshots: WipSnapshot[] = [];
+  for (const line of r.stdout.split("\n")) {
+    if (!line) continue;
+    const [ref, sha, time] = line.split(US);
+    if (!ref || !sha) continue;
+    snapshots.push({ sha, ref, time: time || "", label: wipLabelFromRef(ref) });
+  }
+  snapshots.sort((a, b) => wipTs(b.ref) - wipTs(a.ref));
+  return { ok: true, snapshots };
+}
+
+/** Capture the working tree as a snapshot. Requires a dirty tree (a clean
+ *  snapshot is a nothing-burger), and label may be empty. */
+export function createSnapshot(rootIn: unknown, labelIn: unknown): GitActionResult & { sha?: string; ref?: string } {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  if (treeState(root) !== "clean") return { ok: false, error: `cannot snapshot while ${treeState(root)}` };
+  const dirty = git(root, ["status", "--porcelain"]).stdout.trim();
+  if (!dirty) return { ok: false, error: "the working tree is clean — nothing to snapshot" };
+  const label = typeof labelIn === "string" ? labelIn.trim().slice(0, 80) : "";
+  // Note: no -u. `git stash create` ignores it (it becomes part of the
+  // message) — snapshots capture tracked changes, which is what a safety net
+  // needs to guarantee; untracked files are already cheap to regenerate.
+  const made = git(root, ["stash", "create", "-m", label || "wip snapshot"]);
+  if (made.code !== 0 || !made.stdout.trim()) return { ok: false, error: "could not create a snapshot commit" };
+  const sha = made.stdout.trim();
+  if (!validHash(sha)) return { ok: false, error: "snapshot produced an unusable commit" };
+  const ref = wipRef(Date.now(), label);
+  const upd = run(root, ["update-ref", ref, sha]);
+  if (!upd.ok) return upd;
+  // Prune the oldest beyond the cap — the ts lives in the ref name.
+  const all = git(root, ["for-each-ref", "--format=%(refname)", "refs/agx/wip"]).stdout.trim().split("\n").filter(Boolean);
+  all.sort((a, b) => wipTs(b) - wipTs(a));
+  for (const old of all.slice(WIP_CAP)) run(root, ["update-ref", "-d", old]);
+  return { ok: true, output: upd.output, sha, ref };
+}
+
+/** Bring a snapshot's tree back. Applies the snapshot commit's tree onto the
+ *  current tree — the stash-apply machinery, which leaves the snapshot ref
+ *  in place (restore is not a one-shot ticket). */
+export function restoreSnapshot(rootIn: unknown, shaIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const sha = typeof shaIn === "string" ? shaIn.trim() : "";
+  if (!validHash(sha)) return { ok: false, error: "invalid snapshot sha" };
+  return run(root, ["stash", "apply", sha]);
+}
+
+/** Delete a snapshot for good. */
+export function deleteSnapshot(rootIn: unknown, shaIn: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const sha = typeof shaIn === "string" ? shaIn.trim() : "";
+  if (!validHash(sha)) return { ok: false, error: "invalid snapshot sha" };
+  // The ref is `refs/agx/wip/<timestamp>`, not the sha — find the one that
+  // points at this snapshot.
+  const r = git(root, ["for-each-ref", `--format=%(refname)${US}%(objectname)`, "refs/agx/wip"]);
+  for (const line of r.stdout.split("\n")) {
+    const [ref, obj] = line.split(US);
+    if (obj === sha) return run(root, ["update-ref", "-d", ref || ""]);
+  }
+  return { ok: false, error: "no snapshot with that sha" };
+}
+
+/** Auto-stash wrapper for history surgery: if the tree is dirty, push the
+ *  changes (with untracked) first, run the op, then pop. If the op fails,
+ *  LEAVE the stash — the working tree is exactly as the failure left it, and
+ *  popping would smear the failure's partial state over the WIP. The error
+ *  names the stash index so the user can recover it. */
+export function withAutoStash(root: string, op: () => GitActionResult): GitActionResult {
+  const dirty = git(root, ["status", "--porcelain"]).stdout.trim();
+  if (!dirty) return op();
+  const pushed = git(root, ["stash", "push", "--include-untracked", "-m", "agx: auto-stash before surgery"]);
+  if (pushed.code !== 0) return { ok: false, error: "auto-stash failed — the operation was not started" };
+  const r = op();
+  if (!r.ok) return { ...r, error: `${r.error ?? "operation failed"} — your changes are safe in stash@{0} ("agx: auto-stash before surgery")` };
+  const popped = git(root, ["stash", "pop", "stash@{0}"]);
+  if (popped.code !== 0) {
+    // The op succeeded; the pop hit a conflict (the op touched the same files).
+    // Leaving the stash is the only honest option — the tree is NOT dirty by
+    // us, it is the op's result, and the WIP is intact on the stack.
+    return { ...r, error: `${r.error ?? "operation succeeded"}, but restoring your changes hit a conflict — they are safe in stash@{0} ("agx: auto-stash before surgery")` };
+  }
+  return r;
+}
+
 // --- interactive hunk staging (lazygit's signature) --------------------------
 function gitApplyStdin(root: string, args: string[], patch: string): { code: number; stderr: string } {
   try {
@@ -2468,6 +4194,449 @@ export function applyHunk(rootIn: string, pathAbs: unknown, staged: boolean, act
   return { ok: true, output: `${action}d hunk` };
 }
 
+
+/* ------------------------------------------- which two sides git stopped on */
+
+/**
+ * Name a commit as a branch, when it is the tip of one.
+ *
+ * Local heads before remote-tracking refs: `main` reads better than
+ * `origin/main` and is the same commit when both point at it. Returns null
+ * rather than inventing a name — a rebase's stopped commit is a commit, and
+ * `name-rev` would happily call it `feat~2`, which is not a branch and reads
+ * like one.
+ */
+function refAt(root: string, sha: string): string | null {
+  if (!validHash(sha)) return null;
+  const heads = git(root, ["for-each-ref", "--points-at", sha, "--format=%(refname:short)", "refs/heads"])
+    .stdout.split("\n").filter(Boolean);
+  if (heads.length) return heads[0]!;
+  const remotes = git(root, ["for-each-ref", "--points-at", sha, "--format=%(refname:short)", "refs/remotes"])
+    .stdout.split("\n").filter(Boolean).filter((n) => !n.endsWith("/HEAD"));
+  return remotes[0] ?? null;
+}
+
+/** A commit's first line, so a side with no branch name is still nameable. */
+function subjectOf(root: string, sha: string): string {
+  if (!validHash(sha)) return "";
+  const r = git(root, ["log", "-1", "--format=%s", sha]);
+  return r.code === 0 ? r.stdout.trim() : "";
+}
+
+const sideOf = (root: string, sha: string, ref?: string | null): MergeSide | null =>
+  validHash(sha) ? { ref: ref ?? refAt(root, sha), sha, subject: subjectOf(root, sha) } : null;
+
+/** Read one of git's little state files, or "" — they are absent as often as
+ *  they are present, and an absent one is not an error. */
+function stateFile(dir: string, name: string): string {
+  try { return readFileSync(join(dir, name), "utf8").trim(); } catch { return ""; }
+}
+
+/**
+ * Which two things git has stopped between — measured from `.git`, not deduced.
+ *
+ * Every operation keeps its state somewhere different, and only one of them
+ * keeps it in MERGE_HEAD:
+ *
+ *   merge         MERGE_HEAD is the incoming commit
+ *   rebase        rebase-merge/{onto,head-name,stopped-sha,msgnum,end}, and
+ *                 NO MERGE_HEAD at all — checked against a real rebase
+ *   cherry-pick   CHERRY_PICK_HEAD
+ *   revert        REVERT_HEAD
+ *
+ * The sides invert under a rebase, which is the whole reason this is worth
+ * reading properly: git replays YOUR commits onto the other branch, so `ours`
+ * is the branch you are landing on and `theirs` is your own work. Somebody —
+ * or an agent — told to "prefer theirs" while thinking that means the base
+ * resolves the entire rebase backwards, confidently.
+ *
+ * Goes through gitDir(), never `<root>/.git`: in a linked worktree that path is
+ * a FILE containing a pointer, and every read here would come back empty.
+ */
+export function mergeInfo(rootIn: unknown): MergeInfo {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, state: "clean", ours: null, theirs: null, error: "not a git repository root" };
+  const dir = gitDir(root);
+  if (!dir) return { ok: false, state: "clean", ours: null, theirs: null, error: "cannot find the git directory" };
+
+  const state = treeState(root);
+  const head = git(root, ["rev-parse", "HEAD"]).stdout.trim();
+  const branch = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"]).stdout.trim() || null;
+
+  switch (state) {
+    case "merging":
+      return {
+        ok: true, state,
+        ours: sideOf(root, head, branch),
+        theirs: sideOf(root, stateFile(dir, "MERGE_HEAD")),
+      };
+
+    case "rebasing": {
+      // Two implementations, and they keep the same facts under different
+      // names: the merge backend counts with msgnum/end, the apply backend
+      // (`git rebase --apply`, and `git am`) with next/last.
+      const md = existsSync(join(dir, "rebase-merge")) ? join(dir, "rebase-merge") : join(dir, "rebase-apply");
+      const onto = stateFile(md, "onto");
+      // head-name is a full ref: refs/heads/feat.
+      const headName = stateFile(md, "head-name").replace(/^refs\/heads\//, "") || null;
+      const stopped = stateFile(md, "stopped-sha") || stateFile(md, "original-commit") || head;
+      const step = Number(stateFile(md, "msgnum") || stateFile(md, "next")) || undefined;
+      const total = Number(stateFile(md, "end") || stateFile(md, "last")) || undefined;
+      return {
+        ok: true, state,
+        // Inverted on purpose: see above.
+        ours: sideOf(root, onto || head),
+        theirs: stopped === head && headName
+          ? sideOf(root, stopped, headName)
+          : sideOf(root, stopped),
+        ...(step ? { step } : {}),
+        ...(total ? { total } : {}),
+      };
+    }
+
+    case "cherry-picking":
+      return {
+        ok: true, state,
+        ours: sideOf(root, head, branch),
+        theirs: sideOf(root, stateFile(dir, "CHERRY_PICK_HEAD")),
+      };
+
+    case "reverting":
+      return {
+        ok: true, state,
+        ours: sideOf(root, head, branch),
+        theirs: sideOf(root, stateFile(dir, "REVERT_HEAD")),
+      };
+
+    default:
+      // Bisecting is a state, but not one with two sides to choose between.
+      return { ok: true, state, ours: null, theirs: null };
+  }
+}
+
+/* -------------------------------------- what WOULD conflict, without merging */
+
+/** Answers are cached briefly: the pull-request panel polls, and each miss is
+ *  a network fetch plus a tree merge. A minute is shorter than anyone's
+ *  round trip to GitHub and back. */
+const PREVIEW_TTL_MS = 60_000;
+const previewCache = new Map<string, { at: number; v: ConflictPreview; localTip: string }>();
+
+export interface ConflictPreview {
+  ok: boolean;
+  /** Paths that would conflict, in git's own order. Empty when it merges clean. */
+  conflicts: string[];
+  clean: boolean;
+  /** The refs could not be fetched, so this is from whatever was last pulled
+   *  down. Worth saying rather than presenting an old answer as current. */
+  stale?: boolean;
+  /**
+   * You already merged the base in, here, and have not pushed it.
+   *
+   * The case this exists for: the conflict is settled in a worktree on this
+   * machine and the merge commit is local, so GitHub is still perfectly
+   * correct that the pull request conflicts — and the panel was repeating that
+   * while the answer sat on the same disk it was drawing on. "Merging is
+   * blocked" is true of GitHub and false of you, and the difference is one
+   * push.
+   *
+   * `ahead` is how many commits the local branch has that the pushed head does
+   * not, so the banner can say what pushing would send.
+   */
+  resolvedLocally?: { branch: string; ahead: number };
+  error?: string;
+}
+
+/**
+ * Which files a merge would conflict on — without performing the merge.
+ *
+ * `git merge-tree --write-tree --name-only` merges two commits entirely in
+ * the object database: it writes a tree, prints the conflicted paths, and exits
+ * 1 if there were any. Checked against a real repository: the working tree is
+ * untouched, HEAD does not move, and `git status` is empty afterwards. That
+ * matters because this runs from a panel poll on a checkout somebody is
+ * working in — the existing "Resolve conflicts" button makes a real merge in a
+ * worktree of its own, which is the right thing to do when you are about to
+ * resolve, and much too much to do just to name three files.
+ *
+ * The refs are fetched first. GitHub is the authority on what these branches
+ * are, and a list built from a stale remote-tracking ref names files that may
+ * no longer conflict — a wrong list is worse than none. When the fetch fails
+ * the answer is still given, marked stale, because offline-and-approximate
+ * beats offline-and-silent.
+ */
+export async function conflictPreview(rootIn: unknown, base: string, head: string, number?: number): Promise<ConflictPreview> {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, conflicts: [], clean: false, error: "not a git repository root" };
+  if (!validRef(base) || !validRef(head)) return { ok: false, conflicts: [], clean: false, error: "invalid branch name" };
+  const pr = Number.isInteger(number) && (number as number) > 0 ? (number as number) : null;
+
+  const key = `${root}\u0000${base}\u0000${head}\u0000${pr ?? ""}`;
+
+  /*
+   * The clock is the ceiling; the branch is the trigger.
+   *
+   * A minute of cache is fine for a pull request nobody is touching, and much
+   * too long for the one you are working on: you resolve the conflict in a
+   * worktree, commit, push, and the panel goes on saying "merging is blocked"
+   * because the answer it has is fifty seconds old. The thing that actually
+   * changed is a ref on this disk, and reading it costs a rev-parse.
+   *
+   * So a cached answer is kept only while the local branch is where it was.
+   * Move it — a merge, a commit, a rebase, anything that precedes a push — and
+   * the next look recomputes, fetch and all. No polling, no extra network on
+   * the quiet path.
+   */
+  const localTipOf = (b: string) => git(root, ["rev-parse", "--verify", "--quiet", `${b}^{commit}`]).stdout.trim();
+  const tip = localTipOf(head);
+  const hit = previewCache.get(key);
+  if (hit && Date.now() - hit.at < PREVIEW_TTL_MS && hit.localTip === tip) return hit.v;
+
+  /*
+   * Explicit refspecs rather than `git fetch origin <branch>`, whose effect on
+   * the remote-tracking refs depends on how the remote happens to be
+   * configured. These land where they are named or not at all.
+   *
+   * And the head comes from `refs/pull/<n>/head` when the pull request's
+   * number is known. Measured against this repository's own open pull
+   * requests: one of the two is from a FORK, so `refs/heads/<branch>` does not
+   * exist on origin at all and the first version of this answered "no local
+   * copy of provider-usage-gauges-462" for a pull request that conflicts in a
+   * file it could name perfectly well. On a public repository a fork is the
+   * ordinary case, not the exception — and the same ref also survives the
+   * author deleting their branch while the pull request is still open.
+   */
+  const spec = [`+refs/heads/${base}:refs/remotes/origin/${base}`];
+  if (pr) spec.push(`+refs/pull/${pr}/head:refs/remotes/origin/pr/${pr}`);
+  else spec.push(`+refs/heads/${head}:refs/remotes/origin/${head}`);
+  const fetched = await gitAsync(root, ["fetch", "--quiet", "origin", ...spec]);
+  const stale = fetched.code !== 0;
+
+  const have = (ref: string) => git(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]).code === 0;
+  const pick = (b: string) => (have(`origin/${b}`) ? `origin/${b}` : have(b) ? b : null);
+  const a = pick(base);
+  // The pull ref first: it is the pull request's actual head wherever it
+  // lives, and a same-named local branch may be something else entirely.
+  const z = (pr && have(`origin/pr/${pr}`) ? `origin/pr/${pr}` : null) ?? pick(head);
+  if (!a || !z) {
+    const v: ConflictPreview = { ok: false, conflicts: [], clean: false, error: `no local copy of ${!a ? base : head} — fetch first` };
+    previewCache.set(key, { at: Date.now(), v, localTip: tip });
+    return v;
+  }
+
+  const r = await gitAsync(root, ["merge-tree", "--write-tree", "--name-only", a, z]);
+  // Older git has no --write-tree (it arrived in 2.38) and answers with a
+  // usage error rather than a merge. Saying so beats reporting "no conflicts".
+  if (r.code !== 0 && r.code !== 1) {
+    const v: ConflictPreview = { ok: false, conflicts: [], clean: false, error: r.stderr.trim() || "git could not compare those branches" };
+    previewCache.set(key, { at: Date.now(), v, localTip: tip });
+    return v;
+  }
+  // Line 1 is the written tree's oid; the conflicted paths follow, and a blank
+  // line ends them before git's own commentary.
+  const lines = r.stdout.split("\n");
+  const conflicts: string[] = [];
+  for (const l of lines.slice(1)) { if (!l.trim()) break; conflicts.push(l); }
+
+  /*
+   * Before answering "it conflicts", look at what is on this machine.
+   *
+   * A local branch of the same name that already CONTAINS the base has had the
+   * merge done in it. Two `merge-base --is-ancestor` calls and a rev-list, all
+   * against refs already fetched above — no network, and only on the path
+   * where there is a conflict to explain, so a clean pull request pays nothing.
+   */
+  let resolvedLocally: ConflictPreview["resolvedLocally"];
+  if (conflicts.length && have(head)) {
+    const contains = git(root, ["merge-base", "--is-ancestor", a, head]).code === 0;
+    if (contains) {
+      // What pushing would send: commits the local branch has and the pushed
+      // head does not. Counted against `z`, which is the pull request's actual
+      // head wherever it lives.
+      const ahead = Number(git(root, ["rev-list", "--count", `${z}..${head}`]).stdout.trim()) || 0;
+      resolvedLocally = { branch: head, ahead };
+    }
+  }
+
+  const v: ConflictPreview = {
+    ok: true, conflicts, clean: r.code === 0,
+    ...(stale ? { stale: true } : {}),
+    ...(resolvedLocally ? { resolvedLocally } : {}),
+  };
+  if (previewCache.size > 200) previewCache.clear();
+  previewCache.set(key, { at: Date.now(), v, localTip: tip });
+  return v;
+}
+
+/* --------------------------------------------- the set git stops remembering */
+
+/**
+ * A name for THIS stop, not for the operation.
+ *
+ * A rebase stops once per commit with a different set of files each time, so
+ * the commit being replayed is part of the identity: settle commit 1 and
+ * commit 2's screen must not open claiming three files are already done.
+ */
+export function sessionOp(info: MergeInfo): string {
+  if (!info.theirs?.sha || info.state === "clean" || info.state === "bisecting") return "";
+  return `${info.state}:${info.theirs.sha}`;
+}
+
+/**
+ * What this stop conflicted, including the files already resolved.
+ *
+ * The observation happens here, on read, because there is no other moment
+ * that reliably happens: the panel may be opened at any point during a merge,
+ * including one somebody started in a terminal an hour ago.
+ */
+export function mergeSession(rootIn: unknown): MergeSessionView {
+  const root = repoRoot(rootIn);
+  if (!root) return { ok: false, op: "", files: [], left: [], mine: [], error: "not a git repository root" };
+  const info = mergeInfo(root);
+  const op = sessionOp(info);
+  const left = git(root, ["diff", "--name-only", "--diff-filter=U", "-z"]).stdout.split("\u0000").filter(Boolean);
+  if (!op) {
+    // Nothing is stopped. Whatever we knew is about a merge that is over.
+    return { ok: true, op: "", files: [], left, mine: [] };
+  }
+  const stop = observe(root, op, left);
+  return { ok: true, op, files: stop.files, left, mine: stop.mine };
+}
+
+/**
+ * Put a resolved file back to how git left it.
+ *
+ * `git checkout --merge -- <path>` is the obvious way to do this and it is a
+ * shredder. Driven against a real repository: hand-resolve a conflict, stage
+ * it, run that command — exit 0, not one word of output, and the hand-written
+ * resolution replaced by the original markers. It is the same destruction the
+ * whole-file `--ours` already sits behind a confirmation for, on a control
+ * that reads like an undo.
+ *
+ * So it refuses without an explicit confirmation, and the refusal says what
+ * would be lost — including, when the file was resolved somewhere else, that
+ * the work being thrown away is not ours and we cannot say what it was.
+ */
+export function reopenConflict(rootIn: unknown, relIn: unknown, confirmIn?: unknown): GitActionResult {
+  const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
+  const g = guard(root); if (g) return g;
+  const rels = validRels(root, [relIn]);
+  if (!rels?.length) return { ok: false, error: "invalid path" };
+  const rel = rels[0]!;
+
+  const info = mergeInfo(root);
+  const op = sessionOp(info);
+  if (!op) return { ok: false, error: "nothing is being merged here — there is no conflict to put back" };
+  const stop = stopFor(root, op);
+  if (!stop?.files.includes(rel)) {
+    return { ok: false, error: `${rel} was not one of this merge's conflicts` };
+  }
+  const unmerged = git(root, ["diff", "--name-only", "--diff-filter=U", "-z"]).stdout.split("\u0000").filter(Boolean);
+  if (unmerged.includes(rel)) return { ok: false, error: `${rel} is still conflicted — there is nothing to put back` };
+
+  if (confirmIn !== true) {
+    const mine = stop.mine.includes(rel);
+    return {
+      ok: false,
+      error: mine
+        ? `This throws away how ${rel} was resolved and restores the original conflict. Confirm to continue.`
+        : `${rel} was resolved outside this panel — by an agent, an editor, or by hand. Putting the conflict back deletes that work and this panel cannot show you what it was. Open the file first if you are not sure. Confirm to continue.`,
+    };
+  }
+
+  const r = run(root, ["checkout", "--merge", "--", rel]);
+  if (!r.ok) return r;
+  // Verify rather than assume: `checkout --merge` exits 0 in cases where it
+  // has done nothing, and a button that silently does nothing is worse than
+  // one that fails.
+  const after = git(root, ["diff", "--name-only", "--diff-filter=U", "-z"]).stdout.split("\u0000").filter(Boolean);
+  if (!after.includes(rel)) return { ok: false, error: `git did not put the conflict in ${rel} back` };
+  noteReopened(root, op, rel);
+  return { ok: true, output: `${rel} is conflicted again` };
+}
+
+/**
+ * What must not run while git is stopped in the middle of something.
+ *
+ * The screen hides these, and hiding is not enforcement: the routes are still
+ * there, the Diff view reaches some of them, and an agent with the app open
+ * reaches all of them. So the refusal lives here, where it applies to whoever
+ * asks.
+ *
+ * The list is not "everything". Each of these is either destructive in this
+ * state or produces a result nobody wants:
+ *
+ *   staging, unstaging, discarding, hunk surgery — this is how a file with
+ *     `<<<<<<<` in it gets marked resolved, and how a conflicted file gets
+ *     thrown away by a control meant for ordinary edits;
+ *   committing — a merge is finished with `merge --continue`, which checks for
+ *     leftover markers first; `commit` does not;
+ *   push and pull — push publishes the state from BEFORE the merge, which
+ *     reads as "my merge vanished"; pull refuses anyway, with git's wording;
+ *   checkout, branch delete or rename, reset, stash, another merge or rebase —
+ *     all of them either fail obscurely or leave two operations in flight.
+ *
+ * Fetch is absent on purpose: it writes nothing to the working tree and it is
+ * often exactly what you want before deciding.
+ */
+const STOPPED_REFUSES = new Set([
+  "/git/stage", "/git/unstage", "/git/stage-all", "/git/unstage-all",
+  "/git/discard", "/git/apply-hunk", "/git/commit-staged",
+  "/git/push", "/git/pull", "/git/sync-base",
+  "/git/checkout", "/git/branch-delete", "/git/branch-rename", "/git/reset",
+  "/git/stash-push", "/git/stash-apply", "/git/stash-pop",
+  "/git/merge", "/git/rebase", "/git/undo-merge",
+]);
+
+/**
+ * The refusal, or null to let it through.
+ *
+ * Says what to do rather than what happened: "finish it or abandon it" is the
+ * whole content of the message, and the two buttons that do those things are
+ * on the screen it will appear on.
+ */
+export function stoppedRefusal(rootIn: unknown, pathname: string): GitActionResult | null {
+  if (!STOPPED_REFUSES.has(pathname)) return null;
+  const root = repoRoot(rootIn);
+  if (!root) return null;
+  const state = treeState(root);
+  if (state === "clean" || state === "bisecting") return null;
+  const n = git(root, ["diff", "--name-only", "--diff-filter=U"]).stdout.trim();
+  const left = n ? n.split("\n").length : 0;
+  const doing = state.replace(/ing$/, "");
+  return {
+    ok: false,
+    error: left
+      ? `This checkout is mid-${doing} with ${left} file${left === 1 ? "" : "s"} still conflicted. Resolve them, or abandon the ${doing}, before anything else.`
+      : `This checkout is mid-${doing}. Finish it or abandon it before anything else.`,
+  };
+}
+
+/**
+ * Files that are staged but still read as conflicted.
+ *
+ * The gap `--diff-filter=U` cannot see: anything can `git add` a file with
+ * markers still in it — an agent that stopped early, an editor, a stray
+ * `git add -A` — and from then on git considers it resolved and will happily
+ * commit the markers into the branch.
+ *
+ * Scoped to this stop's own files, with the same patterns the parser uses. A
+ * sweep of the whole index would be both slow and wrong: this repository has
+ * test fixtures whose committed content is conflict markers, and they would
+ * block every merge forever.
+ */
+export function markersLeft(root: string, rels: string[]): string[] {
+  const out: string[] = [];
+  for (const rel of rels) {
+    let text: string;
+    try { text = readFileSync(join(root, rel), "utf8"); } catch { continue; }
+    if (text.includes("\u0000")) continue;
+    for (const line of text.split("\n")) {
+      if (C_START.test(line) || C_MID.test(line) || C_END.test(line)) { out.push(rel); break; }
+    }
+  }
+  return out;
+}
 
 /* ------------------------------------------------- conflicts, block by block */
 
@@ -2551,6 +4720,91 @@ function splitConflicts(text: string): { segments: (string[] | ConflictBlock)[];
   return { segments, blocks };
 }
 
+/**
+ * A fingerprint of the file exactly as it was parsed.
+ *
+ * Cheap and deterministic — length plus a djb2 over the text. Its only job is
+ * to answer "is this still the file I showed?", and the thing it guards
+ * against is another writer (an agent in a tmux tab, nvim, a rerun of the
+ * merge), not a forger.
+ */
+export function contentStamp(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h * 33) ^ text.charCodeAt(i)) >>> 0;
+  return `${text.length.toString(36)}.${h.toString(36)}`;
+}
+
+/**
+ * Walk the parsed segments and give every line its real number.
+ *
+ * Raw numbers: the ones the file has on disk right now, markers included. That
+ * is deliberate — they are what nvim shows when the panel jumps you to a
+ * conflict, and a second numbering scheme that disagrees with the editor is
+ * worse than none.
+ */
+function locate(segments: (string[] | ConflictBlock)[]): ConflictSegment[] {
+  const out: ConflictSegment[] = [];
+  let cur = 1;
+  for (const seg of segments) {
+    if (Array.isArray(seg)) {
+      if (seg.length) out.push({ kind: "text", from: cur, lines: seg });
+      cur += seg.length;
+      continue;
+    }
+    const mid = cur + 1 + seg.ours.length + (seg.base ? 1 + seg.base.length : 0);
+    seg.ourLine = cur + 1;
+    seg.theirLine = mid + 1;
+    seg.endLine = mid + 1 + seg.theirs.length;
+    out.push({ kind: "conflict", index: seg.index });
+    cur = seg.endLine + 1;
+  }
+  return out;
+}
+
+/**
+ * The whole conflicted file, not the conflicts on their own.
+ *
+ * `splitConflicts` has always returned the text between the blocks; the block
+ * endpoint discarded it, so the screen showed regions with nothing around them
+ * and no way to tell what the code they sit in does. This is the same parse,
+ * kept whole.
+ */
+/** How much of a conflicted file this endpoint is willing to send. Four
+ *  megabytes is a very large lockfile and a very small reason to hang a
+ *  browser tab. */
+const CONFLICT_FILE_MAX = 4 * 1024 * 1024;
+
+export function conflictFile(rootIn: unknown, relIn: unknown): ConflictFile {
+  const empty = { segments: [], blocks: [], lines: 0, stamp: "" };
+  const root = repoRoot(rootIn); if (!root) return { ok: false, ...empty, error: "not a git repository root" };
+  const rels = validRels(root, [relIn]);
+  if (!rels?.length) return { ok: false, ...empty, error: "invalid path" };
+  let text: string;
+  try { text = readFileSync(join(root, rels[0]!), "utf8"); }
+  catch { return { ok: false, ...empty, error: "cannot read that file" }; }
+  // A binary file has no lines to choose between, so whole-file is the only
+  // resolution — saying so beats rendering its bytes.
+  if (text.includes("\u0000")) return { ok: false, ...empty, error: "binary file — resolve it whole" };
+  // Above this it is not a file somebody reads a conflict in, it is a
+  // generated artefact — and sending it would be megabytes of JSON to render a
+  // screen nobody can use. Refused outright rather than truncated: a silently
+  // shortened file is how you resolve a conflict you were never shown.
+  if (text.length > CONFLICT_FILE_MAX) {
+    return { ok: false, ...empty, error: `too big to work through here (${(text.length / 1e6).toFixed(1)} MB) — take one side for the whole file, or open it in your editor` };
+  }
+  const { segments, blocks } = splitConflicts(text);
+  // locate() writes the line numbers onto the blocks, so it runs before they
+  // are handed over.
+  const located = locate(segments);
+  return {
+    ok: true,
+    segments: located,
+    blocks,
+    lines: text.split("\n").length,
+    stamp: contentStamp(text),
+  };
+}
+
 export function conflictBlocks(rootIn: unknown, relIn: unknown): {
   ok: boolean; blocks: ConflictBlock[]; error?: string;
 } {
@@ -2575,19 +4829,64 @@ export function conflictBlocks(rootIn: unknown, relIn: unknown): {
  * resolving the wrong conflict with the wrong side, and looking like it worked.
  * Refusing costs a reload; guessing costs code.
  */
-export function resolveBlocks(rootIn: unknown, relIn: unknown, choicesIn: unknown): GitActionResult {
+/** As many lines as one hand-written block may carry. Generous for a real
+ *  edit, small enough that a runaway client cannot post a book. */
+const EDIT_MAX_LINES = 5000;
+
+/**
+ * Check a list of block decisions, and say what is wrong with it in words the
+ * screen can show.
+ *
+ * The one that matters is the marker check. A hand-written block containing
+ * `<<<<<<<` would be staged by git as RESOLVED while the file still reads as
+ * conflicted — so the next parse finds a conflict git does not know about, and
+ * the commit carries the markers. Every other rule here is hygiene; that one
+ * is the difference between a resolution and a corrupted file.
+ */
+function validateChoices(list: unknown[]): string | null {
+  const sides = new Set(["ours", "theirs", "both", "theirs-first"]);
+  for (const c of list) {
+    if (typeof c === "string") {
+      if (!sides.has(c)) return "unknown choice";
+      continue;
+    }
+    if (!c || typeof c !== "object" || !Array.isArray((c as { edit?: unknown }).edit)) return "unknown choice";
+    const lines = (c as { edit: unknown[] }).edit;
+    if (lines.length > EDIT_MAX_LINES) return `an edited block is limited to ${EDIT_MAX_LINES} lines`;
+    for (const l of lines) {
+      if (typeof l !== "string") return "an edited block must be lines of text";
+      // Lines, not a blob: the reassembly joins with "\n", so an embedded
+      // newline would silently produce a line count nobody chose.
+      if (l.includes("\n") || l.includes("\r")) return "an edited block must be split into lines";
+      if (C_START.test(l) || C_MID.test(l) || C_END.test(l) || C_BASE.test(l)) {
+        return "an edited block cannot contain conflict markers — git would stage it as resolved while the file still reads as conflicted";
+      }
+    }
+  }
+  return null;
+}
+
+export function resolveBlocks(rootIn: unknown, relIn: unknown, choicesIn: unknown, stampIn?: unknown): GitActionResult {
   const root = repoRoot(rootIn); if (!root) return { ok: false, error: "not a git repository root" };
   const g = guard(root); if (g) return g;
   const rels = validRels(root, [relIn]);
   if (!rels?.length) return { ok: false, error: "invalid path" };
   if (!Array.isArray(choicesIn)) return { ok: false, error: "choices must be a list" };
-  const allowed = new Set(["ours", "theirs", "both", "theirs-first"]);
-  if (!choicesIn.every((c) => typeof c === "string" && allowed.has(c))) return { ok: false, error: "unknown choice" };
+  const bad = validateChoices(choicesIn);
+  if (bad) return { ok: false, error: bad };
   const choices = choicesIn as BlockChoice[];
 
   const abs = join(root, rels[0]!);
   let text: string;
   try { text = readFileSync(abs, "utf8"); } catch { return { ok: false, error: "cannot read that file" }; }
+  // The count check below catches a stale parse only when the number of
+  // conflicts changed. A rewrite that kept the count — an agent resolving one
+  // block and reintroducing another, the merge rerun — passes it, and then
+  // choice N lands on a block that is no longer the Nth. The stamp catches
+  // that too, and it is what the whole-file view sends.
+  if (typeof stampIn === "string" && stampIn && stampIn !== contentStamp(text)) {
+    return { ok: false, error: "that file changed since you opened it — reload it" };
+  }
   const { segments, blocks } = splitConflicts(text);
   if (blocks.length !== choices.length) {
     return { ok: false, error: `the file has ${blocks.length} conflicts, not ${choices.length} — reload it` };
@@ -2603,7 +4902,8 @@ export function resolveBlocks(rootIn: unknown, relIn: unknown, choicesIn: unknow
     if (Array.isArray(seg)) { outLines.push(...seg); continue; }
     const c = choices[seg.index]!;
     outLines.push(...(
-      c === "ours" ? seg.ours
+      typeof c !== "string" ? c.edit
+      : c === "ours" ? seg.ours
       : c === "theirs" ? seg.theirs
       : c === "both" ? [...seg.ours, ...seg.theirs]
       : [...seg.theirs, ...seg.ours]
@@ -2612,5 +4912,7 @@ export function resolveBlocks(rootIn: unknown, relIn: unknown, choicesIn: unknow
   const out = outLines.join("\n");
 
   try { writeFileSync(abs, out); } catch { return { ok: false, error: "cannot write that file" }; }
-  return run(root, ["add", "--", rels[0]!]);
+  const added = run(root, ["add", "--", rels[0]!]);
+  if (added.ok) noteResolved(root, sessionOp(mergeInfo(root)), [rels[0]!]);
+  return added;
 }

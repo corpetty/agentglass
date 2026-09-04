@@ -2,16 +2,17 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import type { SessionDetail, TimelineEntry } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
-import { ChangesModal } from "./ChangesModal.tsx";
+import { PresetDiff } from "./diff/PresetDiff.tsx";
 import { api } from "../lib/api.ts";
 import { usePoll } from "../lib/usePoll.ts";
 import { Markdown } from "../lib/markdown.tsx";
-import { fmtUsd, fmtTokens, fmtAgo, fmtTime, modelLabelOf, modelColor, sessionTitle } from "../lib/format.ts";
+import { fmtUsd, fmtTokens, fmtEq, fmtAgo, fmtTime, modelLabelOf, modelColor, sessionTitle } from "../lib/format.ts";
 import { ToolRow } from "./ToolRow.tsx";
 import { buildRows, entryKey, type Row } from "../lib/toolTree.ts";
 import { sessionIsLive } from "../lib/derive.ts";
 import { sessionWorktree, sessionCwd } from "../lib/worktree.ts";
 import { useStuckBottom } from "../lib/useStuckBottom.ts";
+import { CloseButton } from "./CloseButton.tsx";
 
 const TOOL_RAMP = ["#a78bfa", "#f472b6", "#34d399", "#60a5fa", "#fbbf24", "#22d3ee", "#a3e635", "#fb923c"];
 const shortType = (t: string) => t.replace(/^workflow-subagent$/, "workflow").replace(/^general-purpose$/, "general");
@@ -42,7 +43,7 @@ const Bubble = memo(function Bubble({ role, ts, text }: { role: string; ts: numb
     <div className={`flex ${user ? "justify-end" : "justify-start"}`}>
       <div className="max-w-[85%] min-w-0 rounded-xl px-3 py-2 text-[11.5px] leading-relaxed break-words"
         style={user ? USER_BUBBLE : AGENT_BUBBLE}>
-        <div className="text-[9px] uppercase tracking-wider mb-1" style={{ color: user ? "var(--primary-hover)" : "var(--info)" }}>{role} · {fmtTime(ts)}</div>
+        <div className="text-[10px] uppercase tracking-wider mb-1" style={{ color: user ? "var(--primary-hover)" : "var(--info)" }}>{role} · {fmtTime(ts)}</div>
         <Markdown text={text} />
       </div>
     </div>
@@ -136,7 +137,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
     useStuckBottom(open ? sessionId : null);
 
   return (
-    <Portal>
+    <Portal find>
       <AnimatePresence>
         {open && (
           <>
@@ -178,7 +179,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                       ) : sessionCwd(d) ? (
                         <button onClick={() => { onResume(d); onClose(); }} className="chip cursor-pointer"
                           title={`Continue this conversation in ${sessionCwd(d)} — claude keeps the full context`}
-                          style={{ color: "var(--ok, #34d399)", background: "color-mix(in srgb, #34d399 15%, transparent)", borderColor: "color-mix(in srgb, #34d399 45%, transparent)" }}>
+                          style={{ color: "var(--success)", background: "color-mix(in srgb, var(--success) 12%, transparent)", borderColor: "color-mix(in srgb, var(--success) 45%, transparent)" }}>
                           ↩ Resume in chat
                         </button>
                       ) : (
@@ -192,7 +193,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                         ⧉ Watch in live feed
                       </button>
                     )}
-                    <button onClick={onClose} className="text-[18px] leading-none px-2 t-dim2 hover:opacity-70">✕</button>
+                    <CloseButton onClick={onClose} />
                   </div>
                 </div>
 
@@ -215,7 +216,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                         <Stat k="Tools" v={d.tools.toLocaleString()} />
                         <Stat k="Errors" v={String(d.errors)} color={d.errors ? "var(--error)" : "var(--text3)"} />
                         <Stat k="Subagents" v={String(d.subagents.length)} color="var(--info)" />
-                        <Stat k="Tokens" v={fmtTokens(d.input_tokens + d.output_tokens)} />
+                        <Stat k="Tokens" v={fmtEq(d.equiv_tokens ?? d.input_tokens + d.output_tokens)} />
                         <Stat k="Cost" v={fmtUsd(d.cost_usd)} color="var(--success)" />
                       </div>
                     </div>
@@ -352,7 +353,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
           </>
         )}
       </AnimatePresence>
-      {d && <ChangesModal open={diffOpen} onClose={() => { setDiffOpen(false); onClose(); }} onBack={() => setDiffOpen(false)} backLabel="Conversation" presetChanges={d.changes} presetTitle={key} presetPath={diffPath} />}
+      {d && <PresetDiff open={diffOpen} onClose={() => { setDiffOpen(false); onClose(); }} onBack={() => setDiffOpen(false)} backLabel="Conversation" changes={d.changes} title={key} path={diffPath} />}
     </Portal>
   );
 }

@@ -51,6 +51,81 @@ agentglass derives cost from token usage and its pricing table.
 If a Claude transcript scanner already owns the session id, the event is
 accepted but skipped (no double-count).
 
+### Kimi Code CLI and Kimi K3
+
+Kimi Code CLI's hook JSON already supplies `hook_event_name` and `session_id`,
+and Kimi runs the command in the session's project directory. Point Kimi at
+`hooks/send_event.py`; `--model-name` supplies the model because Kimi's hook
+payload does not include it.
+
+Add one block per event to `~/.kimi-code/config.toml` (or
+`$KIMI_CODE_HOME/config.toml`). Replace `/absolute/path/to/agentglass` with this
+checkout's real path:
+
+```toml
+[[hooks]]
+event = "SessionStart"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "PreToolUse"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "PostToolUse"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "PostToolUseFailure"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "Stop"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+
+[[hooks]]
+event = "SessionEnd"
+command = "python3 \"/absolute/path/to/agentglass/hooks/send_event.py\" --model-name kimi-code/k3"
+```
+
+The source app defaults to the current project directory's name. Pass
+`--source-app NAME` to override it. On Windows, use `py` or `python` instead of
+`python3`.
+
+Hooks provide the live lifecycle and tool stream. Kimi's hook payload currently
+does not include token usage. A Kimi/Moonshot adapter can add exact tokens and
+cost through `/ingest` using either supported API shape:
+
+```json
+{
+  "source_app": "my-project",
+  "session_id": "kimi-session-1",
+  "hook_event_type": "Stop",
+  "model_name": "kimi-k3",
+  "payload": {
+    "usage": {
+      "prompt_tokens": 1200,
+      "completion_tokens": 300,
+      "cached_tokens": 800
+    }
+  }
+}
+```
+
+The OpenAI-compatible nested form
+`prompt_tokens_details.cached_tokens` is supported too. Cached tokens are split
+out of `prompt_tokens` before cost math, so they are not charged twice.
+Agentglass recognizes `k3`, `kimi-k3`, and `kimi-code/k3` as **Moonshot / K3**.
+The built-in K3 API rate follows
+[Kimi's published pricing](https://www.kimi.com/help/kimi-api/api-pricing):
+$3 / MTok input, $15 / MTok output, and $0.30 / MTok cache reads. Use
+`reported_cost_usd` for Kimi Code subscription usage or whenever the provider
+reports the exact charge.
+
 ### OTLP (any provider)
 
 Point an OTLP/HTTP exporter at the same port. Both **protobuf** (SDK default)
@@ -72,6 +147,55 @@ Mapping (see `server/src/otlp.ts`):
 
 One-command CLI wiring (Gemini / Codex) is documented in the README under
 **Any provider — via OpenTelemetry**.
+
+### Adding a CLI you can talk to, not only watch
+
+OpenTelemetry gets a CLI onto the radar. Driving one from the chat panel is a
+separate seam, and Codex is the worked example of it — `server/src/codex.ts`
+alongside `server/src/chat.ts`. The division that makes it cheap:
+
+- **The server spawns and streams, and does not translate.** It runs the binary
+  non-interactively in a scoped git directory and pipes its JSONL back verbatim,
+  plus an `agx_error` frame of its own when the process never got going. Every
+  guard is shared — `safeAbs` / `repoRootOf` / `inScope`, the `setsid` process
+  group so stopping a turn reaches the whole job tree, the keepalive, and the
+  first-run watchdog that names the login command.
+- **One file in the browser knows the vocabulary.** `web/src/lib/codexFrames.ts`
+  turns Codex's `item.completed` frames into the same `ChatMsg` / `ChatTool` /
+  `ChatUsage` the Claude path fills. Nothing below the store branches on which
+  CLI produced a turn, which is what lets one panel render both.
+- **The differences that remain are real ones, and are surfaced rather than
+  papered over.** Codex has a sandbox where Claude has permission modes; it
+  reports cumulative thread tokens where Claude reports per-turn; it reports no
+  cost and no context window at all. Each of those is a visible difference in
+  the panel, not a fabricated equivalence.
+
+A third CLI repeats that shape, and Google Antigravity is the proof it holds:
+`server/src/antigravity.ts` beside the other two, `web/src/lib/antigravityFrames.ts`
+beside `codexFrames.ts`, and `AgentKind` gaining a member. What the third one
+changed is worth knowing before you add a fourth:
+
+- **The per-agent differences moved into a table.** `AGENTS` in
+  `web/src/lib/agents.ts` holds the label, the binary, the defaults, the
+  unattended mode, and whether the CLI takes attachments or has a replayable
+  transcript. Two agents justified `agent === "codex" ? … : …`; three did not,
+  because a missed branch is silent — a Claude default quietly applied to
+  something that is not Claude. Add the entry, not the branches.
+- **An agent may report through the panel itself.** Claude reaches the fleet
+  over hooks and Codex over OpenTelemetry, but Antigravity exports neither, so
+  its own stream is teed into `ingestBody` — `frameToEvent` maps frames to
+  `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` /
+  `Turn complete`. That is the `via: "chat"` kind in the agent roster. It only
+  covers chats started here, which is said plainly rather than implied.
+- **Check what the usage numbers actually mean before trusting them.** Codex
+  reports cumulative thread totals and Antigravity reports per-turn figures.
+  They look identical on the wire and are assigned in one case and added in the
+  other; getting it backwards over-reports spend severalfold and nothing fails
+  loudly.
+- **A capability the CLI has not got is left off, not faked.** Antigravity has
+  no readable transcript (protobuf inside SQLite), no price, and no context
+  window, so there is no resume route and the cost and context rows stay hidden
+  rather than being filled from a table in this repo.
 
 ## 2. Use the gate in your own harness
 
@@ -141,8 +265,8 @@ curl -sS http://localhost:4000/control \
 
 | `cmd` | Fields | Effect |
 | --- | --- | --- |
-| `view` | `to`: `git`\|`diff`\|`pr`\|`docker`\|`term`\|`chat` | open the workspace on that view |
-| `workspace` | `open?`: boolean | toggle (absent) or set the workspace overlay |
+| `view` | `to`: `dash`\|`git`\|`diff`\|`pr`\|`tasks`\|`docker`\|`term`\|`chat`\|`browser`\|`files` | switch the window to that view |
+| `workspace` | `open?`: boolean | toggle (absent) or set — swaps between the dashboard and the last view, the way `Ctrl+\` does |
 | `esc` | — | close panels / workspace, as Escape does |
 | `open` | `what`: `stats`\|`skills`\|`search`\|`help`\|`palette` | open that panel |
 | `theme` | `name?`: id, or `dir?`: `1`\|`-1` | pin a palette, or step the list |
@@ -181,7 +305,7 @@ Add a palette to `THEMES`, restart the UI, pick it in the theme switcher.
 
 ### A view in the workspace
 
-The six views are a list, and the rail, the shortcuts and the tooltips all read
+The views are a list, and the rail, the shortcuts and the tooltips all read
 from it — so most of a new view is one entry:
 
 ```ts
@@ -251,7 +375,8 @@ folder instead.
 ### Auth and write gates
 
 See the README security table (`AGENTGLASS_TOKEN`, `AGENTGLASS_GIT_WRITE_DISABLED`,
-`AGENTGLASS_DOCKER_WRITE_DISABLED`, `AGENTGLASS_CHAT_DISABLED`, …). Intake routes
+`AGENTGLASS_DOCKER_WRITE_DISABLED`, `AGENTGLASS_CHAT_DISABLED`,
+`AGENTGLASS_CODEX_DISABLED`, …). Intake routes
 (`/ingest`, OTLP) stay tokenless on purpose — local hooks and OTel exporters
 have no way to carry a secret — while everything else needs the token when set.
 
@@ -277,7 +402,7 @@ hooks / OTLP / POST /ingest
 ## Dashboard vs harness (one paragraph)
 
 agentglass does **not** replace Claude Code, Codex, Gemini CLI, LangChain, or
-your custom runner. Those remain the harness. agentglass is the loupe and the
-optional remote control: ingest telemetry, render the fleet, and (if you wire
-it) hold tool calls until a human clicks allow/deny. Point things at it; keep
-shipping with whatever you already run.
+your custom runner. Those remain the harness. agentglass is the glass in front
+of them and the optional remote control: ingest telemetry, render the fleet,
+and (if you wire it) hold tool calls until a human clicks allow/deny. Point
+things at it; keep shipping with whatever you already run.

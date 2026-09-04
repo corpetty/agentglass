@@ -18,10 +18,15 @@ process.env.AGENTGLASS_DB = join(mkdtempSync(join(tmpdir(), "agx-prov-")), "p.db
 
 let serverProviderOf: (m: string | null | undefined) => string | null;
 let webProviderOf: (m: string | null | undefined) => string;
+let webModelLabelOf: (m: string | null | undefined) => string;
+let serverModelLabel: (m: string | null | undefined) => string;
 
 beforeAll(async () => {
   serverProviderOf = (await import("../src/db.ts")).providerOf;
-  webProviderOf = (await import("../../web/src/lib/format.ts")).providerOf;
+  serverModelLabel = (await import("../src/pricing.ts")).modelLabel;
+  const format = await import("../../web/src/lib/format.ts");
+  webProviderOf = format.providerOf;
+  webModelLabelOf = format.modelLabelOf;
 });
 
 // One real id per branch of the mapping, plus the ones that must fall through.
@@ -31,6 +36,8 @@ const MODELS = [
   "gemini-2.5-pro", "models/gemini-1.5-flash", "text-bison", "palm-2", "vertex_ai/gemini",
   "deepseek-chat", "grok-2", "xai/grok", "mistral-large", "mixtral-8x7b", "codestral",
   "llama-3.1-70b", "meta-llama/Llama-3", "command-r-plus", "cohere.command",
+  "k3", "kimi-k3", "kimi-code/k3", "moonshot-v1-128k",
+  "MiniMax-M3", "MiniMax-M2.7",
   // fall-through cases — must be the miss bucket on both sides
   "some-unknown-model", "qwen-2.5", "", "   ", "MODEL-WITH-NO-MATCH",
 ];
@@ -47,5 +54,88 @@ describe("providerOf agrees between the server and the web copy", () => {
   test("null / undefined agree (the miss bucket)", () => {
     expect(norm(serverProviderOf(null))).toBe(webProviderOf(null));
     expect(norm(serverProviderOf(undefined))).toBe(webProviderOf(undefined));
+  });
+
+  test("Kimi K3 aliases resolve to Moonshot and the K3 display label", () => {
+    for (const model of ["k3", "kimi-k3", "kimi-code/k3"]) {
+      expect(serverProviderOf(model)).toBe("Moonshot");
+      expect(webProviderOf(model)).toBe("Moonshot");
+      expect(webModelLabelOf(model)).toBe("K3");
+    }
+  });
+
+  test("MiniMax ids resolve to the MiniMax provider and display labels", () => {
+    for (const model of ["MiniMax-M3", "MiniMax-M2.7"]) {
+      expect(serverProviderOf(model)).toBe("MiniMax");
+      expect(webProviderOf(model)).toBe("MiniMax");
+    }
+    expect(webModelLabelOf("MiniMax-M3")).toBe("MiniMax M3");
+    expect(webModelLabelOf("MiniMax-M2.7")).toBe("MiniMax M2.7");
+  });
+});
+
+// The other half of the same class of bug, and the one that actually shipped.
+// providerOf was pinned here by #282; the display label was not, and it had
+// drifted: server modelLabel() returned the matched PRICE ROW's name, and a
+// price row buckets several ids on purpose. So "gpt-5" priced from the GPT-4.1
+// row was *called* "GPT-4.1" by the cost donut while the fleet card beside it
+// said "GPT-5" — one model, two names, two hash-derived colours, on one screen.
+//
+// Both sides now come from shared/models.ts. This is what stops the split
+// reopening the next time a rate row is made to cover one more id.
+describe("modelLabel agrees between the server and the web copy", () => {
+  const LABELLED = [
+    ...MODELS,
+    // The families where a rate row deliberately covers several models — the
+    // exact shape that used to collapse them all onto one name.
+    "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.5",
+    "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4-turbo",
+    "claude-opus-4-1", "claude-opus-4-5", "claude-3-5-sonnet-20241022",
+    "mythos-1", "k3[512k]",
+  ];
+  for (const m of LABELLED) {
+    test(`"${m}" is called the same thing on both sides`, () => {
+      expect(serverModelLabel(m)).toBe(webModelLabelOf(m));
+    });
+  }
+
+  test("null / undefined agree", () => {
+    expect(serverModelLabel(null)).toBe(webModelLabelOf(null));
+    expect(serverModelLabel(undefined)).toBe(webModelLabelOf(undefined));
+  });
+
+  // The regression that motivated all of this, stated as itself.
+  test("a GPT-5 id is not called GPT-4.1", () => {
+    expect(serverModelLabel("gpt-5")).toBe("GPT-5");
+    expect(serverModelLabel("gpt-5-mini")).toBe("GPT-5 mini");
+  });
+
+  // A price row may still bucket ids together — that is its job. What it may
+  // no longer do is decide what they are called.
+  //
+  // This used to demonstrate the point with gpt-5 and gpt-4.1, which shared a
+  // row. They no longer do: GPT-5 got its own rates, which was the *other*
+  // half of that bug. So the property is stated over the table instead of
+  // through one pair, and cannot go stale the next time rates move.
+  test("a shared rate row does not merge two models' names", async () => {
+    const { priceFor } = await import("../src/pricing.ts");
+    // Pairs that are genuinely different models on one rate. Sharing a row is
+    // fine and often right — gpt-5 and gpt-5-codex share both a row and a name
+    // because they *are* one model — so the property is only about ids that
+    // differ, and it is asserted on ids picked for that.
+    const PAIRS: [string, string][] = [
+      ["o1-mini", "o4-mini"],
+      ["gpt-4.1", "gpt-4.5"],
+    ];
+    for (const [a, b] of PAIRS) {
+      // The premise, checked rather than assumed: this used to be demonstrated
+      // with gpt-5 and gpt-4.1, and stopped being true the day GPT-5 got its
+      // own rates. If a future split does the same here, fail loudly instead
+      // of passing about nothing.
+      expect(priceFor(a), `${a} and ${b} no longer share a rate row — pick another pair`)
+        .toBe(priceFor(b));
+      expect(serverModelLabel(a), `${a} and ${b} are named after their rate row`)
+        .not.toBe(serverModelLabel(b));
+    }
   });
 });

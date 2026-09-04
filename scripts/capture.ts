@@ -18,7 +18,7 @@
  */
 
 import { spawn } from "bun";
-import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -50,86 +50,12 @@ const PANEL_H = 1080;
 /** The GIF is emitted at 1× and this width; 2× frames are downscaled into it,
  *  which is what makes text legible at a small file size. */
 const GIF_W = 1100, GIF_FPS = 12;
-
-/** The demo build is based at /agentglass/demo/ so it can be served from
- *  GitHub Pages, so its asset URLs carry that prefix. Serving it at the root
- *  gives a page whose scripts all 404 and a #root that never fills. */
-const BASE = "/agentglass/demo";
-
-function serveDist() {
-  return Bun.serve({
-    port: 0,
-    async fetch(req) {
-      let path = new URL(req.url).pathname;
-      if (path.startsWith(BASE)) path = path.slice(BASE.length) || "/";
-      const file = Bun.file(join(DIST, path === "/" ? "index.html" : path));
-      if (await file.exists()) return new Response(file);
-      if (!path.split("/").pop()!.includes("."))
-        return new Response(Bun.file(join(DIST, "index.html")), { headers: { "content-type": "text/html" } });
-      return new Response("not found", { status: 404 });
-    },
-  });
-}
-
-const CHROME = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "/usr/bin/google-chrome"];
-function findChrome(): string {
-  const pinned = process.env.CHROME_PATH?.trim();
-  if (pinned) return pinned;
-  for (const c of CHROME) {
-    const r = Bun.spawnSync(["which", c]);
-    if (r.exitCode === 0) return r.stdout.toString().trim();
-  }
-  throw new Error("no Chrome found — set CHROME_PATH");
-}
-
-type CDP = {
-  send: (m: string, p?: unknown) => Promise<any>;
-  ev: (expr: string) => Promise<any>;
-  shot: () => Promise<Buffer>;
-  close: () => void;
-};
-
-async function connect(port: number): Promise<CDP> {
-  let targets: any[] = [];
-  for (let i = 0; i < 60; i++) {
-    try { targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json(); if (targets.length) break; }
-    catch { /* not up yet */ }
-    await Bun.sleep(250);
-  }
-  const page = targets.find((t) => t.type === "page");
-  if (!page) throw new Error("no page target");
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let id = 1;
-  const pending = new Map<number, (v: any) => void>();
-  await new Promise((r) => ws.addEventListener("open", r as any));
-  ws.addEventListener("message", (e: any) => {
-    const m = JSON.parse(String(e.data));
-    if (m.id && pending.has(m.id)) { pending.get(m.id)!(m.result ?? m.error); pending.delete(m.id); }
-  });
-  const send = (method: string, params: unknown = {}) =>
-    new Promise<any>((res) => { const i = id++; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
-  await send("Page.enable");
-  await send("Runtime.enable");
-  const ev = async (expr: string) =>
-    (await send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true })).result?.value;
-  const shot = async () => Buffer.from((await send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false })).data, "base64");
-  return { send, ev, shot, close: () => ws.close() };
-}
-
-/** Wait for a condition rather than a guessed delay — a fixed sleep either
- *  wastes seconds or captures a half-painted frame, and which one depends on
- *  the machine. */
-async function until(cdp: CDP, expr: string, what: string, ms = 15_000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < ms) {
-    if (await cdp.ev(`!!(${expr})`)) return;
-    await Bun.sleep(120);
-  }
-  throw new Error(`timed out waiting for ${what}`);
-}
-
-const key = (cdp: CDP, k: string, mods: Record<string, boolean> = {}) =>
-  cdp.ev(`(()=>{window.dispatchEvent(new KeyboardEvent("keydown",Object.assign({key:${JSON.stringify(k)},bubbles:true,cancelable:true},${JSON.stringify(mods)})));return 1})()`);
+/** How a still goes from a 3840px CDP capture to the asset the README shows —
+ *  see scripts/still.ts for why that step exists at all. */
+import { finishStill, STILL_W } from "./still.ts";
+/** Chrome, the protocol and the static server for the demo build. */
+import { connect, findChrome, key, serveDist, until, DEMO_BASE } from "./cdp.ts";
+import { jsLit } from "../shared/jsLit.ts";
 
 async function main() {
   if (!existsSync(join(DIST, "index.html"))) {
@@ -137,8 +63,8 @@ async function main() {
     process.exit(1);
   }
   mkdirSync(OUT, { recursive: true });
-  const server = serveDist();
-  const url = `http://127.0.0.1:${server.port}${BASE}/`;
+  const server = serveDist(DIST);
+  const url = `http://127.0.0.1:${server.port}${DEMO_BASE}/`;
   const profile = mkdtempSync(join(tmpdir(), "agx-capture-"));
   const port = 9400 + Math.floor(Math.random() * 200);
 
@@ -165,6 +91,19 @@ async function main() {
     await until(cdp, `document.querySelector('#root')?.children.length`, "the app to mount");
     await Bun.sleep(2500); // let the demo stream seed a few events
 
+    // Serious dark for every shot — the house dark is Graphite (SERIOUS_DARK),
+    // not the old blue "dark", set before the viewport is probed so nothing is
+    // captured mid-repaint. Both keys: the theme id and the mode segment, so
+    // however the app resolves the theme on boot it lands on Graphite. (The key
+    // is `agentglass-theme`, hyphenated; a dotted `agentglass.theme` reaches
+    // nobody, and the mode is `agentglass-theme-mode`.)
+    const setTheme = (id: string, mode: string) =>
+      cdp.ev(`(()=>{try{localStorage.setItem('agentglass-theme',${jsLit(id)});localStorage.setItem('agentglass-theme-mode',${jsLit(mode)});return 1}catch{return 0}})()`);
+    await setTheme("graphite", "dark");
+    await cdp.ev(`location.reload()`);
+    await until(cdp, `document.querySelector('#root')?.children.length`, "the graphite theme");
+    await Bun.sleep(2500);
+
     // Size the viewport to the dashboard rather than cropping the dashboard to
     // the viewport. setDeviceMetricsOverride rather than a window size: the
     // window carries chrome of an unknown height, so asking for 1600 gives an
@@ -173,14 +112,32 @@ async function main() {
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: W, height: h, deviceScaleFactor: SCALE, mobile: false });
       await Bun.sleep(1200);
     };
-    const need = Number(await cdp.ev(`(()=>{const a=document.querySelector('.aurora');return a?a.scrollHeight:0})()`)) || 1600;
-    const TALL = Math.min(2200, need + 8);
+    // The rail boots on the git view — loadLastView() defaults to it — so the
+    // dashboard is selected for its own shot rather than assumed to be up. (The
+    // `.aurora` this used to measure is the animated backdrop, present on every
+    // view, so the shot was whatever the rail booted into, sized to the backdrop
+    // — which is how the dashboard still ended up being the git panel.)
+    await cdp.ev(`(()=>{document.querySelector('[data-view="dash"]')?.click();return 1})()`);
+    await Bun.sleep(1500);
+    // Size the viewport to the dashboard, not the dashboard to the viewport: its
+    // content is a scroller, so measure where it starts plus how tall it runs
+    // and give it exactly that. A guessed constant clips the bottom row — cost,
+    // performance, timeline — the first time a card is added.
+    const need = Number(await cdp.ev(`(()=>{const s=[...document.querySelectorAll('.agx-scroll')].filter(e=>e.offsetParent);
+      let m=0; for(const e of s){const r=e.getBoundingClientRect(); m=Math.max(m,Math.ceil(r.top+e.scrollHeight));} return m;})()`)) || 1600;
+    const TALL = Math.min(2400, need + 24);
     console.log(`dashboard needs ${need}px; panels shot at ${W}x${PANEL_H}`);
 
-    /** Take a still, and optionally hold it in the GIF for `beats` frames. */
-    const capture = async (name: string | null, beats = 0) => {
+    /** Take a still, and optionally hold it in the GIF for `beats` frames.
+     *  The GIF keeps the full-resolution frame; only the file on disk shrinks. */
+    const capture = async (name: string | null, beats = 0, width = STILL_W) => {
       const png = await cdp.shot();
-      if (name) { writeFileSync(join(OUT, `${name}.png`), png); console.log(`  ${name}.png`); }
+      if (name) {
+        const file = join(OUT, `${name}.png`);
+        writeFileSync(file, png);
+        finishStill(file, width);
+        console.log(`  ${name}.png`);
+      }
       for (let i = 0; i < beats; i++) writeFileSync(join(framesDir, `f${String(n++).padStart(4, "0")}.png`), png);
     };
 
@@ -203,15 +160,46 @@ async function main() {
     // hand out a shell — so capturing it yields an empty pane, and a second and
     // a half of nothing in the middle of the hero GIF. `capture-live.ts` shoots
     // the real one against a throwaway repo instead.
-    const views: [string, string][] = [["git", "1"], ["diff", "2"], ["docker", "3"], ["chat", "5"]];
+    // Picked by view id, not by Ctrl+<n>. The rail's order is the user's — it
+    // is drag-reorderable and persisted — and it gained the pull-request view
+    // in the middle, which silently turned Ctrl+3 from Docker into PRs and
+    // Ctrl+5 from Chat into the terminal. Two README assets were captured
+    // under the wrong name because of it. An id cannot drift.
+    const views = ["git", "diff", "pr", "tasks", "files", "docker", "chat"];
     await key(cdp, "\\", { ctrlKey: true });
     await until(cdp, `document.querySelector('[role="tablist"][aria-label="Workspace views"]')`, "the workspace");
     await Bun.sleep(1200);
 
-    for (const [name, k] of views) {
-      await key(cdp, k, { ctrlKey: true });
-      await Bun.sleep(1400);
-      await capture(name, STILLS_ONLY ? 0 : 16);
+    for (const id of views) {
+      const ok = await cdp.ev(`(()=>{const b=document.querySelector('[data-view=${jsLit(id)}]');b?.click();return !!b})()`);
+      if (!ok) { console.warn(`  ! no "${id}" view in the rail — skipped`); continue; }
+      await Bun.sleep(1600);
+      // The PR panel opens on Overview; Files is the view worth showing, and
+      // it is what the README's caption describes.
+      if (id === "pr") {
+        await cdp.ev(`(()=>{const b=[...document.querySelectorAll('button')]
+          .find(b=>/^Files\\b/.test(b.textContent.trim()));b?.click();return !!b})()`);
+        await Bun.sleep(1800);
+      }
+      // Tasks opens with an empty detail pane ("Pick an issue"); open the first
+      // one so the shot shows an issue read, not half a blank column.
+      if (id === "tasks") {
+        await cdp.ev(`(()=>{const b=[...document.querySelectorAll('button')]
+          .find(b=>/Cart total is a cent low/.test(b.textContent||''));b?.click();return !!b})()`);
+        await Bun.sleep(1400);
+      }
+      await capture(id, STILLS_ONLY ? 0 : 16);
+    }
+
+    // Ports and Resources are an overlay, not a rail view — opened from the
+    // rail's own buttons (aria-labelled) and dismissed with Escape.
+    for (const [label, name] of [["Ports", "ports"], ["Resources", "resources"]] as const) {
+      const ok = await cdp.ev(`(()=>{const b=document.querySelector('button[aria-label=${jsLit(label)}]');b?.click();return !!b})()`);
+      if (!ok) { console.warn(`  ! no "${label}" button — skipped`); continue; }
+      await Bun.sleep(1600);
+      await capture(name, STILLS_ONLY ? 0 : 14);
+      await key(cdp, "Escape");
+      await Bun.sleep(500);
     }
 
     // Settings, which is where today's shortcuts and About live.
@@ -226,16 +214,29 @@ async function main() {
     await key(cdp, "Escape");
     await Bun.sleep(600);
 
-    // Themes, each on the dashboard so they are comparable.
-    const themes = ["forest", "ember", "deep-sea", "light"];
-    for (const t of themes) {
-      const ok = await cdp.ev(`(()=>{try{localStorage.setItem('agentglass.theme',${JSON.stringify(t)});window.dispatchEvent(new StorageEvent('storage',{key:'agentglass.theme'}));return 1}catch{return 0}})()`);
+    // Themes, on the dashboard so they are comparable. The two serious defaults,
+    // side by side: Graphite (Dark) and Porcelain (Light). The filenames stay
+    // theme-dark / theme-light — that is what each is, a dark shot and a light
+    // one — while the palette is the serious pair, not the old blue and white.
+    const themes: [string, string, string][] = [
+      ["graphite", "dark", "theme-dark"],
+      ["porcelain", "light", "theme-light"],
+    ];
+    for (const [id, mode, name] of themes) {
+      const ok = await setTheme(id, mode);
       if (!ok) continue;
       await cdp.ev(`location.reload()`);
-      await until(cdp, `document.querySelector('#root')?.children.length`, `the ${t} theme`);
-      await setViewport(PANEL_H);
-      await Bun.sleep(2200);
-      await capture(`theme-${t}`, 0);
+      // Wait for the rail itself, not just #root: the reload restores the last
+      // view (not the dashboard), and clicking before the rail has mounted is
+      // what left both theme shots on the empty chat pane.
+      await until(cdp, `document.querySelector('[data-view="dash"]')`, `the ${id} rail`);
+      await Bun.sleep(700);
+      // Back to the dashboard for every theme, at its own height, so the Dark
+      // and Light shots are the same picture in two palettes.
+      await cdp.ev(`(()=>{document.querySelector('[data-view="dash"]')?.click();return 1})()`);
+      await Bun.sleep(1800);
+      await setViewport(TALL);
+      await capture(name, 0, STILL_W);
     }
 
     cdp.close();
@@ -252,6 +253,11 @@ async function main() {
       run(["-framerate", String(GIF_FPS), "-i", join(framesDir, "f%04d.png"), "-i", pal,
         "-lavfi", `scale=${GIF_W}:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=sierra2_4a:diff_mode=rectangle`,
         "-loop", "0", join(OUT, "hero.gif")]);
+      // The landing page shows the same clip, and its copy had silently gone
+      // a release stale — it was still the pre-satellite mark long after the
+      // README's was not. Written here rather than left to whoever remembers.
+      copyFileSync(join(OUT, "hero.gif"), join(ROOT, "landing", "hero.gif"));
+      console.log("  landing/hero.gif");
     }
     rmSync(framesDir, { recursive: true, force: true });
     cleanup();

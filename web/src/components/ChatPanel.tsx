@@ -12,51 +12,50 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ViewHeader } from "./workspace/ViewHeader.tsx";
 import { motion, AnimatePresence } from "motion/react";
 import { CHAT_EFFORTS } from "../../../shared/types.ts";
-import type { GitRepoRef, SessionRollup, ChatEffort } from "../../../shared/types.ts";
+import type { GitRepoRef, SessionRollup, ChatEffort, AgentCliStatus, AgentModel } from "../../../shared/types.ts";
 import { api } from "../lib/api.ts";
 import { Markdown } from "../lib/markdown.tsx";
+import { ALLOW_DEFAULT, initialAllowed } from "../lib/chatAllowlist.ts";
+import { foldPreview, hiddenLineCount, isLongMessage } from "../lib/chatFold.ts";
 import { ToolRow } from "./ToolRow.tsx";
 import { ToolFeed } from "./ToolFeed.tsx";
 import { useDialogs } from "./ConfirmDialog.tsx";
 import { buildRows } from "../lib/toolTree.ts";
 import { chatToMarkdown } from "../lib/chatTranscript.ts";
+import { busyElsewhere, setActiveTurns } from "../lib/chatStore.ts";
 import { tidyPaneScreen } from "../lib/paneScreen.ts";
 import { quickSkills, pinnedSkills, togglePinnedSkill } from "../lib/quickSkills.ts";
 import { fmtTime } from "../lib/format.ts";
 import { Select } from "./Select.tsx";
-import { SCROLLBAR_CSS, CODE_FONT_STYLE } from "./ChangesModal.tsx";
-import { fmtAgo, fmtUsd, fmtTokens, modelLabelOf, modelColor, providerOf } from "../lib/format.ts";
-import { sessionIsLive } from "../lib/derive.ts";
+import { CheckoutPicker } from "./CheckoutPicker.tsx";
+import { SCROLLBAR_CSS, CODE_FONT_STYLE } from "./diff/DiffLines.tsx";
+import { fmtAgo, fmtUsd, fmtTokens, modelLabelOf, modelColor } from "../lib/format.ts";
+import { sessionIsLive, resumableAgent } from "../lib/derive.ts";
 import { ctxLimitOf } from "../lib/contextWindow.ts";
-import { worktreeTag, sessionWorktree, sessionCwd } from "../lib/worktree.ts";
+import { sessionWorktree, sessionCwd } from "../lib/worktree.ts";
 import { useStuckBottom } from "../lib/useStuckBottom.ts";
 import {
   listChats, getChat, newChat, closeChat, update, send, stop, enqueue, unqueue, subscribe, chatResuming,
   engineFor,
-  DEFAULT_MODEL, DEFAULT_MODE, addAttachments, answerPane, dropAttachment, renameChat, clearAttention, type Chat,
-  restoredActiveId, setActiveChatId, chatFocusRequest,
+  AGENTS, isFresh, switchAgent,
+  addAttachments, answerPane, dropAttachment, renameChat, clearAttention, type Chat, type AgentKind,
+  restoredActiveId, setActiveChatId, chatFocusRequest, setPanePinned, hydratePanePins,
 } from "../lib/chatStore.ts";
 import { peekChatIntent, subscribeChatIntent, takeChatIntent } from "../lib/chatIntent.ts";
 import { useSidebarWidth } from "../lib/sidebarWidth.ts";
 import { SidebarGrip } from "./SidebarGrip.tsx";
+import { CloseButton } from "./CloseButton.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
-// Still hand-maintained, and still drifts every release — the runtime-sourced
-// list is its own job.
+// Claude's list arrives from the server, like the other two agents'. It is data
+// there (shared/claude-models.json), filtered to the models whose shutdown date
+// has not passed — Claude Code publishes no list of its own, so a file that can
+// be corrected without a rebuild is the closest thing to asking the CLI.
 //
-// The `· 1M` entry no longer changes what this app measures: `ctxLimitOf`
-// knows Opus 5 is a 1M model, so the plain id and the suffixed one resolve to
-// the same ceiling. It stays because the suffix is not ours to interpret — it
-// is what `claude` reads to pick a window behind an LLM gateway or on Bedrock
-// / Vertex / Foundry, where the plain id really does mean 200k. Locally the
-// two entries are the same choice; for someone pointed at a provider they are
-// not, and only they can tell which.
-const MODELS = [
-  { id: "claude-fable-5", label: "Fable 5" },
-  { id: "claude-opus-5", label: "Opus 5" },
-  { id: "claude-opus-5[1m]", label: "Opus 5 · 1M" },
-  { id: "claude-sonnet-5", label: "Sonnet 5" },
-  { id: "claude-haiku-4-5", label: "Haiku 4.5" },
-];
+// This is only what to draw before that answer arrives, and on a server too old
+// to send one. Deliberately a single certain id rather than a copy of the
+// catalogue: two lists that drift apart is the problem being solved.
+const MODELS_PENDING = [{ id: "claude-opus-5", label: "Claude Opus 5" }];
 // These run through `claude -p`, which has no terminal to prompt from: a tool
 // that would raise a permission dialog is refused outright, and there is no
 // way to grant it mid-chat. "Ask" therefore does not ask — it declines. The
@@ -68,11 +67,55 @@ const MODES = [
   { id: "acceptEdits", label: "Auto-accept edits" },
   { id: "bypassPermissions", label: "⚡ Bypass (runs all)" },
 ];
+
+// Codex draws its line around the filesystem rather than per tool call, so it
+// gets its own three rather than being squeezed into Claude's four. Labelling a
+// sandbox "Ask (denies un-allowed)" would describe a mechanism it has not got.
+// Keep in step with SANDBOXES in server/src/codex.ts.
+const CODEX_MODES = [
+  { id: "read-only", label: "Read-only (no writes)" },
+  { id: "workspace-write", label: "Write in this repo" },
+  { id: "full-access", label: "⚡ Full access (no sandbox)" },
+];
+
+// Antigravity's four land on Claude's, because it really does decide per tool
+// call and really does have a plan mode — this is the CLI's own shape rather
+// than a mapping forced here. `request-review` is its default and is spelled by
+// passing no flag. Keep in step with MODES in server/src/antigravity.ts.
+const ANTIGRAVITY_MODES = [
+  { id: "request-review", label: "Ask (denies un-allowed)" },
+  { id: "plan", label: "Plan (no edits)" },
+  { id: "accept-edits", label: "Auto-accept edits" },
+  { id: "always-proceed", label: "⚡ Bypass (runs all)" },
+];
+
+/** Before the server has answered, and for a CLI that is not installed. */
+const CLI_OFF: AgentCliStatus = { enabled: false, models: [] };
+
+const MODES_BY_AGENT: Record<AgentKind, Array<{ id: string; label: string }>> = {
+  claude: MODES, codex: CODEX_MODES, antigravity: ANTIGRAVITY_MODES,
+};
+const modesFor = (agent: AgentKind) => MODES_BY_AGENT[agent];
+const bypassMode = (agent: AgentKind) => AGENTS[agent].bypassMode;
+const cliName = (agent: AgentKind) => AGENTS[agent].cli;
+const agentLabel = (agent: AgentKind) => AGENTS[agent].label;
+
+/** What the model dropdown may offer.
+ *
+ *  One path for all three agents now: every list comes from the server, because
+ *  every list is the answer to "what will this CLI actually accept" and none of
+ *  them is this component's to decide. Claude used to be the exception, with a
+ *  hand-maintained array here that drifted every release.
+ *
+ *  A list that has not arrived yet falls back to that agent's default rather
+ *  than rendering an empty dropdown. */
+function modelsFor(agent: AgentKind, status: AgentCliStatus): Array<{ id: string; label: string }> {
+  if (status.models.length) return status.models;
+  const fallback = AGENTS[agent].defaultModel;
+  return [{ id: fallback, label: fallback }];
+}
 const CWD_KEY = "agentglass.chatCwd";
 const ALLOW_KEY = "agentglass.chatAllowedTools";
-// A starting point that covers the reading and inspection an assistant reaches
-// for constantly, without granting anything that writes or leaves the machine.
-const ALLOW_DEFAULT = "Read Glob Grep Bash(git status) Bash(git log:*) Bash(git diff:*) Bash(gh pr view:*)";
 const repoName = (p: string) => p.split("/").pop() || p;
 
 const selCls = "text-[10.5px] px-2 py-1 rounded-md outline-none";
@@ -93,6 +136,41 @@ const selStyle = { background: "color-mix(in srgb, var(--bg3) 50%, transparent)"
  * default, which is exactly what nobody asked to read. Liveness is the tool
  * feed's running call and the composer's caret; this stays folded.
  */
+/**
+ * A message that is too long to sit in a conversation whole.
+ *
+ * Almost always a pasted prompt — a review brief with its rules, its context
+ * and a block of JSON — which rendered in full takes the panel and pushes the
+ * reply you came to read off the bottom of it. Folded, the conversation is a
+ * conversation again.
+ *
+ * The top is kept rather than a summary: these are somebody's own words, and
+ * the first lines are the part that says what they are. Reopening is a toggle
+ * rather than a one-way reveal, because the reason to expand one of these is
+ * usually to check a single line and then get out of the way again.
+ */
+function Foldable({ text, children }: { text: string; children: (shown: string) => React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  if (!isLongMessage(text)) return <>{children(text)}</>;
+  const hidden = hiddenLineCount(text);
+  return (
+    <>
+      {children(open ? text : foldPreview(text))}
+      <button onClick={() => setOpen(!open)} aria-expanded={open}
+        className="mt-1.5 text-[10px] px-2 py-0.5 rounded-full hover:opacity-80"
+        style={{
+          color: "var(--primary-hover)",
+          border: "1px solid color-mix(in srgb, var(--primary) 35%, transparent)",
+          background: "color-mix(in srgb, var(--primary) 10%, transparent)",
+        }}>
+        {/* What it costs to open. A fold that will not say how much it is
+            hiding is a fold nobody opens. */}
+        {open ? "Show less" : `Show ${hidden} more line${hidden === 1 ? "" : "s"}`}
+      </button>
+    </>
+  );
+}
+
 function Thinking({ text, streaming }: { text: string; streaming: boolean }) {
   const [open, setOpen] = useState(false);
   const lines = text.trim().split("\n");
@@ -100,11 +178,11 @@ function Thinking({ text, streaming }: { text: string; streaming: boolean }) {
     <div className="mb-1.5 rounded-md overflow-hidden" style={{ background: "color-mix(in srgb, var(--bg3) 30%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 22%, transparent)" }}>
       <button onClick={() => setOpen(!open)} aria-expanded={open}
         className="w-full flex items-center gap-1.5 px-2 py-1 text-left hover:opacity-80">
-        <span className="text-[8px] t-dim2 transition-transform" style={{ transform: open ? "none" : "rotate(-90deg)" }}>▼</span>
-        <span className="text-[9px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>thinking</span>
-        {streaming && <span className="text-[9px]" style={{ color: "var(--info)" }}>·</span>}
+        <span className="text-[10px] t-dim2 transition-transform" style={{ transform: open ? "none" : "rotate(-90deg)" }}>▼</span>
+        <span className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>thinking</span>
+        {streaming && <span className="text-[10px]" style={{ color: "var(--info)" }}>·</span>}
         {/* A length cue, so a fold is an informed choice rather than a mystery. */}
-        {!open && <span className="text-[9px] t-dim2 ml-auto tabular-nums">{lines.length} line{lines.length === 1 ? "" : "s"}</span>}
+        {!open && <span className="text-[10px] t-dim2 ml-auto tabular-nums">{lines.length} line{lines.length === 1 ? "" : "s"}</span>}
       </button>
       {open && (
         <div className="px-2.5 pb-2 pt-0.5 text-[11px] leading-relaxed whitespace-pre-wrap break-words"
@@ -147,14 +225,21 @@ function Inspector({ chat }: { chat: Chat }) {
   return (
     <div className="shrink-0 px-3 py-2 border-t flex flex-col gap-1.5"
       style={{ borderColor: "color-mix(in srgb, var(--border) 30%, transparent)" }}>
-      <div className="flex items-baseline gap-2">
-        <span className="text-[9px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>context</span>
-        <span className="text-[10px] tabular-nums ml-auto" style={{ color: tone }}>{pct.toFixed(0)}%</span>
-        <span className="text-[9px] t-dim2 tabular-nums">{fmtTokens(u.contextTokens)} / {fmtTokens(limit)}</span>
-      </div>
-      <div className="h-1 rounded-full overflow-hidden" style={{ background: "color-mix(in srgb, var(--border) 30%, transparent)" }}>
-        <div className="h-full rounded-full transition-all" style={{ width: `${Math.max(1, pct)}%`, background: tone }} />
-      </div>
+      {/* Only when the CLI told us the prompt size. Codex's exec stream reports
+          no per-turn context and no window, and a bar drawn at 0 / 400k would
+          be a claim about a session we know nothing about. */}
+      {u.contextTokens > 0 && (
+        <>
+          <div className="flex items-baseline gap-2">
+            <span className="text-[9px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>context</span>
+            <span className="text-[10px] tabular-nums ml-auto" style={{ color: tone }}>{pct.toFixed(0)}%</span>
+            <span className="text-[9px] t-dim2 tabular-nums">{fmtTokens(u.contextTokens)} / {fmtTokens(limit)}</span>
+          </div>
+          <div className="h-1 rounded-full overflow-hidden" style={{ background: "color-mix(in srgb, var(--border) 30%, transparent)" }}>
+            <div className="h-full rounded-full transition-all" style={{ width: `${Math.max(1, pct)}%`, background: tone }} />
+          </div>
+        </>
+      )}
       <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 mt-0.5">
         <Row k="In" v={fmtTokens(u.input)} />
         <Row k="Out" v={fmtTokens(u.output)} />
@@ -165,7 +250,7 @@ function Inspector({ chat }: { chat: Chat }) {
       </div>
       {u.costUsd > 0 && (
         <div className="flex items-baseline gap-2 pt-1 mt-0.5 border-t" style={{ borderColor: "color-mix(in srgb, var(--border) 20%, transparent)" }}>
-          <span className="text-[9px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>cost</span>
+          <span className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>cost</span>
           <span className="ml-auto text-[11px] tabular-nums font-medium" style={{ color: "var(--success)" }}>{fmtUsd(u.costUsd)}</span>
         </div>
       )}
@@ -224,7 +309,10 @@ function ChatRow({ chat, active, onPick, onClose }: { chat: Chat; active: boolea
         {/* The dot carries the state as colour; this says which one, because
             "finished" and "stuck, needs you" are the same glance otherwise and
             they want opposite reactions from you. */}
-        <div className="flex items-center gap-1.5 min-w-0">
+        {/* mt-1.5: the repo line sat flush against the chat's title at 0px, so
+            a card read as one wrapped sentence rather than a name and where it
+            runs. Same pair and same step as the changed-file rows. */}
+        <div className="flex items-center gap-1.5 min-w-0 mt-1.5">
           <span className="truncate text-[9.5px] t-dim2">{repoName(chat.cwd) || "No repo"}</span>
           {chat.sending
             ? <span className="text-[9.5px] shrink-0" style={{ color: "var(--success)" }}>· Running</span>
@@ -240,7 +328,7 @@ function ChatRow({ chat, active, onPick, onClose }: { chat: Chat; active: boolea
             const pct = (chat.usage.contextTokens / chatLimit(chat, chat.usage.contextTokens)) * 100;
             if (pct < 1) return null;
             return (
-              <span className="ml-auto shrink-0 text-[9px] tabular-nums" title={`${fmtTokens(chat.usage.contextTokens)} of context used`}
+              <span className="ml-auto shrink-0 text-[10px] tabular-nums" title={`${fmtTokens(chat.usage.contextTokens)} of context used`}
                 style={{ color: pct >= 90 ? "var(--error)" : pct >= 70 ? "var(--warning)" : "var(--text3)" }}>
                 {pct.toFixed(0)}%
               </span>
@@ -248,12 +336,7 @@ function ChatRow({ chat, active, onPick, onClose }: { chat: Chat; active: boolea
           })()}
         </div>
       </div>
-      <button
-        onClick={(e) => { e.stopPropagation(); onClose(); }}
-        className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 text-[13px] leading-none px-1 t-dim2 hover:opacity-70 shrink-0"
-        title="Close chat"
-        aria-label={`Close chat: ${chat.title}`}
-      >✕</button>
+      <CloseButton onClick={(e) => { e.stopPropagation(); onClose(); }} title="Close chat" aria-label={`Close chat: ${chat.title}`} className="opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 focus-visible:opacity-100 shrink-0" />
     </div>
   );
 }
@@ -343,7 +426,7 @@ function EffortDial({ chat }: { chat: Chat }) {
         title={"How hard the model thinks, sent as --effort.\n\nDefault leaves the CLI's own setting alone.\nChanging this restarts the chat's session, keeping the conversation."}
         className="flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-md"
         style={{ color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}>
-        <span className="flex items-end gap-[2px]" aria-hidden>
+        <span className="flex items-end gap-0.5" aria-hidden>
           {CHAT_EFFORTS.map((_, i) => (
             <span key={i} style={{
               width: 3, height: 4 + i * 2, borderRadius: 1,
@@ -404,28 +487,46 @@ function CopyButton({ label, title, text, disabled }: { label: string; title: st
 
 /** Why a session can't be picked up, or `null` if it can.
  *
- *  Three different refusals with three different remedies — "wait for it to
- *  finish", "nothing we can do", "it's already open over there" — so the row
- *  has to say which one applies rather than just going grey. */
-type Blocked = "live" | "no-dir" | null;
-const blockedReason = (s: SessionRollup): Blocked =>
-  sessionIsLive(s) ? "live" : sessionCwd(s) ? null : "no-dir";
+ *  Only one refusal is absolute now: a session that never recorded a directory
+ *  has nowhere to resume into. "Still running" used to be the other, which made
+ *  the sessions you most wanted — the one you just started on your phone, the
+ *  one working in a terminal — the only ones you could not open. They can be
+ *  opened and read; what protects the transcript is that a turn is queued
+ *  rather than sent while someone else is writing (see chatStore.busyElsewhere,
+ *  and the server's own 409 behind it). */
+type Blocked = "no-dir" | null;
+const blockedReason = (s: SessionRollup): Blocked => (sessionCwd(s) ? null : "no-dir");
 
 /** One resumable session in the picker. */
 function ResumeRow({ s, openChatId, onPick }: { s: SessionRollup; openChatId?: string; onPick: () => void }) {
   const why = blockedReason(s);
   const model = modelLabelOf(s.model_name);
+  // Which CLI will be handed this session. Worth showing now that three of them
+  // can appear side by side: the row opens a chat bound to that binary for
+  // life, and "Opus 5" alone no longer says which one — `agy` runs Claude
+  // models too.
+  const agent = resumableAgent(s) ?? "claude";
+  // Claude keeps its transcripts in this app's own store and Codex has a
+  // rollout on disk, so both come back with the conversation in front of you.
+  // Antigravity keeps protobuf inside SQLite, so a resumed thread arrives with
+  // the CLI holding the full context and the panel showing none of it. That is
+  // worth saying before the click, not after.
+  const noReplay = !AGENTS[agent].hasTranscript;
   // A resumable session names the worktree it ran in when that isn't the repo
   // itself — resuming lands back in that checkout, so it has to say which.
   const wt = sessionWorktree(s);
   const label = (s.project_path ? repoName(s.project_path) : s.source_app) + (wt ? ` └ ${wt}` : "");
-  const note = why === "live"
-    ? "This session is still running. A claude session has a single owner — a second one writing to the same transcript would corrupt its history. Resume it once it stops."
-    : why === "no-dir"
+  const live = sessionIsLive(s);
+  const note = why === "no-dir"
     ? "No directory was recorded for this session, so there's nowhere to run the resumed conversation."
     : openChatId
     ? "Already open in this panel — picking it focuses that tab."
-    : `Continue this conversation in ${sessionCwd(s)}`;
+    : live
+    ? `Running now. Opening it shows the conversation; anything you send waits until this turn ends, because a session has one writer.`
+    : `Continue this ${AGENTS[agent].label} conversation in ${sessionCwd(s)}`
+      + (noReplay
+        ? `\n\n${AGENTS[agent].label} keeps no transcript this panel can read, so the reply history won't be shown — ${AGENTS[agent].cli} still has the full context and follow-ups continue the same thread.`
+        : "");
 
   return (
     <button
@@ -443,12 +544,14 @@ function ResumeRow({ s, openChatId, onPick }: { s: SessionRollup; openChatId?: s
           <span className="text-[9.5px] tabular-nums t-dim2 shrink-0">{s.session_id.slice(0, 8)}</span>
         </div>
         <div className="flex items-center gap-1.5 text-[9.5px] t-dim2">
-          <span style={{ color: modelColor(model) }}>{model}</span>
+          <span style={{ color: "var(--text3)" }}>{AGENTS[agent].label}</span>
+          <span style={{ color: modelColor(model) }}>· {model}</span>
+          {noReplay && <span title="History is not replayed for this agent">· no replay</span>}
           <span>· {fmtAgo(s.last_seen)} ago</span>
           <span>· {fmtUsd(s.cost_usd)}</span>
         </div>
       </div>
-      {why === "live"
+      {live
         ? <span className="text-[9.5px] shrink-0" style={{ color: "var(--success)" }}>● Running</span>
         : why === "no-dir"
         ? <span className="text-[9.5px] shrink-0 t-dim2">No dir</span>
@@ -460,13 +563,19 @@ function ResumeRow({ s, openChatId, onPick }: { s: SessionRollup; openChatId?: s
 }
 
 /**
- * Pick up a claude session that already exists.
+ * Pick up a session that already exists, whichever CLI made it.
  *
  * The panel could always *start* conversations, but the ones worth continuing
  * are usually the ones started somewhere else — in a terminal, or by an earlier
  * run — and until now there was no way to reach them from here. This lists what
  * the fleet has seen, most recent first, and hands the chosen session to the
  * store to resume.
+ *
+ * All three agents appear, each row naming the CLI that will be handed it,
+ * because the chat it opens is bound to that binary for life and the model name
+ * alone no longer says which — `agy` runs Claude models too. Sessions belonging
+ * to a CLI this panel cannot drive are left out entirely rather than offered and
+ * failing on the first turn.
  *
  * Running sessions are listed rather than hidden: their absence would read as
  * a bug ("I just used that one, where is it?"), where a greyed row that says
@@ -492,16 +601,19 @@ function ResumePicker({ onPick, onClose }: { onPick: (s: SessionRollup) => void;
   }, [onClose]);
 
   const shown = useMemo(() => {
-    // `claude --resume` only knows about claude's own transcripts, so a session
-    // recorded from another vendor's telemetry is not something we could pick
-    // up. Unknown models stay in — early claude rows have no model recorded.
-    const claudeish = (rows ?? []).filter((s) => {
-      const p = providerOf(s.model_name);
-      return p === "Anthropic" || p === "unknown";
-    });
+    // Every CLI this panel drives can pick its own sessions back up, so the
+    // list is no longer Claude's alone — it was, back when Claude was the only
+    // agent, and stayed that way after Codex and Antigravity could both resume.
+    //
+    // Still not "everything the fleet has seen": a session belonging to a CLI
+    // this panel cannot drive — a Gemini CLI run, any other OTel exporter — has
+    // nothing here that could continue it. `resumableAgent` refuses those
+    // rather than guessing, which matters because the guess would be "Claude"
+    // and `claude --resume` would fail on an id it has never seen.
+    const drivable = (rows ?? []).filter((s) => resumableAgent(s) !== null);
     const needle = q.trim().toLowerCase();
-    if (!needle) return claudeish;
-    return claudeish.filter((s) =>
+    if (!needle) return drivable;
+    return drivable.filter((s) =>
       // cwd included: with a worktree per card, the card id is in the checkout
       // path and nowhere else — searching "20343" has to find that session.
       (`${s.project_path ?? ""} ${s.cwd_path ?? ""} ${s.source_app} ${s.session_id}`).toLowerCase().includes(needle));
@@ -532,7 +644,7 @@ function ResumePicker({ onPick, onClose }: { onPick: (s: SessionRollup) => void;
             <ResumeRow key={s.session_id} s={s} openChatId={chatResuming(s.session_id)?.id} onPick={() => onPick(s)} />
           ))}
         </div>
-        <div className="px-2.5 pt-1.5 pb-0.5 text-[9px] t-dim2 shrink-0">
+        <div className="px-2.5 pt-1.5 pb-0.5 text-[10px] t-dim2 shrink-0">
           Resuming keeps claude's full context · running sessions can't be resumed
         </div>
       </motion.div>
@@ -545,7 +657,7 @@ function ResumePicker({ onPick, onClose }: { onPick: (s: SessionRollup) => void;
 // and matches the stroke weight of the header's icons.
 function ClipIcon() {
   return (
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+    <svg width={ICON.md} height={ICON.md} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
       <path d="M21 11.5l-8.6 8.6a5 5 0 0 1-7-7l8.9-8.9a3.3 3.3 0 0 1 4.7 4.7l-8.9 8.9a1.7 1.7 0 0 1-2.3-2.3l8.2-8.2" />
     </svg>
   );
@@ -596,14 +708,47 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
   // The server silently downgrades bypassPermissions unless the operator opted
   // in (AGENTGLASS_CHAT_BYPASS=1) — don't offer a mode that wouldn't stick.
   const [bypassAllowed, setBypassAllowed] = useState(false);
+  // Which models each CLI currently offers. Every list comes from the server,
+  // because every one of them is that CLI's own answer rather than a table in
+  // this repo — Codex's cache, `agy models`, and for Claude a catalogue file
+  // the server reads and filters by shutdown date.
+  const [claudeModels, setClaudeModels] = useState<AgentModel[]>(MODELS_PENDING);
+  const [codex, setCodex] = useState<AgentCliStatus>(CLI_OFF);
+  const [antigravity, setAntigravity] = useState<AgentCliStatus>(CLI_OFF);
+  /** One lookup for "what does the server say about this agent?", so the
+   *  dropdowns and the gates below stop naming CLIs one at a time. Claude's
+   *  enabled/bypass are separate pieces of state for historical reasons. */
+  const statusOf = (a: AgentKind): AgentCliStatus =>
+    a === "codex" ? codex : a === "antigravity" ? antigravity : { enabled, bypass: bypassAllowed, models: claudeModels };
   // Shared by every chat and remembered across launches: the set of tools you
   // trust is a property of how you work, not of one conversation.
   const [allowed, setAllowed] = useState(() => {
-    try { return localStorage.getItem(ALLOW_KEY) ?? ALLOW_DEFAULT; } catch { return ALLOW_DEFAULT; }
+    try { return initialAllowed(localStorage.getItem(ALLOW_KEY)); } catch { return ALLOW_DEFAULT; }
   });
   useEffect(() => { try { localStorage.setItem(ALLOW_KEY, allowed); } catch { /* private mode */ } }, [allowed]);
   const [query, setQuery] = useState("");
   const [resumeOpen, setResumeOpen] = useState(false);
+
+  /**
+   * Which sessions are mid-turn, from the server.
+   *
+   * The panel knows about its own turns and nothing about a turn started on the
+   * phone or in a terminal — and sending into one of those interrupts it and
+   * loses both answers. Polled rather than pushed because it is two words of
+   * JSON and it must be right within a couple of seconds of a turn ending, when
+   * a queued message is waiting to go out.
+   */
+  useEffect(() => {
+    let stop = false;
+    const read = () => {
+      api.chatActive()
+        .then((r) => { if (!stop) setActiveTurns(r.ids); })
+        .catch(() => { /* keep the last answer; guessing a new one is the bug */ });
+    };
+    read();
+    const t = setInterval(read, 3000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
   const [defaultCwd, setDefaultCwd] = useState<string>(() => { try { return localStorage.getItem(CWD_KEY) || ""; } catch { return ""; } });
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -629,6 +774,20 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
   // another project never renders even for the frame before the effect below
   // moves selection off it.
   const active = chats.find((c) => c.id === activeId);
+
+  /** Which CLIs this machine can actually run a chat with. Drives the agent
+   *  picker, and decides what a brand-new chat should be. */
+  const installed = (Object.keys(AGENTS) as AgentKind[]).filter((a) => statusOf(a).enabled);
+  // Whether *this* chat can run: `enabled` only ever spoke for `claude`, so on
+  // a machine with Codex installed and Claude not, it would have greyed out a
+  // composer that works perfectly well.
+  const usable = active ? statusOf(active.agent).enabled : installed.length > 0;
+  // Pasting and dropping images is a Claude-only affordance. The other two take
+  // images as file paths rather than as content blocks, so there is nowhere for
+  // pasted bytes to go without staging them on disk first — the server refuses
+  // them outright, and offering the button anyway would just be a slower way to
+  // reach that refusal.
+  const canAttach = usable && !!active && AGENTS[active.agent].canAttach;
 
   // Only while the draft is a bare `/word` on the first line: past the first
   // space it is prose, and a menu stealing Enter there would be maddening.
@@ -662,13 +821,26 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
       setRepos(repos);
       setDefaultCwd((c) => c || repos[0]?.root || "");
     }).catch(() => {}).finally(() => setReposKnown(true));
-    api.chatEnabled().then((r) => { setEnabled(r.enabled); setBypassAllowed(!!r.bypass); }).catch(() => {});
+    api.chatEnabled().then((r) => {
+      setEnabled(r.enabled);
+      setBypassAllowed(!!r.bypass);
+      // Absent from a server too old to send it — keep the placeholder rather
+      // than emptying the dropdown.
+      if (r.models?.length) setClaudeModels(r.models);
+    }).catch(() => {});
+    api.codexEnabled().then(setCodex).catch(() => {});
+    api.antigravityEnabled().then(setAntigravity).catch(() => {});
     // Which project this instance is scoped to, if any. A failure here means we
     // never learn of a scope, so nothing is hidden, which is the safe direction.
     api.projects()
       .then((r) => setWorkspace(r.workspace))
       .catch(() => {})
       .finally(() => setScopeKnown(true));
+    // Which panes are pinned lives on the server and deliberately does not
+    // persist with the chat — it is a statement about a process running now.
+    // So a reloaded window knows nothing about it, and a Pin button showing
+    // "off" over a pinned pane is the same lie as the reverse.
+    void hydratePanePins();
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [open]);
 
@@ -753,14 +925,25 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
     // and looked like new chats were broken. Refuse instead, and say why.
     if (!cwd) { setNoRepo(true); return; }
     setNoRepo(false);
-    const c = newChat(cwd, active?.model ?? DEFAULT_MODEL, active?.mode ?? DEFAULT_MODE);
+    // A new chat inherits the agent you were last using, the same way it
+    // inherits the repo and the model — and falls back to whichever CLI is
+    // actually installed when there is nothing to inherit from.
+    const agent: AgentKind = active?.agent ?? installed[0] ?? "claude";
+    const sameAgent = active?.agent === agent;
+    const c = newChat(
+      cwd,
+      sameAgent ? active!.model : AGENTS[agent].defaultModel,
+      sameAgent ? active!.mode : AGENTS[agent].defaultMode,
+      undefined,
+      agent,
+    );
     if (seed) update(c.id, (x) => { x.draft = seed; });
     setActiveId(c.id);
     if (!seed) requestAnimationFrame(() => inputRef.current?.focus());
     return c;
-  }, [active, defaultCwd, repos, workspace]);
+  }, [active, defaultCwd, repos, workspace, enabled, codex.enabled, antigravity.enabled]);
 
-  // Adopt an existing claude session. Focusing an already-open tab rather than
+  // Adopt an existing session. Focusing an already-open tab rather than
   // opening a second one is not a nicety: two chats resuming one session id
   // would both write to that transcript, which is the same corruption the live
   // check exists to prevent.
@@ -768,12 +951,28 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
     setResumeOpen(false);
     // Resume in the checkout it ran in, not the repo it rolls up to.
     const cwd = sessionCwd(s);
-    if (!cwd || sessionIsLive(s)) return;
+    if (!cwd) return;
+    // Which CLI this session belongs to decides which one has to pick it back
+    // up: a thread id is only meaningful to the binary that minted it, so
+    // opening a Codex session as a Claude chat would send `claude --resume` an
+    // id it has never heard of and fail on the first turn.
+    //
+    // The same function the picker filters on, rather than `agentOf` — which
+    // would answer "claude" for a session belonging to no CLI here and hand it
+    // to the wrong binary. Nothing in the list should reach this, but the two
+    // must not be able to disagree.
+    const agent = resumableAgent(s);
+    if (!agent) return;
     const chat = chatResuming(s.session_id)
-      ?? newChat(cwd, s.model_name || undefined, active?.mode ?? DEFAULT_MODE, {
-        sessionId: s.session_id,
-        title: `${s.source_app}:${s.session_id.slice(0, 8)}`,
-      });
+      ?? newChat(
+        cwd,
+        s.model_name || AGENTS[agent].defaultModel,
+        // The mode is this agent's vocabulary, so a mode carried over from the
+        // chat you happened to have open only applies when it is the same one.
+        active?.agent === agent ? active.mode : AGENTS[agent].defaultMode,
+        { sessionId: s.session_id, title: `${s.source_app}:${s.session_id.slice(0, 8)}` },
+        agent,
+      );
     setActiveId(chat.id);
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [active]);
@@ -811,7 +1010,12 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
     // Mid-turn, Enter queues instead of sending. The composer used to go dead
     // for the length of a reply, so a long tool-running turn meant watching it
     // work with an answer already typed and no way to hand it over.
-    if (active.sending) { enqueue(active.id, text); return; }
+    //
+    // The same applies when the turn belongs to someone else — a chat you
+    // started on the phone, an agent running in a terminal. `send` would queue
+    // it anyway; doing it here keeps the composer honest about what pressing
+    // Enter just did.
+    if (active.sending || busyElsewhere(active)) { enqueue(active.id, text); return; }
     send(active.id, text, () => openRef.current && activeIdRef.current === active.id, allowed.split(/\s+/).filter(Boolean));
   };
   const [hint, setHint] = useState("");
@@ -870,6 +1074,14 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
     // it lands as a change event and opens a chat through onChange.
     const chat = active ?? (files.length ? add() ?? null : null);
     if (!chat) return;
+    // Codex and Antigravity take images as file paths, not content blocks, so
+    // there is nowhere for pasted bytes to go. Say so instead of dropping them
+    // silently.
+    if (files.length && !AGENTS[chat.agent].canAttach) {
+      e.preventDefault();
+      setHint(`${cliName(chat.agent)} chats can't take pasted images — start a Claude chat for that`);
+      return;
+    }
     if (!files.length) {
       // A paste that carried a file which wasn't an image would otherwise look
       // identical to the feature being broken.
@@ -890,7 +1102,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
   const onDragOver = (e: React.DragEvent) => {
-    if (!enabled || !active) return;
+    if (!usable || !active) return;
     if (!Array.from(e.dataTransfer.items).some((i) => i.kind === "file")) return;
     // Without this the browser answers the drop itself by navigating to the
     // file, replacing the whole app with the image.
@@ -908,6 +1120,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
     e.preventDefault();
     dragDepth.current = 0;
     setDragOver(false);
+    if (!canAttach) { setHint("codex chats can't take dropped images — start a Claude chat for that"); return; }
     // Files, not just images: `addAttachments` quotes a text file into the
     // draft, which is the same thing the picker and the paste path already do.
     const files = Array.from(e.dataTransfer.files);
@@ -1042,13 +1255,6 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
   // Worktrees read as their card ("└ WEB-1042"), not as a near-duplicate of
   // the project name — with a dozen open, `orbit-WEB-1042` and
   // `orbit-WEB-1043` are one glance apart otherwise.
-  const repoOptions = useMemo(
-    () => repos.map((r) => {
-      const wt = worktreeTag(r);
-      return { value: r.root, label: wt ? `└ ${wt}` : repoName(r.root), hint: r.branch };
-    }),
-    [repos]
-  );
 
   return (
     <div className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -1061,11 +1267,16 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                   {resumeOpen && <ResumePicker onPick={resume} onClose={() => setResumeOpen(false)} />}
                 </AnimatePresence>
 
-                {/* The title belongs to the view, so it spans the view — the
-                    same bar every other section has. It used to sit inside the
+                {/* The bar belongs to the view, so it spans the view — the same
+                    one every other section has. It used to sit inside the
                     sidebar, which made Chat look like a different application:
-                    two half-width bars where the others have one. */}
-                <ViewHeader title="Chats" count={chats.length} actions={<>
+                    two half-width bars where the others have one.
+
+                    The chat count went with the word it belonged to. On its own
+                    it was a bare numeral at the far left of an otherwise empty
+                    bar, and the sidebar beside it already lists the chats it was
+                    counting. */}
+                <ViewHeader label="Chats" actions={<>
                   <button onClick={() => setResumeOpen((v) => !v)} aria-expanded={resumeOpen} aria-haspopup="listbox"
                     className="text-[11px] px-2.5 py-1 rounded-lg shrink-0" style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 35%, transparent)" }}
                     title="Continue a session that already exists — e.g. one you started in a terminal">↩ Resume</button>
@@ -1113,14 +1324,46 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                   <div className="flex items-center gap-2 px-4 py-2.5 border-b shrink-0" style={{ borderColor: "color-mix(in srgb, var(--border) 40%, transparent)" }}>
                     {active ? (
                       <>
-                        <Select value={active.cwd} onChange={(v) => { update(active.id, (c) => { c.cwd = v; }); setDefaultCwd(v); }}
-                          className={selCls} style={selStyle} options={repoOptions} placeholder="Pick a repo" />
+                        {/* The same control every other checkout is picked
+                            with, and a value nobody else can move: this is
+                            where THIS conversation runs, which is not the same
+                            question as what Source control is reading. */}
+                        <CheckoutPicker
+                          repos={repos} value={active.cwd}
+                          onPick={(v) => { update(active.id, (c) => { c.cwd = v; }); setDefaultCwd(v); }}
+                          placeholder="Pick a repo" triggerMaxWidth={220}
+                        />
+                        {/* Only shown when there is a choice to make: on a
+                            machine with one CLI installed this would be a
+                            control with a single option and nothing to explain.
+
+                            Switchable until the chat has a thread, then frozen.
+                            A resume id belongs to the CLI that minted it, so
+                            there is no meaning to handing a live conversation
+                            from one to the other — but a tab you have not sent
+                            anything from yet is just a blank tab. */}
+                        {installed.length > 1 && (
+                          isFresh(active) ? (
+                            <Select value={active.agent} onChange={(v) => switchAgent(active.id, v as AgentKind)}
+                              className={selCls} style={selStyle} title="Which CLI runs this chat"
+                              options={installed.map((a) => ({ value: a, label: AGENTS[a].label }))} />
+                          ) : (
+                            <span className={selCls} title="The CLI behind this chat — settled once it has a thread to resume"
+                              style={{ ...selStyle, color: "var(--text3)" }}>{agentLabel(active.agent)}</span>
+                          )
+                        )}
                         <Select value={active.model} onChange={(v) => update(active.id, (c) => { c.model = v; })}
-                          className={selCls} style={selStyle} options={MODELS.map((m) => ({ value: m.id, label: m.label }))} />
+                          className={selCls} style={selStyle} options={modelsFor(active.agent, statusOf(active.agent)).map((m) => ({ value: m.id, label: m.label }))} />
                         <Select value={active.mode} onChange={(v) => update(active.id, (c) => { c.mode = v; })}
-                          className={selCls} style={selStyle} title="Permission mode for tool use"
-                          options={MODES.filter((m) => bypassAllowed || m.id !== "bypassPermissions").map((m) => ({ value: m.id, label: m.label }))} />
-                        {active.mode !== "bypassPermissions" && (
+                          className={selCls} style={selStyle} title={active.agent === "codex" ? "How much codex may touch without asking" : "Permission mode for tool use"}
+                          options={modesFor(active.agent)
+                            .filter((m) => statusOf(active.agent).bypass || m.id !== bypassMode(active.agent))
+                            .map((m) => ({ value: m.id, label: m.label }))} />
+                        {/* Only Claude has an allowlist to fill in. Codex decides
+                            per filesystem boundary and Antigravity per call under
+                            its own modes, so a box here would be a control that
+                            silently did nothing. */}
+                        {active.agent === "claude" && active.mode !== "bypassPermissions" && (
                           <input
                             value={allowed}
                             onChange={(e) => setAllowed(e.target.value)}
@@ -1130,7 +1373,11 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                             style={{ background: "color-mix(in srgb, var(--bg3) 50%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)", color: "var(--text2)" }}
                           />
                         )}
-                        <EffortDial chat={active} />
+                        {/* Same reasoning as the allowlist above: `--effort` is
+                            Claude's flag, and the send path only passes it on a
+                            Claude turn, so on the other two this dial would set
+                            a value that goes nowhere. */}
+                        {AGENTS[active.agent].hasEffort && <EffortDial chat={active} />}
                         {/* Claude Code's own settings, which are global rather
                             than per chat — so a button rather than something
                             you have to remember is a slash command. Only in
@@ -1145,6 +1392,29 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                             className="text-[10px] px-2 py-1 rounded-md shrink-0 disabled:opacity-40"
                             style={{ color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}
                           >⚙ Config</button>
+                        )}
+                        {/* Keep this one, however long you are away.
+                            The engine reclaims a warm CLI after half an hour
+                            idle, which is right for the four chats you opened to
+                            ask one question each and wrong for the one you are
+                            living in — step away for lunch and the session you
+                            care about is exactly the one reclaimed, so the turn
+                            you come back to is the slow one. Beside the engine
+                            chip rather than in a menu, because a pin that holds
+                            several hundred megabytes should be something you can
+                            see you switched on. */}
+                        {engineFor(active) === "tmux" && active.sessionId && (
+                          <button
+                            onClick={() => void setPanePinned(active.id, !active.panePinned)}
+                            role="switch" aria-checked={!!active.panePinned}
+                            title={active.panePinned
+                              ? "Pinned: this chat's warm CLI is kept no matter how long it sits idle. Closing the chat still releases it."
+                              : "Pin this chat, so its warm CLI is never reclaimed for being idle. Costs a few hundred megabytes for as long as it is on."}
+                            className="text-[10px] px-2 py-1 rounded-md shrink-0"
+                            style={active.panePinned
+                              ? { color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 14%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)" }
+                              : { color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}
+                          >{active.panePinned ? "📌 Pinned" : "📌 Pin"}</button>
                         )}
                         {active.sessionId && <span className="text-[9.5px] t-dim2 tabular-nums" title="Resuming this session">↻ {active.sessionId.slice(0, 8)}</span>}
                         {/* Pushed right so the two copy actions sit together at
@@ -1195,9 +1465,9 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                     <div ref={contentRef} className="min-h-full flex flex-col justify-end gap-3">
                       {active && !active.messages.length && (
                         <div className="grid place-items-center text-center t-dim2 text-[12px] py-10">
-                          {enabled
-                            ? <div>Chat with a Claude session in <b style={{ color: "var(--text2)" }}>{repoName(active.cwd) || "a repo"}</b>.<br />It runs there, appears in your fleet, and follow-ups keep the context.</div>
-                            : <div>No local <code>claude</code> CLI found — install Claude Code to chat.</div>}
+                          {usable
+                            ? <div>Chat with a {agentLabel(active.agent)} session in <b style={{ color: "var(--text2)" }}>{repoName(active.cwd) || "a repo"}</b>.<br />It runs there, appears in your fleet, and follow-ups keep the context.</div>
+                            : <div>No local <code>{cliName(active.agent)}</code> CLI found — install it to chat.</div>}
                         </div>
                       )}
                       {active?.messages.map((m, i) => (
@@ -1227,8 +1497,20 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                               // panel behind it, and on some themes the two roles
                               // were indistinguishable. The left border is what
                               // survives a theme that flattens the fills.
+                              // Filled, not tinted. At 26% over the panel every
+                              // user bubble was within a shade of the surface
+                              // behind it, so on the darker themes the two
+                              // speakers read as one voice. A filled accent is
+                              // the one treatment that survives every palette,
+                              // and it is what puts a conversation on screen
+                              // instead of a transcript.
+                              // Half the accent rather than a quarter of it, and
+                              // no further: past about this the body text stops
+                              // being reliably legible on it across the themes,
+                              // and a bubble you cannot read is a worse problem
+                              // than two that look alike.
                               background: m.role === "user"
-                                ? "color-mix(in srgb, var(--primary) 26%, var(--bg2))"
+                                ? "color-mix(in srgb, var(--primary) 50%, var(--bg2))"
                                 : "color-mix(in srgb, var(--bg3) 85%, var(--bg))",
                               border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)",
                               borderLeft: `3px solid ${m.role === "user" ? "var(--primary)" : "color-mix(in srgb, var(--info) 70%, transparent)"}`,
@@ -1237,8 +1519,12 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                             {/* Role and time, the way the session view has always
                                 shown them — their absence is most of why the two
                                 read as different products. */}
-                            <div className="text-[9px] uppercase tracking-wider mb-1 flex items-center gap-2"
-                              style={{ color: m.role === "user" ? "var(--primary-hover)" : "var(--info)" }}>
+                            {/* On the filled user bubble the old
+                                `--primary-hover` label sat on its own colour and
+                                vanished; the agent's still gets the accent it
+                                always had, because its bubble is a surface. */}
+                            <div className="text-[10px] uppercase tracking-wider mb-1 flex items-center gap-2"
+                              style={{ color: m.role === "user" ? "var(--text)" : "var(--info)", opacity: m.role === "user" ? 0.75 : 1 }}>
                               <span>{m.role}</span>
                               <span className="t-dim2 normal-case tracking-normal">{fmtTime(m.ts)}</span>
                             </div>
@@ -1273,7 +1559,17 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                                 {m.imagesDropped} image{m.imagesDropped > 1 ? "s" : ""} sent with this turn, not kept when the chat was restored
                               </div>
                             )}
-                            {m.text ? <Markdown text={m.text} /> : (m.streaming ? <TypingDots /> : "")}
+                            {/* A reading measure. `max-w-[86%]` bounds the
+                                bubble against the panel, which on a 1600px
+                                window is a 1400px line — the eye loses the
+                                start of the next one on every wrap. Characters
+                                rather than pixels, so it holds when the display
+                                size or the font changes. */}
+                            <div style={{ maxWidth: "82ch" }}>
+                              {m.text
+                                ? <Foldable text={m.text}>{(shown) => <Markdown text={shown} />}</Foldable>
+                                : (m.streaming ? <TypingDots /> : "")}
+                            </div>
                             {m.streaming && m.text && <span className="t-dim2 agx-caret">▍</span>}
                           </div>
                           </div>
@@ -1316,9 +1612,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                             style={{ border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}
                             title={`${a.name} · ${(a.bytes / 1024).toFixed(0)}KB`}>
                             <img src={a.url} alt={a.name} className="block h-14 w-14 object-cover" />
-                            <button onClick={() => dropAttachment(active.id, a.id)} aria-label={`Remove ${a.name}`}
-                              className="absolute top-0.5 right-0.5 w-4 h-4 grid place-items-center rounded text-[10px] leading-none"
-                              style={{ color: "var(--text)", background: "rgba(0,0,0,0.65)" }}>✕</button>
+                            <CloseButton onClick={() => dropAttachment(active.id, a.id)} aria-label={`Remove ${a.name}`} style={{ color: "var(--text)", background: "rgba(0,0,0,0.65)" }} className="absolute top-0.5 right-0.5 rounded" />
                           </div>
                         ))}
                       </div>
@@ -1385,8 +1679,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                           style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 18%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 45%, transparent)" }}>
                           Allow {active.blockedTool}
                         </button>
-                        <button onClick={() => update(active.id, (c) => { c.blockedTool = undefined; })}
-                          className="shrink-0 px-1 t-dim2 hover:opacity-70" aria-label="Dismiss">✕</button>
+                        <CloseButton onClick={() => update(active.id, (c) => { c.blockedTool = undefined; })} title="Dismiss" className="shrink-0" />
                       </div>
                     )}
                     {slashMatches.length > 0 && (
@@ -1439,8 +1732,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                               <button onClick={() => unqueue(active.id, q.id, true)} title="Put this back in the composer"
                                 className="shrink-0 text-[9.5px] t-dim2 hover:opacity-70">Edit</button>
                             )}
-                            <button onClick={() => unqueue(active.id, q.id)} aria-label="Remove queued message"
-                              className="shrink-0 px-1 t-dim2 hover:opacity-70">✕</button>
+                            <CloseButton onClick={() => unqueue(active.id, q.id)} title="Remove queued message" className="shrink-0" />
                           </div>
                         ))}
                       </div>
@@ -1456,8 +1748,10 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                           ev.target.value = ""; // re-picking the same file must still fire
                           if (active && picked.length) setHint(await addAttachments(active.id, picked));
                         }} />
-                      <button onClick={() => fileRef.current?.click()} disabled={!enabled || !active}
-                        title="Attach a file — images are sent as images, text files are quoted into the message"
+                      <button onClick={() => fileRef.current?.click()} disabled={!canAttach || !active}
+                        title={active?.agent === "codex"
+                          ? "codex chats can't take attachments — start a Claude chat for that"
+                          : "Attach a file — images are sent as images, text files are quoted into the message"}
                         aria-label="Attach a file"
                         className="shrink-0 grid place-items-center rounded-lg px-3 self-stretch"
                         style={{ background: "color-mix(in srgb, var(--bg3) 40%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)", color: "var(--text3)" }}>
@@ -1470,7 +1764,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                           the empty state said "press + new" and the box said
                           "Message a new session…", and only one of them was
                           telling the truth. */}
-                      <textarea ref={inputRef} aria-label="Chat composer" value={active?.draft ?? ""} disabled={!enabled} rows={2}
+                      <textarea ref={inputRef} aria-label="Chat composer" value={active?.draft ?? ""} disabled={!usable} rows={2}
                         onChange={(e) => {
                           const v = e.target.value;
                           if (active) { update(active.id, (c) => { c.draft = v; }); return; }
@@ -1481,7 +1775,7 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                         }}
                         onKeyDown={onKey}
                         onPaste={onPaste}
-                        placeholder={!enabled ? "Chat unavailable" : active?.sending ? "Still replying — type anyway, Enter queues it for the next turn" : active?.sessionId ? "Reply… (Enter to send, Shift+Enter newline)" : "Message a new session… (Enter to send)"}
+                        placeholder={!usable ? `${agentLabel(active?.agent ?? "claude")} chat unavailable — no local \`${cliName(active?.agent ?? "claude")}\` CLI` : active?.sending ? "Still replying — type anyway, Enter queues it for the next turn" : active?.sessionId ? "Reply… (Enter to send, Shift+Enter newline)" : "Message a new session… (Enter to send)"}
                         className="agx-scroll flex-1 px-3 py-2 rounded-lg text-[12px] outline-none resize-none" style={{ background: "color-mix(in srgb, var(--bg3) 40%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)", color: "var(--text)" }} />
                       {/* Stop stays reachable while a turn is queueing: the
                           two are different intents — "answer this next" and
@@ -1492,15 +1786,15 @@ export function ChatView({ active: visible, focusId, onClose = () => {} }: { act
                         <button onClick={() => stop(active.id)} title="Interrupt the turn and clear anything queued"
                           className="shrink-0 px-3.5 rounded-lg text-[11.5px] font-semibold self-stretch" style={{ color: "var(--error)", border: "1px solid color-mix(in srgb, var(--error) 40%, transparent)" }}>■ Stop</button>
                       )}
-                      <button onClick={submit} disabled={!hasTurn || !active?.cwd || !enabled} className="shrink-0 px-4 rounded-lg text-[11.5px] font-semibold self-stretch" style={{ color: "var(--text)", background: "color-mix(in srgb, var(--primary) 22%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", opacity: (!hasTurn || !active?.cwd) ? 0.45 : 1 }}>
+                      <button onClick={submit} disabled={!hasTurn || !active?.cwd || !usable} className="shrink-0 px-4 rounded-lg text-[11.5px] font-semibold self-stretch" style={{ color: "var(--text)", background: "color-mix(in srgb, var(--primary) 22%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", opacity: (!hasTurn || !active?.cwd) ? 0.45 : 1 }}>
                         {active?.sending ? "Queue ↵" : "Send ↵"}
                       </button>
                     </div>
                     <div className="mt-1.5 text-[9.5px] t-dim2">
                       {hint
                         ? <span style={{ color: "var(--warning)" }}>{hint}</span>
-                        : <>Runs claude in {active ? repoName(active.cwd) || "the repo" : "the repo"} · {MODES.find((x) => x.id === active?.mode)?.label} · tool calls fold away, click to open</>}
-                      {active?.mode === "bypassPermissions" && <span style={{ color: "var(--warning)" }}> · ⚡ runs tools unattended</span>}
+                        : <>Runs {cliName(active?.agent ?? "claude")} in {active ? repoName(active.cwd) || "the repo" : "the repo"} · {modesFor(active?.agent ?? "claude").find((x) => x.id === active?.mode)?.label} · tool calls fold away, click to open</>}
+                      {active && active.mode === bypassMode(active.agent) && <span style={{ color: "var(--warning)" }}> · ⚡ runs tools unattended</span>}
                     </div>
                   </div>
                 </div>

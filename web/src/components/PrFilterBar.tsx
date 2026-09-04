@@ -1,6 +1,6 @@
 import { FacetMenu } from "./FacetMenu.tsx";
 import {
-  serializeQuery, toggleFacet, clearFacet, setSort, DEFAULT_SORT, SORT_OPTIONS,
+  serializeQuery, toggleFacet, clearFacet, setSort, DEFAULT_SORT, SORT_OPTIONS, FACETS,
   type FilterState, type FacetView, type SortTok,
 } from "../lib/prFilter.ts";
 
@@ -14,16 +14,24 @@ import {
  * state; it turns clicks into new query strings and hands them up via `onQuery`.
  */
 export function PrFilterBar({
-  query, filters, facets, onQuery, checksPending, shown, total,
+  query, filters, facets, onQuery, onSearch, pending, searching, checksPending, shown, total, swept,
 }: {
   query: string;
   filters: FilterState;
   facets: FacetView[];
   onQuery: (q: string) => void;
+  /** Ask GitHub. Never called on a keystroke — see PrPanel's serverQuery. */
+  onSearch: () => void;
+  /** The box says something the last search did not ask for. */
+  pending: boolean;
+  searching?: boolean;
   /** Second-pass check states still loading — the Checks menu says so. */
   checksPending?: boolean;
   shown: number;
   total: number;
+  /** How far the background sweep has read, while free text is filtering. A
+   *  count over a partial pool has to say so. */
+  swept?: { rows: number; done: boolean };
 }) {
   const emit = (next: FilterState) => onQuery(serializeQuery(next));
 
@@ -50,14 +58,52 @@ export function PrFilterBar({
     <div className="px-2 py-1.5 border-b shrink-0 flex flex-col gap-1.5" style={{ borderColor: "color-mix(in srgb, var(--border) 25%, transparent)" }}>
       {/* Query input — the source of truth every pill also writes to. */}
       <div className="flex items-center gap-1.5">
+        {/* Said next to the box doing the filtering, because it is a caveat on
+            the number of rows below it: "3 of 25 read" and "3 of 93 read" are
+            different answers to the same search, and only one of them means
+            there are three. */}
+        {swept && (
+          <span className="text-[10px] tabular-nums shrink-0 order-last"
+            title={swept.done
+              ? `Filtering across all ${swept.rows} pull requests in this view`
+              : `Read ${swept.rows} so far — still fetching the rest of this view`}
+            style={{ color: swept.done ? "var(--text4)" : "var(--warning)" }}>
+            {swept.done ? `${shown} of ${swept.rows}` : `${shown} of ${swept.rows}…`}
+          </span>
+        )}
         <input
           data-pr-filter-input
           value={query}
           onChange={(e) => onQuery(e.target.value)}
-          placeholder="Filter, e.g. author:me label:bug is:draft"
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); onSearch(); } }}
+          placeholder="Filter these, or press ⏎ to search them all"
           spellCheck={false}
           className="flex-1 text-[10px] px-2 py-1 rounded bg-transparent min-w-0"
           style={{ color: "var(--text2)", border, outline: "none" }} />
+        {/*
+          * Appears only when there is something to ask for.
+          *
+          * A permanently-lit Search button beside a box that already filters
+          * live is a button that does nothing most of the time. This one shows
+          * up the moment the box says something GitHub has not been asked, and
+          * goes away again once it has — so its presence IS the message: there
+          * is more behind this than the rows you can see.
+          */}
+        {(pending || searching) && (
+          <button
+            onClick={onSearch}
+            disabled={searching}
+            title={searching ? "Asking GitHub…" : "Search every pull request, not just the ones loaded (⏎)"}
+            className="shrink-0 text-[10px] px-2 py-1 rounded flex items-center gap-1 whitespace-nowrap"
+            style={{
+              color: searching ? "var(--text3)" : "var(--text)",
+              background: "color-mix(in srgb, var(--primary) 18%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)",
+            }}>
+            {searching ? <span className="agx-spin" aria-hidden style={{ width: 8, height: 8, borderWidth: 1.5 }} /> : <span aria-hidden>⌕</span>}
+            <span>{searching ? "Searching" : "Search all"}</span>
+          </button>
+        )}
         {query.trim() && (
           <button onClick={() => onQuery("")} title="Clear all filters" aria-label="Clear all filters"
             className="text-[11px] px-1.5 py-0.5 rounded shrink-0 hover:bg-white/5" style={{ color: "var(--text3)", border }}>
@@ -68,6 +114,23 @@ export function PrFilterBar({
 
       {/* Facet pills — wrap in the narrow sidebar; each menu floats via a Portal. */}
       <div className="flex flex-wrap items-center gap-1">
+        {/*
+          * The row exists before the rows do.
+          *
+          * These pills are built from the pull requests that have been loaded,
+          * so the bar used to appear a second or two after everything else and
+          * shove the board down as it landed — reported as "tarda en cargar,
+          * entonces como que salta". Drawn from the static facet table instead
+          * while there is nothing to count, dimmed and inert: same row, same
+          * height, same place, filling in rather than arriving.
+          */}
+        {facets.length === 0 && FACETS.map((f) => (
+          <span key={f.key} aria-hidden
+            className="text-[10px] px-2 py-0.5 rounded-full whitespace-nowrap select-none"
+            style={{ color: "var(--text4)", border, opacity: 0.55 }}>
+            {f.label} ▾
+          </span>
+        ))}
         {facets.map((f) => (
           <FacetMenu
             key={f.key}
@@ -107,7 +170,7 @@ export function PrFilterBar({
           <button onClick={() => onQuery("")} className="text-[9.5px] px-1.5 py-0.5 rounded-full hover:bg-white/5" style={{ color: "var(--text3)" }}>
             Clear all
           </button>
-          <span className="ml-auto text-[9px] tabular-nums shrink-0" style={{ color: "var(--text3)" }}>{total} match{total === 1 ? "" : "es"}</span>
+          <span className="ml-auto text-[10px] tabular-nums shrink-0" style={{ color: "var(--text3)" }}>{total} match{total === 1 ? "" : "es"}</span>
         </div>
       )}
     </div>

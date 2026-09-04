@@ -23,12 +23,38 @@ export const COMMIT_ENABLED = process.env.AGENTGLASS_COMMIT_DISABLED !== "1";
 
 type GitResult = { code: number; stdout: string; stderr: string };
 
+/**
+ * Configuration this server sets on every git call, because it parses the
+ * output and the user's own config can change it.
+ *
+ * `diff.mnemonicPrefix` is the one that bit: with it on — and plenty of people
+ * have it on — git labels a diff `i/file` and `w/file` (index and worktree)
+ * instead of `a/file` and `b/file`. Our diff parser stripped `a/`/`b/` only, so
+ * every path came out as `w/web/src/…`. The panel then asked for a diff of a
+ * file by that name and got nothing, and staging one ran
+ * `git add -- w/web/src/…`, which fails with "did not match any files". A
+ * working repo looked like a broken app, and only for people with that setting.
+ *
+ * `diff.noprefix` is the same trap from the other side (no prefix at all),
+ * `core.quotepath` escapes non-ASCII names into `\303\251` octal, and
+ * `color.ui=always` would wrap everything we read in ANSI escapes.
+ *
+ * Passed as `-c` overrides rather than environment variables so they apply to
+ * exactly these calls and nothing the user runs themselves.
+ */
+const PINNED: string[] = [
+  "-c", "diff.mnemonicPrefix=false",
+  "-c", "diff.noprefix=false",
+  "-c", "core.quotepath=false",
+  "-c", "color.ui=false",
+];
+
 export function git(cwd: string, args: string[]): GitResult {
   const t0 = performance.now();
   try {
     // A hung git call (index.lock contention, a repo on a stalled mount) would
     // otherwise freeze the whole single-threaded server indefinitely.
-    const proc = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    const proc = Bun.spawnSync(["git", ...PINNED, "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
     const r = {
       code: proc.exitCode ?? 1,
       stdout: proc.stdout?.toString() ?? "",
@@ -126,7 +152,7 @@ async function runGit(cwd: string, args: string[]): Promise<GitResult> {
   // arrive in the meantime. See loopwatch.
   const owner = currentLabel();
   try {
-    const proc = Bun.spawn(["git", "-C", cwd, ...args], {
+    const proc = Bun.spawn(["git", ...PINNED, "-C", cwd, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       // A git that never returns used to cost one hung request: bad, bounded,
@@ -419,6 +445,46 @@ export function commit(root: string, files: string[], title: string, body: strin
   args.push("--", ...commitPaths);
   const c = git(absRoot, args);
   if (c.code !== 0) return { ok: false, error: c.stderr.trim() || c.stdout.trim() || "git commit failed" };
+
+  const sha = git(absRoot, ["rev-parse", "HEAD"]).stdout.trim();
+  return { ok: true, sha, shortSha: sha.slice(0, 8), summary: summarize(c.stdout) };
+}
+
+/**
+ * Amend the last commit with the selected files, keeping the same shape as
+ * `commit()` above: stage exactly the picked files, then rewrite HEAD with a
+ * pathspec so nothing else leaks in. Refuses when the repo is mid-operation —
+ * rewriting a commit under an in-flight sequencer is how the two collide.
+ */
+export function amend(root: string, files: string[], title: string, body: string): CommitResult {
+  if (!COMMIT_ENABLED) return { ok: false, error: "commit is disabled (AGENTGLASS_COMMIT_DISABLED=1)" };
+  const absRoot = safeAbs(root);
+  if (!absRoot) return { ok: false, error: "invalid repo path" };
+  if (!inScope(absRoot)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
+  if (!title.trim()) return { ok: false, error: "commit title required" };
+  // The mirror of gitwork's own guard: never rewrite HEAD in the middle of a
+  // merge, rebase, cherry-pick or revert.
+  const top = git(absRoot, ["rev-parse", "--show-toplevel"]);
+  if (top.code !== 0 || top.stdout.trim() !== absRoot) return { ok: false, error: "not a git repository root" };
+  const stopped = git(absRoot, ["status", "--porcelain=v2", "-b"]).stdout;
+  if (/^(merge|rebase|cherry-pick|revert) in progress/m.test(stopped)) return { ok: false, error: "this checkout is mid-merge or mid-rebase — finish or abandon it before amending" };
+
+  const rels = (Array.isArray(files) ? files : []).map((f) => String(f)).filter(Boolean);
+  if (!rels.length) return { ok: false, error: "no files selected" };
+  for (const rel of rels) {
+    if (rel.includes("\0")) return { ok: false, error: "invalid file path" };
+    const abs = resolve(absRoot, rel);
+    if (abs !== absRoot && !abs.startsWith(absRoot + sep)) return { ok: false, error: `path escapes repo: ${rel}` };
+  }
+
+  const add = git(absRoot, ["add", "--", ...rels]);
+  if (add.code !== 0) return { ok: false, error: add.stderr.trim() || "git add failed" };
+
+  const args = ["commit", "--amend", "-m", title.trim()];
+  if (body && body.trim()) args.push("-m", body.trim());
+  args.push("--", ...rels);
+  const c = git(absRoot, args);
+  if (c.code !== 0) return { ok: false, error: c.stderr.trim() || c.stdout.trim() || "git commit --amend failed" };
 
   const sha = git(absRoot, ["rev-parse", "HEAD"]).stdout.trim();
   return { ok: true, sha, shortSha: sha.slice(0, 8), summary: summarize(c.stdout) };

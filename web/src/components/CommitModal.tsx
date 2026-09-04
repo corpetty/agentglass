@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "motion/react";
 import type { RepoStatus, GitFileStatus, CommitResult } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
 import { api } from "../lib/api.ts";
+import { CloseButton } from "./CloseButton.tsx";
 
 // Commits the repo's LIVE working tree (not the telemetry snapshot): the agent's
 // changed-file list is only the entry point — we read `git status` fresh and
@@ -33,7 +34,7 @@ function suggestTitle(files: string[]): string {
 function Checkbox({ on }: { on: boolean }) {
   return (
     <span
-      className="shrink-0 w-3.5 h-3.5 rounded flex items-center justify-center text-[9px] leading-none"
+      className="shrink-0 w-3.5 h-3.5 rounded flex items-center justify-center text-[10px] leading-none"
       style={{
         color: on ? "var(--bg)" : "transparent",
         background: on ? "var(--primary)" : "transparent",
@@ -48,11 +49,11 @@ function FileRow({ f, on, onToggle }: { f: GitFileStatus; on: boolean; onToggle:
   return (
     <button onClick={onToggle} className="w-full flex items-center gap-2 px-2 py-1 rounded-md text-left transition-colors hover:bg-[color-mix(in_srgb,var(--bg3)_40%,transparent)]">
       <Checkbox on={on} />
-      <span className="text-[9px] px-1 rounded shrink-0 tabular-nums w-[68px] text-center" style={{ color, background: `color-mix(in srgb, ${color} 15%, transparent)` }}>{f.status}</span>
+      <span className="text-[10px] px-1 rounded shrink-0 tabular-nums w-[68px] text-center" style={{ color, background: `color-mix(in srgb, ${color} 15%, transparent)` }}>{f.status}</span>
       <span className="text-[11.5px] truncate" style={{ color: on ? "var(--text)" : "var(--text3)" }}>
         <span className="t-dim2">{dirName(f.path)}</span><span className="font-medium">{baseName(f.path)}</span>
       </span>
-      {!on && f.unstaged && f.staged && <span className="ml-auto text-[9px] t-dim2 shrink-0">Partly staged</span>}
+      {!on && f.unstaged && f.staged && <span className="ml-auto text-[10px] t-dim2 shrink-0">Partly staged</span>}
     </button>
   );
 }
@@ -67,9 +68,11 @@ export function CommitModal({ open, onClose, paths }: { open: boolean; onClose: 
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<CommitResult | null>(null);
+  /** Fold the selected files into the last commit instead of making a new one. */
+  const [amending, setAmending] = useState(false);
 
   const load = () => {
-    setRepos(null); setResult(null); setConfirming(false);
+    setRepos(null); setResult(null); setConfirming(false); setAmending(false);
     api.gitStatus(paths).then((r) => {
       setRepos(r.repos);
       setEnabled(r.commitEnabled);
@@ -101,7 +104,8 @@ export function CommitModal({ open, onClose, paths }: { open: boolean; onClose: 
   const doCommit = () => {
     if (!repo || !title.trim() || !selPaths.length || busy) return;
     setBusy(true);
-    api.gitCommit({ root: repo.root, files: selPaths, title: title.trim(), body: body.trim() })
+    const call = amending ? api.gitAmend({ root: repo.root, files: selPaths, title: title.trim(), body: body.trim() }) : api.gitCommit({ root: repo.root, files: selPaths, title: title.trim(), body: body.trim() });
+    call
       .then((r) => setResult(r))
       .catch((e) => setResult({ ok: false, error: String(e) }))
       .finally(() => { setBusy(false); setConfirming(false); });
@@ -128,7 +132,7 @@ export function CommitModal({ open, onClose, paths }: { open: boolean; onClose: 
                   <span className="text-[15px] font-semibold" style={{ color: "var(--text)" }}>Commit</span>
                   {repo && <span className="chip text-[10px]" style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)" }}>⎇ {repo.branch}</span>}
                   {repo && <span className="text-[10.5px] t-dim2 truncate" title={repo.root}>{repo.root}</span>}
-                  <button onClick={onClose} className="ml-auto text-[18px] leading-none px-2 t-dim2 hover:opacity-70">✕</button>
+                  <CloseButton onClick={onClose} className="ml-auto" />
                 </div>
 
                 <div className="flex-1 min-h-0 overflow-y-auto px-5 py-3">
@@ -140,7 +144,7 @@ export function CommitModal({ open, onClose, paths }: { open: boolean; onClose: 
                   {result?.ok ? (
                     <div className="flex flex-col items-center justify-center py-10 gap-3">
                       <div className="text-[26px]">✅</div>
-                      <div className="text-[14px] font-semibold" style={{ color: "var(--text)" }}>Committed</div>
+                      <div className="text-[14px] font-semibold" style={{ color: "var(--text)" }}>{amending ? "Amended" : "Committed"}</div>
                       <div className="text-[12px] t-dim2 tabular-nums">
                         <span className="font-mono" style={{ color: "var(--primary)" }}>{result.shortSha}</span> · {result.summary}
                       </div>
@@ -213,22 +217,34 @@ export function CommitModal({ open, onClose, paths }: { open: boolean; onClose: 
                 {/* footer */}
                 {repo && !result?.ok && (
                   <div className="flex items-center gap-2 px-5 py-3 border-t shrink-0" style={{ borderColor: "color-mix(in srgb, var(--border) 40%, transparent)" }}>
-                    <span className="text-[10.5px] t-dim2 tabular-nums">
+                    <button
+                      onClick={() => { setAmending((v) => !v); setConfirming(false); }}
+                      className="px-2 py-1 rounded-md text-[10.5px] transition-colors whitespace-nowrap"
+                      style={{
+                        background: amending ? "color-mix(in srgb, var(--warning) 16%, transparent)" : "transparent",
+                        border: `1px solid color-mix(in srgb, var(--warning) ${amending ? 45 : 22}%, transparent)`,
+                        color: amending ? "var(--text)" : "var(--text3)",
+                      }}
+                      title="Fold these changes into the previous commit instead of creating a new one. Only ever the last commit, and only when nothing else is mid-flight.">
+                      {amending ? "✓ amend last commit" : "amend last commit"}
+                    </button>
+                    {amending && <span className="text-[10px] t-dim2">rewrites HEAD — unpushed work only</span>}
+                    <span className="text-[10.5px] t-dim2 tabular-nums ml-auto">
                       {selPaths.length} file{selPaths.length === 1 ? "" : "s"} → <span style={{ color: "var(--warning)" }}>⎇ {repo.branch}</span>
                     </span>
-                    <div className="ml-auto flex items-center gap-2">
+                    <div className="flex items-center gap-2">
                       {confirming ? (
                         <>
                           <button onClick={() => setConfirming(false)} className="px-3 py-1.5 rounded-lg text-[11px]" style={{ background: "color-mix(in srgb, var(--bg3) 45%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)", color: "var(--text3)" }}>Cancel</button>
-                          <button onClick={doCommit} disabled={busy} className="px-3 py-1.5 rounded-lg text-[11px] font-medium" style={{ background: "var(--error)", color: "#fff", opacity: busy ? 0.6 : 1 }}>
-                            {busy ? "Committing…" : `Yes, commit ${selPaths.length}`}
+                          <button onClick={doCommit} disabled={busy} className="px-3 py-1.5 rounded-lg text-[11px] font-medium" style={{ background: amending ? "var(--warning)" : "var(--error)", color: "#fff", opacity: busy ? 0.6 : 1 }}>
+                            {busy ? (amending ? "Amending…" : "Committing…") : amending ? `Yes, amend last commit` : `Yes, commit ${selPaths.length}`}
                           </button>
                         </>
                       ) : (
                         <button onClick={() => canCommit && setConfirming(true)} disabled={!canCommit}
                           className="px-3.5 py-1.5 rounded-lg text-[11px] font-medium transition-opacity"
-                          style={{ background: "var(--primary)", color: "var(--bg)", opacity: canCommit ? 1 : 0.45, cursor: canCommit ? "pointer" : "not-allowed" }}>
-                          Commit {selPaths.length || ""} {selPaths.length === 1 ? "file" : "files"}…
+                          style={{ background: amending ? "var(--warning)" : "var(--primary)", color: "var(--bg)", opacity: canCommit ? 1 : 0.45, cursor: canCommit ? "pointer" : "not-allowed" }}>
+                          {amending ? "Amend last commit…" : `Commit ${selPaths.length || ""} ${selPaths.length === 1 ? "file" : "files"}…`}
                         </button>
                       )}
                     </div>

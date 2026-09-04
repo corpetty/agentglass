@@ -18,9 +18,10 @@
 // `tmux -L agentglass attach -t <id>` drops the user into the very chat they
 // were reading in the app and lets them keep typing. That is not something the
 // `-p` engine can ever offer.
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import type { PaneAgent } from "./paneagent.ts";
+import { claudeCode, claudeHome, projectSlug } from "./agents/claudecode.ts";
 import { stat } from "node:fs/promises";
 import { costUsd } from "./pricing.ts";
 import {
@@ -28,31 +29,26 @@ import {
   touchPane, forgetPane, tmuxCapability, validPaneName, attachCommand,
 } from "./tmuxpane.ts";
 
-const claudeBin = () => Bun.which("claude");
-
-/** Where Claude Code keeps its transcripts. `CLAUDE_CONFIG_DIR` is the CLI's own
- *  knob and is honoured for the same reason it exists; the agentglass override
- *  is so tests can point at a fixture instead of a developer's real history. */
-function claudeHome(): string {
-  return process.env.AGENTGLASS_CLAUDE_HOME || process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-}
-
-/** The directory name Claude Code derives from a working directory.
+/**
+ * Which agent this engine runs.
  *
- *  Every character that is not a letter or a digit becomes `-`, which is why a
- *  path like `/home/x/code/app/.claude/wt` lands in `-home-x-code-app--claude-wt`
- *  (the separator and the leading dot each contribute one). Verified against a
- *  real session rather than inferred. */
-export function projectSlug(cwd: string): string {
-  return cwd.replace(/[^A-Za-z0-9]/g, "-");
-}
+ * One, today. The point of the indirection is not that there are two — it is
+ * that the four things Claude Code's own format decides (where the binary is,
+ * the transcript path, the launch flags, and the line that ends a turn) were
+ * spread through this file, so "run something else in a pane" could not even be
+ * costed. They are named in paneagent.ts and implemented in
+ * agents/claudecode.ts, unchanged.
+ */
+const agent: PaneAgent = claudeCode;
 
 /** Where this session's transcript will be, whether or not it exists yet. The
  *  path has to be computable up front: a brand-new session has no file until it
  *  has answered something, and the turn needs to know where to watch. */
 export function transcriptFor(cwd: string, sessionId: string): string {
-  return join(claudeHome(), "projects", projectSlug(cwd), `${sessionId}.jsonl`);
+  return agent.transcriptFor(cwd, sessionId);
 }
+
+export { projectSlug };
 
 /** Size of a file, or 0 when it does not exist.
  *
@@ -64,8 +60,8 @@ async function sizeOf(path: string): Promise<number> {
 
 // What we launched each pane with. A chat that changes model or permission mode
 // mid-conversation cannot be honoured by an already-running CLI — both are
-// process-level here — so the pane is relaunched with `--resume`, which costs
-// one slow turn and keeps the conversation intact.
+// process-level here — so the pane is taken down and brought back resumed,
+// which costs one slow turn and keeps the conversation intact.
 interface PaneSpec { model: string; mode: string; effort: string; cwd: string }
 const specs = new Map<string, PaneSpec>();
 
@@ -107,12 +103,42 @@ async function waitReady(name: string, deadline: number): Promise<boolean> {
  *  never accepted, and the engine reported failure on a successful turn. */
 const INPUT_ROWS = /^❯(.*)$/gm;
 
+/** Hint text the TUI draws *inside* the empty input box.
+ *
+ *  A hint sits on the box's own row, behind the box's own glyph, and is not one
+ *  character the user typed — but it is not whitespace either, so a box showing
+ *  one reads as "holding something" unless it is named here.
+ *
+ *  That distinction is load-bearing. When a turn is already running, a newly
+ *  submitted prompt is QUEUED, and the box then hints `Press up to edit queued
+ *  messages`. Read as content, that hint is text which is neither empty nor the
+ *  prompt we pasted, which is precisely the signature of "a picker opened" — so
+ *  a prompt the CLI had accepted was reported to the user as an interactive
+ *  prompt it could not draw. Worse on the next turn: the hint was already there
+ *  before the paste, so `waitPasted` returned it as though it were our text, and
+ *  every Enter afterwards compared the hint against itself and looked swallowed.
+ *  The turn pressed Enter into a live pane until it timed out and then reported
+ *  that the pane would not accept the prompt. Both prompts had in fact been
+ *  queued, and both ran. */
+const BOX_HINTS: RegExp[] = [
+  // Anchored at BOTH ends, and that is the whole design of this list: a hint is
+  // the only thing on its row, while a prompt that merely starts the same way
+  // carries on past it. Unanchored, `Try "` also matched a real prompt —
+  // `Try "npm test" first, then look at the failures` — and a box holding one
+  // read as empty, so waitPasted never saw the paste land and the turn was
+  // reported as a pane that would not take it.
+  /^\s*Try ".*"\s*$/,                           // an empty box in a fresh session
+  /^\s*Press up to edit queued messages\s*$/,   // an empty box with prompts queued
+];
+
 /** What is typed in the live input box right now, or `null` if it is not on
  *  screen at all (the TUI redraws while a turn runs). Note the box renders its
- *  empty state with U+00A0, which `\s` covers. */
+ *  empty state with U+00A0, which `\s` covers, and its hinted states with the
+ *  strings above — both of which are empty as far as this engine is concerned. */
 export function inputBox(screen: string): string | null {
   let last: string | null = null;
   for (const m of screen.matchAll(INPUT_ROWS)) last = m[1];
+  if (last !== null && BOX_HINTS.some((re) => re.test(last!))) return "";
   return last;
 }
 
@@ -143,12 +169,14 @@ async function waitPasted(name: string, deadline: number): Promise<string | null
 
 /** What happened to the prompt we submitted.
  *
- *  `sent` — the box emptied, the CLI took it.
+ *  `sent` — the box emptied, the CLI took it and started on it.
+ *  `queued` — the CLI took it but is busy, so it is holding it behind the turn
+ *    already running. Accepted, not started; see QUEUED_RE.
  *  `diverted` — the box holds something that is not our prompt any more. In
  *    practice this means an interactive command opened a picker: `/model`,
  *    `/effort`, `/config` do not run a turn, they draw a menu.
  *  `stuck` — still our text, still not taken, out of time. */
-type SubmitOutcome = "sent" | "diverted" | "stuck";
+type SubmitOutcome = "sent" | "queued" | "diverted" | "stuck";
 
 /** Press Enter until the prompt is actually accepted.
  *
@@ -186,6 +214,10 @@ async function submitConfirmed(name: string, pasted: string, deadline: number): 
      * it was simply thinking.
      */
     if (NEEDS_YOU_RE.test(screen)) return "diverted";
+    // Also before the box check, and for the same reason: a queued prompt has
+    // been ACCEPTED. Pressing again would not resend it — it would append
+    // another copy of it to the queue.
+    if (QUEUED_RE.test(screen)) return "queued";
     const box = inputBox(screen);
     if (!box?.trim()) return "sent";
     // Still our text, nothing opened: the Enter really was swallowed (the TUI
@@ -197,15 +229,15 @@ async function submitConfirmed(name: string, pasted: string, deadline: number): 
 
 /** Ensure a live pane for this session, launching or relaunching as needed.
  *
- *  The distinction that matters: a session id that has never run must be started
- *  with `--session-id`, and one that has must be started with `--resume`. Reusing
- *  `--session-id` on an existing session is a hard error ("Session ID is already
- *  in use"), so getting this backwards does not degrade, it fails the turn. */
+ *  Whether the session has ever run is decided here — an empty transcript means
+ *  it has not — and handed to the agent as `fresh`. What that turns into on the
+ *  command line is the agent's business, and it is not a detail to get wrong:
+ *  see agents/claudecode.ts, where getting it backwards fails the turn outright
+ *  rather than degrading. */
 async function ensurePane(
   sessionId: string, cwd: string, model: string, mode: string, effort: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const bin = claudeBin();
-  if (!bin) return { ok: false, error: "no local `claude` CLI: install Claude Code to chat (Settings ▸ Requirements lists it, with the install guide)" };
+  if (!agent.bin()) return { ok: false, error: agent.missingReason() };
 
   const alive = await paneAlive(sessionId);
   const spec = specs.get(sessionId);
@@ -220,12 +252,7 @@ async function ensurePane(
   }
 
   const fresh = (await sizeOf(transcriptFor(cwd, sessionId))) === 0;
-  const argv = [bin, "--model", model];
-  if (effort) argv.push("--effort", effort);
-  if (fresh) argv.push("--session-id", sessionId);
-  else argv.push("--resume", sessionId);
-  if (mode === "bypassPermissions") argv.push("--dangerously-skip-permissions");
-  else argv.push("--permission-mode", mode);
+  const argv = agent.argv({ sessionId, cwd, model, effort, mode, fresh });
 
   const started = await startPane(sessionId, cwd, argv);
   if (!started.ok) return { ok: false, error: started.stderr.trim() || "could not start the tmux pane" };
@@ -253,6 +280,15 @@ const EXT: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
 };
 
+/**
+ * Where a turn's images are written before their paths go into the prompt.
+ *
+ * Under Claude Code's home, which is where it has always been — but note this
+ * is *not* part of the agent contract. Any CLI can read any path; the directory
+ * only has to exist and be readable. It is imported directly rather than added
+ * to `PaneAgent` so the interface stays the four things that genuinely differ
+ * per agent.
+ */
 function attachmentDir(): string {
   const dir = join(claudeHome(), "agentglass-attachments");
   mkdirSync(dir, { recursive: true });
@@ -290,15 +326,12 @@ export function panePrompt(text: string, paths: string[]): string {
  *  history snapshots, attachment records, the CLI's own title guess. None of it
  *  means anything to the chat renderer, and forwarding it would have the browser
  *  parsing shapes no one wrote a case for. */
-const FORWARD = new Set(["assistant", "user"]);
+const FORWARD = (type: string): boolean => agent.forwards(type);
 
-/** The line that ends a turn.
- *
- *  Deterministic and written by the CLI itself: every completed turn's last
- *  transcript line is a `system` entry with subtype `turn_duration`. This is why
- *  the engine never has to guess from a spinner or an idle screen. */
-const isTurnEnd = (o: Record<string, unknown>): boolean =>
-  o.type === "system" && o.subtype === "turn_duration";
+/** The line that ends a turn — an explicit marker the agent itself wrote, never
+ *  a guess from a spinner or an idle screen. See paneagent.ts for why that is
+ *  the load-bearing part of the contract. */
+const isTurnEnd = (o: Record<string, unknown>): boolean => agent.isTurnEnd(o);
 
 export interface PaneTurnOptions {
   cwd: string;
@@ -326,11 +359,53 @@ const NEEDS_YOU_RE = /Esc to cancel|Enter to confirm|to use this session only/;
 export const __needsYou = (screen: string): boolean => NEEDS_YOU_RE.test(screen);
 export const __isRunning = (screen: string): boolean => RUNNING_RE.test(screen);
 
+/** The CLI is holding prompts it has accepted but not started.
+ *
+ *  Typing while a turn is in flight does not interrupt it and does not fail:
+ *  Claude Code queues the prompt, draws it in a box of pending messages, and
+ *  runs it when the current turn ends. That is a third state next to "running"
+ *  and "idle", and the engine had no name for it, so it read as both of the
+ *  wrong ones — as a picker while submitting (see BOX_HINTS) and as an idle
+ *  pane afterwards, which would have ended the turn eight seconds in.
+ *
+ *  Observed on a machine whose network dropped mid-turn: the CLI sat on
+ *  `Unable to connect to API (ENOTIMP) · Retrying in 8s · attempt 5/10`, two
+ *  prompts sent from the chat were queued behind it, and both were reported to
+ *  the user as errors. Both had been accepted, and both ran once the network
+ *  came back.
+ *
+ *  Matched on the input box's own hint rather than on the pending-message box,
+ *  because the hint is one stable line of text and the box is a drawn frame
+ *  whose contents are the user's own prompts. */
+const QUEUED_RE = /Press up to edit queued messages/;
+export const __isQueued = (screen: string): boolean => QUEUED_RE.test(screen);
+
+/** Wait for a queued prompt to reach the front of the CLI's queue.
+ *
+ *  Deliberately without a deadline. The turn ahead of ours may legitimately run
+ *  for minutes — that is why ours was queued — and giving up on a clock would
+ *  report a failure for a prompt that has been accepted and will run. What is
+ *  bounded is liveness: a pane that has *died* is never coming back, and it is
+ *  checked for on the same interval a silent turn is. */
+async function waitDrained(name: string, stop: () => boolean): Promise<"drained" | "cancelled" | "gone"> {
+  let lastAlive = Date.now();
+  for (;;) {
+    if (stop()) return "cancelled";
+    if (!QUEUED_RE.test(await capture(name))) return "drained";
+    if (Date.now() - lastAlive > STALL_CHECK_MS) {
+      if (!(await paneAlive(name))) return "gone";
+      lastAlive = Date.now();
+    }
+    await Bun.sleep(250);
+  }
+}
+
 /** The submit loop's decision for one observed frame, without the tmux round
  *  trip. Exported so the ordering that matters — picker before input box — is
  *  pinned by a test rather than by a comment. */
 export function __submitVerdict(screen: string, pasted: string): SubmitOutcome | "retry" {
   if (NEEDS_YOU_RE.test(screen)) return "diverted";
+  if (QUEUED_RE.test(screen)) return "queued";
   const box = inputBox(screen);
   if (!box?.trim()) return "sent";
   if (box.trim() !== pasted.trim()) return "diverted";
@@ -436,6 +511,39 @@ export function paneTurnStream(opts: PaneTurnOptions): Response {
           controller.close();
           return;
         }
+        if (outcome === "queued") {
+          /*
+           * Accepted, but behind a turn that was already running. Wait for it
+           * to come up rather than reporting anything: the prompt is in the
+           * CLI's hands and it will run.
+           */
+          const drained = await waitDrained(sessionId, () => cancelled);
+          if (drained === "cancelled") { controller.close(); return; }
+          if (drained === "gone") {
+            forgetPane(sessionId);
+            specs.delete(sessionId);
+            fail("the chat's pane exited while this prompt was still queued behind another turn");
+            controller.close();
+            return;
+          }
+          /*
+           * Re-take the watermark now that ours is the turn running.
+           *
+           * The turn we were queued behind finished while we waited, and it
+           * wrote its answer AND its end-of-turn line into this same transcript
+           * after our original watermark. Streaming from there would replay
+           * someone else's answer into this chat bubble and then close on their
+           * end marker, ending this turn before it had said anything. Their
+           * output is not lost by skipping it — the dashboard hydrates history
+           * from the transcript, which is where it already is.
+           *
+           * The race this accepts: the CLI writes our own user message ~220ms
+           * after submitting, so a slow poll can put the watermark past it. That
+           * costs the echo of a message the browser is already showing, and
+           * never any of the answer, which is a round trip further out.
+           */
+          offset = await sizeOf(path);
+        }
 
         // Usage accumulates across the turn's assistant frames so the closing
         // cost frame can be priced. The `-p` engine gets this handed to it by
@@ -475,7 +583,7 @@ export function paneTurnStream(opts: PaneTurnOptions): Response {
                 controller.close();
                 return;
               }
-              if (!FORWARD.has(String(o.type))) continue;
+              if (!FORWARD(String(o.type))) continue;
               const msg = o.message as Record<string, unknown> | undefined;
               const u = msg?.usage as Record<string, unknown> | undefined;
               if (u) {
@@ -517,7 +625,11 @@ export function paneTurnStream(opts: PaneTurnOptions): Response {
              * a turn that produced no transcript and left the pane idle is over,
              * whatever it was called.
              */
-            const running = RUNNING_RE.test(screen);
+            // A pane holding queued prompts is neither running nor idle: it is
+            // waiting its turn, and its box reads empty because what it shows
+            // is a hint. Without this clause that is indistinguishable from
+            // `/clear`, and a queued turn would be declared over ~8s in.
+            const running = RUNNING_RE.test(screen) || QUEUED_RE.test(screen);
             const box = inputBox(screen);
             if (!running && !box?.trim()) {
               if (++idleProbes >= IDLE_PROBES_TO_END) {
@@ -584,7 +696,7 @@ export function paneTurnStream(opts: PaneTurnOptions): Response {
 export function paneEngineCapability(): { available: boolean; reason: string } {
   const t = tmuxCapability();
   if (!t.available) return t;
-  if (!claudeBin()) return { available: false, reason: "no local `claude` CLI: install Claude Code to chat (Settings ▸ Requirements lists it, with the install guide)" };
+  if (!agent.bin()) return { available: false, reason: agent.missingReason() };
   return { available: true, reason: "" };
 }
 

@@ -1,8 +1,8 @@
 {
   "name": "agentglass",
-  "version": "0.6.0",
+  "version": "0.13.0",
   "private": true,
-  "description": "Real-time observability dashboard for Claude Code multi-agent workflows — cost, tokens, tool latency, error rates, and session timelines.",
+  "description": "Every AI coding agent on your machine, on one screen — live cost, tokens and tool calls across every provider, and a hold on anything dangerous until you say go. From your desk or your phone.",
   "license": "MIT",
   "type": "module",
   "workspaces": ["server", "web", "electron"],
@@ -19,8 +19,10 @@
     "setup": "python3 hooks/install_hooks.py",
     "setup:undo": "python3 hooks/install_hooks.py --uninstall",
     "connect": "python3 hooks/connect_otel.py",
+    "connect:opencode": "python3 hooks/connect_opencode.py",
+    "connect:opencode:undo": "python3 hooks/connect_opencode.py --undo",
     "connect:undo": "python3 hooks/connect_otel.py --undo",
-    "postinstall": "node -e \"console.log('agentglass: run [bun run setup] to wire Claude Code hooks, [bun run connect] for OTel CLIs')\""
+    "postinstall": "node -e \"console.log('agentglass: run [bun run setup] to wire Claude Code hooks, [bun run connect] for OTel CLIs, [bun run connect:opencode] for OpenCode')\""
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

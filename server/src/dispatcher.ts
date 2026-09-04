@@ -19,7 +19,7 @@ import { accountById, listAccounts, type Account } from "./accounts.ts";
 import type { Job } from "../../shared/types.ts";
 import { safeAbs, repoRootOf } from "./git.ts";
 import { existsSync } from "node:fs";
-import { getUsage } from "./usage.ts";
+import { getAccountUsage } from "./usage.ts";
 import {
   queuedJobs, jobsByStatus, resolveBlocked, runningCountByAccount,
   markRunning, markDone, failAttempt, requeueNoPenalty, markExpired, recoverInterrupted,
@@ -228,7 +228,7 @@ async function pickAccount(job: Job, running: Map<string, number>, startedThisTi
     if (!existsSync(a.credentialsPath)) continue;
     const paused = pausedUntil.get(a.id);
     if (paused && now < paused) continue;
-    const u = await getUsage(a.id);
+    const u = await getAccountUsage(a.id);
     // No reading → can't judge headroom. Rather than risk pushing an account we
     // can't see over its limit, skip it this tick.
     if (!u.available) continue;

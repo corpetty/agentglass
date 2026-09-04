@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
+import { LAYER } from "../lib/layers.ts";
+import { StatusPill } from "./StatusPill.tsx";
 
 /**
  * A themed replacement for a native <select>.
@@ -16,7 +18,20 @@ import { Portal } from "./Portal.tsx";
  * scroll; a list positioned in the normal flow would be cut off by its own
  * container.
  */
-export type SelectOption = { value: string; label: string; hint?: string };
+export type SelectOption = {
+  value: string;
+  label: string;
+  hint?: string;
+  /** A colour this option OWNS — a ClickUp status is the case this exists for.
+   *  Absent means the app's own tone: never a colour invented to fill the gap. */
+  tint?: string;
+  /** Draw the label as a status pill, in `tint`, here AND on the closed
+   *  trigger. A status is a tag on its board and reads as one; rendering it as
+   *  a line of prose is what made a list of seventeen unscannable. */
+  pill?: boolean;
+  /** A pill a board files under done or closed: quieter, still legible. */
+  dim?: boolean;
+};
 
 export function Select({
   value, options, onChange, disabled, title, className, style, placeholder, align = "left",
@@ -35,7 +50,8 @@ export function Select({
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState({ top: 0, left: 0, right: 0, minWidth: 0 });
+  const [pos, setPos] = useState<{ top?: number; bottom?: number; left: number; right: number; minWidth: number; maxHeight: number }>(
+    { top: 0, left: 0, right: 0, minWidth: 0, maxHeight: 420 });
   // Replacing a native <select> means re-implementing everything it gave for
   // free. `cursor` is the roving highlight; `typed` backs type-ahead, which is
   // how anyone picks from a long list without reaching for the mouse.
@@ -43,10 +59,22 @@ export function Select({
   const typed = useRef({ buf: "", at: 0 });
 
   useLayoutEffect(() => {
-    if (open && btnRef.current) {
-      const r = btnRef.current.getBoundingClientRect();
-      setPos({ top: r.bottom + 6, left: r.left, right: window.innerWidth - r.right, minWidth: r.width });
-    }
+    if (!open || !btnRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    const below = window.innerHeight - r.bottom - 12;
+    const above = r.top - 12;
+    /* Up when down does not fit and up is roomier — the same rule `BasePicker`
+       uses, and for the same reason: a control near the bottom of the window
+       opened a list that ran off the screen, so the options nobody could reach
+       were the ones at the end. Not flipped for a few pixels' gain, which only
+       moves the list somewhere the eye is not. */
+    const up = below < 220 && above > below;
+    setPos({
+      top: up ? undefined : r.bottom + 6,
+      bottom: up ? window.innerHeight - r.top + 6 : undefined,
+      left: r.left, right: window.innerWidth - r.right, minWidth: r.width,
+      maxHeight: Math.max(180, Math.min(420, up ? above : below)),
+    });
   }, [open]);
 
   // Open on the current value, so ↑/↓ start from where the user already is.
@@ -116,10 +144,17 @@ export function Select({
         className={`${className ?? "rounded-lg px-2 py-1 text-[11px] outline-none max-w-[160px]"} shrink-0 flex items-center gap-1 ${disabled ? "opacity-60 cursor-default" : ""}`}
         style={{ ...style, ...(open ? { borderColor: "color-mix(in srgb, var(--primary) 55%, transparent)" } : null) }}
       >
-        <span className="truncate">{current?.label ?? placeholder ?? value}</span>
-        <span className="text-[8px] shrink-0 opacity-70">▼</span>
+        {current?.pill
+          ? <StatusPill status={current.label} color={current.tint} dim={current.dim} />
+          : <span className="truncate">{current?.label ?? placeholder ?? value}</span>}
+        <span className="text-[10px] shrink-0 opacity-70">▼</span>
       </button>
-      <Portal>
+      {/* Numbered rather than trusting mount order. This took Portal's default
+          and landed on top only because a dropdown's container is appended when
+          it opens — after everything already on screen. That held until a sheet
+          containing one was given a number of its own: Settings at LAYER.settings
+          would have buried every Select inside it. */}
+      <Portal z={LAYER.menu}>
         <AnimatePresence>
           {open && (
             <>
@@ -132,10 +167,10 @@ export function Select({
                 aria-label={title ?? "Options"}
                 className="fixed p-1.5 rounded-xl flex flex-col gap-0.5 overflow-y-auto agw-noscrollbar"
                 style={{
-                  top: pos.top,
+                  ...(pos.bottom == null ? { top: pos.top } : { bottom: pos.bottom }),
                   ...(align === "right" ? { right: pos.right } : { left: pos.left }),
                   minWidth: Math.max(pos.minWidth, 140),
-                  maxHeight: "min(60vh, 420px)",
+                  maxHeight: pos.maxHeight,
                   zIndex: 9999,
                   background: "color-mix(in srgb, var(--bg2) 97%, black)",
                   border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
@@ -154,8 +189,10 @@ export function Select({
                       ? { background: "color-mix(in srgb, var(--primary) 26%, transparent)", color: "var(--primary-hover)" }
                       : o.value === value
                       ? { background: "color-mix(in srgb, var(--primary) 20%, transparent)", color: "var(--primary-hover)" }
-                      : { color: "var(--text3)" }}>
-                    <span className="flex-1">{o.label}</span>
+                      : { color: o.tint || "var(--text3)" }}>
+                    {o.pill
+                      ? <span className="flex-1"><StatusPill status={o.label} color={o.tint} dim={o.dim} /></span>
+                      : <span className="flex-1">{o.label}</span>}
                     {o.hint && <span className="text-[9.5px] opacity-60">{o.hint}</span>}
                   </button>
                 ))}

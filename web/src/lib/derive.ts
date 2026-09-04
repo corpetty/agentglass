@@ -1,7 +1,9 @@
-import type { WatchEvent, OpenToolCall, Liveness } from "../../../shared/types.ts";
+import type { WatchEvent, OpenToolCall, Liveness, SessionRollup } from "../../../shared/types.ts";
 import { agentKey, fmtMs, sessionTitle } from "./format.ts";
+import { providerOf, UNKNOWN } from "../../../shared/models.ts";
 import { sessionWorktree } from "./worktree.ts";
 import { ctxLimitOf } from "./contextWindow.ts";
+import type { AgentKind } from "./agents.ts";
 
 export type AgentStatus = "working" | "waiting" | "errored" | "idle";
 
@@ -39,7 +41,19 @@ export interface AgentCard {
   events: number;
   tools: number;
   errors: number;
+  /** The subset of `errors` that was a tool call failing. The only numerator
+   *  `tools` is a legitimate denominator for — see the rate rule below. */
+  toolErrors: number;
   cost: number;
+  /**
+   * Every token class weighted by its own price, in uncached-input units.
+   *
+   * It used to be `input + output`, which is not a quantity: it adds a token
+   * that costs five to one that costs a tenth and drops the cache classes
+   * entirely — so a session that reads a large context every turn looked
+   * enormous and was cheap. The weighting happens on the server, where the
+   * prices are, and arrives on the event; this side only adds up.
+   */
   tokens: number;
   lastSeen: number;
   lastErrorTs: number;
@@ -48,6 +62,22 @@ export interface AgentCard {
   subagents: number;
   /** Subagent type → count, most common first (e.g. Explore, workflow-subagent). */
   subagentTypes: [string, number][];
+  /**
+   * Why it stopped for you, in its own words — "wants to run Bash", or whatever
+   * the agent's own notification said. Empty unless the latest event was one of
+   * the two that stop a session, which is the same test `status === "waiting"`
+   * is made of, so the two can never disagree.
+   */
+  needBecause: string;
+  /**
+   * The directory this session is actually running in, and the project it folds
+   * onto. `worktree` already derived a LABEL from these two and threw the paths
+   * away, which is enough to print and not enough to go anywhere: answering "is
+   * this the project I am looking at" and "which terminal pane is it in" both
+   * need the path itself.
+   */
+  cwd: string | null;
+  project: string | null;
   /** A tool call that started (PreToolUse) and hasn't reported back yet. */
   runningTool: string | null;
   runningSince: number;
@@ -92,6 +122,30 @@ const TOOL_RUN_WARN_MS = 5 * 60_000;
 // normally trails a failure by a few seconds.
 const ERROR_TAIL_MS = 60_000;
 
+/**
+ * Why an agent stopped, in its own words.
+ *
+ * The reason has always been on the event — a PermissionRequest names the tool
+ * it is asking for, a Notification carries the message the agent raised — and
+ * the server already reads both to write the desktop notification (alerts.ts).
+ * This side threw them away and wrote "waiting for approval / input" for every
+ * case, so the one thing the alert existed to tell you was the one thing it
+ * never said, on the chip, in the dashboard's panel, everywhere.
+ *
+ * Empty for every other event on purpose: it is read only while the session is
+ * `waiting`, and a stale reason left over from the last block would be worse
+ * than none.
+ */
+function becauseOf(e: WatchEvent): string {
+  if (e.hook_event_type === "PermissionRequest")
+    return e.tool_name ? `wants to run ${e.tool_name}` : "wants your approval";
+  if (e.hook_event_type === "Notification") {
+    const m = String((e.payload as { message?: unknown } | null)?.message ?? "").trim();
+    return m || "raised a notification";
+  }
+  return "";
+}
+
 function blankCard(key: string, source_app: string, session_id: string, model_name: string | null): AgentCard {
   return {
     key,
@@ -105,6 +159,7 @@ function blankCard(key: string, source_app: string, session_id: string, model_na
     events: 0,
     tools: 0,
     errors: 0,
+    toolErrors: 0,
     cost: 0,
     tokens: 0,
     lastSeen: 0,
@@ -112,6 +167,9 @@ function blankCard(key: string, source_app: string, session_id: string, model_na
     spark: new Array(20).fill(0),
     subagents: 0,
     subagentTypes: [],
+    needBecause: "",
+    cwd: null,
+    project: null,
     runningTool: null,
     runningSince: 0,
     evidenceAt: null,
@@ -146,7 +204,45 @@ export function buildTitles(sessions: { session_id: string; source_app?: string;
   return m;
 }
 
-export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [], titles?: TitleLookup): AgentCard[] {
+/**
+ * Lifetime totals per session, from the server.
+ *
+ * The card used to sum cost and tokens over the live event buffer, and that
+ * buffer is a window, not a history: it is capped at MAX_EVENTS (2000) across
+ * the whole fleet, and a fresh page load starts from the 300 events the
+ * initial frame carries. So a session that had produced five thousand events
+ * showed the cost of whichever handful of them survived the trim — a real
+ * spend of dollars rendering as $0.00 right after a reload, against a /stats
+ * total that was correct all along.
+ *
+ * The sessions poll already runs for the titles; these are the same rows.
+ */
+type RollupFields = "cost_usd" | "input_tokens" | "output_tokens" | "equiv_tokens" | "tool_count";
+export type RollupLookup = ReadonlyMap<string, Pick<SessionRollup, RollupFields>>;
+
+export function buildRollups(sessions: SessionRollup[]): RollupLookup {
+  const m = new Map<string, Pick<SessionRollup, RollupFields>>();
+  for (const s of sessions) {
+    m.set(s.session_id, {
+      cost_usd: s.cost_usd, input_tokens: s.input_tokens,
+      output_tokens: s.output_tokens, equiv_tokens: s.equiv_tokens, tool_count: s.tool_count,
+    });
+  }
+  return m;
+}
+
+/**
+ * The weighted figure, or the old raw sum when there isn't one.
+ *
+ * `equiv_tokens` is optional because a server older than this does not send it,
+ * and absent has to mean *unknown* rather than zero — a fleet reporting 0
+ * tokens against a real cost is a worse answer than the unweighted count it
+ * replaces, and it is the one a `?? 0` would give.
+ */
+const weighted = (r: { equiv_tokens?: number; input_tokens: number; output_tokens: number }): number =>
+  r.equiv_tokens ?? r.input_tokens + r.output_tokens;
+
+export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [], titles?: TitleLookup, rollups?: RollupLookup): AgentCard[] {
   const now = Date.now();
   const map = new Map<string, AgentCard>();
   // Subagents fold into their parent session_id but carry agent_id/agent_type,
@@ -198,13 +294,22 @@ export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [
       if (e.agent_type || !prev) m.set(e.agent_id, e.agent_type || prev || "subagent");
     }
     a.events++;
-    if (e.hook_event_type === "PostToolUse" || e.hook_event_type === "PostToolUseFailure") a.tools++;
-    if (e.is_error) { a.errors++; if (e.timestamp >= a.lastErrorTs) a.lastErrorTs = e.timestamp; }
+    const isTool = e.hook_event_type === "PostToolUse" || e.hook_event_type === "PostToolUseFailure";
+    if (isTool) a.tools++;
+    if (e.is_error) {
+      a.errors++;
+      if (isTool) a.toolErrors++;
+      if (e.timestamp >= a.lastErrorTs) a.lastErrorTs = e.timestamp;
+    }
     a.cost += e.cost_usd;
-    a.tokens += e.input_tokens + e.output_tokens;
+    a.tokens += weighted(e);
     if (e.timestamp >= a.lastSeen) {
       a.lastSeen = e.timestamp;
       a.lastType = e.hook_event_type;
+      // Set from the same event that sets lastType, which is what decides
+      // `waiting` below — so the reason is always the reason for the block that
+      // is actually current.
+      a.needBecause = becauseOf(e);
       // Both ride on the payload: `project_path` is the repo every checkout
       // folds onto, `cwd` is only written when the turn ran somewhere else.
       //
@@ -217,6 +322,10 @@ export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [
       const p = e.payload as any;
       const wt = sessionWorktree({ project_path: p?.project_path, cwd_path: p?.cwd });
       if (wt) a.worktree = wt;
+      // Same rule, same reason: keep the last known answer rather than letting
+      // an event that does not carry the field blank one that did.
+      if (p?.cwd) a.cwd = String(p.cwd);
+      if (p?.project_path) a.project = String(p.project_path);
       if (e.model_name) a.model_name = e.model_name; // latest, not last-in-array
       a.lastAction = e.tool_name
         ? `${e.hook_event_type} · ${e.tool_name}`
@@ -262,6 +371,22 @@ export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [
   }
 
   for (const a of map.values()) {
+    // Server-authoritative lifetime totals win over the buffer sum wherever
+    // the poll has seen this session. Math.max rather than a plain assignment:
+    // the poll is every 30s and caps at 200 sessions, so a burst of spend
+    // arriving mid-interval is in the buffer before it is in the roll-up, and
+    // a headline number must never read backwards while you watch it.
+    //
+    // Deliberately not applied to errors/lastErrorTs. The rate rule below
+    // divides by a.tools, and swapping a lifetime tool count under a windowed
+    // error count would fire "high failure rate" on long-dead history. spark
+    // stays buffer-derived too — it is a picture of the recent window by design.
+    const r = rollups?.get(a.session_id);
+    if (r) {
+      a.cost = Math.max(a.cost, r.cost_usd);
+      a.tokens = Math.max(a.tokens, weighted(r));
+      a.tools = Math.max(a.tools, r.tool_count);
+    }
     const since = now - a.lastSeen;
     // A session that ended can't still be running a tool, whatever pair we
     // think is open; and an open pair past the ceiling is lost, not long.
@@ -373,7 +498,10 @@ export function deriveAlerts(agents: AgentCard[]): Alert[] {
   const out: Alert[] = [];
   for (const a of agents) {
     if (a.status === "waiting")
-      out.push({ id: "wait:" + a.key, level: "warn", agent: a.key, text: "waiting for approval / input", ts: a.lastSeen });
+      // What it wants, not merely that it wants something. The fallback is for
+      // a card seeded without the blocking event in the buffer, which is the
+      // only case left where we honestly do not know.
+      out.push({ id: "wait:" + a.key, level: "warn", agent: a.key, text: a.needBecause || "waiting for approval / input", ts: a.lastSeen });
     if (a.status === "errored")
       out.push({ id: "err:" + a.key, level: "error", agent: a.key, text: `${a.errors} error(s) — last action ${a.lastAction}`, ts: a.lastSeen });
     // A long tool call used to raise the same warning whatever it was doing,
@@ -390,7 +518,10 @@ export function deriveAlerts(agents: AgentCard[]): Alert[] {
         out.push({ id: "long:" + a.key, level: "warn", agent: a.key, ts: a.runningSince,
           text: `${a.runningTool} running ${openFor} — nothing local to check, so this could be either` });
     }
-    const rate = a.tools > 3 ? a.errors / a.tools : 0;
+    // toolErrors, not errors: the denominator is tool calls, and an errored
+    // LLM span or notification never enters it. With the all-events count this
+    // read "high failure rate 150%" on a session whose every tool succeeded.
+    const rate = a.tools > 3 ? a.toolErrors / a.tools : 0;
     if (rate > 0.25)
       out.push({ id: "rate:" + a.key, level: "error", agent: a.key, text: `high failure rate ${(rate * 100).toFixed(0)}%`, ts: a.lastSeen });
   }
@@ -416,3 +547,94 @@ export const sessionIsLive = (
   s: { ended_at?: number | null; last_seen: number },
   now = Date.now(),
 ): boolean => !s.ended_at && now - s.last_seen < SESSION_LIVE_MS;
+
+/**
+ * Which CLI owns a session on the radar.
+ *
+ * The question only has to be answered to resume one: a thread id means
+ * something to the binary that minted it and nothing to the other, so opening a
+ * Codex session as a Claude chat would hand `claude --resume` an id it has
+ * never seen and fail on the first turn.
+ *
+ * `source_app` is the stronger signal and is checked first. It is whatever the
+ * exporter called itself — Codex's OTel records arrive as `codex_exec` from
+ * `codex exec` and `codex_cli_rs` from the TUI, so this matches on the prefix
+ * rather than on either exact name. Claude Code's hooks send the project
+ * directory's name instead, which is why the model is the fallback and not the
+ * primary: it is the only thing a session with an unfamiliar `source_app` has
+ * to go on.
+ *
+ * Defaults to Claude, because that is the overwhelming majority of what this
+ * app sees and because being wrong in that direction is the recoverable one:
+ * `claude --resume` with a stranger's id reports an unknown session, while
+ * `codex exec resume` would be asked to continue a conversation it does not
+ * have.
+ */
+/**
+ * Which CLI could pick this session back up, or null if none of them could.
+ *
+ * Deliberately not `agentOf`, and the difference is the whole point of having
+ * both. `agentOf` answers "whose is this?" and falls back to Claude, because
+ * for labelling a session that is the overwhelmingly likely answer and being
+ * wrong costs a wrong icon. Resuming cannot use a fallback: a Gemini CLI
+ * session would be offered as a Claude one and hand `claude --resume` an id it
+ * has never seen, which fails on the first turn with nothing to explain it.
+ *
+ * So Claude is only accepted when something corroborates it. An unresolved
+ * model still counts — early Claude Code rows recorded no model, and those are
+ * exactly the old sessions worth reaching for — but a session positively
+ * identified as somebody else's (Gemini CLI, an OTel exporter this panel cannot
+ * drive) is refused rather than guessed at.
+ */
+export const resumableAgent = (
+  s: { source_app?: string | null; model_name?: string | null },
+): AgentKind | null => {
+  const a = agentOf(s);
+  if (a !== "claude") return a; // named itself; nothing to second-guess
+  const p = providerOf(s.model_name);
+  return p === "Anthropic" || p === UNKNOWN ? "claude" : null;
+};
+
+export const agentOf = (s: { source_app?: string | null; model_name?: string | null }): AgentKind => {
+  const app = (s.source_app ?? "").toLowerCase();
+  // Antigravity is matched on `source_app` alone, and only on `source_app`.
+  // Its events are minted by this server (server/src/antigravity.ts), which
+  // sets the name, so the signal is exact rather than a guess — and the model
+  // is no help at all here: `agy` runs Claude and open-weight models as
+  // happily as Gemini ones, so a model-name fallback would file half its
+  // sessions under the wrong CLI.
+  if (app.startsWith("antigravity")) return "antigravity";
+  if (app.startsWith("codex")) return "codex";
+  if (/^(gpt|o[134])[-.]/i.test(s.model_name ?? "")) return "codex";
+  return "claude";
+};
+
+/**
+ * Every provider the cockpit has seen, for the header's filter.
+ *
+ * Takes both sources on purpose. `agents` is derived from the live event
+ * buffer, which is capped: a quiet agent — a Codex or Antigravity chat that ran
+ * nine events an hour ago — falls out of it as soon as a busy Claude session
+ * fills it, and any provider it was the only evidence for leaves the filter
+ * with it. That is how the dashboard came to offer "Anthropic" as the only
+ * provider ever seen while the server's own scoped answer listed three models.
+ *
+ * `sessions` is the roll-up over the whole retention window, so it carries the
+ * quiet ones; `agents` is the fresher of the two and carries a session that
+ * started since the last poll. Neither alone is right.
+ *
+ * `unknown` — sessions whose model never resolved — is kept as a real bucket so
+ * it can be filtered to and the per-provider views still add up, but sorted
+ * last so it never leads the list.
+ */
+export function providersSeen(
+  sessions: { session_id: string; model_name?: string | null }[],
+  agents: { session_id: string; model_name?: string | null }[],
+): string[] {
+  const bySession = new Map<string, string>();
+  for (const s of sessions) if (s.model_name) bySession.set(s.session_id, providerOf(s.model_name));
+  for (const a of agents) if (a.model_name) bySession.set(a.session_id, providerOf(a.model_name));
+  const seen = new Set(bySession.values());
+  const known = [...seen].filter((p) => p !== UNKNOWN).sort();
+  return seen.has(UNKNOWN) ? [...known, UNKNOWN] : known;
+}

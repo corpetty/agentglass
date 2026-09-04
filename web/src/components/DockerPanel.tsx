@@ -1,17 +1,20 @@
 // Live Docker — agentglass's lazydocker replacement. Containers grouped by
 // compose project with live CPU/mem, a streaming-ish log viewer, and start/
 // stop/restart/rm actions. Images / volumes / networks get their own tabs.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { viewHeaderClass, viewHeaderStyle, viewTitleClass } from "./workspace/ViewHeader.tsx";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { PlayIcon, RefreshIcon } from "../lib/glyphIcons.tsx";
+import { viewHeaderClass, viewHeaderStyle } from "./workspace/ViewHeader.tsx";
 import type { DockerOverview, DockerContainer, DockerStat, DockerCapability } from "../../../shared/types.ts";
 import { depSpec } from "../../../shared/deps.ts";
 import { api } from "../lib/api.ts";
 import { Select } from "./Select.tsx";
-import { SCROLLBAR_CSS, CODE_FONT_STYLE } from "./ChangesModal.tsx";
+import { SCROLLBAR_CSS, CODE_FONT_STYLE } from "./diff/DiffLines.tsx";
 import { ConsoleStrip, consoleRoot, runInConsole } from "./TerminalPanel.tsx";
 import { useSidebarWidth } from "../lib/sidebarWidth.ts";
 import { SidebarGrip } from "./SidebarGrip.tsx";
 import { useDialogs } from "./ConfirmDialog.tsx";
+import { CloseIcon } from "./CloseButton.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 // Strip ANSI CSI (colors, cursor moves, erases) + OSC sequences, not just SGR.
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g; // eslint-disable-line no-control-regex
@@ -103,9 +106,9 @@ function Stack({ id, label, n, open, active, onToggle, onActivate, children }: {
         className="w-full flex items-center gap-2 px-2.5 py-1 sticky top-0 z-20 text-left"
         style={{ background: "var(--bg2)", borderLeft: `2px solid ${active ? "var(--primary)" : "transparent"}` }}
         aria-expanded={open}>
-        <span className="text-[8px] t-dim2 w-2 shrink-0">{open ? "▾" : "▸"}</span>
+        <span className="text-[10px] t-dim2 w-2 shrink-0">{open ? "▾" : "▸"}</span>
         <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: active ? "var(--text)" : "var(--text2)" }}>{label}</span>
-        <span className="text-[9px] t-dim2 tabular-nums">{n}</span>
+        <span className="text-[10px] t-dim2 tabular-nums">{n}</span>
       </button>
       {open && children}
     </div>
@@ -116,10 +119,10 @@ function Stack({ id, label, n, open, active, onToggle, onActivate, children }: {
 function StackRow({ label, meta, dim, onClick }: { label: string; meta?: string; dim?: boolean; onClick: () => void }) {
   return (
     <div onClick={onClick} title={label}
-      className="flex items-center gap-2 pl-6 pr-2 py-[3px] cursor-pointer rounded-md"
+      className="flex items-center gap-2 pl-6 pr-2 py-1 cursor-pointer rounded-md"
       style={{ opacity: dim ? 0.5 : 1 }}>
       <span className="min-w-0 flex-1 truncate text-[10.5px]" style={{ color: "var(--text2)" }}>{label}</span>
-      {meta && <span className="text-[9px] t-dim2 shrink-0 tabular-nums">{meta}</span>}
+      {meta && <span className="text-[10px] t-dim2 shrink-0 tabular-nums">{meta}</span>}
     </div>
   );
 }
@@ -135,7 +138,7 @@ function ContainerRow({ c, stat, active, writeEnabled, busy, dense, onSelect, on
   const port = /(\d+)->/.exec(c.ports || "")?.[1];
   return (
     <div onClick={onSelect} data-cid={active ? "active" : undefined}
-      className={`group grid items-center gap-x-2 pl-2 pr-1.5 rounded-md cursor-pointer ${dense ? "py-[2px]" : "py-1"}`}
+      className={`group grid items-center gap-x-2 pl-2 pr-1.5 rounded-md cursor-pointer ${dense ? "py-0.5" : "py-1"}`}
       // A grid, not a flex row: every container's numbers line up in the same
       // columns, which is what makes a list of twelve scannable instead of
       // twelve individually-arranged lines. lazydocker does the same.
@@ -152,7 +155,7 @@ function ContainerRow({ c, stat, active, writeEnabled, busy, dense, onSelect, on
             Underneath, dimmer, it reads as what it is — provenance, not
             identity. In dense mode it goes back to the tooltip, which is the
             trade: half the rows, one less thing per row. */}
-        {!dense && <span className="truncate text-[9px] t-dim2">{c.image}</span>}
+        {!dense && <span className="truncate text-[10px] t-dim2">{c.image}</span>}
       </span>
 
       {/* Numbers, not two unlabelled bars. A bar with no scale and no figure
@@ -164,7 +167,7 @@ function ContainerRow({ c, stat, active, writeEnabled, busy, dense, onSelect, on
         title={stat ? `memory ${stat.mem}% (${stat.memUsage})` : undefined}>
         {stat && running ? `${stat.mem.toFixed(0)}%` : ""}
       </span>
-      <span className="text-[9px] tabular-nums truncate" style={{ color: running ? "var(--info)" : "var(--text4)" }}>
+      <span className="text-[10px] tabular-nums truncate" style={{ color: running ? "var(--info)" : "var(--text4)" }}>
         {/* A stopped container has no numbers, and three blank columns read as
             missing data rather than as "this is not running". */}
         {running ? (port ? `:${port}` : "") : c.state}
@@ -179,12 +182,12 @@ function ContainerRow({ c, stat, active, writeEnabled, busy, dense, onSelect, on
       <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
         {writeEnabled && (running
           ? <>
-              <DockerAction onClick={() => onAction("restart")} disabled={busy} tint="var(--warning)" title="Restart">⟳</DockerAction>
+              <DockerAction onClick={() => onAction("restart")} disabled={busy} tint="var(--warning)" title="Restart"><RefreshIcon /></DockerAction>
               <DockerAction onClick={() => onAction("stop")} disabled={busy} tint="var(--error)" title="Stop">■</DockerAction>
             </>
           : <>
               <DockerAction onClick={() => onAction("start")} disabled={busy} tint="var(--success)" title="Start">▶</DockerAction>
-              <DockerAction onClick={() => onAction("rm")} disabled={busy} tint="var(--error)" title="Remove this container">✕</DockerAction>
+              <DockerAction onClick={() => onAction("rm")} disabled={busy} tint="var(--error)" title="Remove this container"><CloseIcon size={ICON.sm} /></DockerAction>
             </>)}
       </div>
     </div>
@@ -511,7 +514,7 @@ export function DockerView({ active }: { active: boolean }) {
       className="flex-1 min-h-0 flex flex-col outline-none overflow-hidden relative">
                 <style>{SCROLLBAR_CSS}</style>
                 <div className={viewHeaderClass} style={viewHeaderStyle}>
-                  <span className={viewTitleClass} style={{ color: "var(--text)" }}>Docker</span>
+                  <h2 className="sr-only">Docker</h2>
                   {ov?.version && <span className="text-[10px] t-dim2">Engine {ov.version}</span>}
                   {/* Scoped to the open project. The fallback case is spelled out
                       rather than shown as an empty list, so an unlabelled stack
@@ -538,7 +541,7 @@ export function DockerView({ active }: { active: boolean }) {
                         : { color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 35%, transparent)" }}>
                       Dense
                     </button>
-                    <button onClick={() => { loadOverview(); loadStats(); }} title="Refresh" className="text-[13px] px-2 py-1 rounded-lg" style={{ color: "var(--text2)" }}>⟳</button>
+                    <button onClick={() => { loadOverview(); loadStats(); }} title="Refresh" className="text-[13px] px-2 py-1 rounded-lg" style={{ color: "var(--text2)" }}><RefreshIcon /></button>
                   </div>
                 </div>
 
@@ -564,7 +567,7 @@ export function DockerView({ active }: { active: boolean }) {
                         <div key={proj} className="mb-1">
                           <div className="flex items-center gap-2 px-2.5 py-1 sticky top-0 z-10" style={{ background: "var(--bg2)" }}>
                             <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: "var(--text2)" }}>{proj}</span>
-                            <span className="text-[9px] t-dim2 tabular-nums">{cs.filter((c) => c.state === "running").length}/{cs.length}</span>
+                            <span className="text-[10px] t-dim2 tabular-nums">{cs.filter((c) => c.state === "running").length}/{cs.length}</span>
                             {/* Names the columns once per project, in the same
                                 grid the rows use, so the figures below are not
                                 three anonymous numbers. */}
@@ -575,7 +578,7 @@ export function DockerView({ active }: { active: boolean }) {
                             {writeEnabled && (
                               <span className="flex items-center gap-1 ml-2">
                                 {cs.some((c) => c.state !== "running") && (
-                                  <DockerAction onClick={() => doGroupAction(cs, "start")} disabled={busy} tint="var(--success)" title={`Start every stopped container in ${proj}`}>▶</DockerAction>
+                                  <DockerAction onClick={() => doGroupAction(cs, "start")} disabled={busy} tint="var(--success)" title={`Start every stopped container in ${proj}`}><PlayIcon /></DockerAction>
                                 )}
                                 {cs.some((c) => c.state === "running") && (
                                   <>
@@ -708,6 +711,38 @@ export function DockerView({ active }: { active: boolean }) {
                         hints nobody found it — and a shell docked under the
                         logs is the sort of thing you only use if you know it
                         is there. It reads as an action, not as a legend. */}
+                    {/*
+                      * Hand the work to tmux, so closing agentglass cannot take
+                      * it with it.
+                      *
+                      * The sidecar runs with AGENTGLASS_DIE_WITH_PARENT=1 — it
+                      * is tied to the window — so every shell it owns dies when
+                      * the window does. A `make app.build` five minutes in goes
+                      * with it, which is exactly what happened.
+                      *
+                      * A tmux server is nobody's child. Run the build inside one
+                      * and closing agentglass DETACHES rather than kills;
+                      * pressing this again re-attaches to the same session, mid
+                      * build, scrollback and all. `-A` is what makes it one
+                      * button instead of two: attach if it exists, create if it
+                      * does not.
+                      *
+                      * Deliberately typed into the console rather than built
+                      * into the terminal. It changes nothing until it is
+                      * pressed, it is undone by typing `exit`, and it leaves the
+                      * Terminal view and its tabs completely alone — which is
+                      * the whole reason it is one line here instead of a change
+                      * to how shells are started.
+                      */}
+                    {/* The "keep running" button used to be here.
+                        It typed `tmux new-session -A -s …` into this shell — a
+                        BARE tmux, which is the machine's own server with the
+                        machine's own config, borrowed to make an app shell
+                        outlive the app. The console runs on the engine now, in
+                        a session of its own, so it already outlives the window
+                        and comes back where you left it. A button that offers
+                        what is already true is a button that teaches people the
+                        thing was optional. */}
                     <button
                       onClick={() => (consoleOpen ? closeConsole() : setConsoleOpen(true))}
                       className="ml-1 px-2.5 py-1 rounded-lg text-[10.5px] font-medium whitespace-nowrap transition-colors flex items-center gap-1.5"
@@ -720,7 +755,7 @@ export function DockerView({ active }: { active: boolean }) {
                     >
                       <span style={{ fontSize: 11 }}>{consoleOpen ? "▾" : "▸"}</span>
                       <span>Console</span>
-                      <kbd className="text-[8.5px] px-1 py-[1px] rounded" style={{ border: "1px solid color-mix(in srgb, var(--primary) 35%, transparent)", opacity: 0.85 }}>shell</kbd>
+                      <kbd className="text-[8.5px] px-1 py-px rounded" style={{ border: "1px solid color-mix(in srgb, var(--primary) 35%, transparent)", opacity: 0.85 }}>shell</kbd>
                     </button>
                     <span className="ml-auto">Logs auto-refresh · stats every 5s</span>
                   </div>

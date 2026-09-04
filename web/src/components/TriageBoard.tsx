@@ -1,0 +1,959 @@
+// The pull requests that want something from you, in lanes.
+//
+// A board rather than a table, and it is only ever a board over the pull
+// requests you have a stake in — yours, and the ones you were asked to look at.
+// Three hundred and ninety open pull requests are a table; the table is still
+// there, one click away, and this never pretends it could show them.
+//
+// The two pills it replaces were "Mine" and "Needs my review", and they were
+// mutually exclusive: the two populations you care about could not be on screen
+// together. Here they are two lanes, side by side, which is the whole point.
+//
+// Nothing is fetched for this. It reads the two lists the panel already loads
+// for the pill counts — see stakeFrom in prLanes.ts — so the board costs what
+// the pill row cost, and the numbers cannot disagree with their source.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PrSummary } from "../../../shared/types.ts";
+import { LANES, LANE_CAP, board as fileAll, suggestedAction, ACTION_LABEL, type Filed } from "../lib/prLanes.ts";
+import { taskLink, taskLinkTitle } from "../lib/taskLink.ts";
+import { Avatar } from "./Avatar.tsx";
+import { askingBehind, behindOf, onBehind } from "../lib/prBehindStore.ts";
+import { onRollup, rollupOf } from "../lib/prRollupStore.ts";
+import { stamp } from "../lib/whenStamp.ts";
+
+const edge = (pct: number) => `1px solid color-mix(in srgb, var(--text) ${pct}%, transparent)`;
+const TRUNKS = new Set(["main", "master", "trunk", "develop", "development"]);
+
+/** How long nothing may happen before a pull request counts as quiet. */
+const QUIET_DAYS = 30;
+
+/**
+ * Has nothing at all happened to it in a month?
+ *
+ * `updatedAt` is the only clock on `PrSummary`, and it is GitHub's "last
+ * touched by anything" — a push, a comment, a label. There is no push
+ * timestamp on a summary and asking for one would be the per-card request this
+ * board exists to avoid, so the footer says what is actually measured: thirty
+ * days without a push OR a comment. Everything counted here really has had no
+ * push, because a push would have moved this; there may be more that were
+ * commented on and never pushed to. A floor, never an invention.
+ *
+ * A date that will not parse is not quiet. The list arrives in two passes and
+ * fixtures hand over empty strings — counting those would put a number on
+ * screen whose real meaning is "we could not read it".
+ */
+function quietAWhile(iso: string): boolean {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) && Date.now() - t > QUIET_DAYS * 86_400_000;
+}
+
+type Card = PrSummary & { filed: Filed };
+
+export function TriageBoard({
+  mine, review, total, hasTaskProvider, pinned,
+  onOpen, onTogglePin, onShowTable, onAct, busy, acting, loading, settling, pinnedList, root,
+}: {
+  /** The `mine` scope, as the panel already has it. */
+  mine: PrSummary[];
+  /** The `review` scope, likewise. Membership of these two IS the stake. */
+  review: PrSummary[];
+  /** Every open pull request, for the sentence that states the board's scope. */
+  total: number;
+  /** Whether anything is connected that could resolve a work-item id — see
+   *  taskLink.ts for why a convention-shaped id is hidden without one. */
+  hasTaskProvider: boolean;
+  pinned: (n: number) => boolean;
+  onOpen: (n: number) => void;
+  onTogglePin: (p: PrSummary) => void;
+  onShowTable: () => void;
+  /** Perform the card's one suggested action. Only the ones this app can
+   *  really do reach here — see suggestedAction. */
+  onAct: (p: PrSummary, what: "open" | "merge" | "rerun") => void;
+  /** True while an action is in flight, so a card cannot be pressed twice. */
+  busy?: boolean;
+  /** Which pull request that action is on. The board disables every card while
+   *  one runs; the spinner belongs to the one you pressed. */
+  acting?: number | null;
+  /**
+   * The ones you pinned, whoever opened them.
+   *
+   * Not a lane, and not for want of a column: a pin is a fact about YOU, and
+   * the lanes are facts about what a pull request needs. It also reaches
+   * further than they do — you can pin a colleague's, which no lane here will
+   * ever contain — so filing it in one would be wrong twice.
+   *
+   * It sits at the foot of the first column, in the same place every time. Two
+   * of these columns are usually empty and it is tempting to put it wherever
+   * the space happens to be; a thing that moves is a thing you hunt for.
+   */
+  pinnedList?: { number: number; title: string }[];
+  /**
+   * The two lists are still being fetched and nothing has arrived yet.
+   *
+   * Without this the board cannot tell its two zeroes apart: `mine` and
+   * `review` start as empty arrays and are replaced when the calls land, so a
+   * board that has not loaded renders exactly like a board with nothing on it
+   * — five "Nothing here. Good." columns, which is a claim, on no evidence, at
+   * the moment the answer is least knowable. Optional because a caller that
+   * cannot say gets today's behaviour rather than a wrong wait.
+   */
+  loading?: boolean;
+  /**
+   * The rows are here and their check states are not.
+   *
+   * The list arrives in two passes, and which lane a pull request belongs in is
+   * mostly a question about its checks — so a board painted from the first pass
+   * files everything it cannot decide under "yours, in flight" and then moves
+   * it when the second lands. Reported exactly that way: cards appearing in one
+   * column and hopping to another a few seconds later.
+   *
+   * A card that moves on its own is worse than a card that is late. So the
+   * skeleton stays up until the answer is whole — with a deadline, held by the
+   * caller, because a rollup that never arrives must not mean a board that
+   * never draws.
+   */
+  settling?: boolean;
+  /** The checkout these pull requests belong to — needed to ask how far behind
+   *  each branch is, which is not on the list payload. See prBehindStore. */
+  root?: string;
+}) {
+  /* Answers arriving one at a time, each one a re-render of the board and
+     nothing else — the cards do not move, a chip appears on one of them. */
+  const [, bump] = useState(0);
+  useEffect(() => onBehind(() => bump((n) => n + 1)), []);
+  /*
+   * A card that claims failure asks whether it is true.
+   *
+   * The list's rollup is GitHub's aggregate counts, which count a re-run's old
+   * attempt beside the new one — measured on a pull request their own page
+   * calls "All checks have passed" and whose aggregate says FAILURE. Only the
+   * cards claiming red ask, only while they are on screen, and the answer is
+   * remembered for a minute. Everything green is already telling the truth.
+   */
+  const [, bumpRollup] = useState(0);
+  useEffect(() => onRollup(() => bumpRollup((n) => n + 1)), []);
+  const trueChecks = useCallback((p: PrSummary): PrSummary => {
+    if (!root || !p.checks || p.checks.failure === 0) return p;
+    const real = rollupOf(root, p.number);
+    return real ? { ...p, checks: real } : p;
+  }, [root]);
+
+  const lanes = useMemo(() => {
+    // De-duplicated by number before filing: a pull request that is both yours
+    // and asked of you arrives twice, and would otherwise be drawn twice.
+    const by = new Map<number, PrSummary>();
+    for (const p of [...mine, ...review]) if (!by.has(p.number)) by.set(p.number, trueChecks(p));
+    const m = new Set(mine.map((p) => p.number));
+    const r = new Set(review.map((p) => p.number));
+    return fileAll([...by.values()], (p) => ({ mine: m.has(p.number), asked: r.has(p.number) }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mine, review, trueChecks, bumpRollup]);
+
+  const cards = useMemo(() => [...lanes.values()].flat(), [lanes]);
+  const involved = cards.length;
+  const canLand = lanes.get("land")?.length ?? 0;
+  // Only over the cards in hand. The other few hundred are not loaded here and
+  // never will be — see the footer, which says whose staleness this is.
+  const quiet = useMemo(() => cards.filter((p) => quietAWhile(p.updatedAt)).length, [cards]);
+
+  /* Waiting is only waiting while there is nothing to show. A refresh with the
+     previous answer still on screen must not blank it: last minute's board is
+     a better answer than a skeleton, and it is about to be right again.
+     `settling` is the other half — see the prop. */
+  const waiting = (!!loading && involved === 0) || !!settling;
+  const rest = total - involved;
+  /*
+   * Whether `total` can be repeated out loud.
+   *
+   * It is the panel's count of every open pull request, and it has been wrong:
+   * it used to be the CURRENT FILTER's count, which had the board announce
+   * "the other 0 are a table" over a repository with 388 open. A total smaller
+   * than the board standing in front of it is the one case that is provably
+   * wrong from in here — the two lists are the evidence — so every sentence
+   * built on it drops its number instead of repeating it. Clamping is how a
+   * wrong number gets to sound like a right one.
+   */
+  const totalKnown = rest >= 0;
+  const tableLabel = rest > 0 ? `Show all ${total} as a table` : "Show the table";
+
+  /*
+   * The keyboard, and why the cursor is a pair rather than an index.
+   *
+   * A board has two axes and a flat index has one, so `j` from the bottom of a
+   * lane would wrap into the top of the next — which reads as the cursor
+   * teleporting. Lane and row, and `j` at the end of a lane simply stops.
+   */
+  /*
+   * The columns actually drawn.
+   *
+   * `LANES` is the policy; this is the screen. Only one lane opts out of being
+   * shown empty — see `hideWhenEmpty` — and everything downstream counts
+   * columns rather than lanes so the keyboard's 1–5, the h/l walk and the grid
+   * template all agree with what is in front of you.
+   */
+  const cols = useMemo(
+    () => LANES.filter((l) => !l.hideWhenEmpty || (lanes.get(l.id)?.length ?? 0) > 0),
+    [lanes],
+  );
+  /*
+   * What is being looked for in the cards on screen.
+   *
+   * Everything a card SHOWS is searchable, and nothing it does not: the number,
+   * the title, the author, both branches and the labels. Matching on something
+   * invisible is how a search comes back with a card whose row says nothing
+   * about why it is there.
+   */
+  const [find, setFind] = useState("");
+  const findRef = useRef<HTMLInputElement>(null);
+  const needle = find.trim().toLowerCase();
+  const matches = useCallback((p: PrSummary) => {
+    if (!needle) return true;
+    const hay = [
+      `#${p.number}`, String(p.number), p.title, p.author, p.headRefName, p.baseRefName,
+      ...(p.labels ?? []).map((l) => l.name),
+      /* The PEOPLE, which is the question this box is actually asked: "where is
+         Javi on this board". It matched the author and stopped, so typing a
+         name dimmed every card — including the one saying "Waiting on
+         javidoe" in as many words. Assignees and requested reviewers both:
+         who owns it and who is being waited on are one question to somebody
+         looking for their own name. */
+      ...(p.assignees ?? []),
+      ...(p.reviewers ?? []).map((r) => r.login),
+    ].join(" ").toLowerCase();
+    return hay.includes(needle);
+  }, [needle]);
+  const hits = useMemo(() => (needle ? cards.filter(matches).length : 0), [needle, cards, matches]);
+  /**
+   * Lanes opened past their cap, by lane id.
+   *
+   * The cap keeps the board a glance, and the four it left over used to be a
+   * button that sent you to the TABLE — a different surface, sorted
+   * differently, with the lane you were reading nowhere in it. "¿Qué sentido
+   * tiene tener las cards entonces?" is the right question: the rest of a lane
+   * belongs in the lane. The board already holds those rows; only the slice was
+   * hiding them.
+   */
+  const [openLanes, setOpenLanes] = useState<Record<string, boolean>>({});
+  const [cur, setCur] = useState<{ lane: number; row: number }>({ lane: 0, row: 0 });
+  const frame = useRef<HTMLDivElement>(null);
+  // Keyboard navigation walks exactly what is drawn — an opened lane included,
+  // or j past the cap would step onto a card nobody can see.
+  const shown = useCallback((i: number) => {
+    const id = cols[i]?.id ?? "review";
+    const all = lanes.get(id) ?? [];
+    return openLanes[id] ? all : all.slice(0, LANE_CAP);
+  }, [lanes, cols, openLanes]);
+  const at = shown(cur.lane)[cur.row];
+
+  // Keep the cursor on something. Lanes empty and fill as checks land, and a
+  // cursor left pointing past the end is a keypress that does nothing.
+  useEffect(() => {
+    const n = shown(cur.lane).length;
+    if (n === 0) {
+      const next = cols.findIndex((_, i) => shown(i).length > 0);
+      if (next >= 0) setCur({ lane: next, row: 0 });
+    } else if (cur.row >= n) setCur((c) => ({ ...c, row: n - 1 }));
+  }, [lanes, cur.lane, cur.row, shown, cols]);
+
+  useEffect(() => {
+    frame.current?.querySelector<HTMLElement>("[data-cur=\"1\"]")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [cur]);
+
+  const onKey = (e: React.KeyboardEvent) => {
+    /* ⌃F before the typing guard, because the whole point of it is to reach the
+       box from wherever you are — including from inside it, where it selects
+       what is already there rather than doing nothing. */
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      findRef.current?.focus();
+      findRef.current?.select();
+      return;
+    }
+    // Never while somebody is typing in the filter above.
+    if ((e.target as HTMLElement)?.closest?.("input,textarea")) return;
+    const k = e.key;
+    if (k >= "1" && k <= String(cols.length)) {
+      const i = Number(k) - 1;
+      if (shown(i).length) { e.preventDefault(); setCur({ lane: i, row: 0 }); }
+      return;
+    }
+    if (k === "j" || k === "ArrowDown") { e.preventDefault(); setCur((c) => ({ ...c, row: Math.min(c.row + 1, Math.max(0, shown(c.lane).length - 1)) })); return; }
+    if (k === "k" || k === "ArrowUp") { e.preventDefault(); setCur((c) => ({ ...c, row: Math.max(0, c.row - 1) })); return; }
+    if (k === "h" || k === "ArrowLeft") { e.preventDefault(); setCur((c) => ({ lane: Math.max(0, c.lane - 1), row: 0 })); return; }
+    if (k === "l" || k === "ArrowRight") { e.preventDefault(); setCur((c) => ({ lane: Math.min(cols.length - 1, c.lane + 1), row: 0 })); return; }
+    if (!at) return;
+    if (k === "Enter") { e.preventDefault(); onOpen(at.number); return; }
+    if (k === "p") { e.preventDefault(); onTogglePin(at); return; }
+    // One key for "do the thing this card is asking for", whatever that is in
+    // this lane — the same button the card draws, so the two cannot drift.
+    /* `a` opens it too. It used to perform the lane's action from the keyboard,
+       which is the same loaded gun as the button — worse, because a cursor you
+       cannot see decides which card it points at. */
+    if (k === "a") { e.preventDefault(); onAct(at, "open"); return; }
+  };
+
+  return (
+    /*
+     * `h-full`, and the whole layout below hangs off it.
+     *
+     * The board is handed a height by the panel — it must take it rather than
+     * grow past it, because everything above the cards is what a board is FOR.
+     * When this frame was allowed to grow, the panel's own scrollbar carried
+     * it, and the first long lane pushed the scope sentence, the lane
+     * headings and the keys off the top: you were left scrolling a wall of
+     * cards with nothing on screen saying which lane you were in. The
+     * scrolling belongs to each column, one per lane, below.
+     */
+    <div ref={frame} tabIndex={0} onKeyDown={onKey} className="flex flex-col h-full min-h-0 outline-none">
+      {/* The scope, said out loud. A board whose reach nobody states is a board
+          nobody trusts — and the first question anybody asks it is "where are
+          the other three hundred". */}
+      <div className="shrink-0 px-4 pt-3 pb-1 text-[12.5px] flex items-start gap-4">
+        <div className="min-w-0 flex-1">
+        {waiting ? (
+          <>
+            {/* No number, because there is no number yet. A zero here is the
+                same lie the empty lanes used to tell, in bigger type. */}
+            <b className="text-[17px] font-semibold" style={{ color: "var(--text4)" }}>…</b>
+            <span className="ml-1">Reading the two lists this board is made of</span>
+            <span className="block text-[11px] mt-2" style={{ color: "var(--text3)" }}>
+              Yours, and the ones you were asked to look at. Until both are in, an empty lane means nothing.
+            </span>
+          </>
+        ) : (
+          <>
+            <b className="text-[17px] font-semibold">{involved}</b>
+            <span className="ml-1">
+              {totalKnown ? `of ${total} open pull requests` : "open pull requests"} want something from you
+            </span>
+            <span className="block text-[11px] mt-2" style={{ color: "var(--text3)" }}>
+              Yours, and the ones you were asked to look at. The board never shows more than that
+              {" — "}
+              <button onClick={onShowTable} style={{ color: "var(--primary)" }}>
+                {rest > 0 ? `the other ${rest} are a table` : "the rest are a table"}
+              </button>.
+              {canLand > 0 && <> <span style={{ color: "var(--success)" }}>{canLand}</span> can land right now.</>}
+            </span>
+          </>
+        )}
+        </div>
+        {/*
+          * Find, in the board, in the space the summary leaves.
+          *
+          * Not the bar at the top: that one asks GitHub, and pressing return in
+          * it leaves the board for a table of every pull request in the
+          * repository. This is the other question — "which of THESE twelve" —
+          * and the honest answer to it is not a shorter board. A card that
+          * stops being drawn takes its lane'"'"'s shape with it, and the counts
+          * above would start disagreeing with what is under them.
+          *
+          * So nothing is removed: the ones that match keep their colour and the
+          * rest go quiet. Same board, same places, one part of it lit.
+          */}
+        {!waiting && involved > 0 && (
+          <div className="shrink-0 flex items-center gap-1.5">
+            <input
+              ref={findRef}
+              value={find}
+              onChange={(e) => setFind(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Escape") { setFind(""); (e.target as HTMLInputElement).blur(); }
+              }}
+              placeholder="Find in these  ⌃F"
+              spellCheck={false}
+              className="text-[11px] px-2 py-1 rounded-md outline-none"
+              style={{ width: 190, background: "var(--bg2)", color: "var(--text)",
+                border: `1px solid ${find ? "var(--primary)" : "color-mix(in srgb, var(--text) 16%, transparent)"}` }} />
+            {find && (
+              <span className="text-[10.5px] tabular-nums whitespace-nowrap"
+                style={{ color: hits ? "var(--primary)" : "var(--warning)" }}>
+                {hits} of {involved}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/*
+        * Every lane's count on one line.
+        *
+        * A summary, and deliberately not a second way to navigate: the lanes
+        * are directly underneath, 1–5 already jumps to them, and a row of
+        * buttons up here would read as filters that shrink the board. What it
+        * buys is the lanes you cannot see — five columns at 268px do not fit a
+        * narrow window, and the counts scrolled off the right edge are exactly
+        * what you want before deciding to go and look.
+        */}
+      {!waiting && (
+        <div className="shrink-0 flex flex-wrap gap-1 px-4 pb-1.5">
+          {cols.map((l) => {
+            const n = lanes.get(l.id)?.length ?? 0;
+            return (
+              <span key={l.id} data-seg={l.id}
+                className="inline-flex items-baseline gap-1.5 rounded px-2 py-0.5 text-[10.5px]"
+                style={{
+                  color: l.tint,
+                  border: `1px solid color-mix(in srgb, ${l.tint} 45%, transparent)`,
+                  // An empty lane is still worth a segment — "none asked of you"
+                  // is an answer — but it should not compete with a lane of six.
+                  opacity: n ? 1 : 0.5,
+                }}>
+                <b className="tabular-nums font-semibold">{n}</b>
+                <span style={{ color: "var(--text3)" }}>{l.label.toLowerCase()}</span>
+              </span>
+            );
+          })}
+          <span className="inline-flex items-baseline rounded px-2 py-0.5 text-[10.5px] tabular-nums"
+            style={{ color: "var(--text4)", border: edge(16) }}>
+            {totalKnown ? `${involved} / ${total}` : `${involved} on the board`}
+          </span>
+        </div>
+      )}
+
+      {/* The keys, printed. A board with a keyboard nobody is told about is a
+          board with no keyboard. */}
+      <div className="shrink-0 flex gap-3 flex-wrap px-4 pb-1.5 text-[9.5px]" style={{ color: "var(--text4)" }}>
+        <span><K>1</K>–<K>{cols.length}</K> lane</span>
+        <span><K>j</K><K>k</K> card</span>
+        <span><K>h</K><K>l</K> across</span>
+        <span><K>⏎</K> open</span>
+        <span><K>a</K> open it</span>
+        <span><K>p</K> pin</span>
+      </div>
+
+      {/* Sideways only. The five columns still have to be reachable on a narrow
+          window; the up-and-down is each column's own, below. */}
+      <div className="flex-1 min-h-0 overflow-x-auto overflow-y-hidden agx-scroll px-4 pb-3">
+        {!waiting && involved === 0 ? (
+          /* Loaded, and genuinely nothing. Said once, plainly, instead of five
+             columns each announcing its own emptiness — which is the same
+             sentence five times and reads as a board that failed to load. */
+          <div className="h-full grid place-items-center text-center">
+            <div style={{ maxWidth: 400 }}>
+              <div className="text-[13px]" style={{ color: "var(--text2)" }}>Nothing wants anything from you.</div>
+              <p className="m-0 mt-1.5 text-[11px] leading-snug" style={{ color: "var(--text3)" }}>
+                No open pull request of yours, and nobody has asked you to look at one. Both lists
+                are in — this is an answer, not a wait.
+              </p>
+              <button onClick={onShowTable} className="agx-btn mt-3 rounded px-2 py-1 text-[10.5px]"
+                style={{ color: "var(--text2)", border: edge(20) }}>
+                {tableLabel}
+              </button>
+              {/* An empty board is precisely when a pin is the only thing left
+                  on screen. Hiding it here would make the feature vanish at the
+                  moment it is the whole point. */}
+              <div className="mt-4 text-left">
+                <PinnedStrip list={pinnedList} onOpen={onOpen} />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="grid gap-2.5 h-full" style={{ gridTemplateColumns: `repeat(${cols.length}, minmax(268px, 1fr))` }}>
+            {cols.map((l, i) => {
+              const all = lanes.get(l.id) ?? [];
+              const opened = !!openLanes[l.id];
+              const rows = opened ? all : all.slice(0, LANE_CAP);
+              const more = all.length - rows.length;
+              return (
+                /* A column is a box of its own height: heading fixed, cards
+                   scrolling under it. `min-h-0` on both the column and its
+                   scroller or the flex chain hands them their content height
+                   and they grow instead of scrolling. `data-lane` names the box
+                   from outside — it is the thing that scrolls, so it is the
+                   thing a probe has to be able to point at. */
+                <div key={l.id} data-lane={l.id} className="min-w-0 min-h-0 flex flex-col rounded-sm"
+                  style={{ borderTop: `2px solid ${l.tint}` }}>
+                  <div className="shrink-0">
+                    {/*
+                      * One line, always — and that is what the ⓘ is for.
+                      *
+                      * The "why" ran to one line in some lanes and two in
+                      * others, so the first card of each column started at a
+                      * different height and the board read as though it had
+                      * been assembled carelessly. Alignment across five columns
+                      * is most of what makes a board scannable, and it cannot
+                      * survive a heading whose height depends on how long a
+                      * sentence happens to be.
+                      *
+                      * The sentence is not lost: it is what the ⓘ says, and it
+                      * is read once — when you are learning what a lane means —
+                      * not on every glance for ever after.
+                      */}
+                    <h3 className="flex items-center gap-2 m-0 pt-2 pb-2 px-0.5 text-[11px] font-semibold" style={{ color: l.tint }}>
+                      <span className="text-[13px] tabular-nums">{waiting ? "—" : all.length}</span>
+                      <span className="uppercase tracking-wide truncate">{l.label}</span>
+                      <span title={l.why} aria-label={l.why} role="note"
+                        className="shrink-0 grid place-items-center rounded-full cursor-help"
+                        style={{ width: 20, height: 20, fontSize: 14, color: "var(--text4)" }}>ⓘ</span>
+                      <span className="ml-auto text-[9px] px-1 rounded shrink-0" style={{ color: "var(--text4)", border: edge(16) }}>{i + 1}</span>
+                    </h3>
+                  </div>
+
+                  {/* `pb-2`: the last thing in a lane sat flush against the
+                      bottom edge of the column, and a bordered button there
+                      reads as clipped — "el botón Show fewer está como
+                      comido". Cards had `mb-2` between them and nothing after
+                      the final one. */}
+                  <div className="flex-1 min-h-0 overflow-y-auto agx-scroll pb-2">
+                    {waiting ? (
+                      /* The shape of the thing being waited for, and no text:
+                         a lane cannot honestly say how many it will hold. */
+                      <div aria-hidden>
+                        {[0, 1].map((k) => (
+                          <div key={k} className="rounded-lg mb-2 animate-pulse"
+                            style={{ height: 74, background: "var(--bg2)", border: edge(16), animationDelay: `${(i * 2 + k) * 0.08}s` }} />
+                        ))}
+                      </div>
+                    ) : (
+                      <>
+                        {rows.map((p, r) => (
+                          <CardView key={p.number} p={p} hasTaskProvider={hasTaskProvider}
+                            cursor={cur.lane === i && cur.row === r}
+                            pinned={pinned(p.number)} onOpen={() => onOpen(p.number)} onPin={() => onTogglePin(p)}
+                            onAct={onAct} busy={busy} acting={acting} dim={!matches(p)} root={root} />
+                        ))}
+                        {/* Counted, and openable HERE. The cap is what keeps
+                            the board a glance on a bad week; the rest of the
+                            lane is one press away and lands in the lane it
+                            belongs to, not in a table on the other side of the
+                            panel. The column already scrolls. */}
+                        {more > 0 && (
+                          <button onClick={() => setOpenLanes((o) => ({ ...o, [l.id]: true }))}
+                            title={`Show the other ${more} in this lane`}
+                            className="w-full rounded-md py-1 mb-2 text-[10px]"
+                            style={{ color: "var(--text3)", border: edge(16) }}>
+                            +{more} more in this lane
+                          </button>
+                        )}
+                        {opened && all.length > LANE_CAP && (
+                          <button onClick={() => setOpenLanes((o) => ({ ...o, [l.id]: false }))}
+                            title={`Back to the first ${LANE_CAP}`}
+                            className="w-full rounded-md py-1 mb-2 text-[10px]"
+                            style={{ color: "var(--text4)", border: edge(12) }}>
+                            Show fewer
+                          </button>
+                        )}
+                        {all.length === 0 && (
+                          <p className="m-0 px-0.5 text-[10.5px]" style={{ color: "var(--text4)" }}>Nothing here. Good.</p>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  {/* Always the first column, never "wherever there is room".
+                      Its own scroller, so a long pin list cannot push the lane
+                      above it out of reach. */}
+                  {i === 0 && !waiting && <PinnedStrip list={pinnedList} onOpen={onOpen} />}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/*
+        * The footer, and the two things it will not do.
+        *
+        * There is no "sweep the stale ones". agentglass has no API that closes,
+        * comments on or pokes a batch of pull requests, and a button that looks
+        * like it can is the same lie as a nudge on a card — the one thing this
+        * board has refused from the start.
+        *
+        * And the staleness is counted over THESE, not over the repository. The
+        * other few hundred are not loaded — that is the whole bargain of the
+        * board — so a number about them could only be made up. "Of these" is
+        * the honest scope, and it is said in the sentence rather than left for
+        * the reader to assume.
+        */}
+      {!waiting && involved > 0 && (
+        <div className="shrink-0 flex flex-wrap items-center gap-2.5 px-4 py-2 text-[10.5px]"
+          style={{ color: "var(--text3)", borderTop: edge(11) }}>
+          {!totalKnown ? (
+            <span>How many others are open is not a number this view can trust.</span>
+          ) : rest > 0 ? (
+            <span>The other <b style={{ color: "var(--text2)" }}>{rest}</b> open pull requests want nothing from you right now.</span>
+          ) : (
+            <span>That is every open pull request — there is nothing else.</span>
+          )}
+          <span style={{ color: "var(--text4)" }}>·</span>
+          <span title="Measured from each pull request's last update, which GitHub moves for a push, a comment or a label. Counted only over the ones on this board.">
+            {quiet > 0
+              ? <>{quiet} of these {quiet === 1 ? "has" : "have"} gone {QUIET_DAYS} days without a push or a comment</>
+              : <>everything here moved in the last {QUIET_DAYS} days</>}
+          </span>
+          <button onClick={onShowTable} className="agx-btn ml-auto rounded px-2 py-0.5"
+            style={{ color: "var(--text2)", border: edge(20) }}>
+            {tableLabel}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CardView({ p, hasTaskProvider, pinned, cursor, onOpen, onPin, onAct, busy, acting, dim, root }: {
+  p: Card; hasTaskProvider: boolean; pinned: boolean; cursor?: boolean;
+  /** The pull request whose action is running, so only its card spins. */
+  acting?: number | null;
+  /**
+   * A find is running and this card is not one of the answers.
+   *
+   * Quietened, never removed. A card that stops being drawn takes its lane's
+   * shape with it and the counts above start disagreeing with what is under
+   * them — and the reason you are looking at a board rather than a list is that
+   * the shape means something.
+   */
+  dim?: boolean;
+  /** Where to ask how far behind this branch is. Absent means do not ask. */
+  root?: string;
+  onOpen: () => void; onPin: () => void;
+  onAct: (p: PrSummary, what: "open" | "merge" | "rerun") => void; busy?: boolean;
+}) {
+  /* Asked for the first time by whoever draws the card, which is the thing that
+     knows it is on screen. Null until the answer lands. */
+  const behind = root ? behindOf(root, p.number) : null;
+  const asking = root ? askingBehind(root, p.number) : false;
+  /** Said on the number itself for a moment: a clipboard write is invisible. */
+  const [copied, setCopied] = useState<number | null>(null);
+  const [copiedLink, setCopiedLink] = useState(false);
+  const copyLink = () => {
+    /* The URL GitHub itself would give you: `p.url` is already on the row, so
+       there is nothing to build and nothing to build wrong. */
+    void navigator.clipboard?.writeText(p.url || "").catch(() => {});
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 1200);
+  };
+  const copyNumber = (n: number) => {
+    void navigator.clipboard?.writeText(`#${n}`).catch(() => {});
+    setCopied(n);
+    setTimeout(() => setCopied(null), 1200);
+  };
+  const c = p.checks;
+  const act = suggestedAction(p, p.filed);
+  const task = taskLink(p, hasTaskProvider);
+  const tint = c.pending > 0 ? "var(--warning)" : c.verdict === "red" ? "var(--error)"
+    : c.verdict === "green" ? "var(--success)" : "var(--text4)";
+  /*
+   * How much of the suite has reported, as a percentage of the bar.
+   *
+   * Everything that has an answer counts, failures included: a red run that
+   * finished is a finished run, and drawing it half full would say "still
+   * going". `total` can be 0 — nothing has reported at all, which is an empty
+   * track rather than a full one.
+   */
+  const done = c.total > 0 ? Math.round(((c.total - c.pending) / c.total) * 100) : 0;
+  return (
+    /* `data-pr` because a card is the unit anything outside this file counts —
+       a test asking how many landed in a lane, a probe asking which column it
+       is measuring. The number is already on screen; this just makes it
+       addressable without reading the design. */
+    <div onClick={onOpen} role="button" tabIndex={-1} data-pr={p.number} data-cur={cursor ? "1" : undefined}
+      data-dim={dim ? "1" : undefined}
+      className="rounded-lg p-2 mb-2 cursor-pointer agx-btn"
+      style={{
+        border: cursor ? "1px solid color-mix(in srgb, var(--primary) 60%, transparent)" : edge(16),
+        background: "var(--bg2)",
+        boxShadow: cursor ? "inset 2px 0 0 var(--primary)" : undefined,
+        /* Saturation as well as opacity: these cards are read by colour — green
+           lane, red checks, amber waiting — and dimming alone leaves a row of
+           paler versions of the same signal still competing for the eye.
+           Draining the colour takes them out of that conversation while leaving
+           every word legible, which is the difference between "not this one"
+           and "gone". */
+        ...(dim ? { opacity: 0.32, filter: "saturate(0.25)" } : null),
+        transition: "opacity 120ms ease, filter 120ms ease",
+      }}>
+      {/*
+       * Title first, and the pin beside it.
+       *
+       * The pin used to be a 22px glyph in the bottom corner, which is a
+       * target you aim at rather than one you hit — and it sat under a
+       * sentence whose length decided where it ended up, so it moved between
+       * cards. It is 26px now, in the one place every card has in common, and
+       * the whole square is the button rather than the star inside it.
+       */}
+      <div className="flex gap-1.5 items-start text-[11.5px]" style={{ color: "var(--text)" }}>
+        {/*
+          * The number, and pressing it copies it.
+          *
+          * It is the thing you take away from a board — into a branch name, a
+          * commit, a message to somebody — and copying it meant opening the
+          * pull request to reach the button that does. `stopPropagation`
+          * because the card underneath opens on click, and this press means
+          * "give me the number", not "show me the page".
+          */}
+        {/* The same chip the pull request's own masthead wears — a bordered
+            number with ⧉ after it. Written as plain grey text it was a label,
+            and nobody presses a label; this one says what it does before you
+            try it, and the tick afterwards says it happened. */}
+        <button onClick={(e) => { e.stopPropagation(); copyNumber(p.number); }}
+          aria-live="polite"
+          title={copied === p.number ? "Copied!" : `Copy #${p.number}`}
+          className="agx-btn shrink-0 tabular-nums inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px]"
+          style={{
+            color: copied === p.number ? "var(--success)" : "var(--text3)",
+            border: `1px solid color-mix(in srgb, ${copied === p.number ? "var(--success) 50%" : "var(--border) 55%"}, transparent)`,
+            background: "color-mix(in srgb, var(--border) 14%, transparent)",
+          }}>
+          #{p.number}
+          <span aria-hidden style={{ fontSize: 9, opacity: 0.7 }}>{copied === p.number ? "✓" : "⧉"}</span>
+        </button>
+        {/* Two lines, then an ellipsis. A four-line title used to push the
+            state, the sentence and the button down by two rows, so a lane of
+            long titles was a lane you had to scroll — and the cards stopped
+            being the same shape, which is what made the column hard to read
+            down. The whole title is on the card's own tooltip. */}
+        <span className="min-w-0 flex-1" title={p.title}
+          style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden", overflowWrap: "anywhere" }}>
+          {p.title}
+        </span>
+        {/* Its address, beside the pin and the same size as it.
+            The number copies the number, which is what goes in a branch or a
+            commit; this is the other thing a card gets taken away as — a link
+            to paste into a message. A chain link, because that is what every
+            application on this machine draws for one. */}
+        <button onClick={(e) => { e.stopPropagation(); copyLink(); }}
+          title={copiedLink ? "Copied!" : `Copy the link to #${p.number}`}
+          aria-label={`Copy the link to #${p.number}`}
+          className="agx-btn shrink-0 -mt-0.5 grid place-items-center rounded-md"
+          style={{ width: 26, height: 26, lineHeight: 1,
+            color: copiedLink ? "var(--success)" : "var(--text3)",
+            border: "1px solid transparent", background: "transparent" }}>
+          {copiedLink ? (
+            <span style={{ fontSize: 13 }}>✓</span>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5" />
+              <path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5" />
+            </svg>
+          )}
+        </button>
+        <button onClick={(e) => { e.stopPropagation(); onPin(); }}
+          title={pinned ? `Unpin #${p.number}` : `Pin #${p.number} to the bar at the top`}
+          aria-label={pinned ? `Unpin #${p.number}` : `Pin #${p.number}`}
+          aria-pressed={pinned}
+          className="agx-btn shrink-0 -mt-0.5 -mr-0.5 grid place-items-center rounded-md"
+          style={{ width: 26, height: 26, fontSize: 15, lineHeight: 1,
+            color: pinned ? "var(--primary-hover)" : "var(--text3)",
+            border: pinned ? "1px solid color-mix(in srgb, var(--primary) 40%, transparent)" : "1px solid transparent",
+            background: pinned ? "color-mix(in srgb, var(--primary) 12%, transparent)" : "transparent" }}>
+          {pinned ? "★" : "☆"}
+        </button>
+      </div>
+
+      {/*
+       * The suite as a bar, not as a word.
+       *
+       * "6/14" and "13/14" are the same shape at ten pixels and read as the
+       * same thing at a glance, which is exactly the glance this board is
+       * for. The bar is filled by what has reported: a suite half in looks
+       * half in. Red fills whatever got that far rather than filling to the
+       * end, because a failure is not a finished run — the colour says the
+       * verdict and the length says the progress, and they are two different
+       * questions.
+       *
+       * Nothing has reported: an empty track. Not a hidden bar, which would
+       * make the card a different height, and not a full grey one, which
+       * would read as "done".
+       */}
+      <div className="mt-1.5 rounded-full overflow-hidden" style={{ height: 3, background: "color-mix(in srgb, var(--text) 12%, transparent)" }}>
+        <span className="block h-full rounded-full" style={{ width: `${done}%`, background: tint, transition: "width .25s" }} />
+      </div>
+
+      <div className="flex items-center gap-1.5 mt-1 text-[10px]" style={{ color: "var(--text3)" }}>
+        {/* The verdict in words, in the bar's own colour — colour alone cannot
+            say "red" to somebody who cannot see red. */}
+        <span className="shrink-0 tabular-nums" style={{ color: tint }}>
+          {c.pending > 0 ? `${c.success} of ${c.total} in` : c.verdict === "red" ? `${c.failure} failing`
+            : c.total === 0 ? "no checks" : "green"}
+        </span>
+        <span style={{ color: "var(--text4)" }}>→</span>
+        {/* Where it lands, tinted when it is not the trunk — a stacked pull
+            request read as a trunk one is a mistake you make once. */}
+        {/* Truncated at 90px, so the one that matters — a stacked branch with a
+            long ticket in its name — is exactly the one you cannot read. The
+            full thing is on hover, both sides of the arrow, because "into
+            what" is only half the question. */}
+        <span className="truncate" title={`${p.headRefName} → ${p.baseRefName}`}
+          style={{ maxWidth: 90, color: TRUNKS.has(p.baseRefName) ? "var(--text4)" : "var(--warning)" }}>{p.baseRefName}</span>
+        {/*
+          * How far behind the base, when somebody has found out.
+          *
+          * The pull request'"'"'s own page has carried this for a while — "Update
+          * branch & pull · 222 behind" — and the board, which is where you
+          * decide what to open, said nothing at all. It is not on the list
+          * payload and cannot be (see prBehindStore), so it arrives late and
+          * lands as a chip on a card that does not move.
+          *
+          * Nothing at all while the answer is unknown, and nothing when it is
+          * zero: a branch that is up to date has no news.
+          */}
+
+        {/* On the right, with the other numbers about the change, rather than
+            wedged against a branch name that is already truncated. */}
+        <span className="ml-auto flex items-center gap-1.5 shrink-0">
+          {behind ? (
+          <span className="shrink-0 tabular-nums px-1 rounded"
+            title={`${behind} commit${behind === 1 ? "" : "s"} on ${p.baseRefName} that this branch does not have — its checks ran against an older base`}
+            style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)" }}>
+            ↻ {behind}
+          </span>
+        ) : asking ? (
+          /* The space, held, while the answer is out. Twelve chips arriving one
+             by one over a few seconds is the board rearranging itself in slow
+             motion; the same shape, drawn quiet, is a board that is filling in.
+             It goes away for a branch that turns out to be up to date — that is
+             not news and its space is not owed to it. */
+          <span aria-hidden className="shrink-0 rounded animate-pulse"
+            title="Working out how far behind its base this branch is"
+            style={{ width: 26, height: 11, background: "color-mix(in srgb, var(--text) 10%, transparent)" }} />
+          ) : null}
+          <span className="tabular-nums" style={{ color: "var(--text4)" }}>
+            +{p.additions} −{p.deletions} · {p.changedFiles}f
+          </span>
+        </span>
+      </div>
+
+      <div className="flex items-center gap-1.5 mt-1 text-[10px]" style={{ color: "var(--text3)" }}>
+        <span className="truncate" style={{ maxWidth: 110 }}>{p.author}</span>
+        <span style={{ color: "var(--text4)" }}>·</span>
+        <span className="tabular-nums shrink-0">{ago(p.updatedAt)}</span>
+        {/* Everything that is only sometimes true, on the line that is allowed
+            to be empty. A card with none of these keeps its shape. */}
+        <span className="flex items-center gap-1 min-w-0 text-[9.5px] ml-1">
+          {p.isCurrentBranch && <Tag tint="var(--primary)">here</Tag>}
+          {p.isDraft && <Tag>draft</Tag>}
+          {task && <Tag tint="var(--accent, var(--primary))" title={taskLinkTitle(task)}>{task.label}</Tag>}
+          {p.labels.slice(0, 1).map((l) => <Tag key={l.name}>{l.name}</Tag>)}
+          {p.labels.length > 1 && <span title={p.labels.map((l) => l.name).join(", ")}>+{p.labels.length - 1}</span>}
+        </span>
+
+      </div>
+
+      {/* The sentence that put it in this lane. Without it a board is a list
+          whose order you have to re-derive every morning. Two lines, like the
+          title: the longest of these runs to four on a narrow lane, and a card
+          whose height is decided by a sentence cannot be scanned beside one
+          whose sentence is short. */}
+      <div className="flex gap-1.5 mt-1.5 text-[10.5px] leading-snug" style={{ color: "var(--text3)" }}>
+        <span className="shrink-0" style={{ color: "var(--text4)" }}>↳</span>
+        <span title={p.filed.reason}
+          style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden", overflowWrap: "anywhere" }}>
+          {p.filed.reason}
+        </span>
+        {/* The moment itself, hard right, on the line that says what the card is
+            waiting for — because "waiting since when" is one question and the
+            two halves of it belong together. It sits after the sentence in the
+            source so a sentence that runs to two lines pushes it down with it
+            rather than floating away from what it dates. */}
+        <span className="ml-auto shrink-0 self-end tabular-nums" style={{ color: "var(--text4)" }}
+          title={`Last activity on this pull request — ${new Date(p.updatedAt).toString()}`}>
+          {stamp(p.updatedAt)}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-1.5 mt-1.5">
+        {/* One button, and it is the one this lane is asking for. A row of five
+            is a row nobody reads; the rest are a click away inside. */}
+        <button onClick={(e) => { e.stopPropagation(); onAct(p, "open"); }} disabled={busy}
+          className="agx-btn rounded px-2 py-0.5 text-[10px] disabled:opacity-40 inline-flex items-center gap-1"
+          style={{ color: "var(--text2)", border: edge(20) }}>
+          {/* `busy` is the panel'''s, and on this board only one card can be
+              acting at a time — the whole surface disables while it runs. So the
+              spinner goes on the card whose action is in flight rather than on
+              all of them: `acting` is the number the panel is working on. */}
+          {acting === p.number && (
+            <span className="agx-spin" aria-hidden
+              style={{ width: 8, height: 8, borderWidth: 1.5,
+                borderColor: act === "merge" ? "color-mix(in srgb, var(--bg) 55%, transparent)" : "currentColor",
+                borderTopColor: "transparent" }} />
+          )}
+          {/* One button, and it opens the pull request.
+              It used to perform the lane's action — Merge on a green card,
+              Re-run on a red one — and a board is a place you scan and point
+              at, not a place to press Merge from. Reported after pressing
+              "Re-run failed" by accident, twice over, on a card that was under
+              the pointer for a different reason. The verdict still travels: the
+              lane and its sentence say what wants doing, and the page that can
+              do it is one click away. */}
+          Open{act === "merge" ? " to merge" : act === "rerun" ? " to re-run" : ""} →
+        </button>
+
+        {/*
+          * Who is on this pull request, bottom right, where the eye lands last.
+          *
+          * The author and whoever was asked to look at it: those are the two
+          * facts a list row carries, and together they answer "whose is this
+          * and who is holding it". Five at most — past that the card is a
+          * contact sheet, and the pull request itself lists them all.
+          *
+          * Overlapped left to right, the way every other row of people in this
+          * app is drawn, so five of them cost the width of two.
+          */}
+        <span className="ml-auto shrink-0 flex items-center"
+          title={`${p.author}${p.reviewers?.length ? ` · asked: ${p.reviewers.map((r) => r.login).join(", ")}` : ""}`}>
+          {[p.author, ...(p.reviewers ?? []).map((r) => r.login)]
+            .filter((l, n, all) => l && all.indexOf(l) === n)
+            .slice(0, 5)
+            .map((login, n) => (
+              <span key={login} style={{ marginLeft: n ? -5 : 0, zIndex: 5 - n, position: "relative" }}>
+                <Avatar login={login} size={16} />
+              </span>
+            ))}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+const Tag = ({ children, tint, title }: { children: React.ReactNode; tint?: string; title?: string }) => (
+  <span title={title} className="rounded px-1" style={{ color: tint ?? "var(--text3)", border: `1px solid color-mix(in srgb, ${tint ?? "var(--text)"} ${tint ? 34 : 16}%, transparent)` }}>
+    {children}
+  </span>
+);
+
+/** Short enough to sit in a row of ten-pixel type. */
+function ago(iso: string): string {
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+  if (!Number.isFinite(s)) return "";
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  if (s < 86400) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+const K = ({ children }: { children: React.ReactNode }) => (
+  <span className="rounded px-1 mx-px" style={{ border: `1px solid color-mix(in srgb, var(--text) 16%, transparent)` }}>{children}</span>
+);
+
+/**
+ * The ones you pinned, drawn wherever there is a board to draw them on.
+ *
+ * Its own component because it appears in two places that are otherwise
+ * unrelated — the foot of the first lane, and the empty state — and the second
+ * one matters more than it looks: a board with no lanes is exactly when a pin
+ * is the only thing left on screen.
+ */
+function PinnedStrip({ list, onOpen }: { list?: { number: number; title: string }[]; onOpen: (n: number) => void }) {
+  if (!list?.length) return null;
+  return (
+    <div className="shrink-0 flex flex-col min-h-0 mt-2 pt-2" style={{ borderTop: edge(18), maxHeight: "40%" }}>
+      <h4 className="flex items-baseline gap-2 m-0 pb-1 px-0.5 text-[9px] uppercase tracking-wider shrink-0"
+        style={{ color: "var(--text3)" }}>
+        <span style={{ color: "var(--primary-hover)" }}>★</span> Pinned
+        <span className="tabular-nums" style={{ color: "var(--text4)" }}>{list.length}</span>
+      </h4>
+      <div className="flex-1 min-h-0 overflow-y-auto agx-scroll">
+        {list.map((p) => (
+          <button key={p.number} onClick={() => onOpen(p.number)} title={p.title}
+            className="agx-btn w-full text-left rounded px-1.5 py-1 mb-1 flex items-baseline gap-1.5"
+            style={{ border: edge(14) }}>
+            <span className="shrink-0 text-[10px] tabular-nums" style={{ color: "var(--text4)" }}>#{p.number}</span>
+            <span className="min-w-0 truncate text-[10.5px]" style={{ color: "var(--text2)" }}>{p.title}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}

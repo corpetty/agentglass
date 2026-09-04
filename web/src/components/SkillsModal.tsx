@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import type { SkillInfo } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
+import { LAYER } from "../lib/layers.ts";
 import { api } from "../lib/api.ts";
 import { fmtAgo, fmtUsd } from "../lib/format.ts";
+import { CloseButton } from "./CloseButton.tsx";
 
 type Kind = "all" | "skill" | "command";
 type Usage = "all" | "used" | "never";
@@ -123,6 +125,18 @@ function SkillCard({ s, isNew, isTop, expanded, onToggle }: { s: SkillInfo; isNe
 
 export function SkillsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null);
+  // The window the call counts actually cover. They are pruned at
+  // AGENTGLASS_RETENTION_DAYS (8 by default), so "used 3x" meant 3x in the
+  // last week while reading as a lifetime total — and the understatement is
+  // worst for the oldest, most-established skills, which is backwards for
+  // the question this panel exists to answer. Stated once here rather than
+  // on forty rows.
+  const [usageSince, setUsageSince] = useState<number | null>(null);
+  // usage_since === 0 means retention is disabled: the counts are genuinely
+  // lifetime and the caveat would be a lie of its own.
+  const usageWindow = usageSince
+    ? `the last ${Math.max(1, Math.round((Date.now() - usageSince) / 86_400_000))}d`
+    : null;
   const [q, setQ] = useState("");
   const [kind, setKind] = useState<Kind>("all");
   const [usage, setUsage] = useState<Usage>("all");
@@ -132,7 +146,7 @@ export function SkillsModal({ open, onClose }: { open: boolean; onClose: () => v
 
   useEffect(() => {
     if (!open) return;
-    api.skills().then((r) => setSkills(r.skills)).catch(() => setSkills([]));
+    api.skills().then((r) => { setSkills(r.skills); setUsageSince(r.usage_since ?? null); }).catch(() => setSkills([]));
     setQ("");
     setExpanded(null);
   }, [open]);
@@ -192,10 +206,8 @@ export function SkillsModal({ open, onClose }: { open: boolean; onClose: () => v
   const used = all.filter((s) => s.calls > 0).length;
 
   return (
-    // Above the workspace's portal, not merely after it: the rail opens this
-    // from inside the workspace, and at equal z the frame — which mounts later
-    // — would paint straight over the catalog.
-    <Portal z={10100}>
+    // Why this is numbered at all, and what it has to stay below: lib/layers.ts.
+    <Portal z={LAYER.catalog}>
       <AnimatePresence>
         {open && (
           <>
@@ -215,7 +227,7 @@ export function SkillsModal({ open, onClose }: { open: boolean; onClose: () => v
                   <span className="text-[15px] font-semibold" style={{ color: "var(--text)" }}>Skills explorer</span>
                   {skills && (
                     <span className="text-[10px] t-dim2 tabular-nums">
-                      {all.length} available · {all.filter((s) => s.kind === "skill").length} skills · {all.filter((s) => s.kind === "command").length} commands · {used} used recently · {all.length - used} to discover
+                      {all.length} available · {all.filter((s) => s.kind === "skill").length} skills · {all.filter((s) => s.kind === "command").length} commands · {used} used recently · {all.length - used} to discover{usageWindow ? ` · usage over ${usageWindow}` : ""}
                     </span>
                   )}
                 </div>
@@ -223,7 +235,7 @@ export function SkillsModal({ open, onClose }: { open: boolean; onClose: () => v
                   <a href={api.skillsExportUrl("md")} className="chip" style={{ color: "var(--text3)" }} onClick={(e) => e.stopPropagation()}>↓ md</a>
                   <a href={api.skillsExportUrl("csv")} className="chip" style={{ color: "var(--text3)" }} onClick={(e) => e.stopPropagation()}>↓ csv</a>
                   <a href={api.skillsExportUrl("json")} className="chip" style={{ color: "var(--text3)" }} onClick={(e) => e.stopPropagation()}>↓ json</a>
-                  <button onClick={onClose} className="text-[18px] leading-none px-2 t-dim2 hover:opacity-70">✕</button>
+                  <CloseButton onClick={onClose} />
                 </div>
               </div>
 

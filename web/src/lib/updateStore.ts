@@ -88,6 +88,9 @@ export function ingestUpdate(st: UpdateStatus | null): void {
       ? `${st.behind} releases newer than this build — Settings › About to install`
       : "Settings › About to see what is in it and install",
     urgency: 1,
+    // The body was an instruction to go somewhere, on a row that could go
+    // there. Now the sentence and the click agree.
+    goto: { kind: "settings", pane: "about" },
   });
 }
 
@@ -110,12 +113,13 @@ async function check(): Promise<void> {
  * available for a week can wait another forty seconds.
  */
 export function startUpdateChecks(): () => void {
-  // Only the desktop shell can answer. `/update/*` is gated on the custom
-  // scheme at the server (it reveals the install path and can start an
-  // install), so from a browser tab — and now from a phone on the LAN, which
-  // is a browser tab that someone is looking at — this poll can only ever
-  // produce a 403 in the console every six hours. Not asking is the fix; the
-  // badge it feeds is desktop-only too.
+  // Only the desktop shell can act on the answer. A browser tab — including a
+  // phone on the LAN, which is a browser tab someone is looking at — can now
+  // read the build's identity from `/update/status`, but it gets that with
+  // `available: false` and no release comparison, because installing is gated
+  // on the custom scheme and always will be. Polling it every six hours would
+  // therefore be six-hourly work to learn nothing actionable, and the badge it
+  // feeds is desktop-only too. The About pane asks directly when it opens.
   if (IS_DEMO || !IS_DESKTOP || timer) return () => {};
   const first = setTimeout(check, FIRST_CHECK_MS);
   timer = setInterval(check, EVERY_MS);

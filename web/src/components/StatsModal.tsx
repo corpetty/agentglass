@@ -1,7 +1,12 @@
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import type { StatsSummary } from "../../../shared/types.ts";
+import type { StatsSummary, UsageHistory } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
-import { fmtUsd, fmtTokens, typeColor } from "../lib/format.ts";
+import { api } from "../lib/api.ts";
+import { fmtUsd, fmtTokens, fmtEq, eqTitle, typeColor } from "../lib/format.ts";
+import { CloseButton } from "./CloseButton.tsx";
+import { subscribeProviderUsage, providerUsage, usageLoaded, usedColor, resetLabel, ageLabel } from "../lib/usageStore.ts";
+import { panelState } from "./UsageBox.tsx";
 
 const WINDOW_LABELS: [number, string][] = [
   [15 * 60_000, "last 15m"],
@@ -22,14 +27,14 @@ function Heatmap({ data }: { data: number[] }) {
   const max = Math.max(1, ...data);
   return (
     <div className="w-full">
-      <div className="grid gap-[4px] w-full" style={{ gridTemplateColumns: "30px repeat(24, minmax(0,1fr))" }}>
+      <div className="grid gap-1 w-full" style={{ gridTemplateColumns: "30px repeat(24, minmax(0,1fr))" }}>
         <span />
         {Array.from({ length: 24 }, (_, h) => (
           <span key={h} className="text-[8px] t-dim2 text-center tabular-nums">{h % 3 === 0 ? h : ""}</span>
         ))}
         {DAYS.map((day, d) => (
           <div key={d} className="contents">
-            <span className="text-[9px] t-dim2 self-center pr-1 text-right">{day}</span>
+            <span className="text-[10px] t-dim2 self-center pr-1 text-right">{day}</span>
             {Array.from({ length: 24 }, (_, h) => {
               const n = data[d * 24 + h] ?? 0;
               const intensity = n === 0 ? 0 : 0.18 + (n / max) * 0.82;
@@ -44,6 +49,86 @@ function Heatmap({ data }: { data: number[] }) {
             })}
           </div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Daily spend, further back than the events table goes.
+ *
+ * Every other widget here reads /stats, which reads the events table, which
+ * retention trims to eight days by default — so picking "30d" or "all time"
+ * showed eight days of data under a longer label. The retention fold has kept
+ * the day totals all along (#292); this is the panel that finally reads them.
+ *
+ * The seam is drawn rather than hidden. Left of it the bars are day summaries
+ * of rows that no longer exist; right of it they are still whole events. A
+ * chart that blurred the two would make "we stopped keeping that" look
+ * identical to "we spent nothing", which is the one confusion this feature has
+ * to avoid.
+ */
+function SpendHistory({ history }: { history: UsageHistory | null }) {
+  if (!history) return <div className="t-dim2 text-[11px] py-3">Loading…</div>;
+  const days = history.days;
+  if (!days.length) return <div className="t-dim2 text-[11px] py-3">No history yet — this fills in as the fleet runs</div>;
+
+  const max = Math.max(0.0001, ...days.map((d) => d.cost_usd));
+  const total = days.reduce((n, d) => n + d.cost_usd, 0);
+  const seam = history.seam_day;
+  const folded = seam ? days.filter((d) => d.day < seam) : [];
+  // The seam is only worth drawing when there is something on both sides of it.
+  const showSeam = folded.length > 0 && folded.length < days.length;
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-end gap-0.5 h-28">
+        {days.map((d) => {
+          const summarised = !!seam && d.day < seam;
+          // A day with spend never renders as nothing: a 1px floor keeps a
+          // quiet day visually distinct from a day with no data at all.
+          const h = d.cost_usd > 0 ? Math.max(2, (d.cost_usd / max) * 100) : 0;
+          return (
+            <div
+              key={d.day}
+              className="flex-1 min-w-[2px] h-full flex items-end"
+              title={`${d.day} · ${fmtUsd(d.cost_usd)} · ${d.events.toLocaleString()} events · ${d.sessions} session${d.sessions === 1 ? "" : "s"}${summarised ? " (day summary)" : ""}`}
+            >
+              <div
+                className="w-full rounded-[2px]"
+                style={{
+                  height: `${h}%`,
+                  // Same hue either side — this is one series, not two — with
+                  // the folded half held back so the eye reads it as older and
+                  // coarser rather than as a different measurement.
+                  background: h
+                    ? summarised
+                      ? "color-mix(in srgb, var(--primary) 38%, transparent)"
+                      : "var(--primary)"
+                    : "transparent",
+                }}
+              />
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center justify-between gap-3 text-[9.5px] t-dim2 flex-wrap">
+        <span className="tabular-nums">{days[0]!.day} → {days[days.length - 1]!.day}</span>
+        {showSeam && (
+          <span className="flex items-center gap-3">
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-[2px]" style={{ background: "color-mix(in srgb, var(--primary) 38%, transparent)" }} />
+              day summaries
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="h-2 w-2 rounded-[2px]" style={{ background: "var(--primary)" }} />
+              full events {history.retention_days ? `(last ${history.retention_days}d)` : ""}
+            </span>
+          </span>
+        )}
+        {!history.retention_days && <span>nothing is pruned — every day here is still whole events</span>}
+        <span className="tabular-nums" style={{ color: "var(--text2)" }}>{fmtUsd(total)} total</span>
       </div>
     </div>
   );
@@ -78,6 +163,53 @@ function BarList({
   );
 }
 
+
+/**
+ * Plan quota, with room for what the dashboard box has no space for: plan
+ * type, the exact reset time, and when the reading was taken.
+ *
+ * Shares `panelState` with `UsageBox` rather than re-deriving it: the store's
+ * `firstFetchDone` flips true in a `.finally()`, so "loaded" and "has rows"
+ * are independent — a failed first poll is loaded with no rows, a state
+ * distinct from both "still loading" and "have data" that a naive
+ * `if (!rows) return null` would render as nothing at all.
+ */
+function UsageSection() {
+  const rows = useSyncExternalStore(subscribeProviderUsage, providerUsage, () => null);
+  const loaded = useSyncExternalStore(subscribeProviderUsage, usageLoaded, () => false);
+  const state = panelState(loaded, rows);
+
+  if (state === "loading") return <div className="t-dim2 text-[11px] py-3">Reading plan quota…</div>;
+  if (state === "unreachable") return <div className="t-dim2 text-[11px] py-3">Could not reach the server for plan quota.</div>;
+  if (state === "empty") return <div className="t-dim2 text-[11px] py-3">No connected agent reports plan quota. Connect one in Settings › Agents.</div>;
+
+  return (
+    <div className="flex flex-col gap-2">
+      {rows!.map((u) => (
+        <div key={u.provider} className="flex flex-col gap-1">
+          <div className="flex items-baseline gap-2">
+            <span className="text-[12px]" style={{ color: "var(--text)" }}>{u.label}</span>
+            {u.plan && <span className="chip text-[9px] uppercase">{u.plan}</span>}
+            {u.observedAt && <span className="text-[10px] t-dim2 ml-auto">read {ageLabel(u.observedAt)}</span>}
+          </div>
+          {u.available
+            ? (u.windows.length
+              ? u.windows.map((w) => (
+                  <div key={w.label} className="flex items-center gap-2 text-[10.5px]">
+                    <span className="w-12 t-dim2">{w.label}</span>
+                    <span className="tabular-nums font-semibold" style={{ color: usedColor(w.usedPercent) }}>
+                      {w.usedPercent}%
+                    </span>
+                    {w.resetsAt && <span className="t-dim2">resets {resetLabel(w.resetsAt)}</span>}
+                  </div>
+                ))
+              : <span className="text-[10.5px] t-dim2">No quota windows reported.</span>)
+            : <span className="text-[10.5px] t-dim2">{u.note ?? "No usage note provided."}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 // Gentle per-widget drift so each glass panel feels alive, not gridded.
 // Kept small so adjacent cards never drift close enough to touch.
@@ -132,6 +264,18 @@ export function StatsModal({ open, onClose, stats, windowMs }: { open: boolean; 
   const apps = (stats?.by_app ?? []).slice(0, 10);
   const types = (stats?.by_type ?? []).slice(0, 10);
 
+  // Fetched here rather than lifted into the poller: it is day-grained and
+  // changes at most once a day, so re-reading it on the /stats cadence would
+  // be a scan of the whole rollup every few seconds for a chart that cannot
+  // have moved. Once per opening is the right frequency.
+  const [history, setHistory] = useState<UsageHistory | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    api.usageDaily(90).then((h) => { if (alive) setHistory(h); }).catch(() => {});
+    return () => { alive = false; };
+  }, [open]);
+
   return (
     <Portal>
       <AnimatePresence>
@@ -159,12 +303,19 @@ export function StatsModal({ open, onClose, stats, windowMs }: { open: boolean; 
                       <span className="text-[17px] font-semibold" style={{ color: "var(--text)" }}>Statistics</span>
                       <span className="chip" style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 18%, transparent)", borderColor: "color-mix(in srgb, var(--primary) 45%, transparent)" }}>{windowLabel(windowMs)}</span>
                     </div>
-                    <button onClick={onClose} className="h-8 w-8 grid place-items-center rounded-full text-[15px] t-dim2 hover:opacity-80" style={{ background: "color-mix(in srgb, white 8%, transparent)", backdropFilter: "blur(10px)", border: "1px solid color-mix(in srgb, white 12%, transparent)" }}>✕</button>
+                    <CloseButton onClick={onClose} hit={32} className="rounded-full" style={{ background: "color-mix(in srgb, white 8%, transparent)", backdropFilter: "blur(10px)", border: "1px solid color-mix(in srgb, white 12%, transparent)" }} />
                   </motion.div>
 
                 <div className="flex flex-col gap-6">
+                {/* First, because it is the only widget here that is not bound
+                    by the window chip above — and the one that answers the
+                    question the chip cannot: what did the last quarter cost. */}
+                <Widget title="spend per day · past the retention line" i={0} full>
+                  <SpendHistory history={history} />
+                </Widget>
+
                 {stats?.heatmap && stats.heatmap.some((n) => n > 0) && (
-                  <Widget title="when the fleet works · day × hour" i={0} full>
+                  <Widget title="when the fleet works · day × hour" i={6} full>
                     <Heatmap data={stats.heatmap} />
                   </Widget>
                 )}
@@ -197,7 +348,7 @@ export function StatsModal({ open, onClose, stats, windowMs }: { open: boolean; 
                             return (
                               <div key={s.skill} className="grid grid-cols-[minmax(0,160px)_1fr_auto] gap-x-3 items-center">
                                 <span className="truncate text-[11px]" style={{ color: "var(--text2)" }} title={s.skill}>{s.skill}</span>
-                                <div className="flex gap-[3px]">
+                                <div className="flex gap-1">
                                   {s.buckets.map((n, i) => (
                                     <div
                                       key={i}
@@ -218,7 +369,7 @@ export function StatsModal({ open, onClose, stats, windowMs }: { open: boolean; 
                           })}
                           <div className="grid grid-cols-[minmax(0,160px)_1fr_auto] gap-x-3 mt-0.5">
                             <span />
-                            <div className="flex justify-between text-[9px] t-dim2"><span>{windowLabel(windowMs).replace("last ", "-")}</span><span>now</span></div>
+                            <div className="flex justify-between text-[10px] t-dim2"><span>{windowLabel(windowMs).replace("last ", "-")}</span><span>now</span></div>
                             <span />
                           </div>
                         </div>
@@ -253,19 +404,24 @@ export function StatsModal({ open, onClose, stats, windowMs }: { open: boolean; 
                     <div className="t-dim2 text-[11px] py-3">No activity in this window</div>
                   ) : (
                     <div className="flex flex-col">
-                      <div className="grid grid-cols-[minmax(0,1fr)_repeat(3,auto)] gap-x-4 text-[9px] uppercase tracking-wider t-dim2 pb-1">
-                        <span>app</span><span className="text-right">sessions</span><span className="text-right">tokens</span><span className="text-right">cost</span>
+                      <div className="grid grid-cols-[minmax(0,1fr)_repeat(3,auto)] gap-x-4 text-[10px] uppercase tracking-wider t-dim2 pb-1">
+                        <span>app</span><span className="text-right">sessions</span><span className="text-right">tokens (eq)</span><span className="text-right">cost</span>
                       </div>
                       {apps.map((a) => (
                         <div key={a.source_app} className="grid grid-cols-[minmax(0,1fr)_repeat(3,auto)] gap-x-4 items-baseline py-1 border-t" style={{ borderColor: "color-mix(in srgb, var(--border) 25%, transparent)" }}>
                           <span className="truncate text-[11px]" style={{ color: "var(--text2)" }} title={a.source_app}>{a.source_app}</span>
                           <span className="text-[11px] tabular-nums text-right t-dim">{a.sessions}</span>
-                          <span className="text-[11px] tabular-nums text-right t-dim">{fmtTokens(a.tokens)}</span>
+                          <span className="text-[11px] tabular-nums text-right t-dim" title={eqTitle(a.tokens)}>{fmtEq(a.tokens)}</span>
                           <span className="text-[11px] tabular-nums text-right" style={{ color: "var(--success)" }}>{fmtUsd(a.cost_usd)}</span>
                         </div>
                       ))}
                     </div>
                   )}
+                </Widget>
+
+                {/* quota and spend answer the same question from opposite ends */}
+                <Widget title="plan quota · by provider" i={7} full>
+                  <UsageSection />
                 </Widget>
                 </div>{/* stack (gap-6 between heatmap, columns, apps) */}
                 </div>{/* content w-1040 */}
