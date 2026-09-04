@@ -1,0 +1,57 @@
+# agentglass as a systemd **user** service — a headless box, always on.
+#
+#   install -D deploy/agentglass.service ~/.config/systemd/user/agentglass.service
+#   # edit WorkingDirectory / ExecStart below if your clone or bun live elsewhere
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentglass
+#   loginctl enable-linger $USER      # keep it running with nobody logged in
+#   journalctl --user -u agentglass -f
+#
+# A **user** unit, not a system one, on purpose: the server reads ~/.claude
+# (transcripts, per-account login dirs, OAuth credentials) and runs `claude -p`
+# as you. A system service running as root or as its own user sees none of that.
+#
+# Run `bun run build` in the clone first. Without web/dist the server is
+# API-only and serves no dashboard on the port.
+
+[Unit]
+Description=agentglass cockpit
+Documentation=https://github.com/corpetty/agentglass/blob/main/docs/HARNESS.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agentglass/server
+ExecStart=%h/.bun/bin/bun run src/index.ts
+Restart=on-failure
+RestartSec=5
+
+# The DB defaults to ~/.local/share/agentglass/agentglass.db (dir 0700) unless
+# an agentglass.db already sits in WorkingDirectory. Set it explicitly if you
+# want it somewhere else — it holds prompts, file contents and command output
+# in cleartext.
+#Environment=AGENTGLASS_DB=%h/.local/share/agentglass/agentglass.db
+
+Environment=AGENTGLASS_PORT=4000
+Environment=AGENTGLASS_BIND=127.0.0.1
+
+# Reaching it from another machine — read this before changing BIND.
+# agentglass opens a real shell, writes to your repos and controls Docker, so a
+# non-loopback bind is a remote-shell service. The safe default is to leave BIND
+# on loopback and tunnel:  ssh -L 4000:localhost:4000 <this-box>
+# If you really want a LAN bind, all three of these belong together:
+#Environment=AGENTGLASS_BIND=0.0.0.0
+#Environment=AGENTGLASS_TOKEN=<long-random-secret>
+#Environment=AGENTGLASS_TRUST_LAN=1
+# TRUST_LAN widens the CSRF origin gate to private-IP pages; it is only safe on
+# top of a token. Behind a reverse proxy, also name the host in
+# AGENTGLASS_ALLOWED_HOSTS (the DNS-rebinding guard).
+
+# Harness knobs — see docs/HARNESS.md for the full table.
+#Environment=AGENTGLASS_QUEUE_CEILING=80
+#Environment=AGENTGLASS_JOB_CONCURRENCY=1
+#Environment=AGENTGLASS_DISPATCH_DISABLED=1
+#Environment=AGENTGLASS_RETENTION_DAYS=8
+
+[Install]
+WantedBy=default.target

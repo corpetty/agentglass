@@ -450,6 +450,12 @@ When `web/dist` doesn't exist (plain `bun run dev`, or the packaged app's
 bundled server), nothing is served over HTTP: the server is API-only and no
 dashboard is reachable on that port at all.
 
+To keep that running permanently, `deploy/agentglass.service` is a ready
+systemd **user** unit — install it, `loginctl enable-linger`, done. The full
+walkthrough (why a user unit, per-account logins on a headless box, and what
+binding off loopback actually costs you) is in
+[docs/HARNESS.md ▸ Running it as a service](docs/HARNESS.md#running-it-as-a-service).
+
 Prefer `make`? Every entry point is a described Makefile target, and `make help`
 lists them all (`make dev`, `make setup`, `make demo-feed`, `make desktop`, …).
 The in-app terminal (`t` → **⚙ commands**) surfaces the same list, ready to

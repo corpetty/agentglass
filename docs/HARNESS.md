@@ -14,6 +14,7 @@ account or queue a job.
 - [The job queue & dispatcher](#the-job-queue--dispatcher)
 - [Reviewing a finished job](#reviewing-a-finished-job)
 - [Desktop instances](#desktop-instances)
+- [Running it as a service](#running-it-as-a-service)
 - [Safety & ToS posture](#safety--tos-posture)
 - [Reference](#reference)
 
@@ -256,6 +257,97 @@ older Cowork history needs a wider window. **Not** ingestible: the conversations
 behind `~/Claude/Projects/*` that run fully remotely / in the Cowork VM — those
 live only in the cloud and the Desktop app's IndexedDB, not on disk in readable
 form. See `../../Downloads/cowork-ingestion-plan.md` for the full design.
+
+---
+
+## Running it as a service
+
+The harness is worth leaving on: the dispatcher only drains the queue while the
+server runs, and the scanner only sees transcripts written since the retention
+window. On a box you want it running permanently, install it as a **systemd user
+service** from `deploy/agentglass.service`.
+
+### Install the checkout
+
+```bash
+git clone -b feat/cowork-ingest https://github.com/corpetty/agentglass.git ~/agentglass
+cd ~/agentglass
+bun install
+bun run build     # web/dist — without it the server is API-only, no dashboard
+bun run setup     # wire ~/.claude hooks (live streaming + PreToolUse gating)
+```
+
+Needs Bun >= 1.1 and Python 3. `bun run build` matters: the single-port deploy is
+the server serving the built UI itself, one process, API and dashboard on the
+same origin.
+
+### Install the unit
+
+```bash
+install -D deploy/agentglass.service ~/.config/systemd/user/agentglass.service
+systemctl --user daemon-reload
+systemctl --user enable --now agentglass
+loginctl enable-linger $USER          # survive logout / run at boot
+journalctl --user -u agentglass -f
+```
+
+A **user** unit, not a system one, deliberately. The server reads `~/.claude` —
+transcripts, each account's `claude_config_dir`, the OAuth credentials it
+refreshes — and the dispatcher runs `claude -p` under those logins. A system
+service running as root or as its own user sees none of it, and every meter
+reports `re-login needed`.
+
+`enable-linger` is what makes it a service rather than a session process:
+without it systemd tears down your user manager on logout and the queue stops
+draining the moment you close the SSH connection.
+
+### Per-account logins on a headless box
+
+Each account still needs its own completed login. Do it once, interactively,
+per account before enabling the unit — same as
+[Provisioning a second account](#provisioning-a-second-account):
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-accounts/personal claude auth login
+CLAUDE_CONFIG_DIR=~/.claude-accounts/personal claude auth status   # verify
+```
+
+A job dispatched to an account with no valid login produces nothing and gets
+killed by `AGENTGLASS_JOB_STARTUP_TIMEOUT_MS` — that timeout exists for exactly
+this failure. Check Accounts (`a`) shows every account metered, not
+`re-login needed`, before queueing work.
+
+### Reaching it from another machine
+
+The server binds `127.0.0.1` and that is the right default here: agentglass
+opens a real shell, writes to your repos and controls Docker, so a non-loopback
+bind publishes a remote-shell service. Prefer a tunnel:
+
+```bash
+ssh -L 4000:localhost:4000 <box>     # then http://localhost:4000
+```
+
+If you genuinely want a LAN bind, the three settings go together — `AGENTGLASS_BIND=0.0.0.0`,
+`AGENTGLASS_TOKEN=<secret>`, and `AGENTGLASS_TRUST_LAN=1` (which widens the CSRF
+origin gate to private-IP pages and is only safe on top of the token). Open the
+dashboard once as `http://<box>:4000/?token=<secret>`; it is stored and stripped
+from the address bar. Behind a reverse proxy, add the proxy's hostname to
+`AGENTGLASS_ALLOWED_HOSTS` or the DNS-rebinding guard refuses the request.
+
+Note that `AGENTGLASS_ALLOW_REMOTE` is a **hook-side** variable, not this one:
+it lets `hooks/send_event.py` post to a server that isn't on localhost. You only
+need it if Claude Code runs on a different machine than the server.
+
+### State and upgrades
+
+| What | Where |
+|---|---|
+| Database | `~/.local/share/agentglass/agentglass.db` (dir `0700`), unless an `agentglass.db` sits in the working directory or `AGENTGLASS_DB` says otherwise |
+| Account registry | `~/.config/agentglass/config.json` |
+| Generated auth token | `~/.config/agentglass/token` (`0600`) — only generated when you bind non-loopback without setting `AGENTGLASS_TOKEN`; printed once at startup |
+
+Upgrading is `git pull && bun install && bun run build && systemctl --user restart agentglass`.
+The DB migrates forward in place on boot; nothing else needs moving.
 
 ---
 
