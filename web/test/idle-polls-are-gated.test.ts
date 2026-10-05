@@ -38,7 +38,9 @@ describe("the dashboard's own polls", () => {
   test("the dashboard hands both of them its own active flag", async () => {
     const text = await src("components/DashboardView.tsx");
     expect(text).toContain("<Alerts alerts={alerts} agents={agents} active={active}");
-    expect(text).toContain("<Sessions provider={filter.provider} active={active} />");
+    // A pattern rather than the literal tag, so a filter prop added beside it
+    // (the fleet's `host`) does not read as the flag going missing.
+    expect(text).toMatch(/<Sessions provider=\{filter\.provider\}[^>]*\bactive=\{active\}/);
   });
 });
 

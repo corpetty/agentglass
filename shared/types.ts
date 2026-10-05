@@ -1030,6 +1030,8 @@ export interface SessionDetail {
   session_id: string;
   source_app: string;
   model_name: string | null;
+  /** The machine it ran on. Same contract as WatchEvent.host. */
+  host?: string;
   /** Where it ran — a resume has to start in the same directory. */
   project_path?: string | null;
   /** The linked worktree / subdir it actually ran in, if not the repo root. */

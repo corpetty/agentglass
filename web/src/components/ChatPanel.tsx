@@ -15,6 +15,7 @@ import { motion, AnimatePresence } from "motion/react";
 import { CHAT_EFFORTS } from "../../../shared/types.ts";
 import type { GitRepoRef, SessionRollup, ChatEffort, AgentCliStatus, AgentModel } from "../../../shared/types.ts";
 import { api } from "../lib/api.ts";
+import { serverHost } from "../lib/useServerHost.ts";
 import { Markdown } from "../lib/markdown.tsx";
 import { ALLOW_DEFAULT, initialAllowed } from "../lib/chatAllowlist.ts";
 import { foldPreview, hiddenLineCount, isLongMessage } from "../lib/chatFold.ts";
@@ -592,7 +593,13 @@ function ResumePicker({ onPick, onClose }: { onPick: (s: SessionRollup) => void;
   // Fetched once per opening rather than polled: this is a menu the user is
   // actively reading, and rows shuffling under the cursor would be worse than
   // a list a few seconds stale.
-  useEffect(() => { api.sessions(60).then(setRows).catch(() => setRows([])); }, []);
+  // Only this machine's sessions: one forwarded from another machine
+  // (docs/FLEET.md) can only be resumed there, and the server refuses it here.
+  useEffect(() => {
+    Promise.all([api.sessions(60), serverHost()])
+      .then(([list, here]) => setRows(here ? list.filter((s) => !s.host || s.host === here) : list))
+      .catch(() => setRows([]));
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -533,7 +533,6 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_events_account_ts ON events(account, tim
 // it, windowed by timestamp like the other scope columns.
 try { db.exec("ALTER TABLE events ADD COLUMN host TEXT"); } catch { /* already present */ }
 try { db.exec("ALTER TABLE sessions ADD COLUMN host TEXT"); } catch { /* already present */ }
-db.exec("DROP INDEX IF EXISTS idx_events_host_ts");
 db.exec("CREATE INDEX IF NOT EXISTS idx_events_foreign_host_ts ON events(host, timestamp) WHERE host IS NOT NULL");
 
 // Backfill `account` for rows ingested before this dimension existed (mostly
@@ -2426,7 +2425,12 @@ function foldExpiringEvents(cutoff: number): number {
             SUM(COALESCE(cost_usd, 0)),
             SUM(COALESCE(duration_ms, 0)),
             SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
-     FROM events WHERE timestamp < ?
+     -- This machine's rows only. The rollup has no host column, so another
+     -- machine's spend folded in here would land under a local project path
+     -- and in every budget and before-the-seam figure read from it. Forwarded
+     -- rows still expire with the rest; their long-range history is the node's
+     -- own rollup (docs/FLEET.md).
+     FROM events WHERE timestamp < ? AND +host IS NULL
      GROUP BY 1, 2, 3, 4, 5, 6
      ON CONFLICT(day, project_path, session_id, model_name, provider) DO UPDATE SET
        events = events + excluded.events,
@@ -3802,7 +3806,10 @@ export function wasPromptOf(sessionId: string, text: string, sinceMs = 0): boole
  * since it last asked (`newestPromptId`).
  */
 const promptSeenSince = db.query<{ one: number }, [number, string]>(
-  `SELECT 1 AS one FROM events WHERE timestamp >= ? AND hook_event_type = 'UserPromptSubmit' AND json_extract(payload, '$.prompt') = ? LIMIT 1`);
+  // `+host IS NULL`: a prompt typed on another machine (docs/FLEET.md) says
+  // nothing about what a pane HERE was started with, and this answer decides
+  // the command a restore relaunches. The `+` keeps the plan it had.
+  `SELECT 1 AS one FROM events WHERE timestamp >= ? AND hook_event_type = 'UserPromptSubmit' AND +host IS NULL AND json_extract(payload, '$.prompt') = ? LIMIT 1`);
 export function wasPromptAnywhere(text: string, sinceMs = 0): boolean {
   if (!text) return false;
   try { return promptSeenSince.get(Math.max(0, sinceMs), text) !== null; } catch { return false; }
@@ -4759,6 +4766,9 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
      */
     custom_title: roll?.custom_title ?? null,
     ai_title: roll?.ai_title ?? null,
+    // Which machine it ran on, labelled like every other read — the deep-dive
+    // is where Resume lives, and Resume is exactly the button that must know.
+    host: roll?.host ?? hostId(),
     // Same rule as the list: only when there is no title to use instead.
     first_prompt: roll?.custom_title || roll?.ai_title
       ? null
@@ -4884,6 +4894,45 @@ export function exportRows(limit = 100_000): WatchEvent[] {
     .query<any, any[]>(`SELECT * FROM events WHERE 1=1${s.clause} ORDER BY id ASC LIMIT ?`)
     .all(...s.args, limit)
     .map(parseEventRow);
+}
+
+/**
+ * Rows by key, parsed and labelled like every other read — for a writer that
+ * did not go through insertEvent (the fleet hub, fleethub.ts) and still has to
+ * hand the live socket the same shape a reload would show.
+ */
+/**
+ * The machine a session id belongs to when it is not this one — or null.
+ *
+ * For the routes that would act on a session by id: a resume, a handoff. A
+ * session forwarded from another machine (docs/FLEET.md) has its transcript,
+ * its checkout and its process over there, and acting on it here starts
+ * something local under somebody else's name. A `host:` prefix is how the hub
+ * stores an id another machine already held, so it is foreign even before the
+ * row is looked up.
+ */
+export function foreignHostOf(sessionId: string): string | null {
+  if (!sessionId) return null;
+  const row = db.query<{ host: string | null }, [string]>("SELECT host FROM sessions WHERE session_id = ?").get(sessionId);
+  if (row?.host) return row.host;
+  const colon = sessionId.indexOf(":");
+  return colon > 0 ? sessionId.slice(0, colon) : null;
+}
+
+export function eventsByIds(ids: number[]): WatchEvent[] {
+  if (!ids.length) return [];
+  return db
+    .query<any, number[]>(`SELECT * FROM events WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`)
+    .all(...ids)
+    .map(parseEventRow);
+}
+
+export function sessionsByIds(ids: string[]): SessionRollup[] {
+  if (!ids.length) return [];
+  return db
+    .query<Record<string, unknown>, string[]>(`SELECT * FROM sessions WHERE session_id IN (${ids.map(() => "?").join(",")})`)
+    .all(...ids)
+    .map(parseSessionRow);
 }
 
 export { db };

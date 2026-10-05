@@ -922,6 +922,8 @@ const realApi = {
   // retention fold wrote them at, and re-slicing a day-summary by a viewer's
   // clock would move spend onto a day it was never recorded on.
   usageDaily: (days = 90) => get<UsageHistory>(`/usage/daily?days=${days}`),
+  /** This server's name and its place in a fleet (docs/FLEET.md). */
+  fleetStatus: () => get<{ host: string; upstream: { state: string }; nodes: { host: string; connected: boolean }[] }>(`/fleet/status`),
   sessions: (limit = 100, provider?: string, account?: string, host?: string) =>
     get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}${host ? `&host=${encodeURIComponent(host)}` : ""}`),
   // `hosts` is optional because an older server does not send it.
@@ -2214,6 +2216,9 @@ const demoApi: typeof realApi = {
   paneDirsAll: (_w: string) => D({ ok: true, panes: [] as { pane: string; active: boolean; dirs: string[]; agent?: string }[] }),
   agentSessions: (_root: string) => D({ ok: true, sessions: [] as AgentSessionRow[] }),
   focusPane: (_p: { sessionId: string; windowId: string; paneId: string }) => D({ ok: false, error: "not in the demo" }),
+  // The demo is one fabricated machine; a fleet of fake ones would be a lie
+  // about a feature nobody can see working there.
+  fleetStatus: () => D({ host: "demo", upstream: { state: "off" }, nodes: [] as { host: string; connected: boolean }[] }),
   stats: (windowMs: number, provider?: string) => D(demo.stats(windowMs, provider)),
   usageDaily: (days = 90) => D(demo.usageDaily(days)),
   sessions: (_limit?: number, provider?: string) => D(demo.sessions(provider)),

@@ -1,0 +1,171 @@
+// Two real servers, one forwarding to the other (docs/FLEET.md, phase 2).
+//
+// Everything that makes the link trustworthy is a property of the two
+// processes together — the hub mints a credential bound to one name, the node
+// finds its config without a restart, rows cross and land under that name, and
+// a credential taken back at the hub stops the node — so this drives both for
+// real, each with its own HOME, database and port.
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { freePort } from "./freePort.ts";
+import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { SERVER_BOOT_MS } from "./serverBoot.ts";
+
+const TOKEN = "hub-secret-for-fleet-link-test";
+let root: string;
+let hub: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string };
+let node: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string };
+let nodeToken = "";
+
+async function boot(name: string, extra: Record<string, string>) {
+  const dir = join(root, name);
+  mkdirSync(dir, { recursive: true });
+  const port = await freePort();
+  const proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
+    env: {
+      PATH: [dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
+      TMUX_TMPDIR: TMUX_TEST_TMPDIR,
+      HOME: dir,
+      XDG_CONFIG_HOME: dir,
+      AGENTGLASS_STATE_DIR: join(dir, "state"),
+      CLAUDE_CONFIG_DIR: join(dir, ".claude"),
+      AGENTGLASS_DB: join(dir, "a.db"),
+      AGENTGLASS_SCAN_DISABLED: "1",
+      AGENTGLASS_DISPATCH_DISABLED: "1",
+      AGENTGLASS_TERMINAL_DISABLED: "1",
+      AGENTGLASS_PORT: String(port),
+      ...extra,
+    },
+    stdout: "ignore", stderr: "pipe",
+  });
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 150; i++) {
+    try { if ((await fetch(base + "/health")).ok) return { base, proc, dir }; } catch { /* not up yet */ }
+    await Bun.sleep(100);
+  }
+  throw new Error(`${name} did not come up: ` + (await new Response(proc.stderr as ReadableStream).text()).slice(0, 400));
+}
+
+/** `Response.json()` is `unknown` to the checker; these bodies are read loosely on purpose. */
+const body = async (r: Promise<Response> | Response): Promise<any> => (await r).json();
+
+const asHub = (path: string, init: RequestInit = {}) =>
+  fetch(hub.base + path, { ...init, headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", ...(init.headers ?? {}) } });
+
+async function until<T>(what: string, fn: () => Promise<T | null | undefined | false>, ms = 15_000): Promise<T> {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v as T;
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(200);
+  }
+}
+
+const nodeStatus = async () => (await body(fetch(node.base + "/fleet/status"))).upstream;
+
+beforeAll(async () => {
+  root = mkdtempSync(join(tmpdir(), "agx-fleet-link-"));
+  [hub, node] = await Promise.all([
+    boot("hub", { AGENTGLASS_HOST_ID: "hub", AGENTGLASS_TOKEN: TOKEN }),
+    boot("node", { AGENTGLASS_HOST_ID: "bean" }),
+  ]);
+}, SERVER_BOOT_MS * 2);
+
+afterAll(() => {
+  for (const s of [hub, node]) try { s?.proc.kill(); } catch { /* gone */ }
+  try { rmSync(root, { recursive: true, force: true }); } catch { /* fine */ }
+});
+
+describe("joining a node to a hub", () => {
+  test("the hub mints a credential bound to one name, once", async () => {
+    const r = await body(asHub("/fleet/nodes", { method: "POST", body: JSON.stringify({ host: "bean" }) }));
+    expect(r.ok).toBe(true);
+    expect(r.device.host).toBe("bean");
+    expect(r.device.hash).toBeUndefined();
+    nodeToken = r.token;
+    const again = await asHub("/fleet/nodes", { method: "POST", body: JSON.stringify({ host: "bean" }) });
+    expect(again.status).toBe(409);
+    const own = await asHub("/fleet/nodes", { method: "POST", body: JSON.stringify({ host: "hub" }) });
+    expect(own.status).toBe(400);
+  });
+
+  test("rows written on the node arrive on the hub under its name, without a restart", async () => {
+    for (let i = 0; i < 3; i++) {
+      await fetch(node.base + "/ingest", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_app: "proj", session_id: "link-s1", hook_event_type: "PostToolUse", payload: { tool_name: "Bash", cwd: "/home/u/proj" } }),
+      });
+    }
+    // Written behind the running node's back, as `bun run fleet join` does —
+    // which creates the directory too; a fresh node may not have yet.
+    mkdirSync(join(node.dir, "agentglass"), { recursive: true });
+    writeFileSync(join(node.dir, "agentglass", "upstream.json"), JSON.stringify({ url: hub.base, token: nodeToken }), { mode: 0o600 });
+    const sessions = await until("the session on the hub", async () => {
+      const list = await body(asHub("/sessions?host=bean"));
+      return list.find((s: any) => s.session_id === "link-s1" && s.event_count === 3) ? list : null;
+    });
+    expect(sessions.every((s: any) => s.host === "bean")).toBe(true);
+    const st = await nodeStatus();
+    expect(st.state).toBe("live");
+    expect(st.hubHost).toBe("hub");
+    const nodes = await body(asHub("/fleet/nodes"));
+    expect(nodes.nodes.find((n: any) => n.host === "bean")?.connected).toBe(true);
+  }, 30_000);
+
+  test("a new row follows within a couple of seconds", async () => {
+    await fetch(node.base + "/ingest", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_app: "proj", session_id: "link-s1", hook_event_type: "Stop", payload: { cwd: "/home/u/proj" } }),
+    });
+    await until("the Stop on the hub", async () => {
+      const evs = await body(asHub("/events/recent?host=bean"));
+      return evs.some((e: any) => e.hook_event_type === "Stop");
+    }, 5000);
+  });
+
+  test("the node credential is good for the link and nothing else on the hub", async () => {
+    const r = await fetch(hub.base + "/sessions", { headers: { Authorization: `Bearer ${nodeToken}` } });
+    expect(r.status).toBe(403);
+  });
+
+  test("a credential cannot forward as a name it was not minted for", async () => {
+    const r = await body(asHub("/fleet/nodes", { method: "POST", body: JSON.stringify({ host: "rooter" }) }));
+    const ws = new WebSocket(hub.base.replace("http", "ws") + "/fleet/link", {
+      headers: { Authorization: `Bearer ${r.token}` },
+    } as unknown as string[]);
+    const frame = await new Promise<any>((res, rej) => {
+      ws.addEventListener("open", () => ws.send(JSON.stringify({ t: "hello", v: 1, host: "bean" })));
+      ws.addEventListener("message", (e) => res(JSON.parse(String((e as MessageEvent).data))));
+      ws.addEventListener("close", () => rej(new Error("closed without an answer")));
+    });
+    expect(frame.t).toBe("refuse");
+    expect(frame.error).toContain("rooter");
+    // And the real bean is still linked — the impostor did not displace it.
+    const nodes = await body(asHub("/fleet/nodes"));
+    expect(nodes.nodes.find((n: any) => n.host === "bean")?.connected).toBe(true);
+  });
+
+  test("the hub will not resume another machine's session here", async () => {
+    const r = await asHub("/chat/send", {
+      method: "POST",
+      body: JSON.stringify({ cwd: hub.dir, message: "carry on", resumeId: "link-s1" }),
+    });
+    expect(r.status).toBe(409);
+    expect((await body(r)).error).toContain("bean");
+  });
+
+  test("forgetting the credential at the hub stops the node", async () => {
+    const creds = (await body(asHub("/fleet/nodes"))).credentials;
+    const id = creds.find((c: any) => c.host === "bean").id;
+    const r = await body(asHub("/pair/forget", { method: "POST", body: JSON.stringify({ id }) }));
+    expect(r.closed).toBeGreaterThanOrEqual(1);
+    const st = await until("the node to notice", async () => {
+      const s = await nodeStatus();
+      return s.state === "refused" ? s : null;
+    }, 10_000);
+    expect(st.error).toBeTruthy();
+  }, 20_000);
+});

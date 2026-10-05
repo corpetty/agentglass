@@ -5,7 +5,33 @@ for watching several — a desk, a laptop, a headless box driven over Remote
 Control, and, as far as it can go, sessions running in Anthropic's cloud — from
 a single cockpit.
 
-Status: **phase 1 built** (host identity, no link yet). Everything from phase 2 on is design, not code.
+Status: **phases 1–2 built** — every row knows its host, and nodes forward to a
+hub. Phases 3–5 are design, not code.
+
+## Setting it up
+
+On the hub — the always-on box. It needs a token, because a node credential is
+only ever checked on a server that has one (`AGENTGLASS_TOKEN` in its systemd
+unit, or the generated `~/.config/agentglass/token`):
+
+```bash
+bun run fleet add-node bean      # once per node; prints a credential, once
+```
+
+On each node, with its agentglass running and named to match (`AGENTGLASS_HOST_ID=bean`,
+or `"hostId"` in its `config.json`, unless that is already its short hostname):
+
+```bash
+bun run fleet join http://100.x.y.z:4000 <credential>   # the hub's Tailscale address
+bun run fleet status
+```
+
+No restart on either side. The hub URL has to keep the link private: `https`, a
+Tailscale address (`100.64.0.0/10` or `*.ts.net`), or an ssh tunnel to
+`localhost`. Plain HTTP across a LAN is refused, because the link carries
+prompts and file contents and the credential rides in its first request.
+`bun run fleet nodes` on the hub lists who forwards there; **Forget** in the
+Remote pane revokes a node like any paired device.
 
 ---
 
@@ -52,7 +78,9 @@ Every row knows the machine it came from. Useful on its own and harmless on a
 single machine — nothing about a one-machine install changes.
 
 - **A host id per instance.** `AGENTGLASS_HOST_ID`, or `hostId` in
-  `config.json`, defaulting to the machine's hostname. Reported on `/health`.
+  `config.json`, defaulting to the machine's hostname. Reported on
+  `/fleet/status` — not on `/health`, which answers without a credential and
+  must not hand out a hostname.
 - **`host` on `events`, `sessions` and `gates`. NULL means "this machine".**
   Local rows are never stamped, so there is no backfill over a multi-GB events
   table, nothing changes for a single-machine install, and renaming the host id
@@ -80,8 +108,8 @@ What phase 1 deliberately leaves for the link to settle:
   first row that names one and never moves. The link must stamp *every* row it
   forwards, or the unstamped ones read as local.
 - **Fallback session ids collide across machines.** The hooks fall back to
-  `"unknown"` and OTLP to `"otel-session"`; the receiving end must namespace
-  those by host before they meet `sessions.session_id`, which is still the key.
+  `"unknown"` and OTLP to `"otel-session"`. *Settled in phase 2:* the hub stores
+  an id another host already holds as `host:id`.
 - **The daily rollup has no host.** Once retention folds events into
   `daily_rollup`, the long-range daily series is whole-fleet only — the same as
   it already is for provider and account.
@@ -93,19 +121,65 @@ What phase 1 deliberately leaves for the link to settle:
   picker still says which machine it is.
 
 Set the name with `AGENTGLASS_HOST_ID=box` or `"hostId": "box"` in
-`~/.config/agentglass/config.json`; `/health` reports it.
+`~/.config/agentglass/config.json`; `/fleet/status` reports it.
 
 ### 2. The link
 
-- A node with `upstream: { url, credential }` holds a WebSocket open to the hub.
-- It streams rows as they are inserted — post-dedup, post-pricing — with its own
-  `events.id` as the cursor. The hub inserts idempotently on `(host, origin id)`
-  and acknowledges; the node persists the acknowledged cursor, so after sleep or
-  a dropped network it backfills the gap on reconnect.
-- Session metadata (titles, Cowork session meta) rides the same link.
-- The hub shows each node online/offline and when it was last heard from.
-- The node's credential comes from the existing pairing flow — six digits shown
-  at the hub, accepted by a person there — as a new `node` grant.
+Built: `fleetwire.ts` (the wire format, and every check the hub applies),
+`fleethub.ts` (the hub's socket), `fleetlink.ts` (the node's uplink),
+`fleetstore.ts` (both sides' tables and queries), `scripts/fleet.ts` (the CLI).
+
+- **One outbound WebSocket per node**, `GET /fleet/link`. The node says hello,
+  the hub answers with its cursor — the highest row id it has stored from that
+  host — and the node sends what comes after it in batches of at most 500 rows
+  or 4 MB, one in flight, each acknowledged before the next. The cursor lives
+  only on the hub, in the same transaction as the rows it covers, so the two
+  sides cannot disagree about what was delivered. A node asleep for a night
+  asks on waking and backfills the gap.
+- **Rows are stored as sent.** The hub does not run forwarded rows through
+  `insertEvent`: deltas, cost, latency pairing and the session rollup were all
+  computed on the machine that saw the session, and doing them twice is a second
+  answer that can disagree with the first. Sessions are mirrored column for
+  column, so the hub's totals are the node's by construction. `(host, origin_id)`
+  is unique, so a batch retried after a lost ack lands once.
+- **Session-only changes** — a rename, an AI title arriving after its turn —
+  ride a resync of the last day's sessions every minute.
+- **A node credential is a device with `role: "node"`, bound to one host
+  name.** It opens `/fleet/link` and nothing else (`nodeAllows` in auth.ts): it
+  cannot read the hub's cockpit, answer a gate, or forward as any name but its
+  own. It is minted by `POST /fleet/nodes` at the hub's own machine — the CLI
+  over ssh, for a headless hub — rather than through the phone's six-digit
+  pairing, whose accept step is loopback-only and built around a screen.
+- **Ids that collide** are stored as `host:id` (see phase 1). A session this
+  machine, or a third one, recorded is never written over.
+- **The hub's live feed** gets forwarded rows from the last ten minutes, pushed
+  like the scanner's. A week of backfill lands in history, not in the feed.
+- **`/fleet/status`** on any instance: its own name, its uplink (state, cursor,
+  last ack, why it is not live), and the nodes forwarding to it.
+
+- **Another machine's session is never acted on here.** Resume (`/chat/send`,
+  `/codex/send`, `/antigravity/send`) answers 409 naming the machine it ran on,
+  and the UI shows "Ran on …" instead of the button. Handing one off to a local
+  agent needs a checkout named explicitly — the session's own path is a
+  directory on the other machine. Shared-tree and collision detection, run
+  bills, the agent probe, tmux restore's prompt check and the retention fold all
+  read this machine's rows only, and a remote card shows no branch or
+  shared-tree chip read off a local checkout at the same path.
+
+What phase 2 leaves open:
+
+- **No alerts from forwarded rows.** A held gate or a finished run on a node
+  does not notify the hub's desk yet — deliberately, until phase 3 makes it a
+  decision rather than a side effect.
+- **Forwarding is one hop.** A node never relays rows it was itself sent.
+- **Two machines that both catalogue the same session** (Claude Desktop's
+  session index can list sessions run elsewhere) show it twice on the hub, the
+  second as `host:id`.
+- **No hub-side UI for nodes yet** beyond the host picker and chips; status is
+  `bun run fleet status` or `/fleet/status`.
+- **Forwarded rows are not folded into the hub's daily rollup** (it has no host
+  column). Within retention the hub has everything; past it, long-range history
+  for a node lives in that node's own rollup.
 
 ### 3. Gates from anywhere
 
@@ -145,7 +219,8 @@ hooks can post out if the environment's network policy allows the destination.
 ## Things to keep in view
 
 - **Transcripts move.** A node forwards prompts, file contents and command
-  output to the hub. The hub's database deserves the same care as `~/.claude`.
+  output to the hub. The hub's database deserves the same care as `~/.claude`,
+  and its retention (`AGENTGLASS_RETENTION_DAYS`) applies to forwarded rows too.
 - **Grants.** Phase 4 is where the hub gains reach into other machines; that is
   why the ceiling is node-side and the terminal is last.
 - **Upstream merges.** This fork tracks SirAllap/agentglass. The link and hub

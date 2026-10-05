@@ -7,6 +7,7 @@ import { Portal } from "./Portal.tsx";
 import { PresetDiff } from "./diff/PresetDiff.tsx";
 import { api } from "../lib/api.ts";
 import { usePoll } from "../lib/usePoll.ts";
+import { useServerHost, ranElsewhere } from "../lib/useServerHost.ts";
 import { Markdown } from "../lib/markdown.tsx";
 import { fmtUsd, fmtTokens, fmtEq, fmtAgo, fmtTime, modelLabelOf, modelColor, sessionTitle } from "../lib/format.ts";
 import { ToolRow } from "./ToolRow.tsx";
@@ -15,7 +16,7 @@ import { sessionIsLive } from "../lib/derive.ts";
 import { sessionWorktree, sessionCwd } from "../lib/worktree.ts";
 import { useStuckBottom } from "../lib/useStuckBottom.ts";
 import { CloseButton } from "./CloseButton.tsx";
-import { BranchIcon, CopyIcon, IconLabel } from "../lib/glyphIcons.tsx";
+import { BranchIcon, CopyIcon, IconLabel, MonitorIcon } from "../lib/glyphIcons.tsx";
 import { agentsOf, subscribeAgents } from "../lib/fleetAgents.ts";
 import { branchesOf, subscribeBranches } from "../lib/repoBranches.ts";
 import {
@@ -61,6 +62,7 @@ const Bubble = memo(function Bubble({ role, ts, text }: { role: string; ts: numb
 
 export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume }:{ sessionId: string | null; sourceApp?: string; onClose: () => void; onFilter?: (app: string) => void; onResume?: (s: SessionDetail) => void }) {
   const [d, setD] = useState<SessionDetail | null>(null);
+  const here = useServerHost();
   const [loading, setLoading] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [diffPath, setDiffPath] = useState<string | undefined>(undefined);
@@ -199,7 +201,14 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                   </div>
                   <div className="ml-auto flex items-center gap-2 shrink-0">
                     {d && onResume && (
-                      live ? (
+                      ranElsewhere(d.host, here) ? (
+                        // Its transcript and checkout are on that machine; the
+                        // server refuses a resume here (409), so say where it
+                        // can be resumed instead of offering a button that fails.
+                        <span className="chip t-dim2" title={`This session ran on ${d.host} — resume it from there.`}>
+                          <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Ran on {d.host}
+                        </span>
+                      ) : live ? (
                         // A claude session has one owner. Resuming one that's
                         // still running would put a second writer on the same
                         // transcript, so say why rather than offer a button

@@ -306,7 +306,7 @@ export interface Caller {
    * is the fence going up before the thing that needs fencing arrives, which is
    * the only order in which a fence is ever built correctly.
    */
-  principal?: "understudy" | "seat";
+  principal?: "understudy" | "seat" | "node";
   /** When `principal` is `seat`: which project's chair, and what that chair
    *  was granted. Carried on the caller rather than looked up per request so
    *  the grant is the one made at seating — changing the setting afterwards
@@ -483,7 +483,22 @@ export function callerFor(req: Request, url: URL, token: string): Caller | null 
   if (plugin) return { kind: "plugin", scope: plugin.scope, plugin: plugin.name };
   if (eq(provided, token)) return { kind: "machine", scope: "full" };
   const device = deviceFor(provided);
+  if (device?.role === "node") return { kind: "device", scope: "read", device, principal: "node" };
   return device ? { kind: "device", scope: device.scope, device } : null;
+}
+
+/**
+ * Everything another agentglass may ask of this one, as a hub: its link.
+ *
+ * Its own total function for the understudy's reason — a principal, not a
+ * rank. A node is a machine forwarding its own rows; it has no business
+ * reading this cockpit (every other machine's prompts are in it), answering a
+ * gate or driving anything here. A scope of `read` would hand it the first of
+ * those, so no scope is consulted at all. The link is a GET because it is a
+ * WebSocket upgrade; the rows it carries are checked in fleethub.ts.
+ */
+export function nodeAllows(method: string, pathname: string): boolean {
+  return method === "GET" && pathname === "/fleet/link";
 }
 
 /**
@@ -668,6 +683,7 @@ export function allowed(caller: Caller, method: string, pathname: string): boole
      check — the seat's token says `full` so its reads work, and an `||` here
      would hand back every write this exists to withhold. */
   if (caller.principal === "seat") return seatAllows(caller.seat?.powers ?? "speak", method, pathname);
+  if (caller.principal === "node") return nodeAllows(method, pathname);
   // A plugin's own channel: its panels, its settings, its event queue, its
   // notes. Open at any scope because drawing is not a power over anything
   // else — what it may draw was declared in its manifest and approved, and
@@ -718,6 +734,9 @@ export function answersFromADevice(caller: Caller | null | undefined): boolean {
   // The day someone gives the understudy an `answer`-scoped credential for some
   // unrelated convenience, this is what stops it releasing its own holds.
   if (caller?.principal === "understudy") return false;
+  // A node is a device by kind and a machine by nature: refused by name, so a
+  // future widening of the line below cannot let another box release a hold.
+  if (caller?.principal === "node") return false;
   // A plugin is spelled out too, although `kind === "device"` below already
   // excludes it, for the same reason the understudy is: this is the door, and
   // the caller that was walking through it until the kind existed (see

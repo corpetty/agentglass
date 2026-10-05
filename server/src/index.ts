@@ -11,6 +11,10 @@ import { slackReachable } from "./slackreach.ts";
 import { normalize, detectError, clampIngestTimestamp, externalIngestError } from "./ingest.ts";
 import { pricingProvenance, startPricingRefresh } from "./pricing.ts";
 import { db } from "./db.ts";
+import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
+import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, type FleetWsData } from "./fleethub.ts";
+import { startUplink, uplinkStatus } from "./fleetlink.ts";
+import { HOST_ID_RE } from "./fleetwire.ts";
 import {
   insertEvent,
   getRecent,
@@ -187,7 +191,7 @@ import { takeLease, endLease, leaseHeld, reapLeases } from "./panelease.ts";
 import { runAgentInteractivePane } from "./understudy-pane.ts";
 import { startScanner, ownsSession, knownProjects, projectsKnownAtStart, resyncScope, scanningEnabled } from "./transcripts.ts";
 import { conflictPrompt } from "./conflictPrompt.ts";
-import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots, hostId } from "./config.ts";
+import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots, hostId, isLocalHost } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
 import { createJob, createJobs, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
 import { listInstances, launchInstance, stopInstance } from "./instances.ts";
@@ -1398,7 +1402,7 @@ import { bunBin, NO_BUN } from "./bunbin.ts";
 import { understudyRunEnv } from "./understudy-runenv.ts";
 import { recoverAfterRestart, startUnderstudyWatchdog, stopUnderstudyWatchdog, setResumeHook, setGitHook, setFenceHook, setAliveHook, setBunHook, setBusyHook } from "./understudy-watchdog.ts";
 import { openRequests, helpHistory, markAnswered } from "./understudy-help.ts";
-import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, type Scope } from "./devices.ts";
+import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, issueDevice, type Scope } from "./devices.ts";
 import { credentialsPath, hasCredential } from "./credentials.ts";
 import { startCardWatch, cardForTitle } from "./clickupwatch.ts";
 import * as CardIndex from "./clickupindex.ts";
@@ -1495,7 +1499,7 @@ const BUDGET_WRITE_ENABLED = process.env.AGENTGLASS_BUDGET_WRITE_DISABLED !== "1
 // it, forgetting a device revokes its credential and leaves whatever it is
 // already holding — an event stream, a terminal — running until it disconnects
 // on its own, which is a revoke in the list and not on the wire.
-type WsData = ({ kind: "events" } | { kind: "notify" } | PtyWsData) & { ip?: string | null; deviceId?: string | null };
+type WsData = ({ kind: "events" } | { kind: "notify" } | PtyWsData | FleetWsData) & { ip?: string | null; deviceId?: string | null };
 /** The docker reads that start a process per request and have no cache or
  *  single-flight in front of them. See spawncap.ts. */
 const DOCKER_SPAWNS = new Set([
@@ -2643,6 +2647,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
             error: `the orchestrator's seat may not ${req.method} ${pathname}: this chair is set to "${caller.seat?.powers ?? "speak"}"`,
           }, 403);
         }
+        if (caller.principal === "node") {
+          return json({ ok: false, error: `a fleet node credential opens /fleet/link and nothing else, not ${req.method} ${pathname}` }, 403);
+        }
         if (caller.principal === "understudy") {
           recordFence(pathname, req.method);
           return json({
@@ -2806,6 +2813,27 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // so without this any page in the user's browser could open a socket to
     // localhost and read the whole fleet's prompts, paths and errors as they
     // stream — a read this feed is not meant to give to the open web.
+    // --- the fleet link: another agentglass forwarding its rows (docs/FLEET.md) ---
+    //
+    // Only a node credential gets here (`nodeAllows` in auth.ts), and it names
+    // the one host the socket may speak as. A hub with no token never resolves
+    // a caller at all, so it cannot tell a node from anyone else on its port —
+    // it says so instead of accepting rows from whoever asks.
+    if (pathname === "/fleet/link") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (caller?.principal !== "node" || !caller.device?.host) {
+        return json({
+          ok: false,
+          error: AUTH_TOKEN
+            ? "the fleet link needs a node credential — mint one on the hub with `bun run fleet add-node <host>`"
+            : "this hub has no token configured, so it cannot tell a node from anyone else — set AGENTGLASS_TOKEN",
+        }, 401);
+      }
+      const data: FleetWsData = { kind: "fleet", host: caller.device.host, deviceId: caller.device.id, ip: clientIp ?? null };
+      if (srv.upgrade(req, { data })) return undefined as unknown as Response;
+      return new Response("upgrade failed", { status: 426 });
+    }
+
     if (pathname === "/stream") {
       if (!trustedCaller(req, from)) return csrfBlocked();
       if (srv.upgrade(req, { data: { kind: "events", ip: clientIp ?? null, deviceId: caller?.device?.id ?? null } })) return undefined as unknown as Response;
@@ -2908,10 +2936,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const direct = peer.source === "socket" && !!clientIp && isLoopback(clientIp);
       const proof = challenge && challenge.length <= 128 && AUTH_TOKEN && direct
         ? healthProof(AUTH_TOKEN, srv.port ?? PORT, challenge) : undefined;
-      // `host` is what this machine's rows read as beside another's (hostId()
-      // in config.ts) — and what a client sends back as ?host= to mean "here".
+      // No `host` here, though it would be convenient: it is usually the
+      // machine's hostname, and this route answers anyone who can reach the
+      // port without a credential (pair-routes.test.ts holds that line). The
+      // name is on /fleet/status, which is a read like any other.
       return json({
-        ok: true, service: "agentglass", host: hostId(), clients: clients.size,
+        ok: true, service: "agentglass", clients: clients.size,
         notifyWatching: notifyWatching(), build: buildStamp(), proof,
       });
     }
@@ -4895,6 +4925,55 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       return !AUTH_TOKEN || tokenOk(req, url, AUTH_TOKEN);
     };
     const notHere = () => json({ ok: false, error: "only this machine can do that" }, 403);
+
+    // --- the fleet (docs/FLEET.md) ---
+
+    // Both halves on one page: what this machine forwards to, and who forwards
+    // here. A read, so a paired phone can see whether the box is linked.
+    if (pathname === "/fleet/status") {
+      return json({ host: hostId(), upstream: uplinkStatus(), nodes: fleetNodes() });
+    }
+
+    /*
+     * Mint a node credential, at the hub, for one named host.
+     *
+     * At the machine for the reason a pairing ticket is: an invitation is made
+     * where the person is sitting. The fleet CLI runs on the hub's own shell —
+     * over ssh, for a headless box — and that shell is already all the
+     * authority there is here, so no six-digit ceremony is added on top. The
+     * token is shown once, in the answer, and only its hash is kept.
+     *
+     * One live credential per host: minting again for a name that already has
+     * one is refused unless `replace` says to revoke the old one, because two
+     * machines forwarding as "bean" would interleave into one history that
+     * neither of them recorded.
+     */
+    if (pathname === "/fleet/nodes" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (!atMachine()) return notHere();
+      if (!AUTH_TOKEN) {
+        return json({ ok: false, error: "this hub has no token configured, so a node credential could never be checked — set AGENTGLASS_TOKEN first" }, 409);
+      }
+      let b: { host?: unknown; replace?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.host === "string" ? b.host.trim() : "";
+      if (!HOST_ID_RE.test(host)) return json({ ok: false, error: "host must be a plain label: letters, digits, . _ -" }, 400);
+      if (host === hostId()) return json({ ok: false, error: `"${host}" is this hub's own name` }, 400);
+      const existing = activeDevices().filter((d) => d.role === "node" && d.host === host);
+      if (existing.length && b.replace !== true) {
+        return json({ ok: false, error: `"${host}" already has a node credential — pass replace to revoke it and mint a new one` }, 409);
+      }
+      for (const d of existing) {
+        revokeDevice(d.id);
+        for (const ws of [...sockets]) if (ws.data?.deviceId === d.id) { try { ws.close(1008, "credential replaced"); } catch { /* gone */ } }
+      }
+      const { device, token } = issueDevice(`agentglass on ${host}`, "read", Date.now(), { host });
+      return json({ ok: true, token, device: publicDevice(device) });
+    }
+    if (pathname === "/fleet/nodes") {
+      const creds = activeDevices().filter((d) => d.role === "node").map(publicDevice);
+      return json({ nodes: fleetNodes(), credentials: creds });
+    }
 
     if (pathname === "/pair/ticket" && req.method === "POST") {
       if (!atMachine()) return notHere();
@@ -7921,7 +8000,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!d) return json({ ok: false, error: "no such session" }, 404);
       const wanted = typeof b.kind === "string" ? b.kind : "claude";
       if (!agentKind(wanted)) return json({ ok: false, error: "no such agent" }, 400);
-      const cwd = gitSafeAbs(b.cwd) || gitSafeAbs(d.cwd_path) || workspaceRoot() || "";
+      // Another machine's session hands over its story, not its directory: its
+      // cwd names a checkout on that machine, and the same path here — if it
+      // exists at all — is a different tree. Only a cwd the caller chose counts.
+      const foreign = !isLocalHost(d.host);
+      const cwd = gitSafeAbs(b.cwd) || (foreign ? "" : gitSafeAbs(d.cwd_path) || workspaceRoot()) || "";
+      if (foreign && !cwd) return json({ ok: false, error: `that session ran on ${d.host} — say which checkout here to hand it to` }, 400);
       if (!cwd || !inScope(cwd) || !fsExists(cwd)) return json({ ok: false, error: "that directory is not in the open project" }, 400);
       const prompt = handoffBrief(d);
       const title = `handoff: ${(d.custom_title || d.ai_title || session.slice(0, 8)).slice(0, 40)}`;
@@ -8343,6 +8427,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       // The launch, not the turn. chatSend returns a stream rather than an
       // outcome, and the auditable fact is that somebody started an agent in a
       // checkout through this cockpit — what it then does is gated and lands in
@@ -8486,6 +8572,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       // Same reasoning as /chat/send: the launch is the auditable fact, not the
       // turn, and the prompt is already in Codex's own rollout.
       noteAction(clientIp, "/codex/send",
@@ -8513,6 +8601,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       noteAction(clientIp, "/antigravity/send",
         { root: b.cwd, name: b.model }, { ok: true }, asActor(caller));
       // `ingestBody` is handed in rather than imported by antigravity.ts, which
@@ -8753,6 +8843,7 @@ const server = Bun.serve<WsData>({
       // user cuts that device off.
       sockets.add(ws);
       noteSocket(ws.data?.ip, 1);
+      if (ws.data?.kind === "fleet") { fleetOpen(ws as ServerWebSocket<FleetWsData>); return; }
       if (ws.data?.kind === "pty") {
         // Alive from the moment it connects — see the note on the sweep above.
         alive.set(ws, Date.now());
@@ -8796,6 +8887,7 @@ const server = Bun.serve<WsData>({
       // event streams only and leaks an entry per terminal.
       alive.delete(ws);
       noteSocket(ws.data?.ip, -1);
+      if (ws.data?.kind === "fleet") { fleetClose(ws as ServerWebSocket<FleetWsData>); return; }
       if (ws.data?.kind === "pty") { ptyClose(ws); return; }
       if (ws.data?.kind === "notify") {
         // Unsubscribing is what stops the monitor process once the last
@@ -8813,6 +8905,7 @@ const server = Bun.serve<WsData>({
       // A frame that did arrive is still proof somebody is running — for a
       // pty this is a keystroke or a resize, not just the event stream.
       alive.set(ws, Date.now());
+      if (ws.data?.kind === "fleet") { fleetMessage(ws as ServerWebSocket<FleetWsData>, msg as string | Buffer); return; }
       if (ws.data?.kind === "pty") { ptyMessage(ws, msg as string | Buffer); return; }
       if (ws.data?.kind === "events" && typeof msg === "string" && msg.length < 512 && msg.startsWith("{")) {
         let f: { type?: unknown; clientId?: unknown; browser?: unknown } = {};
@@ -9283,6 +9376,50 @@ startScanner(({ event, session }) => {
   if (event.hook_event_type === "PreToolUse" || event.hook_event_type.startsWith("PostToolUse")) pushOpenTools();
   maybeAlert(event);
 });
+
+/**
+ * Refuse to resume another machine's session here (docs/FLEET.md).
+ *
+ * Its transcript and checkout are on that machine. Resuming it locally either
+ * fails after spawning a process, or — the tmux engine, finding no transcript —
+ * starts a NEW local session under the remote id, whose rows then merge into
+ * the forwarded session and are labelled as the other machine's work. A
+ * `host:` id would otherwise fail the id check and be dropped silently,
+ * starting an unresumed agent with no error at all. Phase 4 is where a remote
+ * resume runs on the machine that owns it.
+ */
+function foreignResumeRefusal(b: { resumeId?: unknown }): string | null {
+  const rid = typeof b?.resumeId === "string" ? b.resumeId : "";
+  const host = foreignHostOf(rid);
+  return host ? `that session ran on ${host} — it can only be resumed there` : null;
+}
+
+// Another machine's rows, just stored by the fleet hub (fleethub.ts). Pushed
+// live like the scanner's, with two differences. Only the recent ones: a node
+// backfilling a week of history sends it in batches of hundreds, and drawing
+// last Tuesday's events into the live feed one by one is noise, not news — a
+// reload shows them where they belong. And no alert: an alert here is a
+// notification on this desk, and phase 3 is where another machine's holds
+// learn to reach it deliberately rather than as a side effect.
+const FOREIGN_LIVE_MS = 10 * 60_000;
+whenForeignRows(({ inserted, sessions }) => {
+  for (const sid of sessions) sessionCache.delete(sid);
+  const recent = Date.now() - FOREIGN_LIVE_MS;
+  let toolEdge = false;
+  for (const e of eventsByIds(inserted)) {
+    if (e.timestamp < recent || !sessionInScope({ host: e.host })) continue;
+    broadcast({ type: "event", data: e });
+    if (e.hook_event_type === "PreToolUse" || e.hook_event_type.startsWith("PostToolUse")) toolEdge = true;
+  }
+  for (const s of sessionsByIds(sessions)) {
+    if (s.last_seen >= recent && sessionInScope(s)) broadcast({ type: "session", data: s });
+  }
+  if (toolEdge) pushOpenTools();
+});
+
+// Forward this machine's rows to a hub, if it has joined one. Off by default
+// and inert until `bun run fleet join` writes upstream.json.
+startUplink({ version: buildStamp() || undefined });
 
 // Bring back the gate requests that were in flight when this process last
 // stopped. Anything still inside its window returns to "what needs you"; the

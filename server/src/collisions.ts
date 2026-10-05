@@ -531,6 +531,9 @@ export async function getCollisions(
               json_extract(payload,'$.tool_input.workdir') AS workdir
        FROM events
        WHERE timestamp > ? AND hook_event_type IN ('PreToolUse','SessionEnd')
+         -- This machine's sessions only: another machine's "localhost:5432" and
+         -- its checkouts are not resources anything here can collide over.
+         AND +host IS NULL
        ORDER BY timestamp`,
     )
     .all(since);
