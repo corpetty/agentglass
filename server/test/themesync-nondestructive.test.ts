@@ -118,7 +118,8 @@ describe("syncTheme never edits the user's own config", () => {
       expect(r.error).toContain("refusing to write");
       expect(existsSync(notScratch)).toBe(false); // and it created nothing on the way
     } finally {
-      process.env.XDG_CONFIG_HOME = saved;
+      if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = saved;
     }
   });
 
