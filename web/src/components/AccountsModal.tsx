@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
+import { CloseButton } from "./CloseButton.tsx";
 import { api, type Account, type AccountInput, type UsagePayload, type UsageWindow } from "../lib/api.ts";
 import type { DesktopInstance } from "../../../shared/types.ts";
 
@@ -223,7 +224,7 @@ export function AccountsModal({ open, onClose }: { open: boolean; onClose: () =>
                     </div>
                     <div className="flex items-center gap-2">
                       {!editing && <button onClick={() => { setErr(null); setEditing({ id: "", account_paths: [] }); }} className="text-[12px] px-3 py-1.5 rounded-lg font-medium hover:opacity-90" style={{ color: "white", background: "var(--primary)" }}>+ add account</button>}
-                      <button onClick={onClose} className="h-8 w-8 grid place-items-center rounded-full text-[15px] t-dim2 hover:opacity-80" style={{ background: "color-mix(in srgb, white 8%, transparent)", backdropFilter: "blur(10px)", border: "1px solid color-mix(in srgb, white 12%, transparent)" }}>✕</button>
+                      <CloseButton onClick={onClose} />
                     </div>
                   </motion.div>
 

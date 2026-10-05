@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
+import { CloseButton } from "./CloseButton.tsx";
 import { api, type Account } from "../lib/api.ts";
 import type { Job, JobStatus, JobInput } from "../../../shared/types.ts";
 
@@ -150,7 +151,7 @@ export function QueueModal({ open, onClose, onOpenSession }: { open: boolean; on
                       <span className="text-[17px] font-semibold" style={{ color: "var(--text)" }}>Queue</span>
                       <span className="text-[12px] t-dim2">{active} active · {jobs.length} total</span>
                     </div>
-                    <button onClick={onClose} className="h-8 w-8 grid place-items-center rounded-full text-[15px] t-dim2 hover:opacity-80" style={{ background: "color-mix(in srgb, white 8%, transparent)", backdropFilter: "blur(10px)", border: "1px solid color-mix(in srgb, white 12%, transparent)" }}>✕</button>
+                    <CloseButton onClick={onClose} />
                   </motion.div>
 
                   <div className="flex flex-col gap-3">
