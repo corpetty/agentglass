@@ -13,6 +13,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, realpathS
 import { homedir, tmpdir } from "node:os";
 import { join, resolve, dirname, relative, sep, delimiter } from "node:path";
 import { worktreeFamily } from "./worktree.ts";
+import { failed } from "./refused.ts";
 
 /**
  * Resolved per call, and read per path.
@@ -1014,7 +1015,7 @@ export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?:
   let cur: Config = {};
   try {
     cur = JSON.parse(readFileSync(path, "utf8")) as Config;
-  } catch (e) {
+  } catch {
     if (existsSync(path)) {
       return { ok: false, error: `config file is malformed — fix ${path} to persist changes` };
     }
@@ -1026,7 +1027,7 @@ export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?:
     cached = null; // force config() to re-read, so the new registry is seen now
     return { ok: true };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: failed("config", e, `could not save ${path}`) };
   }
 }
 

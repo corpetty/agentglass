@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readdirSync, existsSync } from "node:fs";
 import { listAccounts } from "./accounts.ts";
+import { failed } from "./refused.ts";
 import type { DesktopInstance } from "../../shared/types.ts";
 
 export const INSTANCES_ENABLED = process.env.AGENTGLASS_INSTANCES_DISABLED !== "1";
@@ -120,7 +121,7 @@ export function launchInstance(name: string): { ok: boolean; error?: string; not
     const proc = Bun.spawn(setsid ? [setsid, bin] : [bin], { env, stdout: "ignore", stderr: "ignore", stdin: "ignore" });
     proc.unref();
   } catch (e) {
-    return { ok: false, error: `launch failed: ${e instanceof Error ? e.message : e}` };
+    return { ok: false, error: failed("instances", e, "Claude Desktop could not be launched") };
   }
   return { ok: true };
 }

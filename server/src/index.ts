@@ -3432,7 +3432,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // --- accounts registry ---
     if (pathname === "/accounts") {
       if (req.method === "POST") {
-        if (!localOrigin(req)) return csrfBlocked();
+        if (!trustedCaller(req, from)) return csrfBlocked();
         let b: any = {};
         try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
         const res = upsertAccount(b);
@@ -3442,7 +3442,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     }
     // POST (not DELETE) for removal — the CORS allow-list is GET,POST only.
     if (pathname === "/accounts/delete" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = removeAccount(String(b.id ?? ""));
@@ -3452,7 +3452,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // --- job queue ---
     if (pathname === "/jobs") {
       if (req.method === "POST") {
-        if (!localOrigin(req)) return csrfBlocked();
+        if (!trustedCaller(req, from)) return csrfBlocked();
         let b: any = {};
         try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
         const res = createJob(b);
@@ -3461,7 +3461,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       return json({ jobs: listJobs() });
     }
     if (pathname === "/jobs/batch" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const items = Array.isArray(b) ? b : Array.isArray(b?.jobs) ? b.jobs : null;
@@ -3476,7 +3476,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     }
     // POST for writes — the CORS allow-list is GET,POST only (no PATCH/DELETE).
     if (pathname === "/jobs/update" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const { id, ...patch } = b;
@@ -3484,7 +3484,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       return json(res, res.ok ? 200 : 400);
     }
     if (pathname === "/jobs/cancel" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = cancelJob(String(b.id ?? ""));
@@ -3494,14 +3494,14 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // --- desktop instances ---
     if (pathname === "/instances") return json({ instances: listInstances() });
     if (pathname === "/instances/launch" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = launchInstance(String(b.name ?? ""));
       return json(res, res.ok ? 200 : 400);
     }
     if (pathname === "/instances/stop" && req.method === "POST") {
-      if (!localOrigin(req)) return csrfBlocked();
+      if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ ok: false, error: "invalid json" }, 400); }
       const res = stopInstance(String(b.name ?? ""));
