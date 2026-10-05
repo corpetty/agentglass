@@ -8,14 +8,14 @@ import { usePoll } from "../lib/usePoll.ts";
 import { fmtUsd, fmtMs, fmtEq, modelColor, modelLabelOf } from "../lib/format.ts";
 import { sharedPhase } from "../lib/sharedPhase.ts";
 
-export const Sessions = memo(function Sessions({ provider = "", active = true }: { provider?: string; active?: boolean }) {
+export const Sessions = memo(function Sessions({ provider = "", host = "", active = true }: { provider?: string; host?: string; active?: boolean }) {
   const [sessions, setSessions] = useState<SessionRollup[]>([]);
   // Five seconds is the fastest poll on the dashboard, and it was the only one
   // with no gate at all: it kept asking from a panel behind another view, on a
   // hidden window, for as long as the app was open. `usePoll` covers both — see
   // the note in Alerts.
-  const load = () => { api.sessions(40, provider || undefined).then(setSessions).catch(() => {}); };
-  useEffect(() => { if (active) load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [active, provider]);
+  const load = () => { api.sessions(40, provider || undefined, undefined, host || undefined).then(setSessions).catch(() => {}); };
+  useEffect(() => { if (active) load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [active, provider, host]);
   usePoll(active, load, 5000);
 
   const now = Date.now();

@@ -910,21 +910,23 @@ const realApi = {
   // a laptop can cross a timezone between two polls and the server caches per
   // zone anyway. Resolving it can throw on an exotic runtime; the server falls
   // back to its own clock when it is absent.
-  stats: (windowMs: number, provider?: string, account?: string) =>
+  stats: (windowMs: number, provider?: string, account?: string, host?: string) =>
     get<StatsSummary>(
       `/stats?window=${windowMs}`
       + (provider ? `&provider=${encodeURIComponent(provider)}` : "")
       + (account ? `&account=${encodeURIComponent(account)}` : "")
+      + (host ? `&host=${encodeURIComponent(host)}` : "")
       + (viewerTz() ? `&tz=${encodeURIComponent(viewerTz()!)}` : ""),
     ),
   // No tz, unlike /stats: these days are UTC because that is the grain the
   // retention fold wrote them at, and re-slicing a day-summary by a viewer's
   // clock would move spend onto a day it was never recorded on.
   usageDaily: (days = 90) => get<UsageHistory>(`/usage/daily?days=${days}`),
-  sessions: (limit = 100, provider?: string, account?: string) =>
-    get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}`),
+  sessions: (limit = 100, provider?: string, account?: string, host?: string) =>
+    get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}${host ? `&host=${encodeURIComponent(host)}` : ""}`),
+  // `hosts` is optional because an older server does not send it.
   filterOptions: () =>
-    get<{ source_apps: string[]; hook_event_types: string[]; models: string[]; accounts: string[] }>(
+    get<{ source_apps: string[]; hook_event_types: string[]; models: string[]; accounts: string[]; hosts?: string[] }>(
       `/events/filter-options`
     ),
   // `kind`: "events" is the raw rows, bounded by retention; "daily" is the

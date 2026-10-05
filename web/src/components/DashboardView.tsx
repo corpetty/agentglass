@@ -48,7 +48,7 @@ const WINDOWS = [
   { label: "All", ms: 0 },
 ];
 
-export type DashFilter = { app: string; type: string; provider: string; account: string };
+export type DashFilter = { app: string; type: string; provider: string; account: string; host: string };
 
 export function DashboardView({
   active, events, visibleEvents, agents, alerts, stats, sessionProvider, providers,
@@ -81,7 +81,7 @@ export function DashboardView({
    * They used to be polled from the app root every twenty seconds for the whole
    * life of the process, to fill two dropdowns that exist on this screen alone.
    */
-  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[]; accounts: string[] }>({ source_apps: [], hook_event_types: [], accounts: [] });
+  const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[]; accounts: string[]; hosts?: string[] }>({ source_apps: [], hook_event_types: [], accounts: [], hosts: [] });
   useEffect(() => {
     if (!active) return;
     const load = () => api.filterOptions().then(setOpts).catch(() => {});
@@ -93,7 +93,7 @@ export function DashboardView({
   /* Read once, for the strip and the KPI tiles alike: one screen, one count. */
   const fleet = useFleetVerdict();
 
-  const hasFilter = filter.app || filter.type || filter.provider || filter.account;
+  const hasFilter = filter.app || filter.type || filter.provider || filter.account || filter.host;
   const selStyle = {
     background: "color-mix(in srgb, var(--bg3) 40%, transparent)",
     border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)",
@@ -139,6 +139,13 @@ export function DashboardView({
           <Select value={filter.account} style={selStyle}
             options={[{ value: "", label: "All accounts" }, ...opts.accounts.map((a) => ({ value: a, label: a }))]}
             onChange={(v) => onFilter({ ...filter, account: v })} />
+        )}
+        {/* Hidden on a one-machine install, like the two above: a picker with
+            one choice is a control that does nothing. */}
+        {(opts.hosts?.length ?? 0) > 1 && (
+          <Select value={filter.host} style={selStyle}
+            options={[{ value: "", label: "All hosts" }, ...opts.hosts!.map((h) => ({ value: h, label: h }))]}
+            onChange={(v) => onFilter({ ...filter, host: v })} />
         )}
         {hasFilter && (
           <button onClick={onClearFilter} className="text-[10.5px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap"
@@ -193,7 +200,7 @@ export function DashboardView({
               Usage cell above is allowed to ask for more. */}
           <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><CostByModel stats={stats} /></div>
           <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Latency stats={stats} /></div>
-          <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Sessions provider={filter.provider} active={active} /></div>
+          <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Sessions provider={filter.provider} host={filter.host} active={active} /></div>
           <div className="xl:col-span-9 min-w-0 min-h-0 h-[140px] xl:h-[140px]"><MissionTimeline stats={stats} /></div>
         </div>
       </div>

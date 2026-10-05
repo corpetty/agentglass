@@ -178,9 +178,9 @@ function Spark({ data, color }: { data: number[]; color: string }) {
   );
 }
 
-function SessionCard({ a, selected, onSelect, collisions, branch, shared }: {
+function SessionCard({ a, selected, onSelect, collisions, branch, shared, showHost }: {
   a: AgentCard; selected: boolean; onSelect?: (a: AgentCard) => void;
-  collisions: Collision[]; branch: string | null; shared: boolean;
+  collisions: Collision[]; branch: string | null; shared: boolean; showHost: boolean;
 }) {
   const st = STATUS[a.status];
   const model = modelLabelOf(a.model_name);
@@ -248,6 +248,15 @@ function SessionCard({ a, selected, onSelect, collisions, branch, shared }: {
             <span className="chip shrink-0" title={SHARED_TREE_TOOLTIP}
               style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)" }}>
               {SHARED_TREE_LABEL}
+            </span>
+          )}
+          {/* Which machine, once there is more than one to tell apart. Groups
+              are by project, so `agentglass` on the desk and on the box sit in
+              the same group — the chip is what says which is which. */}
+          {showHost && a.host && (
+            <span className="chip shrink-0" title={`Running on ${a.host}`}
+              style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--text) 9%, transparent)" }}>
+              ⌂ {a.host}
             </span>
           )}
         </div>
@@ -384,6 +393,9 @@ export function Fleet({ agents, activeApp, onSelect, active = true }: { agents: 
       })
       .sort((a, b) => b.live - a.live || b.lastSeen - a.lastSeen);
   }, [agents, claimed]);
+  // A host chip on every card of a one-machine fleet is the same word repeated
+  // down the wall. It earns its space only when the cards on screen disagree.
+  const showHost = useMemo(() => new Set(agents.map((a) => a.host).filter(Boolean)).size > 1, [agents]);
 
   // A fully-idle group with several sessions collapses by default to cut clutter.
   const isCollapsed = (app: string, live: number, size: number) => overrides[app] ?? (live === 0 && size > 2);
@@ -423,6 +435,7 @@ export function Fleet({ agents, activeApp, onSelect, active = true }: { agents: 
               collisions={collisions}
               branch={branchForCwd(workingTreeOf(a), branches)}
               shared={isSharedCwd(workingTreeOf(a), sharedCwds)}
+              showHost={showHost}
             />
           )}
         />
@@ -459,6 +472,7 @@ export function Fleet({ agents, activeApp, onSelect, active = true }: { agents: 
                         collisions={collisions}
                         branch={branchForCwd(workingTreeOf(a), branches)}
                         shared={isSharedCwd(workingTreeOf(a), sharedCwds)}
+                        showHost={showHost}
                       />
                     ))}
                   </motion.div>

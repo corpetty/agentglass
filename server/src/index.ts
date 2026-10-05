@@ -187,7 +187,7 @@ import { takeLease, endLease, leaseHeld, reapLeases } from "./panelease.ts";
 import { runAgentInteractivePane } from "./understudy-pane.ts";
 import { startScanner, ownsSession, knownProjects, projectsKnownAtStart, resyncScope, scanningEnabled } from "./transcripts.ts";
 import { conflictPrompt } from "./conflictPrompt.ts";
-import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots } from "./config.ts";
+import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots, hostId } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
 import { createJob, createJobs, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
 import { listInstances, launchInstance, stopInstance } from "./instances.ts";
@@ -2908,8 +2908,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const direct = peer.source === "socket" && !!clientIp && isLoopback(clientIp);
       const proof = challenge && challenge.length <= 128 && AUTH_TOKEN && direct
         ? healthProof(AUTH_TOKEN, srv.port ?? PORT, challenge) : undefined;
+      // `host` is what this machine's rows read as beside another's (hostId()
+      // in config.ts) — and what a client sends back as ?host= to mean "here".
       return json({
-        ok: true, service: "agentglass", clients: clients.size,
+        ok: true, service: "agentglass", host: hostId(), clients: clients.size,
         notifyWatching: notifyWatching(), build: buildStamp(), proof,
       });
     }
@@ -3060,7 +3062,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // --- reads ---
     if (pathname === "/events/recent") {
       const limit = Math.min(2000, Number(url.searchParams.get("limit") || 300));
-      return json(getRecent(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
+      return json(getRecent(
+        limit,
+        url.searchParams.get("provider") || undefined,
+        url.searchParams.get("account") || undefined,
+        url.searchParams.get("host") || undefined,
+      ));
     }
     if (pathname === "/events/filter-options") return json(getFilterOptions());
     // Every project the scanner has seen, with the real folder it lives in —
@@ -8574,7 +8581,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     }
     if (pathname === "/sessions") {
       const limit = Math.min(1000, Number(url.searchParams.get("limit") || 100));
-      return json(getSessions(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
+      return json(getSessions(
+        limit,
+        url.searchParams.get("provider") || undefined,
+        url.searchParams.get("account") || undefined,
+        url.searchParams.get("host") || undefined,
+      ));
     }
     if (pathname === "/stats") {
       const windowMs = parseWindowMs(url.searchParams.get("window"));
@@ -8588,6 +8600,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
           url.searchParams.get("provider") || undefined,
           url.searchParams.get("tz") || undefined,
           url.searchParams.get("account") || undefined,
+          url.searchParams.get("host") || undefined,
         ),
         server_started_at: STARTED_AT,
         retention_days: RETENTION_DAYS,

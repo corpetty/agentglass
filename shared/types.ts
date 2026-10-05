@@ -83,6 +83,13 @@ export interface WatchEvent {
    *  type as WatchEvent; rows read back from the events table always carry it
    *  (null when untagged). */
   account?: string | null;
+  /**
+   * The machine this ran on (docs/FLEET.md). Always a name on the wire: the
+   * server stores its own rows unlabelled and fills in its hostId() on the way
+   * out, so this is never null from a current server. Optional because an older
+   * one does not send it — absent means "the server you are talking to".
+   */
+  host?: string;
 }
 
 export interface SessionRollup {
@@ -92,6 +99,8 @@ export interface SessionRollup {
   /** Which Claude account/instance owns this session (e.g. "work" / "personal").
    *  Null for rows recorded before the column existed. */
   account?: string | null;
+  /** The machine the session ran on. Same contract as WatchEvent.host. */
+  host?: string;
   /** Directory the session ran in — what a resume needs to run in the right
    *  place. Null for rows recorded before the column existed. */
   project_path?: string | null;
@@ -1120,6 +1129,8 @@ export interface SessionRisk extends RiskFlag {
 export interface OpenToolCall {
   session_id: string;
   source_app: string;
+  /** The machine the call is running on. Same contract as WatchEvent.host. */
+  host?: string;
   tool_name: string;
   since: number; // ms — the PreToolUse timestamp
   /** The file this tool's own input said it would touch, when it named one.
