@@ -10,7 +10,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  cleanEvent, cleanSession, linkTransportOk, linkUrl, parseNodeFrame, parseHubFrame, FLEET_PROTOCOL,
+  cleanEvent, cleanGate, cleanSession, linkTransportOk, linkUrl, parseNodeFrame, parseHubFrame, FLEET_PROTOCOL, MAX_GATES,
 } from "../src/fleetwire.ts";
 
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-fleet-wire-"));
@@ -139,3 +139,38 @@ describe("a node credential", () => {
     expect(answersFromADevice(caller)).toBe(false);
   });
 });
+
+describe("phase 3: holds and answers", () => {
+  const gate = (over: Record<string, unknown> = {}) => ({
+    id: "0f8fad5b-d9cb-469f-a165-70867728950e", source_app: "proj", session_id: "s1", tool_name: "Bash",
+    summary: "rm -rf build", created: 1000, expires: 61_000, where: "proj · main", ...over,
+  });
+
+  test("a forwarded hold is checked like a row", () => {
+    expect(cleanGate(gate())).not.toBeNull();
+    expect(cleanGate(gate({ id: "not-a-uuid" }))).toBeNull();
+    expect(cleanGate(gate({ expires: 500 }))).toBeNull();      // ends before it began
+    expect(cleanGate(gate({ summary: "x".repeat(3000) }))).toBeNull();
+    expect(cleanGate(gate({ tool_name: "" }))).toBeNull();
+  });
+
+  test("a queue longer than a person's is refused", () => {
+    const many = Array.from({ length: MAX_GATES + 1 }, () => gate({ id: crypto.randomUUID() }));
+    expect(parseNodeFrame(JSON.stringify({ t: "gates", gates: many })).ok).toBe(false);
+    expect(parseNodeFrame(JSON.stringify({ t: "gates", gates: [gate()] })).ok).toBe(true);
+  });
+
+  test("an answer from the hub must be exactly an answer — it releases a call on the node", () => {
+    const ok = { t: "decide", id: "0f8fad5b-d9cb-469f-a165-70867728950e", decision: "deny", reason: "no", by: "local" };
+    expect(parseHubFrame(JSON.stringify(ok))).toEqual(ok as any);
+    expect(parseHubFrame(JSON.stringify({ ...ok, decision: "maybe" }))).toBeNull();
+    expect(parseHubFrame(JSON.stringify({ ...ok, id: "../x" }))).toBeNull();
+    expect(parseHubFrame(JSON.stringify({ ...ok, reason: "x".repeat(5000) }))).toBeNull();
+  });
+
+  test("the node's confirmation is checked too", () => {
+    expect(parseNodeFrame(JSON.stringify({ t: "decided", id: "0f8fad5b-d9cb-469f-a165-70867728950e", ok: false, error: "late" })).ok).toBe(true);
+    expect(parseNodeFrame(JSON.stringify({ t: "decided", id: "nope", ok: true })).ok).toBe(false);
+  });
+});
+

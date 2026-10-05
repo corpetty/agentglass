@@ -16,6 +16,16 @@
  *   hub  → node  ack      { t, upto }
  *   hub  → node  refuse   { t, error }               then closes
  *
+ * Phase 3 — gates held on the node, answered at the hub:
+ *
+ *   node → hub   gates    { t, gates }                    the node's whole queue, on every change
+ *   hub  → node  decide   { t, id, decision, reason, by } a person at the hub answered one
+ *   node → hub   decided  { t, id, ok, error? }           whether it took (it may have timed out)
+ *
+ * `decide` can arrive at any moment — in the middle of a batch waiting for its
+ * ack — so the node handles it the moment it lands rather than queueing it
+ * behind the ack it is waiting for.
+ *
  * One batch is in flight at a time; the node sends the next only after the
  * ack. The hub is the cursor's source of truth — a node that restarts, or
  * reconnects after a night asleep, asks where it got to rather than
@@ -58,13 +68,61 @@ export type SessionColumn = (typeof SESSION_COLUMNS)[number];
 export type WireEvent = { origin_id: number } & Partial<Record<EventColumn, string | number | null>>;
 export type WireSession = Partial<Record<SessionColumn, string | number | null>>;
 
+/** One held tool call, as a node forwards it. Mirrors PendingGate. */
+export interface WireGate {
+  id: string;
+  source_app: string;
+  session_id: string;
+  tool_name: string;
+  summary: string;
+  created: number;
+  expires: number;
+  where?: string;
+  budget?: string;
+}
+
 export type NodeFrame =
   | { t: "hello"; v: number; host: string; version?: string }
-  | { t: "rows"; upto: number; events: WireEvent[]; sessions: WireSession[] };
+  | { t: "rows"; upto: number; events: WireEvent[]; sessions: WireSession[] }
+  | { t: "gates"; gates: WireGate[] }
+  | { t: "decided"; id: string; ok: boolean; error?: string };
 export type HubFrame =
   | { t: "welcome"; v: number; host: string; after: number }
   | { t: "ack"; upto: number }
-  | { t: "refuse"; error: string };
+  | { t: "refuse"; error: string }
+  | { t: "decide"; id: string; decision: "allow" | "deny"; reason: string; by: string };
+
+/** Same shape gate.ts accepts from a hook: a uuid, never anything else. */
+export const GATE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** More holds than this at once is not a person's queue; it is a loop. */
+export const MAX_GATES = 100;
+const MAX_GATE_TEXT = 2000;
+const MAX_REASON = 2000;
+const MAX_ACTOR = 200;
+
+const shortStr = (v: unknown, max: number): string | null =>
+  typeof v === "string" && v.length <= max ? v : null;
+
+/** One forwarded hold, checked — or null. Text is capped, ids are uuids, and
+ *  the two times have to be real times in the right order. */
+export function cleanGate(raw: unknown): WireGate | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.id !== "string" || !GATE_ID_RE.test(r.id)) return null;
+  const source_app = shortStr(r.source_app, 200);
+  const session_id = shortStr(r.session_id, 200);
+  const tool_name = shortStr(r.tool_name, 200);
+  const summary = shortStr(r.summary ?? "", MAX_GATE_TEXT);
+  if (!source_app || !session_id || !tool_name || summary === null) return null;
+  const created = r.created, expires = r.expires;
+  if (typeof created !== "number" || !Number.isSafeInteger(created)) return null;
+  if (typeof expires !== "number" || !Number.isSafeInteger(expires) || expires < created) return null;
+  const where = r.where === undefined ? undefined : shortStr(r.where, 300);
+  const budget = r.budget === undefined ? undefined : shortStr(r.budget, 300);
+  if (where === null || budget === null) return null;
+  return { id: r.id, source_app, session_id, tool_name, summary, created, expires,
+    ...(where ? { where } : {}), ...(budget ? { budget } : {}) };
+}
 
 /** Same rule as hostId() in config.ts: a plain label, because it lands in a
  *  URL query, a filter option and a column every reader trusts. */
@@ -182,6 +240,21 @@ export function parseNodeFrame(text: string, now = Date.now()):
     if (typeof f.host !== "string" || !HOST_ID_RE.test(f.host)) return { ok: false, error: "bad host" };
     return { ok: true, frame: { t: "hello", v: f.v, host: f.host, version: typeof f.version === "string" ? f.version.slice(0, 40) : undefined } };
   }
+  if (f.t === "gates") {
+    if (!Array.isArray(f.gates) || f.gates.length > MAX_GATES) return { ok: false, error: "bad gates" };
+    const gates: WireGate[] = [];
+    for (const raw of f.gates) {
+      const g = cleanGate(raw);
+      if (!g) return { ok: false, error: "bad gate" };
+      gates.push(g);
+    }
+    return { ok: true, frame: { t: "gates", gates } };
+  }
+  if (f.t === "decided") {
+    if (typeof f.id !== "string" || !GATE_ID_RE.test(f.id) || typeof f.ok !== "boolean") return { ok: false, error: "bad decided" };
+    const error = typeof f.error === "string" ? f.error.slice(0, 300) : undefined;
+    return { ok: true, frame: { t: "decided", id: f.id, ok: f.ok, ...(error ? { error } : {}) } };
+  }
   if (f.t === "rows") {
     // 0 is a real cursor: a sessions-only resync from a node that has not
     // forwarded an event yet.
@@ -220,6 +293,16 @@ export function parseHubFrame(text: string): HubFrame | null {
   }
   if (f.t === "ack" && typeof f.upto === "number" && Number.isSafeInteger(f.upto)) return { t: "ack", upto: f.upto };
   if (f.t === "refuse") return { t: "refuse", error: String(f.error ?? "refused").slice(0, 300) };
+  // Checked as strictly as the hub checks a node: this frame releases a held
+  // tool call on this machine, so a malformed one is no answer at all.
+  if (f.t === "decide") {
+    if (typeof f.id !== "string" || !GATE_ID_RE.test(f.id)) return null;
+    if (f.decision !== "allow" && f.decision !== "deny") return null;
+    const reason = shortStr(f.reason ?? "", MAX_REASON);
+    const by = shortStr(f.by ?? "", MAX_ACTOR);
+    if (reason === null || by === null) return null;
+    return { t: "decide", id: f.id, decision: f.decision, reason, by };
+  }
   return null;
 }
 

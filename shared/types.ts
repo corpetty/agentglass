@@ -787,6 +787,12 @@ export interface PendingGate {
   where?: string;
   /** The tmux pane it is running in, so the notification has somewhere to go. */
   pane?: string;
+  /** The machine holding it, when that is not the server you asked
+   *  (docs/FLEET.md, phase 3). Absent for this server's own holds. */
+  host?: string;
+  /** When it times out on the machine holding it. Sent for a forwarded hold,
+   *  so a hub can show how long is left. */
+  expires?: number;
 }
 
 /** A gate request that has been resolved. `resolution` is who resolved it:

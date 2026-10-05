@@ -75,6 +75,22 @@ const waiters = new Map<string, Pending>();
 let onChange: () => void = () => {};
 export function onGateChange(fn: () => void) { onChange = fn; }
 
+/*
+ * Everyone else who needs to hear that the queue moved — today the fleet
+ * uplink (fleetlink.ts), which forwards this machine's holds to a hub so they
+ * can be answered there. A set beside the single `onGateChange` slot rather
+ * than a replacement for it, so nothing that already uses the slot changes.
+ */
+const watchers = new Set<() => void>();
+export function watchGates(fn: () => void): () => void {
+  watchers.add(fn);
+  return () => { watchers.delete(fn); };
+}
+function changed(): void {
+  onChange();
+  for (const fn of watchers) { try { fn(); } catch { /* a listener must not stop a hold resolving */ } }
+}
+
 /** What a timeout resolves to, under the configured policy — or under a
  *  policy the route set for THIS request. An outward action (something a
  *  colleague can see) is held closed whatever the machine's default is: the
@@ -120,7 +136,7 @@ function finish(
   }
   resolveGateRow(id, out.decision, out.reason, resolution, Date.now(), by);
   w?.resolve?.(out);
-  onChange();
+  changed();
 }
 
 /**
@@ -224,7 +240,7 @@ export function submitGate(
     // push the whole reason off the lock screen, which is the one surface it
     // had to survive on.
     pushGate(where, tool_name, budget ? (summary ? `${budget} · ${summary}` : budget) : summary, pane ?? undefined);
-    onChange();
+    changed();
   });
 }
 
@@ -281,7 +297,7 @@ function recordByRule(
   // that as "allow", and a call the rule stopped would run.
   try {
     recordRuleGate({ id, source_app, session_id, tool_name, summary, created: now }, out.decision, out.reason);
-    onChange();
+    changed();
   } catch (e) {
     console.warn(`[gate] a rule's ${out.decision} was not recorded:`, e instanceof Error ? e.message : e);
   }
@@ -417,6 +433,18 @@ export function pendingGates(): (PendingGate & { budget?: string })[] {
 }
 
 /**
+ * The queue with each hold's deadline — for the fleet uplink, which forwards
+ * it so a hub can show how long is left and stop offering a hold that has
+ * already timed out on the machine that holds it.
+ */
+export function heldGates(): (PendingGate & { budget?: string; expires: number })[] {
+  return [...waiters.values()]
+    .map(({ id, source_app, session_id, tool_name, summary, created, expires, budget, where }) =>
+      ({ id, source_app, session_id, tool_name, summary, created, expires, budget, where }))
+    .sort((a, b) => a.created - b.created);
+}
+
+/**
  * Rebuild the queue from SQLite at boot.
  *
  * Requests still inside their window go back into "what needs you" and stay
@@ -457,6 +485,6 @@ export function restoreGates(): { restored: number; expired: number } {
     });
     restored++;
   }
-  if (restored || expired) onChange();
+  if (restored || expired) changed();
   return { restored, expired };
 }

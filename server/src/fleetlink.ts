@@ -22,9 +22,11 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostId } from "./config.ts";
 import {
-  FLEET_PROTOCOL, MAX_BATCH_BYTES, MAX_BATCH_ROWS, linkTransportOk, linkUrl, parseHubFrame, type HubFrame,
+  FLEET_PROTOCOL, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_GATES, linkTransportOk, linkUrl, parseHubFrame, type HubFrame,
 } from "./fleetwire.ts";
 import { localBatch, localSessions, recentLocalSessions } from "./fleetstore.ts";
+import { heldGates, decideGate, watchGates } from "./gate.ts";
+import { isMachineActor, MACHINE_ACTOR } from "./actions.ts";
 
 export function upstreamPath(): string {
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "agentglass", "upstream.json");
@@ -37,7 +39,7 @@ function offLimits(p: string): boolean {
 }
 
 export type UpstreamConfig =
-  | { ok: true; url: string; token: string; insecure: boolean; stamp: string }
+  | { ok: true; url: string; token: string; insecure: boolean; stamp: string; gates: boolean }
   | { ok: false; error: string; stamp: string };
 
 function stampOf(p: string): string {
@@ -63,11 +65,13 @@ export function upstreamConfig(): UpstreamConfig | null {
   const stamp = upstreamStamp();
   let url = process.env.AGENTGLASS_UPSTREAM_URL?.trim() || "";
   let token = process.env.AGENTGLASS_UPSTREAM_TOKEN?.trim() || "";
+  let gates = process.env.AGENTGLASS_UPSTREAM_GATES !== "0";
   if (!url && !offLimits(p) && existsSync(p)) {
     try {
-      const f = JSON.parse(readFileSync(p, "utf8")) as { url?: unknown; token?: unknown };
+      const f = JSON.parse(readFileSync(p, "utf8")) as { url?: unknown; token?: unknown; gates?: unknown };
       url = typeof f.url === "string" ? f.url.trim() : "";
       token = token || (typeof f.token === "string" ? f.token.trim() : "");
+      if (f.gates === false) gates = false;
     } catch (e) {
       return { ok: false, error: `${p}: ${e instanceof Error ? e.message : e}`, stamp };
     }
@@ -84,7 +88,28 @@ export function upstreamConfig(): UpstreamConfig | null {
     };
   }
   if (!token) return { ok: false, error: "no token — run `bun run fleet join <hub> <token>`", stamp };
-  return { ok: true, url, token, insecure, stamp };
+  return { ok: true, url, token, insecure, stamp, gates };
+}
+
+/*
+ * The hub this process will take gate answers from: the one it was configured
+ * with when it STARTED, and only that one.
+ *
+ * Forwarding rows to a hub is harmless to get wrong; taking answers from one is
+ * not. An answer releases a held tool call on this machine, and the party being
+ * held is an agent running as this user — which can write upstream.json as
+ * easily as anything else here. If a config written at runtime were trusted for
+ * answers, an agent could point it at a "hub" of its own on localhost and wave
+ * its own calls through, which is the one thing a gate exists to prevent (see
+ * mayReleaseAHold in index.ts). So a change made while running still moves the
+ * rows — joining a fleet needs no restart — but answers wait for one. The same
+ * line devices.json draws, for the same reason, with the same ceiling: a
+ * process that can edit the file and wait for a restart can also replace this
+ * server's code, and nothing here defends against that (SECURITY.md).
+ */
+let pinned: { url: string; token: string } | null = null;
+function gatesRelayed(cfg: Extract<UpstreamConfig, { ok: true }>): boolean {
+  return cfg.gates && !!pinned && pinned.url === cfg.url && pinned.token === cfg.token;
 }
 
 export interface UplinkStatus {
@@ -99,11 +124,17 @@ export interface UplinkStatus {
   lastAckAt: number | null;
   error: string | null;
   retryAt: number | null;
+  /**
+   * Whether this machine's held tool calls go to the hub to be answered there.
+   * `restart` means the hub was joined after this process started, so answers
+   * from it are not taken until it restarts (see `pinned`).
+   */
+  gates: "relayed" | "off" | "restart";
 }
 
 const status: UplinkStatus = {
   state: "off", hub: null, hubHost: null, acked: 0, sent: 0,
-  connectedAt: null, lastAckAt: null, error: null, retryAt: null,
+  connectedAt: null, lastAckAt: null, error: null, retryAt: null, gates: "off",
 };
 export function uplinkStatus(): UplinkStatus { return { ...status }; }
 
@@ -132,8 +163,20 @@ class Inbox {
   private queue: string[] = [];
   private waiter: (() => void) | null = null;
   closed: Error | null = null;
+  /** A `decide` is handled the moment it lands — it may arrive while a batch
+   *  is waiting for its ack, and queueing it behind the ack would read as the
+   *  hub acknowledging something else. */
+  onDecide: ((f: Extract<HubFrame, { t: "decide" }>) => void) | null = null;
+  /** Set by the loop when the gate queue moved, so an idle wait ends now. */
+  poke(): void { this.wake(); }
   constructor(ws: WebSocket) {
-    ws.addEventListener("message", (ev) => { this.queue.push(String((ev as MessageEvent).data)); this.wake(); });
+    ws.addEventListener("message", (ev) => {
+      const raw = String((ev as MessageEvent).data);
+      const f = raw.includes('"decide"') ? parseHubFrame(raw) : null;
+      if (f?.t === "decide") { this.onDecide?.(f); return; }
+      this.queue.push(raw);
+      this.wake();
+    });
     ws.addEventListener("close", (ev) => {
       const c = ev as CloseEvent;
       this.closed = closeReason(c.code, c.reason, true);
@@ -223,8 +266,36 @@ async function runOnce(cfg: Extract<UpstreamConfig, { ok: true }>, version: stri
     let cursor = hello.after;
     let lastResync = 0;
 
+    // Phase 3: this machine's holds, offered to the hub to be answered there.
+    const relay = gatesRelayed(cfg);
+    status.gates = relay ? "relayed" : cfg.gates ? "restart" : "off";
+    let forwarded = new Set<string>();
+    let gatesDirty = relay;
+    const unwatch = relay ? watchGates(() => { gatesDirty = true; inbox.poke(); }) : () => {};
+    inbox.onDecide = (f) => {
+      const answer = (ok: boolean, error?: string) =>
+        ws.send(JSON.stringify({ t: "decided", id: f.id, ok, ...(error ? { error } : {}) }));
+      if (!relay) return answer(false, "this machine does not take gate answers from its hub");
+      // Only a hold this machine actually offered. A hub cannot release a call
+      // it was never shown — including one held after the last snapshot left.
+      if (!forwarded.has(f.id)) return answer(false, "that is not a request this machine forwarded");
+      // Who pressed it, and where. The machine-token form is kept when that is
+      // what pressed it at the hub, so the model on this end is told nobody
+      // reviewed the call rather than that a person did (gate.ts defaultReason).
+      const where = `via ${status.hubHost ?? "the hub"}`;
+      const by = isMachineActor(f.by) ? `${MACHINE_ACTOR} · ${where}` : `${f.by || "a person"} ${where}`;
+      const ok = decideGate(f.id, f.decision, f.reason, by);
+      answer(ok, ok ? undefined : "already resolved here — it timed out, or was answered at this machine");
+    };
+    try {
     for (;;) {
       if (inbox.closed) throw inbox.closed;
+      if (gatesDirty) {
+        gatesDirty = false;
+        const gates = heldGates().slice(0, MAX_GATES);
+        forwarded = new Set(gates.map((g) => g.id));
+        ws.send(JSON.stringify({ t: "gates", gates }));
+      }
       if (inbox.pending()) await inbox.next(0); // an unasked refusal throws here
       if (upstreamStamp() !== cfg.stamp) { ws.close(1000, "config changed"); return; }
       const batch = localBatch(cursor, MAX_BATCH_ROWS, PACK_BYTES);
@@ -246,6 +317,10 @@ async function runOnce(cfg: Extract<UpstreamConfig, { ok: true }>, version: stri
       status.sent += batch.events.length;
       status.lastAckAt = Date.now();
     }
+    } finally {
+      unwatch();
+      inbox.onDecide = null;
+    }
   } finally {
     try { ws.close(); } catch { /* already closed */ }
   }
@@ -260,6 +335,8 @@ let started = false;
 export function startUplink(opts: { version?: string } = {}): void {
   if (started) return;
   started = true;
+  const atStart = upstreamConfig();
+  pinned = atStart?.ok ? { url: atStart.url, token: atStart.token } : null;
   void (async () => {
     let backoff = BACKOFF_MIN_MS;
     let told = "";

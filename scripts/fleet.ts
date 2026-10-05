@@ -150,6 +150,12 @@ async function status() {
       ? `live to ${u.hubHost} (${u.hub}) · hub has everything up to row ${u.acked} · last ack ${ago(u.lastAckAt)}`
       : `${u.state}${u.hub ? ` → ${u.hub}` : ""}${u.error ? ` — ${u.error}` : ""}${u.retryAt ? ` · retrying ${new Date(u.retryAt).toLocaleTimeString()}` : ""}`;
     console.log(`Forwarding:   ${line}`);
+    const gates = {
+      relayed: "held tool calls here can be answered at the hub",
+      restart: "not relayed yet — this machine joined its hub after it started; restart agentglass to take answers from it",
+      off: "not relayed (AGENTGLASS_UPSTREAM_GATES=0, or \"gates\": false in upstream.json)",
+    }[u.gates as string] ?? u.gates;
+    if (u.state === "live") console.log(`Gates:        ${gates}`);
   }
   if (s.nodes.length) {
     console.log("Nodes:");

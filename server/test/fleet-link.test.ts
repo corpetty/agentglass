@@ -18,6 +18,8 @@ let root: string;
 let hub: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string };
 let node: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string };
 let nodeToken = "";
+let rooterToken = "";
+let rooter: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string } | null = null;
 
 async function boot(name: string, extra: Record<string, string>) {
   const dir = join(root, name);
@@ -75,7 +77,7 @@ beforeAll(async () => {
 }, SERVER_BOOT_MS * 2);
 
 afterAll(() => {
-  for (const s of [hub, node]) try { s?.proc.kill(); } catch { /* gone */ }
+  for (const s of [hub, node, rooter]) try { s?.proc.kill(); } catch { /* gone */ }
   try { rmSync(root, { recursive: true, force: true }); } catch { /* fine */ }
 });
 
@@ -133,6 +135,7 @@ describe("joining a node to a hub", () => {
 
   test("a credential cannot forward as a name it was not minted for", async () => {
     const r = await body(asHub("/fleet/nodes", { method: "POST", body: JSON.stringify({ host: "rooter" }) }));
+    rooterToken = r.token;
     const ws = new WebSocket(hub.base.replace("http", "ws") + "/fleet/link", {
       headers: { Authorization: `Bearer ${r.token}` },
     } as unknown as string[]);
@@ -155,6 +158,66 @@ describe("joining a node to a hub", () => {
     });
     expect(r.status).toBe(409);
     expect((await body(r)).error).toContain("bean");
+  });
+
+  test("a hub joined at runtime moves rows but does not take gate answers until a restart", async () => {
+    // The node was running before upstream.json existed; an agent on it could
+    // have written that file. See `pinned` in fleetlink.ts.
+    expect((await nodeStatus()).gates).toBe("restart");
+  });
+
+  test("a hold on a node is answered at the hub and takes effect on the node", async () => {
+    // rooter starts already configured, which is the case where answers are taken.
+    rooter = await boot("rooter", {
+      AGENTGLASS_HOST_ID: "rooter",
+      AGENTGLASS_UPSTREAM_URL: hub.base,
+      AGENTGLASS_UPSTREAM_TOKEN: rooterToken,
+    });
+    const rooterBase = rooter.base;
+    await until("rooter's link", async () => (await body(fetch(rooterBase + "/fleet/status"))).upstream.state === "live");
+    expect((await body(fetch(rooterBase + "/fleet/status"))).upstream.gates).toBe("relayed");
+
+    const id = crypto.randomUUID();
+    // The hook's held request, on rooter. It does not answer until decided.
+    const held = fetch(rooterBase + "/gate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, source_app: "proj", session_id: "gate-s1", tool_name: "Bash", tool_input: { command: "rm -rf build" }, timeout_ms: 60_000 }),
+    }).then((r) => body(r));
+
+    const g = await until("the hold on the hub", async () =>
+      (await body(asHub("/gate/pending"))).gates.find((x: any) => x.id === id));
+    expect(g.host).toBe("rooter");
+
+    // The party being held may not release itself: no Origin, no device — refused
+    // here exactly as a local hold would be.
+    const blocked = await asHub("/gate/decide", { method: "POST", body: JSON.stringify({ id, decision: "allow" }) });
+    expect(blocked.status).toBe(403);
+
+    // A person at the hub's desk denies it.
+    const r = await body(asHub("/gate/decide", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ id, decision: "deny", reason: "not on the box" }),
+    }));
+    expect(r.ok).toBe(true);
+    const outcome = await held;
+    expect(outcome.decision).toBe("deny");
+    expect(outcome.reason).toBe("not on the box");
+    // Recorded on rooter, as rooter's hold, decided via the hub.
+    const hist = await body(fetch(rooterBase + "/gate/history"));
+    const row = hist.gates.find((x: any) => x.id === id);
+    expect(row.resolution).toBe("human");
+    expect(row.decided_by).toContain("via hub");
+    // And gone from the hub's queue once rooter says so.
+    await until("the hub's queue to clear", async () =>
+      !(await body(asHub("/gate/pending"))).gates.some((x: any) => x.id === id), 5000);
+  }, 60_000);
+
+  test("an answer for a hold nobody is keeping says so", async () => {
+    const r = await body(asHub("/gate/decide", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ id: crypto.randomUUID(), decision: "allow" }),
+    }));
+    expect(r.ok).toBe(false);
   });
 
   test("forgetting the credential at the hub stops the node", async () => {

@@ -16,7 +16,8 @@
  */
 import type { ServerWebSocket } from "bun";
 import { hostId } from "./config.ts";
-import { FLEET_PROTOCOL, parseNodeFrame, type HubFrame } from "./fleetwire.ts";
+import type { PendingGate } from "../../shared/types.ts";
+import { FLEET_PROTOCOL, parseNodeFrame, type HubFrame, type WireGate } from "./fleetwire.ts";
 import { applyBatch, fleetNodeRows, nodeCursor, noteNode, type AppliedBatch } from "./fleetstore.ts";
 
 export interface FleetWsData {
@@ -46,6 +47,80 @@ let onForeign: ((b: AppliedBatch) => void) | null = null;
 export function whenForeignRows(fn: ((b: AppliedBatch) => void) | null): void { onForeign = fn; }
 
 const HELLO_MS = 10_000;
+
+/*
+ * Phase 3: the holds each node is keeping, as it last said (docs/FLEET.md).
+ *
+ * A snapshot per host, replaced whole on every `gates` frame and dropped when
+ * the node's link closes — a hold nobody here can answer is not one to offer.
+ * The hold itself never lives here: the node keeps it, times it out under its
+ * own policy, and is the only place a decision takes effect.
+ */
+const remoteGates = new Map<string, Map<string, WireGate>>();
+/** Decisions sent down a link and not yet answered, by gate id. */
+const awaiting = new Map<string, { host: string; resolve: (r: { ok: boolean; error?: string }) => void; timer: ReturnType<typeof setTimeout> }>();
+const DECIDE_MS = 10_000;
+
+let onRemoteGate: ((host: string, g: WireGate) => void) | null = null;
+/** Who hears that a node started holding a call this hub had not seen
+ *  (index.ts: the same alert a local hold raises, naming the machine). */
+export function whenRemoteGate(fn: ((host: string, g: WireGate) => void) | null): void { onRemoteGate = fn; }
+
+/** Every hold the linked nodes are keeping, shaped like this server's own. A
+ *  hold already past its deadline is left out: the node has timed it out or
+ *  is about to, and a button that can only lose is not worth drawing. */
+export function remotePendingGates(now = Date.now()): PendingGate[] {
+  const out: PendingGate[] = [];
+  for (const [host, gates] of remoteGates) {
+    for (const g of gates.values()) {
+      if (g.expires <= now) continue;
+      out.push({ id: g.id, source_app: g.source_app, session_id: g.session_id, tool_name: g.tool_name,
+        summary: g.summary, created: g.created, expires: g.expires, where: g.where, host });
+    }
+  }
+  return out.sort((a, b) => a.created - b.created);
+}
+
+/** The node holding this gate, if a linked node is. */
+export function remoteGate(id: string): (WireGate & { host: string }) | null {
+  for (const [host, gates] of remoteGates) {
+    const g = gates.get(id);
+    if (g) return { ...g, host };
+  }
+  return null;
+}
+
+/**
+ * Send a person's answer to the node holding the call, and say whether it took.
+ *
+ * Whether it took is the node's to say — the hold may have timed out there a
+ * moment ago, or been answered at that machine's own desk — so this waits for
+ * the node's `decided` rather than assuming. `by` is who pressed it here, in
+ * actions.ts's vocabulary; the node records it, with this hub's name, as the
+ * actor on its own gate row.
+ */
+export function decideRemote(id: string, decision: "allow" | "deny", reason: string, by: string): Promise<{ ok: boolean; error?: string }> {
+  const g = remoteGate(id);
+  const ws = g ? live.get(g.host) : undefined;
+  if (!g || !ws) return Promise.resolve({ ok: false, error: "that request is not one a linked machine is holding" });
+  if (awaiting.has(id)) return Promise.resolve({ ok: false, error: "an answer to that request is already on its way" });
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      awaiting.delete(id);
+      resolve({ ok: false, error: `${g.host} did not confirm in time — check it there` });
+    }, DECIDE_MS);
+    awaiting.set(id, { host: g.host, resolve, timer });
+    send(ws, { t: "decide", id, decision, reason, by });
+  });
+}
+
+function settle(id: string, r: { ok: boolean; error?: string }): void {
+  const w = awaiting.get(id);
+  if (!w) return;
+  clearTimeout(w.timer);
+  awaiting.delete(id);
+  w.resolve(r);
+}
 
 function send(ws: Ws, f: HubFrame): void {
   try { ws.send(JSON.stringify(f)); } catch { /* closing */ }
@@ -91,6 +166,26 @@ export function fleetMessage(ws: Ws, msg: string | Buffer): void {
   }
 
   if (!ws.data.greeted) return refuse(ws, "rows before hello");
+
+  if (f.t === "gates") {
+    const before = remoteGates.get(ws.data.host);
+    const now = new Map(f.gates.map((g) => [g.id, g]));
+    remoteGates.set(ws.data.host, now);
+    for (const g of now.values()) {
+      if (before?.has(g.id)) continue;
+      try { onRemoteGate?.(ws.data.host, g); } catch (e) {
+        console.error(`[fleet] gate alert failed: ${e instanceof Error ? e.message : e}`);
+      }
+    }
+    return;
+  }
+  if (f.t === "decided") {
+    // Only an answer this hub asked this node for. A node cannot settle a
+    // decision that was sent to another machine.
+    if (awaiting.get(f.id)?.host === ws.data.host) settle(f.id, { ok: f.ok, error: f.error });
+    return;
+  }
+
   let applied: AppliedBatch;
   try {
     applied = applyBatch(ws.data.host, f.upto, f.events, f.sessions);
@@ -112,7 +207,14 @@ export function fleetMessage(ws: Ws, msg: string | Buffer): void {
 
 export function fleetClose(ws: Ws): void {
   clearTimeout(ws.data.helloTimer);
-  if (live.get(ws.data.host) === ws) live.delete(ws.data.host);
+  if (live.get(ws.data.host) !== ws) return; // a newer link already replaced this one
+  live.delete(ws.data.host);
+  // Its holds are still held over there, and still time out there; they are
+  // only no longer answerable from here, so they stop being offered.
+  remoteGates.delete(ws.data.host);
+  for (const [id, w] of awaiting) {
+    if (w.host === ws.data.host) settle(id, { ok: false, error: `${w.host} went offline before confirming — check it there` });
+  }
 }
 
 export interface FleetNodeStatus {

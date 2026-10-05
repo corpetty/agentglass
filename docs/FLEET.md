@@ -5,8 +5,9 @@ for watching several — a desk, a laptop, a headless box driven over Remote
 Control, and, as far as it can go, sessions running in Anthropic's cloud — from
 a single cockpit.
 
-Status: **phases 1–2 built** — every row knows its host, and nodes forward to a
-hub. Phases 3–5 are design, not code.
+Status: **phases 1–3 built** — every row knows its host, nodes forward to a
+hub, and a node's held tool calls can be answered there. Phases 4–5 are design,
+not code.
 
 ## Setting it up
 
@@ -26,7 +27,9 @@ bun run fleet join http://100.x.y.z:4000 <credential>   # the hub's Tailscale ad
 bun run fleet status
 ```
 
-No restart on either side. The hub URL has to keep the link private: `https`, a
+No restart is needed to start forwarding. **Answering a node's holds from the
+hub needs one restart of the node after joining** — see phase 3 for why. The
+hub URL has to keep the link private: `https`, a
 Tailscale address (`100.64.0.0/10` or `*.ts.net`), or an ssh tunnel to
 `localhost`. Plain HTTP across a LAN is refused, because the link carries
 prompts and file contents and the credential rides in its first request.
@@ -183,11 +186,37 @@ What phase 2 leaves open:
 
 ### 3. Gates from anywhere
 
-- The gate stays where the session runs. The hook still talks to `127.0.0.1`;
-  if the hub is down, nothing about gating changes.
-- The node forwards "a call is held" up the link; a decision made at the hub is
-  sent down and resolved locally. The decision is attributed (`decided_by`) to
-  the hub device that made it.
+Built: `gate`/`decide`/`decided` frames in `fleetwire.ts`, the hub's queue of
+remote holds in `fleethub.ts`, the relay in `fleetlink.ts`.
+
+- **The hold stays where the session runs.** The hook still talks to
+  `127.0.0.1`, the node keeps the hold, its timer and its fail-open/closed
+  policy. A hub that is down or unreachable changes nothing about gating.
+- **The node sends its whole queue** on connect and on every change. The hub
+  lists those holds beside its own in `/gate/pending`, each carrying `host`, and
+  raises the same approval alert a local hold does — desk notification and
+  paired phone — naming the machine. A node that goes offline takes its holds
+  off the hub's list; a hold past its deadline is not offered.
+- **An answer at the hub is checked exactly as a local one is** — Origin, and
+  that the held party cannot release itself (`mayReleaseAHold`) — then sent down
+  the link. The node accepts it only for a hold it actually forwarded, records it
+  as `<who pressed it> via <hub>` (keeping the machine-token form when that is
+  what pressed it, so the model is not told a person reviewed it), and says
+  whether it took: it may have timed out, or been answered at that machine.
+- **Answers are only taken from the hub the node started with.** The held party
+  is an agent running as you, and it can write `upstream.json`. Trusting a
+  runtime change for answers would let it point the node at a "hub" of its own
+  and approve its own calls. So joining at runtime forwards rows at once, and
+  answers start after the node's next restart — the line `devices.json` draws,
+  with the same ceiling. `bun run fleet status` says which state a node is in.
+- **Off switch on the node:** `AGENTGLASS_UPSTREAM_GATES=0`, or `"gates": false`
+  in `upstream.json`. Forwarding rows continues; holds stay local.
+
+What phase 3 leaves open:
+
+- **Remote gate history** is on the node (`/gate/history` there), not the hub.
+- **Other alerts** — a run finishing, a tool failing — still do not cross the
+  link; only holds do.
 
 ### 4. Remote workspace, one tier at a time
 

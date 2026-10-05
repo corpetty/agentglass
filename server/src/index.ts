@@ -12,7 +12,7 @@ import { normalize, detectError, clampIngestTimestamp, externalIngestError } fro
 import { pricingProvenance, startPricingRefresh } from "./pricing.ts";
 import { db } from "./db.ts";
 import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
-import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, type FleetWsData } from "./fleethub.ts";
+import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, type FleetWsData } from "./fleethub.ts";
 import { startUplink, uplinkStatus } from "./fleetlink.ts";
 import { HOST_ID_RE } from "./fleetwire.ts";
 import {
@@ -46,7 +46,7 @@ import {
   releaseDatabaseClaim,
   noteWaitFromHook,
 } from "./db.ts";
-import { maybeAlert, setAlertSink, pushDeviceStoreChanged, lanternSnapshot, pushJobFailed, pushAccountPaused } from "./alerts.ts";
+import { maybeAlert, setAlertSink, pushDeviceStoreChanged, lanternSnapshot, pushJobFailed, pushAccountPaused, pushGate } from "./alerts.ts";
 import { noteAction, actorOf, type ActorSource } from "./actions.ts";
 import { getSkills, catalogMarkdown, catalogCsv, usageSince } from "./skills.ts";
 import { getInsights } from "./insights.ts";
@@ -3650,7 +3650,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const out = await awaitGate(String(url.searchParams.get("id") || ""));
       return out ? json(out) : json({ decision: null, reason: "unknown gate" }, 404);
     }
-    if (pathname === "/gate/pending") return json({ gates: pendingGates() });
+    // This machine's holds, then the ones linked nodes are keeping (phase 3,
+    // docs/FLEET.md) — each of those carries `host`, which is how the client
+    // tells the two apart and how /gate/decide below knows where to send it.
+    if (pathname === "/gate/pending") return json({ gates: [...pendingGates(), ...remotePendingGates()] });
     // What was decided while you weren't looking — including the requests a
     // timeout or a restart resolved for you.
     if (pathname === "/gate/history") {
@@ -3679,6 +3682,30 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       // the line worth keeping is what was held, not the uuid it was held
       // under. "denied Bash · rm -rf build" is an audit line; a uuid is not.
       const held = getGate(String(b.id));
+      /*
+       * A hold another machine is keeping (phase 3, docs/FLEET.md).
+       *
+       * Every check above has already run — the Origin, and the one this route
+       * exists for: that the party being held cannot release itself. So the
+       * hub releases a node's hold under exactly the rule it releases its own.
+       * The answer travels down that node's link and takes effect there; the
+       * node says whether it took, because it may have timed out there first.
+       * There is no local row: the hold, its timer and its history all live on
+       * the machine that holds it, and that is where the actor is recorded.
+       *
+       * The one-device-asks-and-approves rule below has nothing to check here:
+       * a remote session cannot be sent a turn from this hub (resume refuses),
+       * so this hub never holds the record that rule reads.
+       */
+      const remote = held ? null : remoteGate(String(b.id));
+      if (remote) {
+        const origin = req.headers.get("origin");
+        const who = actorOf(clientIp, caller ? { ...asActor(caller)!, fromPage: !!origin && vouchedOrigin(origin) } : caller);
+        const r = await decideRemote(remote.id, decision, String(b.reason || ""), who);
+        noteAction(clientIp, `/gate/${decision}`,
+          { tool: remote.tool_name, summary: `${remote.summary} · on ${remote.host}` }, { ok: r.ok, error: r.error }, asActor(caller));
+        return json({ ok: r.ok, ...(r.error ? { error: r.error } : {}) });
+      }
       // The device that sent this session its last turn does not also let that
       // turn's tool call through: that is one phone asking for a command and
       // approving it, with nobody else in the loop. See noteTurnSender.
@@ -9415,6 +9442,16 @@ whenForeignRows(({ inserted, sessions }) => {
     if (s.last_seen >= recent && sessionInScope(s)) broadcast({ type: "session", data: s });
   }
   if (toolEdge) pushOpenTools();
+});
+
+// A linked node started holding a tool call (phase 3). The same alert a hold
+// here raises — the desk's notification and the paired phone's — with the
+// machine named, because "agentglass wants to run Bash" is three different
+// machines' worth of question in a fleet. No pane: that is a tmux window over
+// there, not a place this desk can take you.
+whenRemoteGate((host, g) => {
+  const what = g.budget ? (g.summary ? `${g.budget} · ${g.summary}` : g.budget) : g.summary;
+  pushGate(`${g.where || g.source_app} on ${host}`, g.tool_name, what);
 });
 
 // Forward this machine's rows to a hub, if it has joined one. Off by default

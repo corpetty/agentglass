@@ -32,7 +32,7 @@ import { api } from "../lib/api.ts";
 import { subscribe as subscribeChats, listChats } from "../lib/chatStore.ts";
 import { subscribeGitChanged } from "../lib/gitBus.ts";
 import { notesWorthyRepos } from "../lib/gitNote.ts";
-import { answerGate, gateForNote, listGates, subscribeGates, subscribeNewGates } from "../lib/gateStore.ts";
+import { answerGate, gateForNote, gateWho, listGates, subscribeGates, subscribeNewGates } from "../lib/gateStore.ts";
 import { enqueue, dequeue } from "../lib/toastQueue.ts";
 import {
   subscribeNotifyHistory, notifyHistory, notifyUnread,
@@ -184,7 +184,7 @@ export function useAmbientNotes(): { note: Note | null; behind: number; ahead: n
       kind: "blocked",
       color: "var(--warning)",
       title: `Approve ${g.tool_name}?`,
-      sub: `${g.source_app}:${g.session_id.slice(0, 8)} is waiting on you`,
+      sub: `${gateWho(g)} is waiting on you`,
       // Ahead of the chatter, and never dropped for being late: the hold is
       // still holding.
       urgent: true,
