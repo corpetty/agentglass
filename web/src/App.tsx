@@ -1201,6 +1201,8 @@ export default function App() {
         onSkills={() => setSkillsOpen(true)}
         onSettings={() => setSettingsOpen(true)}
         onMachine={setMachine}
+        onAccounts={() => setAccountsOpen(true)}
+        onQueue={() => setQueueOpen(true)}
         chatFocusId={chatFocus}
         dashboard={(active) => (
           <LazyPanel label="The dashboard">

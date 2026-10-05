@@ -5,6 +5,7 @@ import {
 } from "./views.ts";
 import { chordFor, chordLabel, chords, subscribeBindings } from "../../lib/keybindings.ts";
 import { SkillsIcon } from "./icons.tsx";
+import { AccountsIcon, QueueIcon } from "./harnessIcons.tsx";
 import { PortsIcon, ResourcesIcon } from "../Header.tsx";
 import { ContextMenu as RailMenu, MenuItem } from "../ContextMenu.tsx";
 import { ICON } from "../../lib/iconSize.ts";
@@ -65,7 +66,7 @@ function useRailActive(): string {
 export const RAIL_W = 52;
 
 export function ViewRail({
-  view, onSelect, onSkills, onSettings, onMachine, pips,
+  view, onSelect, onSkills, onSettings, onMachine, onAccounts, onQueue, pips,
 }: {
   view: ViewId;
   onSelect: (v: ViewId) => void;
@@ -80,6 +81,10 @@ export function ViewRail({
   /** Ports and resources, the same pair the header carries, in the same order —
    *  so the machine is looked at from one place whichever surface you are on. */
   onMachine: (tab: "ports" | "resources") => void;
+  /** The fork's harness panels (docs/HARNESS.md). Modals like Settings, so
+   *  they sit below the hairline with the other things that open over you. */
+  onAccounts: () => void;
+  onQueue: () => void;
   pips?: Partial<Record<ViewId, RailPip>>;
 }) {
   // The rail's layout is the user's. Read through a store so a drag updates
@@ -426,6 +431,24 @@ export function ViewRail({
           </button>
         )}
 
+        <button
+          onClick={onAccounts}
+          aria-label="Accounts"
+          data-tip="Accounts · usage meters and login status, per subscription"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
+          style={{ color: "var(--text4)" }}
+        >
+          <AccountsIcon size={ICON.rail} />
+        </button>
+        <button
+          onClick={onQueue}
+          aria-label="Queue"
+          data-tip="Queue · unattended jobs, run when an account has headroom"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
+          style={{ color: "var(--text4)" }}
+        >
+          <QueueIcon size={ICON.rail} />
+        </button>
         <button
           onClick={() => onMachine("ports")}
           aria-label="Ports"

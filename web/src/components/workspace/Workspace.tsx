@@ -81,13 +81,15 @@ const KEEP_RUNNING = new Set<ViewId>(["term", "chat", "browser"]);
  */
 
 export function Workspace({
-  view, onView, onSkills, onSettings, onMachine, chatFocusId, dashboard, prJump, cardJump, issueJump,
+  view, onView, onSkills, onSettings, onMachine, onAccounts, onQueue, chatFocusId, dashboard, prJump, cardJump, issueJump,
 }: {
   view: ViewId;
   onView: (v: ViewId) => void;
   onSkills: () => void;
   onSettings: () => void;
   onMachine: (tab: "ports" | "resources") => void;
+  onAccounts: () => void;
+  onQueue: () => void;
   chatFocusId?: string | null;
   /** The dashboard is a view like any other, but its data lives at the root
    *  (the live socket feeds the chat store too), so it arrives already built
@@ -187,7 +189,7 @@ export function Workspace({
   return (
     <div ref={frameRef} tabIndex={-1} className="flex-1 min-h-0 flex outline-none">
       <ViewRail view={view} onSelect={onView} onSkills={onSkills}
-        onSettings={onSettings} onMachine={onMachine} pips={pips} />
+        onSettings={onSettings} onMachine={onMachine} onAccounts={onAccounts} onQueue={onQueue} pips={pips} />
 
       <div className="relative flex-1 min-w-0">
         {mounted.map((v) => {
