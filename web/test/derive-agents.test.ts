@@ -102,6 +102,21 @@ test("roll-ups sum across a session; subagents are tallied by type", () => {
   expect(c.subagentTypes).toEqual([["explorer", 2], ["planner", 1]]);
 });
 
+test("last turn cost is the newest MAIN-thread turn, never a subagent's and never the lifetime sum", () => {
+  // Same measured problem as the context guard above: a subagent is billed to
+  // its own context, not the session's, so a subagent turn arriving after the
+  // main thread's must not win "last turn" — otherwise an expensive subagent
+  // call would flash as the price of the next main-thread keystroke, and the
+  // number next to the context meter would describe a different turn than the
+  // meter itself.
+  const olderMain = ev({ agent_id: null, input_tokens: 30, cost_usd: 1.25, timestamp: now - 9000 });
+  const cheapMain = ev({ agent_id: null, input_tokens: 40, cost_usd: 0.02, timestamp: now - 5000 });
+  const pricierSub = ev({ agent_id: "acme-explorer-1", agent_type: "orbit-explorer", input_tokens: 9000, cost_usd: 4.5, timestamp: now - 1000 });
+  const c = only([olderMain, cheapMain, pricierSub]);
+  expect(c.ctxTokens).toBe(40);
+  expect(c.turnCost).toBeCloseTo(0.02, 6);
+});
+
 test("distinct sessions become distinct cards, newest first", () => {
   const cards = deriveAgents([
     ev({ session_id: "old", timestamp: now - 10_000 }),
@@ -297,4 +312,77 @@ test("the card keeps the directory and project it last reported", () => {
   ]);
   expect(card.cwd).toBe("/home/x/code/app-wt");
   expect(card.project).toBe("/home/x/code/app");
+});
+
+// ---------------------------------------------------------------------------
+// A failed tool call is not somebody waiting on you.
+//
+// The chip reads WAITING ON YOU and the panel behind it opens with "everything
+// that is waiting on you, with what can honestly be done about it". An
+// `errored` card was being pushed onto it as "N error(s) — last action
+// PostToolUse · Bash", whose only affordance was "Go to its pane" — and going
+// there showed a session working away with nothing wrong, because by then there
+// wasn't. He checked, and that is how this was found.
+//
+// Measured over 8 days of the real database, 465 error events: 464 had another
+// event from the same session within 60 seconds, all 465 within five minutes,
+// and NOT ONE was the last thing a session ever did. There is no error class
+// left over that needs a human.
+//
+// The states that DO mean he is needed are separate and stay: `waiting` (an
+// agent asked), and `stalled` (a tool open with nothing moving behind it).
+// These pin both halves, because silencing the first without keeping the second
+// would trade sixty useless interruptions for zero useful ones.
+// ---------------------------------------------------------------------------
+
+test("a recent error raises nothing on the WAITING ON YOU panel", () => {
+  const card = only([ev({ is_error: 1, error_text: "boom", timestamp: now - 2000 })]);
+  expect(card.status, "the card is still painted as errored").toBe("errored");
+  expect(deriveAlerts([card]).filter((a) => a.id.startsWith("err:"))).toEqual([]);
+});
+
+test("an agent that asked for something still does", () => {
+  const card = only([ev({
+    hook_event_type: "Notification", tool_name: null, timestamp: now - 1000,
+    payload: { message: "Claude needs your permission to use Bash" },
+  })]);
+  expect(card.status).toBe("waiting");
+  const wait = deriveAlerts([card]).filter((a) => a.id.startsWith("wait:"));
+  expect(wait.length).toBe(1);
+  expect(wait[0]!.text).toContain("permission");
+});
+
+test("and an error does not silence the question underneath it", () => {
+  // The order matters: the card takes its status from the LAST event, so an
+  // agent that asked and then logged a failure must still be listed as asking.
+  // `waiting` is tested above `errored` in deriveAgents for exactly this.
+  const card = only([
+    ev({ is_error: 1, error_text: "boom", timestamp: now - 3000 }),
+    ev({ hook_event_type: "Notification", tool_name: null, timestamp: now - 1000,
+      payload: { message: "Claude needs your permission to use Bash" } }),
+  ]);
+  expect(deriveAlerts([card]).filter((a) => a.id.startsWith("wait:")).length).toBe(1);
+});
+
+test("a question nobody answered stops interrupting after half an hour", () => {
+  /*
+   * The bug this closes. A permission prompt arrives in the middle of a tool
+   * call, so the pair stays open — and the open call is what spares a card from
+   * the idle clock, because a long build is silent while it works. The card sat
+   * on the amber strip for 22 hours: "esta notificación es infinita".
+   *
+   * Fresh, it still interrupts. Stale, it is idle and `unanswered`, which is
+   * the accurate word for it, and the Lantern still lists the session.
+   */
+  const open = ev({ hook_event_type: "PreToolUse", tool_name: "Bash", timestamp: now - 40 * 60_000 });
+  const asked = ev({ hook_event_type: "Notification", tool_name: null, timestamp: now - 35 * 60_000 });
+  const stale = only([open, asked]);
+  expect(stale.status).toBe("idle");
+  expect(stale.outcome).toBe("unanswered");
+
+  const fresh = only([
+    ev({ hook_event_type: "PreToolUse", tool_name: "Bash", timestamp: now - 9 * 60_000 }),
+    ev({ hook_event_type: "Notification", tool_name: null, timestamp: now - 8 * 60_000 }),
+  ]);
+  expect(fresh.status).toBe("waiting");
 });

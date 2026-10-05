@@ -5,11 +5,65 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  # What changed, before anything is cloned or installed. A catalogue listing
+  # is one generated line of `landing/plugins.json` and it was running the
+  # whole matrix — build, mobile, both sidecars — for twenty-seven lines of
+  # JSON. `paths-ignore` cannot fix that on its own: `build` is a required
+  # check, and a check that never runs never reports, so the pull request
+  # waits for it for ever. So the jobs still run and decide for themselves
+  # whether there is anything to do.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # the changed-file list
+    outputs:
+      code: ${{ steps.what.outputs.code }}
+      # Whether the pull request touches the catalogue, and whether that is
+      # ALL it touches. The `catalogue` job below reads both.
+      catalogue: ${{ steps.what.outputs.catalogue }}
+      catalogue_only: ${{ steps.what.outputs.catalogue_only }}
+    steps:
+      - id: what
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            { echo "code=true"; echo "catalogue=false"; echo "catalogue_only=false"; } >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The API, not a checkout: the question is which files the pull
+          # request touches, and cloning the repository to answer it is the
+          # cost this job exists to avoid.
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.number }}/files" --paginate --jq '.[].filename')"
+          if printf '%s\n' "$files" | grep -qvE '^landing/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$files" | grep -qx 'landing/plugins.json'; then
+            echo "catalogue=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "catalogue=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$files" = "landing/plugins.json" ]; then
+            echo "catalogue_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "catalogue_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+        if: needs.changes.outputs.code == 'true'
       # Pinned, and this is the line that decides whether CI is measuring the
       # tree or the week. `latest` resolved to bun 1.4.0 the moment it shipped
       # — 2026-08-20 14:14 UTC — and main went red at 16:08 the same day, on a
@@ -25,16 +79,31 @@ jobs:
       #
       # 1.3.14 is not a guess. It is what `latest` meant on the 17th, which is
       # the last run of this workflow that was green.
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: needs.changes.outputs.code == 'true'
         with:
+          # A version, not `latest`, for the same reason `bunx tsc` is banned two
+          # steps down: a toolchain the registry picks is a toolchain nobody in
+          # this repository chose. `latest` means a Bun released this morning can
+          # redden — or, worse, quietly change the output of — a commit that
+          # touched nothing, and the desktop workflow compiles the server sidecar
+          # with `bun build --compile`, so there the runner's Bun ends up INSIDE
+          # the binary people download.
+          # Pinned to what main chose. Several files still record behaviour
+          # "measured on Bun 1.3.9" — server/src/tmuxctl.ts, tmuxsnapshot.ts,
+          # alerts.ts and six test files — and those measurements are the reason
+          # a few of them are written the way they are. Bumping this is a real
+          # change, and the suites that carry those notes are the ones to re-run.
           bun-version: 1.3.14
       - name: Install
+        if: needs.changes.outputs.code == 'true'
         run: bun install --frozen-lockfile
       # The mark lives in seven places — a standalone SVG, the favicon, a React
       # component, the boot splash and three inlines in the landing page. They
       # drifted once and a fix shipped to six of them while the seventh kept
       # the bug, so they are generated now and this is what catches a hand-edit.
       - name: The mark is in sync
+        if: needs.changes.outputs.code == 'true'
         run: bun scripts/logo.mjs --check
       # `bun run typecheck`, never `bunx tsc`. bunx runs a LOCAL binary if there
       # is one and silently downloads the newest published otherwise, and
@@ -49,11 +118,30 @@ jobs:
       # web's script checks tsconfig.json AND tsconfig.test.json — web/test/'s
       # 122 suites are run here by `bun test`, which strips types without
       # checking them, so until that second config existed nothing read them.
+      # Cheapest thing in the job and the one most likely to catch an outside
+      # contributor's slip, so it runs before the compilers. Correctness rules
+      # only — see .oxlintrc.json, which explains at length what is demoted,
+      # where, and why a linter that reformatted this codebase's hand-written
+      # style would have been the wrong tool.
+      - name: Lint (correctness)
+        if: needs.changes.outputs.code == 'true'
+        run: bun run lint
       - name: Typecheck web (app and tests)
+        if: needs.changes.outputs.code == 'true'
         run: cd web && bun run typecheck
       - name: Typecheck server
+        if: needs.changes.outputs.code == 'true'
         run: cd server && bun run typecheck
+      # electron/ is hand-written .js, and for years that meant this job checked
+      # every line of the app except the ~2,400 that mint the auth token, decide
+      # what a <webview> may be, and register every IPC channel the renderer can
+      # reach. `// @ts-check` at the top of main.js and preload.js is what makes
+      # `tsc` read them; this is what makes CI read them.
+      - name: Typecheck desktop shell
+        if: needs.changes.outputs.code == 'true'
+        run: cd electron && bun run typecheck
       - name: Tests (server)
+        if: needs.changes.outputs.code == 'true'
         # Generous per-test timeout, not bun's 5s default: several server tests
         # do real git/spawn/settle work that finishes in ~seconds on a dev box
         # but brushes the 5s ceiling on the runner's constrained 2 cores, so one
@@ -65,13 +153,16 @@ jobs:
       # themes, the session-live rule, the file tree — could break on a PR and
       # nothing would say so.
       - name: Tests (web)
+        if: needs.changes.outputs.code == 'true'
         run: cd web && bun test
       - name: Build web
+        if: needs.changes.outputs.code == 'true'
         run: cd web && bun run build
       # Pinned rather than the runner's preinstalled Chrome: the ubuntu-latest
       # image has dropped and re-added browsers before, and this also keeps the
       # step working on container or self-hosted runners that ship none.
-      - uses: browser-actions/setup-chrome@v2
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        if: needs.changes.outputs.code == 'true'
         id: chrome
         with:
           chrome-version: stable
@@ -83,6 +174,7 @@ jobs:
       # run has no repos, so it cannot open a chat, so the chat-persistence check
       # skips itself and the reload path goes uncovered.
       - name: Smoke (production bundle boots)
+        if: needs.changes.outputs.code == 'true'
         run: |
           cd server
           AGENTGLASS_PORT=4000 AGENTGLASS_DB=/tmp/smoke.db AGENTGLASS_SCAN_DISABLED=1 bun run src/index.ts &
@@ -101,15 +193,134 @@ jobs:
       # this process serves the terminal's PTY on the same thread as every git
       # call it makes. This is the only step that measures it.
       - name: Perf budget (the event loop stays answerable)
+        if: needs.changes.outputs.code == 'true'
         run: bun scripts/perfbudget.ts
       - name: Server boots
+        if: needs.changes.outputs.code == 'true'
         run: |
           cd server
           AGENTGLASS_PORT=4123 AGENTGLASS_DB=/tmp/ci.db AGENTGLASS_SCAN_DISABLED=1 bun run src/index.ts &
           SVPID=$!
-          sleep 2
-          curl -sf http://localhost:4123/health
+          # Polled, not slept: a loaded runner printed the banner 2.4 s in, after
+          # a fixed `sleep 2` had already sent curl to a closed port. Twenty
+          # seconds is the ceiling on "boots", not an expected time.
+          ok=1
+          for _ in $(seq 40); do
+            if curl -sf http://localhost:4123/health; then ok=0; break; fi
+            sleep 0.5
+          done
           kill $SVPID
+          exit $ok
+
+  # The catalogue's own check, and the one auto-merge should wait on.
+  #
+  # A listing is a pull request that changes `landing/plugins.json`, written
+  # by the approval workflow. That workflow used to report `build` on its own
+  # commit, so the only thing between a listing and main was a check the
+  # listing wrote about itself. This job re-derives the entry from the pull
+  # request instead: one entry added or replaced, pinned to a commit, and a
+  # fresh clone of that commit validates and hashes to what the entry says —
+  # see scripts/catalogue-check.py for the whole list.
+  #
+  # It always runs and always reports, so it can be a required check: a pull
+  # request that does not touch the catalogue passes it with nothing to do,
+  # and one that touches the catalogue AND anything else fails it, because a
+  # listing is one entry and nothing more. The one exception is a pull request
+  # the repository owner wrote: a release carries its own catalogue edits (pins,
+  # hashes) next to everything else, and the owner reviews it by hand. The
+  # approval workflow's listings are authored by its app, never by the owner,
+  # so they still travel alone and are still re-derived.
+  #
+  # The tools it runs are the BASE branch's, never the pull request's: a pull
+  # request that edited the check could otherwise pass it. It clones a
+  # stranger's repository, so it holds no secret and keeps no credentials.
+  catalogue:
+    needs: changes
+    # Not skipped when `changes` fails: a skipped job reports "skipped", and a
+    # required check that was skipped does not hold a merge back. It runs, and
+    # the first step turns a failed file list into a red check.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: The file list was read
+        if: needs.changes.result != 'success'
+        run: |
+          echo "::error::the changes job did not say what this pull request touches, so nothing here can say it is safe"
+          exit 1
+      - name: Nothing to check
+        if: needs.changes.result == 'success' && (github.event_name != 'pull_request' || needs.changes.outputs.catalogue != 'true')
+        run: echo "this change does not touch landing/plugins.json"
+      - name: The owner's own pull request
+        if: github.event_name == 'pull_request' && needs.changes.outputs.catalogue == 'true' && needs.changes.outputs.catalogue_only != 'true' && github.event.pull_request.author_association == 'OWNER'
+        run: echo "::notice::landing/plugins.json changed with other files in a pull request the owner wrote; reviewed by hand, not as a listing"
+      - name: A listing travels alone
+        if: github.event_name == 'pull_request' && needs.changes.outputs.catalogue == 'true' && needs.changes.outputs.catalogue_only != 'true' && github.event.pull_request.author_association != 'OWNER'
+        run: |
+          echo "::error::landing/plugins.json changed together with other files; a listing is one entry in its own pull request"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request' && needs.changes.outputs.catalogue_only == 'true'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: The entry is what its commit holds
+        if: github.event_name == 'pull_request' && needs.changes.outputs.catalogue_only == 'true'
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The pull request's version of the file, read as data from its head
+          # commit; the working tree stays the base branch's.
+          git fetch -q --depth 1 origin "$HEAD_SHA"
+          git show "$HEAD_SHA:landing/plugins.json" > "$RUNNER_TEMP/head.json"
+          python3 scripts/catalogue-check.py landing/plugins.json "$RUNNER_TEMP/head.json"
+
+  # Windows and macOS have never run a line of this in CI.
+  #
+  # `electron/package.json` has declared an `nsis` target and a `dmg` target for
+  # five releases and neither has ever been executed — not here, not anywhere
+  # the history shows (#193). An audit of an NSIS install on Windows 11 found
+  # roughly a dozen breakages, every one a first-ten-minutes failure of the kind
+  # this job catches in ninety seconds: an env var split on the wrong character,
+  # a prefix test with a hardcoded `/`, a shell that does not exist there. The
+  # cost was never the bugs. It was that they accumulated across five releases
+  # and were found by a person installing the app.
+  #
+  # It does not build an installer. Booting the sidecar and asking it four
+  # questions catches everything in that audit but the packaging provenance, and
+  # waiting for a signed artifact would have kept this from landing at all.
+  #
+  # Not `fail-fast`: a red Windows must not hide a green macOS, which is the
+  # whole reason both are here rather than one.
+  platform:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Sidecar (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14 # pinned — see the note in `build`
+      - name: Install
+        run: bun install --frozen-lockfile
+      # One bun script rather than shell steps, and that is the point: the
+      # shells differ exactly where the bugs are. `windows-latest` runs
+      # PowerShell, where `&` does not background, `curl` is an alias for
+      # Invoke-WebRequest and `seq` does not exist — so a shell-written version
+      # of this job would have to be written twice, and the half nobody reads
+      # would rot. See scripts/platformsmoke.ts for what it asserts and why the
+      # terminal check accepts two different answers.
+      - name: The sidecar boots and answers here
+        run: bun scripts/platformsmoke.ts
 
   # The phone had no CI at all: 29 suites and two tsconfigs that only ran when
   # somebody remembered, while mobile/README.md and mobile/.npmrc both described
@@ -120,6 +331,8 @@ jobs:
   # npm from its own package-lock.json, and nothing above depends on it — so a
   # red phone should not hide a green dashboard or wait behind vite.
   mobile:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # `mobile/` arrives in a later commit than this workflow does: the phone and
     # the job that tests it were split into separate pull requests, so on the
@@ -127,7 +340,9 @@ jobs:
     # died in eight seconds on a path that did not exist. It is also the honest
     # condition for main, which has no mobile/ until the phone lands.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Is there a phone to test?
         id: phone
         run: |
@@ -143,9 +358,9 @@ jobs:
       # This job passes under 1.4.0 today, which is exactly why it is pinned:
       # two jobs on two different bun versions is a difference nobody chose and
       # nobody would think to look for.
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.3.14 # pinned — see the note above
       # `npm ci` and not `npm install`: the lockfile is the point. Its
       # postinstall runs scripts/build-terminal-engine.mjs and
       # build-terminal-font.mjs, which write src/terminal/engine.generated.ts

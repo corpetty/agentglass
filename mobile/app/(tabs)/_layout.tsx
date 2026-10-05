@@ -1,31 +1,31 @@
 /*
- * The navigator: eight screens, five of them in the bar.
+ * The navigator: four destinations in the bar, two screens that are not.
  *
- * What this file decides is what is a TAB, and the answer is "everything",
- * including the three the bar does not draw. Now, Repos and Settings could
- * have been pushed onto the root stack instead — that is what a pushed screen
- * normally is — and it would have hidden the bar for as long as you were in
- * one, which puts the terminal two taps away from the screens people leave
- * open. So they are tabs with no tab: mounted here, reached from a gear and
- * the rows under it, and the bar stays up the whole time.
+ * Source control and Settings are tabs with no tab rather than screens pushed
+ * on the root stack, because a push hides the bar for as long as you are in
+ * one — and both are screens people leave open and come back from.
  *
- * The bar itself is src/nav/TabBar.tsx, and which destinations it offers is
- * src/nav/bar.ts. The reasoning about the seven that were here — and the
- * arithmetic that says why they no longer fit — moved into bar.ts with them;
- * the drawn icons and the argument for drawing them at all moved into
- * src/nav/icons.tsx. Nothing about that reasoning was dropped, it stopped
- * living in a layout file that had grown into three files' worth of it.
+ * The bar is src/nav/TabBar.tsx and which destinations it offers is
+ * src/nav/bar.ts, which also says why the Inbox, Now and the More sheet that
+ * held Now, Source control and Settings are gone.
+ *
+ * ── the header ───────────────────────────────────────────────────────────
+ * Two things on the right of every destination: the usage chip, and the gear.
+ * Settings used to sit behind a `···` sheet with two other screens, which was
+ * three taps to a switch and a menu whose name said nothing about what was in
+ * it. Everything that belongs to one screen stays on that screen, the way the
+ * terminal keeps its own menu.
  */
-import { Pressable } from "react-native";
+import { Pressable, View } from "react-native";
 import { Tabs, useRouter } from "expo-router";
 import { TabBar } from "../../src/nav/TabBar.tsx";
 import { BackIcon, SettingsIcon } from "../../src/nav/icons.tsx";
 import { usePaletteTick } from "../../src/state/use-palette.ts";
 import { C, SPACE, T } from "../../src/theme.ts";
 import { TAP } from "../../src/ui.tsx";
+import { UsageChip } from "../../src/usage/Usage.tsx";
 
-/** A header button, at the tap target the rest of the app holds itself to.
- *  Square, because both of the two are a single glyph. */
+/** A header button, at the tap target the rest of the app holds itself to. */
 function HeaderButton({ label, onPress, side, children }: {
   label: string;
   onPress: () => void;
@@ -37,12 +37,15 @@ function HeaderButton({ label, onPress, side, children }: {
       accessibilityRole="button"
       accessibilityLabel={label}
       onPress={onPress}
+      hitSlop={4}
       style={({ pressed }) => ({
         width: TAP, height: TAP, alignItems: "center", justifyContent: "center",
         // The header pays its own edge padding on the other side already.
         marginLeft: side === "left" ? -SPACE.sm : 0,
         marginRight: side === "right" ? SPACE.xs : 0,
-        opacity: pressed ? 0.6 : 1,
+        borderRadius: TAP / 2,
+        backgroundColor: pressed ? C.bg3 : "transparent",
+        transform: [{ scale: pressed ? 0.97 : 1 }],
       })}
     >{children}</Pressable>
   );
@@ -52,56 +55,48 @@ export default function TabsLayout(): React.ReactNode {
   usePaletteTick(); // a scene repaints only if it asks — see use-palette.ts
   const router = useRouter();
 
-  /** The way out of a screen the bar cannot return you to. `back` in a tab
-   *  navigator goes to the first route, which is Home — and Home is the only
-   *  place either of these two can be opened from, so it is also the right
-   *  answer. */
+  /* What is left of the plan, then the gear. The chip is on every
+     destination because the question it answers is asked right before starting
+     something long, from wherever that is — see src/usage/Usage.tsx. */
+  const trailing = (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.xs }}>
+      <UsageChip />
+      <HeaderButton label="Settings" side="right" onPress={() => router.push("/settings")}>
+        <SettingsIcon color={C.text2} size={22} />
+      </HeaderButton>
+    </View>
+  );
+
+  /** The way out of a screen the bar does not return you to. `back` pops to
+   *  whichever destination opened it, which is the tab history's job. */
   const back = (
     <HeaderButton label="Back" side="left" onPress={() => router.back()}>
-      <BackIcon color={C.text} />
+      <BackIcon color={C.text} size={22} />
     </HeaderButton>
   );
+
+  const destination = { headerRight: () => trailing, headerTitleAlign: "left" as const };
 
   return (
     <Tabs
       tabBar={(props) => <TabBar {...props} />}
+      backBehavior="history"
       screenOptions={{
         headerStyle: { backgroundColor: C.bg },
+        headerShadowVisible: false,
         headerTintColor: C.text,
-        headerTitleStyle: { fontSize: T.title },
+        headerTitleStyle: { fontSize: T.head, fontWeight: "600" },
         sceneStyle: { backgroundColor: C.bg },
       }}
     >
-      {/* ── the bar ─────────────────────────────────────────────────────── */}
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: "Inbox",
-          headerRight: () => (
-            <HeaderButton label="Settings" side="right" onPress={() => router.push("/settings")}>
-              <SettingsIcon color={C.text} />
-            </HeaderButton>
-          ),
-        }}
-      />
-      {/* Pull requests and cards were one destination behind a segmented
-          control, which was a saving made when the bar was full of screens
-          that have since gone. They are two destinations now, and each keeps
-          the screen it always had. */}
-      {/*
-        Every one of these carries the way back, because none of them is drawn
-        in a bar any more. `back` in a tab navigator goes to the first route,
-        which is the Inbox — and the Inbox is now the only place any of them is
-        opened from, so it is also the right answer.
-      */}
-      <Tabs.Screen name="prs" options={{ title: "Pull requests", headerLeft: () => back }} />
+      {/* Draws nothing: forwards to where the app was last left. */}
+      <Tabs.Screen name="index" options={{ headerShown: false }} />
       {/* The terminal draws its own header — it is the one screen that gives
-          the pane every point it can, so the navigator's chrome would be
-          spending 56 of them on a title. Its back control is in that header. */}
+          the pane every point it can, and its header is about the pane. */}
       <Tabs.Screen name="terminal" options={{ title: "Terminal", headerShown: false }} />
-      <Tabs.Screen name="issues" options={{ title: "Issues", headerLeft: () => back }} />
-      <Tabs.Screen name="tasks" options={{ title: "Cards", headerLeft: () => back }} />
-      <Tabs.Screen name="now" options={{ title: "Now", headerLeft: () => back }} />
+      <Tabs.Screen name="prs" options={{ title: "Pull requests", ...destination }} />
+      <Tabs.Screen name="issues" options={{ title: "Issues", ...destination }} />
+      <Tabs.Screen name="tasks" options={{ title: "Cards", ...destination }} />
       <Tabs.Screen name="repos" options={{ title: "Source control", headerLeft: () => back }} />
       <Tabs.Screen name="settings" options={{ title: "Settings", headerLeft: () => back }} />
     </Tabs>

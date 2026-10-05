@@ -1,5 +1,6 @@
 import { adoptServer } from "./api.ts";
 import { partitionsFor } from "./browserProfiles.ts";
+import type { ImportedShelf } from "./browserShelf.ts";
 
 // Desktop-only capabilities.
 //
@@ -20,15 +21,36 @@ type DesktopBridge = {
   autostartEnabled: () => Promise<boolean>;
   setAutostart: (on: boolean) => Promise<boolean>;
   revealPath?: (p: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Absent on shells built before the machine could stay awake for an agent. */
+  powerStatus?: () => Promise<PowerStatus>;
+  setPowerMode?: (mode: PowerMode) => Promise<PowerStatus>;
   remoteEnabled?: () => Promise<boolean>;
   setRemote?: (on: boolean) => Promise<boolean>;
   revokeRemote?: () => Promise<boolean>;
-  onServerChanged?: (fn: (p: { origin?: string | null; token?: string | null }) => void) => () => void;
+  onServerChanged?: (fn: (p: { origin?: string | null; token?: string | null; deskKey?: string | null }) => void) => () => void;
+  /** A link somebody clicked on a web page: today only "install this plugin".
+   *  Absent on a shell built before the app claimed its own scheme, and in a
+   *  browser tab, where there is no scheme to claim. */
+  takeDeepLink?: () => Promise<DeepLink | null>;
+  /** Make or destroy a lane's hidden window (the app's own window only).
+   *  `ephemeral` (S6): an in-memory jar of its own, not a slot in the
+   *  persisted profile family — `slug` is meaningless together with it and
+   *  main.js ignores it when true. */
+  laneOpen?: (id: string, slug: string, ephemeral?: boolean) => Promise<{ ok: boolean; error?: string }>;
+  laneClose?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  laneKeep?: (ids: string[]) => Promise<number>;
+  /** `newtab --from-template`'s visible-tab jar: the in-memory partition
+   *  string is minted by the main process, not the renderer — unlike a lane,
+   *  where the id comes from the server first. `tabEphemeralOpen` must
+   *  resolve before the tab's `<webview>` is created with that partition. */
+  tabEphemeralOpen?: () => Promise<{ ok: boolean; partition?: string; error?: string }>;
+  tabEphemeralClose?: (partition: string) => Promise<{ ok: boolean }>;
+  onDeepLink?: (fn: (link: DeepLink) => void) => () => void;
   /** The window's own controls. Optional because an older shell still has a
    *  system title bar and does not need them — and because a renderer that
    *  assumed they were there would draw three dead buttons in a browser tab. */
   winMinimize?: () => Promise<void>;
-  winToggleMaximize?: () => Promise<boolean>;
+  winToggleMaximize?: (why?: string) => Promise<boolean>;
   winClose?: () => Promise<void>;
   winIsMaximized?: () => Promise<boolean>;
   winState?: () => Promise<{ max: boolean; full: boolean }>;
@@ -39,10 +61,43 @@ type DesktopBridge = {
   /** Absent on shells built before the browser could zoom. */
   onBrowserZoom?: (fn: (level: number) => void) => () => void;
   onBrowserOpenTab?: (fn: (url: string) => void) => () => void;
+  /** Absent on shells built before the browser had its own keyboard. */
+  onBrowserKey?: (fn: (key: string) => void) => () => void;
+  onBrowserSearch?: (fn: (text: string) => void) => () => void;
+  /** All absent on shells built before the inspector was a pane. */
+  browserDevtools?: (req: { guest: number; rect: DevtoolsRect; x?: number; y?: number; zoom?: number }) => Promise<{ ok: boolean; docked?: boolean; error?: string }>;
+  browserDevtoolsClose?: (req: { guest: number }) => Promise<{ ok: boolean }>;
+  browserDevtoolsRect?: (req: { guest: number; rect: DevtoolsRect }) => void;
+  browserDevtoolsZoom?: (req: { guest: number; level: number }) => Promise<{ ok: boolean; level?: number }>;
+  browserDevtoolsShot?: (req: { guest: number }) => Promise<{ ok: boolean; png?: string; via?: string; error?: string }>;
+  browserDevtoolsPanel?: (req: { guest: number; panel: string }) => Promise<{ ok: boolean; panel?: string; via?: string; error?: string }>;
+  onDevtoolsZoom?: (fn: (at: { guest: number; level: number }) => void) => () => void;
+  /** Absent on shells built before the inspector could be opened from a CLI. */
+  onDevtoolsOpen?: (fn: (at: { guest: number; open: boolean }) => void) => () => void;
+  onAppBack?: (fn: (at: { back: boolean }) => void) => () => void;
+  onBrowserInspect?: (fn: (at: { x: number; y: number }) => void) => () => void;
   setActiveBrowserGuest?: (id: number) => Promise<boolean>;
   browserPlaces?: (req: { source: string }) => Promise<{ ok: boolean; places?: ImportedPlace[]; error?: string }>;
+  /** Absent on shells built before a sidebar could be imported. */
+  browserShelfRead?: (source: string) => Promise<{ ok: boolean; shelf?: unknown; error?: string }>;
+  captureFullPage?: (how?: "copy" | "save") => Promise<{ ok: boolean; width?: number; height?: number; cut?: boolean; path?: string; error?: string }>;
   /** Absent on shells built before agents could screenshot the browser. */
-  captureBrowser?: () => Promise<string | null>;
+  /* §12 widened this: a crop and a full-page capture are the SHELL's job,
+     because a webview cannot screenshot beyond its own viewport. */
+  captureBrowser?: (opts?: { clip?: { x: number; y: number; width: number; height: number }; fullPage?: boolean; guestId?: number }) =>
+    Promise<string | null | { png: string | null; why?: string; cut?: boolean }>;
+  /** Absent on shells built before §4 — addInitScript/expose. */
+  registerInitScript?: (name: string, source: string, guestId?: number) => Promise<{ ok: boolean; error?: string }>;
+  /** Absent on shells built before §5 — the DevTools protocol, relayed whole. */
+  cdp?: (method: string, params?: unknown, guestId?: number) => Promise<{ ok: boolean; result?: unknown; error?: string }>;
+  /** The PERSON's zoom — `webContents.setZoomFactor` in the shell, which scales
+   *  the page inside the box it has. Omit the factor to read. */
+  zoom?: (factor?: number, guestId?: number) => Promise<{ ok: boolean; factor?: number; percent?: number; error?: string }>;
+  cdpEvents?: (guestId?: number) => Promise<{ ok: boolean; events?: Array<{ at: number; method: string; params: unknown }>; error?: string }>;
+  /** All absent on shells built before session-level settings existed. */
+  sessionSettings?: (req: Record<string, unknown>) => Promise<{ ok: boolean; applied?: string[]; error?: string; value?: unknown }>;
+  /** S9: absent on shells built before the identity header existed. */
+  setGuestOwner?: (guestId: number, owner: string) => void;
   /** All absent on shells built before cookie import existed. */
   cookieSources?: () => Promise<CookieSourcesReply>;
   importCookies?: (req: { source: string; sites: string[] }) => Promise<CookieImportReply>;
@@ -104,6 +159,43 @@ export async function forgetCookies(sites: string[], profileIds: readonly string
   try { return await b.forgetCookies({ sites, partitions }); } catch (e) { return { ok: false, error: String(e) }; }
 }
 
+/** Whether this shell can make lanes, which is what lets it register as the window that does. */
+export const CAN_MAKE_LANES = typeof (typeof window !== "undefined"
+  ? (window as unknown as { agentglass?: { laneOpen?: unknown } }).agentglass?.laneOpen
+  : undefined) === "function";
+
+export async function openLaneWindow(id: string, slug: string, ephemeral = false): Promise<{ ok: boolean; error?: string }> {
+  const b = bridge();
+  if (!b?.laneOpen) return { ok: false, error: "this build cannot make lanes" };
+  try { return await b.laneOpen(id, slug, ephemeral); } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+/** The lanes the server still knows: every other host of this app is destroyed. */
+export async function keepLaneWindows(ids: string[]): Promise<void> {
+  try { await bridge()?.laneKeep?.(ids); } catch { /* the next heartbeat says it again */ }
+}
+
+export async function closeLaneWindow(id: string): Promise<{ ok: boolean; error?: string }> {
+  const b = bridge();
+  if (!b?.laneClose) return { ok: false, error: "this build cannot close lanes" };
+  try { return await b.laneClose(id); } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+/** Mint an ephemeral tab's partition, before the tab itself is created. */
+export async function openEphemeralTab(): Promise<{ ok: boolean; partition?: string; error?: string }> {
+  const b = bridge();
+  if (!b?.tabEphemeralOpen) return { ok: false, error: "this build cannot make ephemeral tabs" };
+  try { return await b.tabEphemeralOpen(); } catch (e) { return { ok: false, error: String(e) }; }
+}
+
+/** Wipe an ephemeral tab's jar. Fire-and-forget at every call site: there is
+ *  nowhere better for a failure to go, and the tab is gone either way. */
+export async function closeEphemeralTab(partition: string): Promise<{ ok: boolean }> {
+  const b = bridge();
+  if (!b?.tabEphemeralClose) return { ok: false };
+  try { return await b.tabEphemeralClose(partition); } catch { return { ok: false }; }
+}
+
 function bridge(): DesktopBridge | null {
   if (typeof window === "undefined") return null;
   const b = (window as unknown as { agentglass?: DesktopBridge }).agentglass;
@@ -158,6 +250,131 @@ export function onBrowserZoom(fn: (level: number) => void): () => void {
 }
 
 /**
+ * A browser chord pressed while the PAGE had the focus.
+ *
+ * `t`, `l`, `f` — a new tab, the address bar, the find strip. The shell keeps
+ * reload and back to itself: those are the page's own business and forwarding
+ * them would take the focus off it for nothing.
+ */
+export function onBrowserKey(fn: (key: string) => void): () => void {
+  const b = bridge();
+  return b?.onBrowserKey ? b.onBrowserKey(fn) : () => {};
+}
+
+/** "Search the web for…", from the page's own context menu. Text, not a url:
+ *  the engine is a setting, and it lives on this side. */
+export function onBrowserSearch(fn: (text: string) => void): () => void {
+  const b = bridge();
+  return b?.onBrowserSearch ? b.onBrowserSearch(fn) : () => {};
+}
+
+/**
+ * Put the inspector in a pane of this window instead of a floating one.
+ *
+ * A `<webview>` guest has no window of its own, so every docking mode Electron
+ * offers collapses to "detached" — which on a fractionally scaled display came
+ * up as a separate window whose content did not fill its frame. The shell hosts
+ * the DevTools in a view of its own and floats it over the hole the panel
+ * leaves for it; `rect` is that hole, in the renderer's own pixels.
+ *
+ * NOT a second `<webview>`, which is the obvious reading of the API and was the
+ * first attempt: measured, it came up with a working toolbar and an empty
+ * Elements tree — a webview-to-webview limitation open since 2018.
+ */
+export async function browserDevtools(req: { guest: number; rect: DevtoolsRect; x?: number; y?: number; zoom?: number }): Promise<{ ok: boolean; docked?: boolean; error?: string }> {
+  const b = bridge();
+  if (!b?.browserDevtools) return { ok: false, error: "this shell has no inspector" };
+  try { return await b.browserDevtools(req); } catch { return { ok: false, error: "the inspector could not be opened" }; }
+}
+
+/** Where the inspector's hole is, in the renderer's own pixels. `on: false`
+ *  hides it without closing it — a floating view knows nothing about which
+ *  workspace view is on screen, and left visible it sits over the terminal. */
+export interface DevtoolsRect { x: number; y: number; width: number; height: number; on?: boolean }
+
+/**
+ * The inspector's own zoom — not the app's, and not the page's.
+ *
+ * It is a WebContents of its own, so this is one call and it touches nothing
+ * else. The gesture, though, is not free: Ctrl+plus and Ctrl+wheel land inside
+ * that view and never reach this document, so the shell catches them there and
+ * reports back through `onDevtoolsZoom`.
+ */
+export function browserDevtoolsZoom(guest: number, level: number): void {
+  const b = bridge();
+  try { void b?.browserDevtoolsZoom?.({ guest, level }); } catch { /* older shell */ }
+}
+
+/*
+ * A picture of the inspector, and which panel it is showing.
+ *
+ * Both awaited rather than fired and forgotten, unlike the zoom above: an
+ * agent asked for these and is waiting on the answer, so a shell too old to
+ * have them has to say so rather than go quiet.
+ */
+export async function browserDevtoolsShot(guest: number): Promise<{ ok: boolean; png?: string; via?: string; error?: string }> {
+  const b = bridge();
+  if (!b?.browserDevtoolsShot) return { ok: false, error: "this shell cannot photograph the inspector" };
+  try { return await b.browserDevtoolsShot({ guest }); }
+  catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
+}
+
+export async function browserDevtoolsPanel(guest: number, panel: string): Promise<{ ok: boolean; panel?: string; via?: string; error?: string }> {
+  const b = bridge();
+  if (!b?.browserDevtoolsPanel) return { ok: false, error: "this shell cannot change the inspector's panel" };
+  try { return await b.browserDevtoolsPanel({ guest, panel }); }
+  catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
+}
+
+export function onDevtoolsZoom(fn: (at: { guest: number; level: number }) => void): () => void {
+  const b = bridge();
+  return b?.onDevtoolsZoom ? b.onDevtoolsZoom(fn) : () => {};
+}
+
+/*
+ * WHO HAS THE INSPECTOR OPEN, told rather than assumed.
+ *
+ * The panel used to be the only thing that could open one, so its own state
+ * was the answer. An agent can open one now — `agentglass-browser inspect
+ * open` — and it opens HIDDEN, so a person looking at the browser had no way
+ * at all to know it was there: no pixel on screen, and the panel's own switch
+ * still off. Before it opened hidden you found out because it covered half the
+ * window, which was a bug and was also, accidentally, the only signal.
+ *
+ * So the shell says it, for every open and every close, whoever asked. One
+ * source, including the panel's own opens: two sources for one fact are two
+ * sources that can disagree.
+ */
+/** The mouse's back (or forward) button. It arrives as a window app command —
+ *  Chromium never dispatches it to the page — so this is the only way a view
+ *  can hear it. Outside the desktop shell there is nothing to subscribe to. */
+export function onAppBack(fn: (at: { back: boolean }) => void): () => void {
+  const b = bridge();
+  return b?.onAppBack ? b.onAppBack(fn) : () => {};
+}
+
+export function onDevtoolsOpen(fn: (at: { guest: number; open: boolean }) => void): () => void {
+  const b = bridge();
+  return b?.onDevtoolsOpen ? b.onDevtoolsOpen(fn) : () => {};
+}
+
+export function browserDevtoolsRect(guest: number, rect: DevtoolsRect): void {
+  const b = bridge();
+  try { b?.browserDevtoolsRect?.({ guest, rect }); } catch { /* older shell */ }
+}
+
+export async function browserDevtoolsClose(guest: number): Promise<void> {
+  const b = bridge();
+  try { await b?.browserDevtoolsClose?.({ guest }); } catch { /* older shell */ }
+}
+
+/** "Inspect" from the page's own context menu, with where it was clicked. */
+export function onBrowserInspect(fn: (at: { x: number; y: number }) => void): () => void {
+  const b = bridge();
+  return b?.onBrowserInspect ? b.onBrowserInspect(fn) : () => {};
+}
+
+/**
  * A page in the built-in browser asked for a window.
  *
  * A middle click, a `target="_blank"`, an OAuth popup. Every one of them used
@@ -179,6 +396,34 @@ export function onBrowserOpenTab(fn: (url: string) => void): () => void {
  * always whichever guest attached last; with tabs it is whichever you are
  * looking at, and this side is the only one that knows.
  */
+/**
+ * Another browser's sidebar: its spaces, its folders, its pinned pages.
+ *
+ * Read by the shell rather than the server, like the cookies and the history —
+ * it is somebody's browsing, and a route would put it on the surface an agent
+ * driving this browser can reach.
+ */
+/**
+ * The whole page — scroll included — onto the desktop's clipboard.
+ *
+ * Done in the shell rather than here for two reasons: what is below the fold
+ * was never painted, so only the debugger can render it; and a renderer's
+ * clipboard write is refused while the guest holds the focus, which during a
+ * screenshot it always does.
+ */
+export async function captureFullPage(how: "copy" | "save" = "copy"): Promise<{ ok: boolean; width?: number; height?: number; cut?: boolean; path?: string; error?: string }> {
+  const b = bridge();
+  if (!b?.captureFullPage) return { ok: false, error: "this shell cannot capture a whole page" };
+  try { return await b.captureFullPage(how); } catch { return { ok: false, error: "the capture did not answer" }; }
+}
+
+export async function browserShelfRead(source: string): Promise<{ ok: boolean; shelf?: ImportedShelf; error?: string }> {
+  const b = bridge();
+  if (!b?.browserShelfRead) return { ok: false, error: "this shell cannot read another browser's sidebar" };
+  try { return await b.browserShelfRead(source) as { ok: boolean; shelf?: ImportedShelf; error?: string }; }
+  catch (e) { return { ok: false, error: String(e) }; }
+}
+
 export function setActiveBrowserGuest(id: number): void {
   const b = bridge();
   try { void b?.setActiveBrowserGuest?.(id); } catch { /* older shell */ }
@@ -207,10 +452,118 @@ export async function browserPlaces(source: string): Promise<ImportedPlace[]> {
  * no page to capture — the caller falls back to asking the element, which works
  * whenever the pane happens to be on screen.
  */
-export async function captureBrowser(): Promise<string | null> {
+/**
+ * A frame of the browser pane, and the reason when there is none.
+ *
+ * The shell used to answer a bare `null` and every caller reported it as "the
+ * pane is not on screen" — which is one of three reasons and was usually not
+ * the right one. An older shell still answers a string, and that is handled
+ * rather than assumed away.
+ */
+export async function captureBrowser(
+  /** `shot --selector/--clip` (§12/§18): what the frame should contain,
+   *  resolved before the shell ever asks Chromium for one. */
+  opts?: { clip?: { x: number; y: number; width: number; height: number }; fullPage?: boolean },
+  /** §9: WHICH tab. Without it the shell captures whichever guest is in front,
+   *  so one agent's shot came back as a picture of another agent's page —
+   *  right dimensions, plausible content, wrong page, and nothing saying so. */
+  guestId?: number,
+): Promise<{ png: string | null; why: string; cut?: boolean; url?: string }> {
   const b = bridge();
-  if (!b?.captureBrowser) return null;
-  try { return await b.captureBrowser(); } catch { return null; }
+  if (!b?.captureBrowser) return { png: null, why: "this shell cannot capture the browser" };
+  try {
+    const r = await b.captureBrowser({ ...(opts ?? {}), ...(guestId ? { guestId } : {}) });
+    if (typeof r === "string" || r === null) return { png: r, why: r ? "" : "the pane produced no frame" };
+    return { png: r.png, why: r.why ?? "", cut: r.cut, url: (r as { url?: string }).url };
+  } catch { return { png: null, why: "the capture did not answer" }; }
+}
+
+/** §4: register a named init script with the shell — see
+ *  `registerInitScript` on `AgentglassBridge` and `browserDrive.ts`, which
+ *  calls this. */
+export async function registerBrowserInitScript(name: string, source: string, guestId?: number): Promise<{ ok: boolean; error?: string }> {
+  const b = bridge();
+  if (!b?.registerInitScript) return { ok: false, error: "this shell cannot register an init script" };
+  try {
+    return await b.registerInitScript(name, source, guestId);
+  } catch { return { ok: false, error: "the shell did not answer" }; }
+}
+
+/**
+ * §5: one CDP command, and the events that arrived since the last drain.
+ *
+ * Deliberately not one wrapper per DevTools feature. The spec names nine —
+ * debugger, DOM breakpoints, listeners, coverage, profiler, heap, source maps,
+ * layers, accessibility audit — and every one is a domain Chromium already
+ * speaks. Nine wrappers would be nine ways to be missing the tenth.
+ */
+export async function browserCdp(
+  method: string,
+  params?: unknown,
+  /** §9: WHICH tab. Without it the relay talks to whichever guest is in front,
+   *  so every DevTools call — the screenshot route included — went to the tab
+   *  the person was looking at rather than the one the caller named. */
+  guestId?: number,
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  const b = bridge();
+  if (!b?.cdp) return { ok: false, error: "this shell has no DevTools protocol relay" };
+  try {
+    return await b.cdp(method, params, guestId);
+  } catch { return { ok: false, error: "the shell did not answer" }; }
+}
+
+/**
+ * The person's zoom on the tab they are looking at.
+ *
+ * Separate from the `zoom` VERB, which is a device metrics override: an
+ * override narrows the layout viewport while the `<webview>` keeps its box, so
+ * the page comes out the same size in a smaller rectangle. Right for an agent
+ * emulating a screen, wrong for a person leaning in — reported with three
+ * screenshots of a page shrinking into the corner.
+ *
+ * Omitting the factor reads the current one, through the same door, so reading
+ * and setting cannot disagree.
+ */
+export async function browserZoom(
+  factor?: number, guestId?: number,
+): Promise<{ ok: true; factor: number; percent: number } | { ok: false; error: string }> {
+  const b = bridge();
+  if (!b?.zoom) return { ok: false, error: "this shell cannot zoom a page" };
+  try {
+    const r = await b.zoom(factor, guestId);
+    if (!r?.ok || typeof r.factor !== "number") return { ok: false, error: r?.error || "the shell did not answer" };
+    return { ok: true, factor: r.factor, percent: r.percent ?? Math.round(r.factor * 100) };
+  } catch { return { ok: false, error: "the shell did not answer" }; }
+}
+
+/** Whatever CDP sent while nobody was asking — a debugger pause, a DOM
+ *  breakpoint firing, a console call. Draining empties the buffer, so two
+ *  callers do not both get the same pause and both act on it. */
+export async function browserCdpEvents(guestId?: number): Promise<Array<{ at: number; method: string; params: unknown }>> {
+  const b = bridge();
+  if (!b?.cdpEvents) return [];
+  try {
+    const r = await b.cdpEvents(guestId);
+    return r.ok && Array.isArray(r.events) ? r.events : [];
+  } catch { return []; }
+}
+
+/** Apply session-level settings: proxy, extensions, cookies, DNS.
+ *  Session-level settings are applied through the Electron main process,
+ *  not through the page's DevTools protocol. */
+export async function applySessionSettings(req: Record<string, unknown>): Promise<{ ok: boolean; applied?: string[]; error?: string; value?: unknown }> {
+  const b = bridge();
+  if (!b?.sessionSettings) return { ok: false, error: "this shell does not support session settings" };
+  try {
+    return await b.sessionSettings(req);
+  } catch { return { ok: false, error: "the shell did not apply the settings" }; }
+}
+
+/** S9: tell main which agent's requests a guest is making, so the identity
+ *  header — off by default, only for a dev origin — has a name to send. A
+ *  no-op on a shell that predates it, same as every other bridge call here. */
+export function setGuestOwner(guestId: number, owner: string): void {
+  try { bridge()?.setGuestOwner?.(guestId, owner); } catch { /* nothing to push to */ }
 }
 
 /** Whether the app is set to launch at login. Null when not applicable (a
@@ -232,6 +585,95 @@ export async function setAutostart(on: boolean): Promise<boolean | null> {
   if (!b) return null;
   try {
     return await b.setAutostart(on);
+  } catch {
+    return null;
+  }
+}
+
+/** `on` stays awake continuously, `agent` only while something is working,
+ *  `off` allows normal sleep. */
+export type PowerMode = "on" | "agent" | "off";
+export interface PowerStatus {
+  mode: PowerMode;
+  /** Whether the assertion is held right now. */
+  awake: boolean;
+  /** The last poll's answer to "is an agent working" — only meaningful in `agent` mode. */
+  working: boolean;
+  /** The server's reasons for `working`, by source. Null from a server that
+   *  does not send them; absent on a shell from before. */
+  why?: { chats: number; runs: number; hooked: number; named: number } | null;
+  /** What is held now: the logind sleep lock's mode (null when none is
+   *  held), the lid switch, the screen, and on a Mac App Nap. */
+  locks?: { sleep: string | null; lid: boolean; display: boolean; app: boolean };
+  /** Linux without systemd-inhibit: only the screen can be held. */
+  inhibitMissing?: boolean;
+  /** The shell's `process.platform`, which decides what a held lock means. */
+  platform?: string;
+}
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * The power button's colour and tooltip, from the shell's status.
+ *
+ * "Awake" alone could not answer what a person asks before closing a lid or
+ * picking suspend from the menu: what is held, and why. The sleep lock is
+ * weak in both of the modes the shell takes it in (`block-weak`, and plain
+ * `block` on a logind before 257, where block was weak), so a held lock
+ * always means the person's own suspend goes through — said here, because
+ * the first version blocked it and the menu entry did nothing. A machine
+ * without systemd-inhibit holds only the screen; that is a warning, not
+ * "awake".
+ */
+export function powerReadout(s: PowerStatus): { tone: "held" | "idle" | "warn"; title: string } {
+  const next = s.mode === "on" ? "Agent mode" : s.mode === "agent" ? "Off" : "always awake";
+  const click = `Click for ${next}.`;
+  if (s.mode === "off") return { tone: "idle", title: `Normal sleep. ${click}` };
+  if (!s.awake) return { tone: "idle", title: `${s.mode === "agent" ? "Agent mode — idle, nothing is working" : "Always awake, not held yet"}. ${click}` };
+  const w = s.why;
+  const reasons = w ? [
+    w.chats ? plural(w.chats, "chat") + " mid-turn" : "",
+    w.runs ? plural(w.runs, "run") + " in progress" : "",
+    w.hooked ? plural(w.hooked, "agent") + " active in the last 10 minutes" : "",
+    w.named ? plural(w.named, "named agent") + " running" : "",
+  ].filter(Boolean) : [];
+  const head = s.mode === "on" ? "Always awake" : `Agent mode — awake: ${reasons.length ? reasons.join(", ") : "an agent is working"}`;
+  if (s.inhibitMissing) {
+    return { tone: "warn", title: `${head}. But only the screen is held: systemd-inhibit is not installed, so the machine still sleeps on its own and when the lid closes. ${click}` };
+  }
+  const l = s.locks;
+  /* A Linux shell that took no lid lock — logind or polkit refused it, or no
+     logind answered — is holding the screen and not the machine: closing the
+     lid suspends it mid-run, and a green button would say otherwise. */
+  if (l && s.platform === "linux" && !l.lid) {
+    return { tone: "warn", title: `${head}. But the lid switch is not held${l.sleep ? "" : ", and neither is sleep"}: closing the lid suspends the machine. ${click}` };
+  }
+  /* What each lock is, and no more: the weak sleep lock holds logind's own
+     idle action and not a suspend its owner asks for — the menu's, or one
+     the person's idle daemon requests; a Mac holds idle sleep and not the
+     lid. */
+  const held = !l ? "" : l.sleep || l.lid
+    ? `Holding ${[l.sleep ? "logind's idle suspend" : "", l.lid ? "the lid switch" : ""].filter(Boolean).join(" and ")}${l.sleep ? "; your own suspend still goes through" : ""}.`
+    : l.app ? "Holding the screen and idle sleep; closing the lid still sleeps." : l.display ? "Holding the screen." : "";
+  return { tone: "held", title: `${head}.${held ? ` ${held}` : ""} ${click}` };
+}
+
+/** Null in a browser tab, or on a shell built before this existed. */
+export async function powerStatus(): Promise<PowerStatus | null> {
+  const b = bridge();
+  if (!b?.powerStatus) return null;
+  try {
+    return await b.powerStatus();
+  } catch {
+    return null;
+  }
+}
+
+export async function setPowerMode(mode: PowerMode): Promise<PowerStatus | null> {
+  const b = bridge();
+  if (!b?.setPowerMode) return null;
+  try {
+    return await b.setPowerMode(mode);
   } catch {
     return null;
   }
@@ -368,12 +810,34 @@ export async function revokeRemoteAccess(): Promise<boolean | null> {
  * socket reconnect. No reload, so terminals, drafts and scroll positions
  * survive a setting change.
  */
+/** What a link may ask for. One shape, checked in the main process before it
+ *  ever reaches here — this is the window's copy of the answer, not a parser. */
+export type DeepLink = { kind: "plugin-install"; url: string };
+
+/**
+ * "Install this plugin", clicked on the catalogue's web page.
+ *
+ * Two ways in, because a link arrives at two different moments: one that
+ * started the app cold is waiting when the window mounts (`takeDeepLink`),
+ * and one clicked while it was already running arrives as an event. Neither
+ * installs anything — the window opens the install box with the URL in it and
+ * the person approves it exactly as they approve a URL they pasted.
+ */
+export function followDeepLinks(fn: (link: DeepLink) => void): () => void {
+  const b = bridge();
+  if (!b) return () => {};
+  void b.takeDeepLink?.().then((held) => { if (held) fn(held); }).catch(() => { /* older shell */ });
+  return b.onDeepLink?.(fn) ?? (() => {});
+}
+
 export function followServerChanges(): () => void {
   const b = bridge();
   if (!b?.onServerChanged) return () => {};
   return b.onServerChanged((p) => {
     adoptServer(p);
-    window.dispatchEvent(new CustomEvent("agentglass:server-changed"));
+    // The desk key alone — a claim on an adopted server taken or lost — moves
+    // no socket: same server, same token, and a reconnect would drop them all.
+    if (p.origin !== undefined || p.token !== undefined) window.dispatchEvent(new CustomEvent("agentglass:server-changed"));
   });
 }
 
@@ -389,7 +853,7 @@ export const WINDOW_CONTROLS = (() => {
   if (!b?.winMinimize || !b.winToggleMaximize || !b.winClose) return null;
   return {
     minimize: () => { void b.winMinimize!().catch(() => {}); },
-    toggleMaximize: () => { void b.winToggleMaximize!().catch(() => {}); },
+    toggleMaximize: (why?: string) => { void b.winToggleMaximize!(why).catch(() => {}); },
     close: () => { void b.winClose!().catch(() => {}); },
     /** Maximised AND fullscreen, in one answer — they are different states and
      *  two different parts of the bar care about them. */

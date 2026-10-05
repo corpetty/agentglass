@@ -11,9 +11,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { SERVER_BOOT_MS } from "./serverBoot.ts";
 
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -26,12 +27,22 @@ beforeAll(async () => {
     // scratch directory, so nothing here can write a developer's real
     // ~/.gemini or ~/.codex.
     env: {
-      PATH: process.env.PATH ?? "",
+      /* The system's directories and bun's own, not the developer's PATH. The
+         tests below reason about which agent CLIs this machine has — "Codex has
+         neither a binary on PATH nor a config directory here" — and that was
+         true of whoever wrote it and false on any machine that installs codex
+         through a version manager, where the refusal test went green→red for
+         no change of code. An agent CLI is never a system package, so these
+         directories are the machine as a fresh user would find it. */
+      PATH: [dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
       // The server sweeps tmux window sizes at boot; without this it sweeps the
       // developer's own socket directory. See tmuxTmp.ts.
       TMUX_TMPDIR: TMUX_TEST_TMPDIR,
       HOME: dir,
       XDG_CONFIG_HOME: dir,
+      // State (audit log, ledgers, engine conf) jailed too: without this a booted
+      // server writes into the developer's real ~/.local/state/agentglass.
+      AGENTGLASS_STATE_DIR: `${dir}/state`,
       CLAUDE_CONFIG_DIR: join(dir, ".claude"),
       AGENTGLASS_ROOT: dir,
       AGENTGLASS_DB: join(dir, "f.db"),
@@ -52,7 +63,7 @@ beforeAll(async () => {
     await Bun.sleep(100);
   }
   throw new Error("the server did not come up: " + (await new Response(proc.stderr as ReadableStream).text()).slice(0, 400));
-});
+}, SERVER_BOOT_MS);
 
 afterAll(() => {
   try { proc?.kill(); } catch { /* already gone */ }

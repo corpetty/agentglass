@@ -4,7 +4,7 @@
 // renderer as the telemetry view.
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { diffSplit, diffWrap } from "../lib/diffPrefs.ts";
-import { conflictBriefing, CONFLICT_ASK } from "../lib/conflictBrief.ts";
+import { conflictBriefing, conflictHandoff } from "../lib/conflictBrief.ts";
 import { ConflictMode } from "./ConflictMode.tsx";
 import { ContextMenu, MenuItem } from "./ContextMenu.tsx";
 import { RebaseModal } from "./RebaseModal.tsx";
@@ -17,6 +17,7 @@ import { useDismiss } from "../lib/useDismiss.ts";
 import { viewHeaderClass, viewHeaderStyle } from "./workspace/ViewHeader.tsx";
 import { CHIP } from "./workspace/Chrome.tsx";
 import { ICON } from "../lib/iconSize.ts";
+import { BlockedIcon, BranchIcon, ChartIcon, CommitIcon, CrossIcon, DoneIcon, FileIcon, IconLabel, ListIcon, MinusIcon, PlusIcon, RefreshIcon, SparkleIcon, StashIcon, TargetIcon, TreeIcon, UndoIcon } from "../lib/glyphIcons.tsx";
 import type { GitRepoRef, WorkingTree, GitFileChange, GitBranch, GitBranchInfo, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, ConflictBlock, BlockChoice, MergeInfo, FileChange, WalkthroughResult, WalkthroughFile, TidyReport, TidyFinding, GitSubmodule } from "../../../shared/types.ts";
 import { partitionByWorktree, splitReadable, goneConfirmTitle, goneConfirmBody, forcedDeletePrompt } from "../lib/goneCleanup.ts";
 import { CheckoutPicker } from "./CheckoutPicker.tsx";
@@ -24,7 +25,8 @@ import { BasePicker } from "./BasePicker.tsx";
 import { ShellConsole } from "./ShellConsole.tsx";
 import { RescueModal } from "./RescueModal.tsx";
 import { useDialogs } from "./ConfirmDialog.tsx";
-import { api } from "../lib/api.ts";
+import { api, IS_DEMO } from "../lib/api.ts";
+import { refusalFinal, useCoverHold } from "../lib/cover.ts";
 import { subscribeGitChanged } from "../lib/gitBus.ts";
 import { seedChat } from "../lib/chatStore.ts";
 import { HiliteCtx, useDiffHighlight } from "../lib/diffHighlight.ts";
@@ -36,7 +38,7 @@ import { buildFileTree, visibleRows, allDirPaths } from "../lib/fileTree.ts";
 import { useIncremental } from "../lib/useIncremental.ts";
 import { CommandLog } from "./CommandLog.tsx";
 import { UnifiedDiff, SplitDiff, SCROLLBAR_CSS } from "./diff/DiffLines.tsx";
-import { ThemePicker, Toggle } from "./diff/DiffControls.tsx";
+import { ThemePicker, Toggle, DiffSettingsLink } from "./diff/DiffControls.tsx";
 import { changesetSig, readWalkCache, writeWalkCache } from "../lib/walkCache.ts";
 import { PresetDiff } from "./diff/PresetDiff.tsx";
 import { useSidebarWidth } from "../lib/sidebarWidth.ts";
@@ -50,6 +52,8 @@ import { primaryAction, groupByPrefix, bulkDeletable, type GitKind, type GitRowS
 import { openPrs, openPr } from "../lib/openPrs.ts";
 import { isScratchBranch, scratchNote } from "../lib/scratchBranch.ts";
 import { chipTarget } from "../lib/chipTarget.ts";
+import { openPeek } from "../lib/openPeek.ts";
+import { groupHunks } from "../lib/changeGroups.ts";
 import type { PrBranchSummary } from "../../../shared/types.ts";
 
 const unifiedText = (c: GitFileChange) => c.hunks.map((h) => `@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@\n${h.lines.join("\n")}`).join("\n");
@@ -149,7 +153,7 @@ function TidyView({ report, root, busy }: { report: TidyReport | null; root: str
     return (
       <div className="grid place-items-center gap-1.5 py-14 px-6 text-center">
         <div className="grid place-items-center rounded-full mb-1"
-          style={{ width: 34, height: 34, background: "color-mix(in srgb, var(--success) 14%, transparent)", color: "var(--success)", fontSize: 15 }}>✓</div>
+          style={{ width: 34, height: 34, background: "color-mix(in srgb, var(--success) 14%, transparent)", color: "var(--success)" }}><DoneIcon size={ICON.sm} /></div>
         <div className="text-[12.5px]" style={{ color: "var(--text)" }}>Nothing has piled up</div>
         <div className="text-[10.5px]" style={{ color: "var(--text3)", maxWidth: 340 }}>
           No stale branches, no dangling worktrees, no loose objects worth packing.
@@ -212,7 +216,7 @@ function TidyView({ report, root, busy }: { report: TidyReport | null; root: str
                         truncated: these run to ninety characters and a
                         trailing "· held" is the first thing to disappear —
                         which made six held branches look like one. */}
-                    {held ? `⊘ ${i}` : i}
+                    {held ? <IconLabel icon={<BlockedIcon size={ICON.xs} />}>{i}</IconLabel> : i}
                   </span>
                 );
               })}
@@ -329,13 +333,13 @@ function BranchChip({ branch, onCopied }: { branch: GitBranchInfo; onCopied?: (n
         navigator.clipboard?.writeText(branch.name).then(() => onCopied?.(branch.name)).catch(() => { /* no clipboard permission */ });
       }}
       title={`${branch.name}${upstream ? `\ntracking ${upstream}` : "\nno upstream — nothing to compare against"}\n\nclick to copy the branch name`}>
-      <span className="truncate min-w-0">⎇ {branch.name}</span>
+      <span className="truncate min-w-0"><BranchIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />{branch.name}</span>
       {busy && <span style={{ color: "var(--warning)" }}>({busy})</span>}
       {/* Behind first, then ahead — it reads as "pull this many, push that many",
           and it's the order lazygit uses, so the shape is already familiar. */}
       {behind > 0 && <span style={{ color: "var(--warning)" }}>↓{behind}</span>}
       {ahead > 0 && <span style={{ color: "var(--success)" }}>↑{ahead}</span>}
-      {upstream && !ahead && !behind && <span style={{ color: "var(--success)" }} title="in sync with upstream">✓</span>}
+      {upstream && !ahead && !behind && <span className="flex" style={{ color: "var(--success)" }} title="in sync with upstream"><DoneIcon size={ICON.xs} /></span>}
     </span>
   );
 }
@@ -444,7 +448,7 @@ function ListToolbar({ q, onQ, placeholder, sort, onSort, sorts, count, total, c
    * It sits IN this strip rather than in one of its own above it. Every tab had
    * two rows of controls doing one job, which cost a row of height on each of
    * six tabs and made the panel read as two toolbars stacked. Reported as
-   * "puede ser todo en una misma línea", and it can.
+   * "it can all go on one single line", and it can.
    */
   lead?: ReactNode;
 }) {
@@ -576,10 +580,12 @@ function HelpSheet({ view, onClose }: { view: View; onClose: () => void }) {
 }
 
 function ShortcutBar({ view, logOpen, onToggleLog, editorName }: { view: View; logOpen: boolean; onToggleLog: () => void; editorName?: string | null }) {
-  // Only advertised where it works: on a machine with no editor at all, `e`
-  // does nothing, and a bar that claims otherwise is the bar lying.
+  /* Advertised whenever there is a file to open: it opens the app's own editor
+     pane now rather than shouting at an nvim somewhere else, so it no longer
+     depends on this machine having one running. `editorName` still gates it —
+     a machine with no editor at all has nothing to open the pane with. */
   const keys: [string, string][] = view === "changes" && editorName
-    ? [...VIEW_KEYS.changes.slice(0, 2), ["e", `edit in ${editorName}`], ...VIEW_KEYS.changes.slice(2)]
+    ? [...VIEW_KEYS.changes.slice(0, 2), ["e", "open it here"], ...VIEW_KEYS.changes.slice(2)]
     : VIEW_KEYS[view];
   return (
     <div className="shrink-0 px-4 py-1 border-t text-[9.5px] t-dim2 flex items-center gap-3" style={{ borderColor: "color-mix(in srgb, var(--border) 40%, transparent)" }}>
@@ -824,6 +830,8 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     }
   }, [wtJump]);
   const [tree, setTree] = useState<WorkingTree | null>(null);
+  /** The first read of the tree has come back, one way or the other. */
+  const [treeRead, setTreeRead] = useState(false);
   // Which root the tree on screen belongs to. When it isn't the current root,
   // the header (branch, sync-behind count, push/pull state) is still showing the
   // worktree you just switched away from — so the group can say it is recomputing
@@ -946,8 +954,8 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
    * `loadTree` is async and records the root it answered for in `treeFor`. The
    * conflict screen keys off this value, so between switching worktree and the
    * new tree arriving, a conflict belonging to the checkout you LEFT was drawn
-   * over the one you opened — reported as the resolver appearing "para todos
-   * los wt/branches", with the file list beside it reading "nothing to commit,
+   * over the one you opened — reported as the resolver appearing "for every
+   * worktree/branch", with the file list beside it reading "nothing to commit,
    * working tree clean" because that half had already caught up.
    *
    * A tree from somewhere else is not evidence about here, so it reads clean
@@ -977,7 +985,28 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
   useEffect(() => {
     // `treeFor` for the same reason as `mergeState` above: asking the server
     // about a root whose tree has not arrived yet answers about the wrong one.
-    if (!open || !root || treeFor !== root || mergeState === "clean") { setConflicts([]); setMerge(null); return; }
+    if (!open || !root || treeFor !== root || mergeState === "clean") {
+      setConflicts([]);
+      setMerge(null);
+      /*
+       * AND CLOSE THE EDITOR, because the conflict it is editing is gone.
+       *
+       * `blockFile` was only ever cleared by its own close button or by
+       * applying — so a merge that ended UNDERNEATH it (an abort, a branch
+       * change, somebody resolving it in a terminal) left the three-way editor
+       * open over a file that no longer conflicts. Reported plainly: "it stays
+       * sort of stuck… no matter which branch I switch to".
+       *
+       * It is a real stuck state, not a cosmetic one: the editor is drawn
+       * instead of the changes list, so the panel stops being usable for
+       * anything else until the tab is reloaded.
+       */
+      setBlockFile(null);
+      setBlocks(null);
+      setPicks({});
+      setBlockErr(null);
+      return;
+    }
     api.gitConflicts(root).then((r) => setConflicts(r.files ?? [])).catch(() => {});
     api.gitMergeInfo(root).then((r) => setMerge(r.ok ? r : null)).catch(() => {});
   }, [open, root, treeFor, mergeState, tree]);
@@ -994,10 +1023,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
    *  part, and two copies of it would drift. */
   const conflictPrompt = () => {
     const rels = conflicts.map((p) => p.startsWith(root) ? p.slice(root.length + 1) : p);
-    return [
-      ...conflictBriefing(root, tree?.branch, repos.find((r) => r.root === root), mergeState, rels, merge),
-      ...CONFLICT_ASK,
-    ].join("\n");
+    const ref = repos.find((r) => r.root === root);
+    return conflictHandoff(
+      conflictBriefing(root, tree?.branch, ref, mergeState, rels, merge),
+      () => api.prConflictPrompt({ worktree: root, files: rels, branch: tree?.branch?.name, base: tree?.branch?.base ?? undefined }),
+    );
   };
 
   /**
@@ -1010,8 +1040,14 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
    * on whether you intend to watch or to join in, which is the same choice the
    * pull request panel already offers for a review.
    */
-  const askClaudeInTerminal = () => {
-    requestTermIssue(root, "conflicts", conflictPrompt(), true);
+  // The prompt is fetched first and can take a moment; without this a second
+  // press in that window opened a second tab.
+  const handing = useRef(false);
+  const askClaudeInTerminal = async () => {
+    if (handing.current) return;
+    handing.current = true;
+    const h = await conflictPrompt().finally(() => { handing.current = false; });
+    requestTermIssue(root, "conflicts", h.prompt, true, false, "", h.model, h.effort);
     // It opens a tmux window somewhere you are not looking, and until this said
     // so the button read as broken: it worked perfectly, silently, and people
     // pressed it again.
@@ -1030,8 +1066,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
    * only at mount — so the prompt landed in a tab nobody was looking at and the
    * chat opened blank. It looked exactly like the button doing nothing.
    */
-  const askClaude = () => {
-    seedChat(root, conflictPrompt(), "Resolve merge conflicts");
+  const askClaude = async () => {
+    if (handing.current) return;
+    handing.current = true;
+    const h = await conflictPrompt().finally(() => { handing.current = false; });
+    seedChat(root, h.prompt, "Resolve merge conflicts");
     onOpenChat?.();
   };
   // Only the branches whose upstream is gone — the merged-and-tidied ones. Off
@@ -1153,36 +1192,31 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
    * file you opened *because* of a diff means scrolling back to where you
    * already were.
    */
-  const editFile = async (c: GitFileChange | null, hunkIdx = 0) => {
+  /**
+   * Open the selected file in the editor, HERE.
+   *
+   * It used to hand the file to whatever nvim happened to be running, and on a
+   * machine with none it copied a command to the clipboard and called that an
+   * answer. His words: "that should no longer work that way, it is old — now we
+   * always open a floating modal with nvim". So `e` and the button do the same
+   * thing the pull request does, and the file opens at the change you were
+   * reading with the rest of them down the right.
+   */
+  const editFile = (c: GitFileChange | null, hunkIdx = 0) => {
     if (!c) return;
-    const line = c.hunks[hunkIdx]?.newStart ?? c.hunks[0]?.newStart ?? 1;
-    try {
-      const r = await api.editorOpen(c.file_path, line);
-      if (!r.ok) return flash(false, r.error || "Could not open the editor");
-      if (r.how === "remote") {
-        // It landed in a window that may be behind this one, so say so —
-        // otherwise pressing `e` looks like it did nothing at all. And when it
-        // went to a sibling checkout of the same project rather than this one,
-        // name it: the file opens in the nvim you have, which is the point, but
-        // you should not have to work out which window it appeared in.
-        flash(true, r.viaFamily
-          ? `Sent to your nvim in ${r.viaFamily.split("/").pop()} · ${baseName(c.file_path)}:${line}`
-          : `Sent to your open nvim · ${baseName(c.file_path)}:${line}`);
-      } else if (r.command) {
-        // Nothing reachable for *this* file. Saying "no nvim running" when one
-        // is open two panes away sends you looking for a bug; naming the repo
-        // it's in explains the refusal in one line.
-        // Three different situations, three different things to do about them.
-        const elsewhere = r.otherCwds?.length
-          ? `nvim is open in ${r.otherCwds.map((p) => p.split("/").pop()).join(", ")}, not this repo — copied: ${r.command}`
-          : r.stuck
-          ? `An nvim is running but not answering (${r.stuck} stale socket${r.stuck === 1 ? "" : "s"}) — copied: ${r.command}`
-          : `No nvim running — copied: ${r.command}`;
-        flash(true, elsewhere);
-        navigator.clipboard?.writeText(r.command).catch(() => { /* no clipboard permission */ });
-      }
-    } catch (e) { flash(false, String(e)); }
+    const groups = groupHunks(c.hunks);
+    openPeek({
+      root,
+      path: c.file_path,
+      label: rel(c),
+      edit: true,
+      branch: tree?.branch?.name || undefined,
+      line: groups[hunkIdx]?.from ?? groups[0]?.from ?? 1,
+      groups,
+    });
   };
+
+
   const { hilite, themePref, setThemePref, bold, setBold, hiliteError } = useDiffHighlight(selected?.file_path);
   const writeEnabled = tree?.writeEnabled ?? false;
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 2600); };
@@ -1208,7 +1242,12 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     const seq = ++treeSeq.current;
     try { const t = await api.gitTree(r); if (seq !== treeSeq.current) return; setTree(t); setTreeFor(r); if (t.error) flash(false, t.error); }
     catch (e) { if (seq === treeSeq.current) flash(false, String(e)); }
+    finally { if (seq === treeSeq.current) setTreeRead(true); }
   }, []);
+  /* On screen at launch, Git holds the launch cover until the working tree has
+     been read once — answered or failed — so it arrives with its files listed
+     instead of "Reading the working tree…". */
+  useCoverHold("git", open && !IS_DEMO && !treeRead);
   const rel = (c: GitFileChange) => (c.file_path.startsWith(root + "/") ? c.file_path.slice(root.length + 1) : c.file_path);
 
   useEffect(() => {
@@ -1224,12 +1263,26 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
       setToast(null); setTitle(""); setBody(""); setView("changes"); setNewBranch("");
     }
     api.editorCapability().then(setEditor).catch(() => setEditor({ hasNvim: false, editor: null }));
-    api.gitRepos().then(({ repos }) => {
+    // Refused while the server is still starting: asked again rather than left
+    // empty. The list was read once per open, so a slow cold start opened on
+    // an empty Git that stayed empty until the view was opened again.
+    let live = true;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    const readRepos = () => api.gitRepos().then(({ repos }) => {
+      if (!live) return;
       setRepos(repos);
       const first = repos[0]?.root ?? "";
       setRoot((cur) => cur || first); // the [root, open] effect owns tree loading
-    }).catch((e) => flash(false, String(e)));
+      if (!first) setTreeRead(true); // no checkout: there is no tree to wait for
+    }).catch((e) => {
+      if (!live) return;
+      if (e instanceof TypeError && !refusalFinal()) { retry = setTimeout(readRepos, 500); return; }
+      flash(false, String(e));
+      setTreeRead(true);
+    });
+    void readRepos();
     requestAnimationFrame(() => frameRef.current?.focus());
+    return () => { live = false; if (retry) clearTimeout(retry); };
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { if (open && root) loadTree(root); }, [root, open, loadTree]);
@@ -2406,7 +2459,10 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     else if (lower === "x" && selected && writeEnabled && !selected.staged) { e.preventDefault(); discard(selected); }
     // lazygit's `e`. Lowercase only: `E` stays free for an "edit in a new
     // instance" variant if that ever turns out to be wanted.
-    else if (k === "e" && selected && editor?.editor) { e.preventDefault(); void editFile(selected); }
+    // `e`, as lazygit has it — but it opens the editor HERE rather than
+    // shouting at one somewhere else, so it no longer depends on there being an
+    // nvim already running.
+    else if (k === "e" && selected) { e.preventDefault(); editFile(selected); }
   };
 
   // Which tab each group was last left on, so 1–5 returns you where you were.
@@ -2422,15 +2478,15 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     if (action === "discard" && !(await ask({ title: "Discard this hunk?", body: "This cannot be undone.", danger: true, confirmLabel: "Discard" }))) return;
     act(() => api.gitApplyHunk(root, selected.file_path, selected.staged, action, selected.hunks[i]), `${action}d hunk`);
   };
-  const hunkBtn = (label: string, tint: string, onClick: () => void) => (
+  const hunkBtn = (label: ReactNode, tint: string, onClick: () => void) => (
     <button onClick={onClick} className="text-[10px] px-1.5 py-0.5 rounded" style={{ fontFamily: "system-ui, sans-serif", color: tint, background: "color-mix(in srgb, var(--bg3) 70%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 30%, transparent)" }}>{label}</button>
   );
   const hunkActionFn = (writeEnabled && selected && selected.status === "modified" && !selected.binary)
     ? (i: number) => (
         <span className="inline-flex items-center gap-1">
           {selected.staged
-            ? hunkBtn("－ Unstage hunk", "var(--text)", () => applyHunk("unstage", i))
-            : <>{hunkBtn("＋ Stage hunk", "var(--text)", () => applyHunk("stage", i))}{hunkBtn("↺ Discard", "var(--error)", () => applyHunk("discard", i))}</>}
+            ? hunkBtn(<IconLabel icon={<MinusIcon size={ICON.xs} />}>Unstage hunk</IconLabel>, "var(--text)", () => applyHunk("unstage", i))
+            : <>{hunkBtn(<IconLabel icon={<PlusIcon size={ICON.xs} />}>Stage hunk</IconLabel>, "var(--text)", () => applyHunk("stage", i))}{hunkBtn(<IconLabel icon={<UndoIcon size={ICON.xs} />}>Discard</IconLabel>, "var(--error)", () => applyHunk("discard", i))}</>}
         </span>
       )
     : undefined;
@@ -2760,21 +2816,21 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                     {/* Switched worktrees — say the numbers are being recomputed
                         rather than leave the old branch's sync count sitting
                         there looking current. */}
-                    {treeStale && <span className="animate-spin shrink-0 text-[12px]" style={{ color: "var(--text3)" }} title="Reading the branch you switched to…">⟳</span>}
+                    {treeStale && <span className="animate-spin shrink-0 text-[12px]" style={{ color: "var(--text3)" }} title="Reading the branch you switched to…"><RefreshIcon size={ICON.xs} /></span>}
                     <button
                       onClick={() => setInsightsOpen(true)}
                       disabled={busy}
                       className="text-[11px] px-2 py-1 rounded-lg whitespace-nowrap shrink-0 font-medium"
                       style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--text) 4%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", opacity: busy ? 0.5 : 1 }}
                       title="Repo insights — commit pace, contributors, churn, changelog"
-                    >☰ insights</button>
+                    ><IconLabel icon={<ChartIcon size={ICON.xs} />}>insights</IconLabel></button>
                     {branch?.state === "bisecting" && (
                       <button
                         onClick={() => setBisectOpen(true)}
                         className="text-[11px] px-2 py-1 rounded-lg whitespace-nowrap shrink-0"
                         style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 45%, transparent)" }}
                         title="A bisect is in progress — mark the checked-out commit good or bad"
-                      >◉ bisect</button>
+                      ><IconLabel icon={<TargetIcon size={ICON.xs} />}>bisect</IconLabel></button>
                     )}
                     {branch && <BranchChip branch={branch} onCopied={(n) => flash(true, `copied ${n}`)} />}
                     {/* Offered only while undoing is exact: an unpushed merge
@@ -2796,7 +2852,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                         className="text-[11px] px-2 py-1 rounded-lg whitespace-nowrap shrink-0"
                     style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)", opacity: busy ? 0.5 : 1 }}
                     title="Undo the last merge — the branch returns to exactly where it was. Offered only because it is unpushed and nothing sits on top of it.">
-                    {pending === "undo" ? "undoing…" : "⎌ undo merge"}
+                    {pending === "undo" ? "undoing…" : <IconLabel icon={<UndoIcon size={ICON.xs} />}>undo merge</IconLabel>}
                       </button>
                     )}
 
@@ -2987,7 +3043,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                           <button onClick={askClaude}
                             className="text-[10.5px] px-2 py-0.5 rounded-lg whitespace-nowrap"
                             style={{ color: "var(--primary-hover)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)" }}
-                            title="Open a chat in this repo, asking Claude to resolve them">✦ ask claude</button>
+                            title="Open a chat in this repo, asking Claude to resolve them"><IconLabel icon={<SparkleIcon size={ICON.xs} />}>ask claude</IconLabel></button>
                           {/* The other half of the same choice — see
                               askClaudeInTerminal. A tmux window in this repo,
                               attached, beside your own shells. */}
@@ -3045,11 +3101,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                   <TidyView report={tidy} root={root} busy={busyView === "tidy"} />
                 ) : view === "changes" ? (
                   <div className="flex-1 min-h-0 flex">
-                    <div className="shrink-0 flex flex-col min-h-0" style={{ width: sidebarW }}>
+                    <div className="shrink-0 flex flex-col min-h-0 agx-sidelist" style={{ width: sidebarW }}>
                       {!tree?.clean && (
                         <div className="shrink-0 px-2.5 py-2 border-b" style={{ borderColor: "color-mix(in srgb, var(--border) 40%, transparent)" }}>
                           <button onClick={() => explain(!!walk)} disabled={walkLoading} className="text-[11px] px-2.5 py-1 rounded-lg w-full" style={{ color: "var(--text)", background: "color-mix(in srgb, var(--info) 13%, transparent)", border: "1px solid color-mix(in srgb, var(--info) 28%, transparent)", opacity: walkLoading ? 0.6 : 1 }}>
-                            {walkLoading ? "✨ explaining…" : walk ? "✨ re-explain changes" : "✨ Explain changes"}
+                            <IconLabel icon={<SparkleIcon size={ICON.xs} />}>{walkLoading ? "explaining…" : walk ? "re-explain changes" : "Explain changes"}</IconLabel>
                           </button>
                           {(walk?.reviewFocus || walk?.error) && (
                             <div className="mt-1.5 text-[10px] leading-snug" style={{ color: walk?.error ? "var(--warning)" : "var(--text2)" }}>
@@ -3068,11 +3124,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                       )}
                       {!tree?.clean && (
                         <div className="shrink-0 flex items-center gap-1 px-2.5 py-1 border-b" style={{ borderColor: "color-mix(in srgb, var(--border) 25%, transparent)" }}>
-                          <button onClick={() => setTreeMode((v) => !v)} title="Toggle file tree / flat list (`)" className="text-[9.5px] px-1.5 py-0.5 rounded" style={{ color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 25%, transparent)" }}>{treeMode ? "⊟ tree" : "≡ flat"}</button>
+                          <button onClick={() => setTreeMode((v) => !v)} title="Toggle file tree / flat list (`)" className="text-[9.5px] px-1.5 py-0.5 rounded" style={{ color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 25%, transparent)" }}>{treeMode ? <IconLabel icon={<TreeIcon size={ICON.xs} />}>tree</IconLabel> : <IconLabel icon={<ListIcon size={ICON.xs} />}>flat</IconLabel>}</button>
                           {treeMode && (
                             <>
-                              <button onClick={() => setCollapsed(new Set(allDirPaths(buildFileTree(all, relOf))))} title="Collapse all (-)" className="text-[9.5px] px-1.5 py-0.5 rounded" style={{ color: "var(--text3)" }}>−</button>
-                              <button onClick={() => setCollapsed(new Set())} title="Expand all (=)" className="text-[9.5px] px-1.5 py-0.5 rounded" style={{ color: "var(--text3)" }}>＋</button>
+                              <button onClick={() => setCollapsed(new Set(allDirPaths(buildFileTree(all, relOf))))} title="Collapse all (-)" className="text-[9.5px] px-1.5 py-0.5 rounded flex" style={{ color: "var(--text3)" }}><MinusIcon size={ICON.xs} /></button>
+                              <button onClick={() => setCollapsed(new Set())} title="Expand all (=)" className="text-[9.5px] px-1.5 py-0.5 rounded flex" style={{ color: "var(--text3)" }}><PlusIcon size={ICON.xs} /></button>
                             </>
                           )}
                         </div>
@@ -3084,7 +3140,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                     {tree?.clean && (
                       <div className="grid place-items-center gap-1.5 py-10 px-4 text-center">
                         <div className="grid place-items-center rounded-full mb-1"
-                          style={{ width: 34, height: 34, background: "color-mix(in srgb, var(--success) 14%, transparent)", color: "var(--success)", fontSize: 15 }}>✓</div>
+                          style={{ width: 34, height: 34, background: "color-mix(in srgb, var(--success) 14%, transparent)", color: "var(--success)" }}><DoneIcon size={ICON.sm} /></div>
                         <div className="text-[12.5px]" style={{ color: "var(--text)" }}>Working tree clean</div>
                         <div className="text-[10.5px]" style={{ color: "var(--text3)" }}>
                           {branch?.ahead ? `${branch.ahead} commit${branch.ahead === 1 ? "" : "s"} waiting to push` : "nothing to commit here"}
@@ -3124,7 +3180,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                           <button onClick={() => setMergeRest(true)}
                             className="w-full text-left px-3 py-2 text-[10.5px] hover:bg-white/5"
                             style={{ color: "var(--text3)" }}>
-                            ＋ {(tree?.staged.length ?? 0) + (tree?.unstaged.length ?? 0)} more the merge brought — show them
+                            <PlusIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />{(tree?.staged.length ?? 0) + (tree?.unstaged.length ?? 0)} more the merge brought — show them
                           </button>
                         )}
                         {(!conflicts.length || mergeRest) && !!tree?.staged.length && (
@@ -3144,7 +3200,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                       <div className="shrink-0 border-t p-3 space-y-2" style={{ borderColor: "color-mix(in srgb, var(--text) 8%, transparent)", background: "color-mix(in srgb, var(--bg3) 22%, transparent)" }}>
                         <input value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") doCommit(); }} placeholder="Summary of what changed…" disabled={!writeEnabled} className="w-full px-2.5 py-1.5 rounded-lg text-[11.5px] outline-none" style={{ background: "color-mix(in srgb, var(--text) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", color: "var(--text)" }} />
                         <textarea value={body} onChange={(e) => setBody(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") doCommit(); }} placeholder="Why, if it needs saying (optional)…" rows={2} disabled={!writeEnabled} className="agx-scroll w-full px-2.5 py-1.5 rounded-lg text-[11px] outline-none resize-none" style={{ background: "color-mix(in srgb, var(--text) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", color: "var(--text)" }} />
-                        <button onClick={doCommit} disabled={!writeEnabled || busy || !tree?.staged.length || !title.trim()} className="w-full py-1.5 rounded-lg text-[11.5px] font-semibold" style={{ background: "color-mix(in srgb, var(--primary) 22%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", color: "var(--text)", opacity: (!writeEnabled || !tree?.staged.length || !title.trim()) ? 0.45 : 1 }}>⎇ Commit {tree?.staged.length ? `${tree.staged.length} staged` : ""}</button>
+                        <button onClick={doCommit} disabled={!writeEnabled || busy || !tree?.staged.length || !title.trim()} className="w-full py-1.5 rounded-lg text-[11.5px] font-semibold" style={{ background: "color-mix(in srgb, var(--primary) 22%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", color: "var(--text)", opacity: (!writeEnabled || !tree?.staged.length || !title.trim()) ? 0.45 : 1 }}><IconLabel icon={<CommitIcon size={ICON.xs} />}>Commit {tree?.staged.length ? `${tree.staged.length} staged` : ""}</IconLabel></button>
                         {!writeEnabled && <div className="text-[9.5px] t-dim2 text-center">read-only (AGENTGLASS_GIT_WRITE_DISABLED)</div>}
                       </div>
                     </div>
@@ -3199,15 +3255,51 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                               {selected.deletions > 0 && <span style={{ color: "var(--error)" }}>−{selected.deletions}</span>}
                             </span>
                             <div className="ml-auto flex items-center gap-1.5 shrink-0">
-                              {writeEnabled && (selected.staged ? <Toggle onClick={() => unstage(selected)} title="Unstage this file">－ unstage</Toggle> : <Toggle onClick={() => stage(selected)} title="Stage this file">＋ stage</Toggle>)}
+                              {/* `e` has always done this; the button is for the
+                                  hands that are on the mouse. It opens at the
+                                  first changed line rather than at the top —
+                                  scrolling back to where you already were is
+                                  the whole reason people stay in the diff. */}
+                              {/* Opens HERE, the way the pull request does —
+                                  the modal with an editor in it, at the first
+                                  changed line, with the rest down its right.
+                                  `e` still sends the file to an nvim you
+                                  already have open; the two are different
+                                  intentions and both are worth having. */}
+                              <Toggle onClick={() => editFile(selected)}
+                                title={`Open ${rel(selected)} here, at its first change`}><IconLabel icon={<FileIcon size={ICON.xs} />}>open</IconLabel></Toggle>
+                              {writeEnabled && (selected.staged ? <Toggle onClick={() => unstage(selected)} title="Unstage this file"><IconLabel icon={<MinusIcon size={ICON.xs} />}>unstage</IconLabel></Toggle> : <Toggle onClick={() => stage(selected)} title="Stage this file"><IconLabel icon={<PlusIcon size={ICON.xs} />}>stage</IconLabel></Toggle>)}
                               <Toggle on={split} onClick={() => setSplit((s) => !s)} title="Split / unified">{split ? "split" : "unified"}</Toggle>
                               <Toggle on={wrap} onClick={() => setWrap((w) => !w)} title="Toggle line wrap">wrap</Toggle>
-                              <ThemePicker value={themePref} onChange={setThemePref} error={hiliteError} />
+                              <ThemePicker value={themePref} onChange={setThemePref} error={hiliteError} /><DiffSettingsLink />
                               <Toggle on={bold} onClick={() => setBold((b) => !b)} title="Bold keywords, functions & types (Neovim-style)">bold</Toggle>
                             </div>
                           </div>
-                          <div className="flex-1 min-h-0 flex relative" style={{ background: "var(--bg)" }}>
-                            {selected.binary ? <div className="flex-1 grid place-items-center t-dim2 text-[12px]">binary file — no textual diff</div>
+                          {/*
+                            * The column that scrolls.
+                            *
+                            * The diff panes deliberately do not: `overflow-x:
+                            * auto` computes `overflow-y: auto` unless the other
+                            * axis is pinned, and two nested vertical scrollers
+                            * is the double-scroll this app already fixed once
+                            * (see DiffLines.tsx). The pull-request view gives
+                            * them an outer scroller; this one did not, so in
+                            * split+wrap nothing scrolled at all and the file
+                            * was simply cut off at the bottom of the pane.
+                            *
+                            * And a BLOCK, not a flex row — which is the half
+                            * that took two goes. As a flex row this container
+                            * stretches its children to its own height, and a
+                            * child with `overflow-y: hidden` then CLIPS its
+                            * content instead of growing past it: the scrollbar
+                            * appears and scrolls nothing, because as far as the
+                            * container is concerned there is nothing below.
+                            * Block lets the diff be as tall as the file and
+                            * this column scroll it, which is what the panes
+                            * mean by "inside whatever scrolls the page".
+                            */}
+                          <div className="agx-scroll flex-1 min-h-0 relative overflow-y-auto" data-diff-scroller style={{ background: "var(--bg)" }}>
+                            {selected.binary ? <div className="h-full grid place-items-center t-dim2 text-[12px]">binary file — no textual diff</div>
                               : <HiliteCtx.Provider value={selected.hunks.reduce((n, h) => n + h.lines.length, 0) > 3000 ? { ...hilite, theme: null } : hilite}>{split ? <SplitDiff c={selected} wrap={wrap} /> : <UnifiedDiff c={selected} wrap={wrap} hunkAction={hunkActionFn} />}</HiliteCtx.Provider>}
                           </div>
                         </>
@@ -3262,7 +3354,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                       <span className="text-[9.5px] uppercase tracking-wider t-dim2 shrink-0">history of</span>
                       <span className="min-w-0 truncate text-[11px] px-2 py-0.5 rounded" style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 12%, transparent)" }}
                         title={logScope === "all" ? "every branch in this repository" : `${graphBranch || "HEAD"} — the branch this checkout is on`}>
-                        {logScope === "all" ? "every branch" : `⎇ ${graphBranch || branch?.name || "HEAD"}`}
+                        {logScope === "all" ? "every branch" : <IconLabel icon={<BranchIcon size={ICON.xs} />}>{graphBranch || branch?.name || "HEAD"}</IconLabel>}
                       </span>
                       <div className="flex items-center gap-px rounded-md ml-1" style={{ background: "color-mix(in srgb, var(--border) 12%, transparent)" }}>
                         {([["head", "this branch"], ["all", "all branches"]] as const).map(([s, label]) => (
@@ -3390,7 +3482,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                         <button onClick={() => setOnlyGone((v) => !v)} className="text-[10.5px] px-2.5 py-1 rounded-lg transition-colors"
                           style={{ background: onlyGone ? "color-mix(in srgb, var(--error) 16%, transparent)" : "transparent", border: `1px solid color-mix(in srgb, var(--error) ${onlyGone ? 45 : 22}%, transparent)`, color: onlyGone ? "var(--text)" : "var(--text2)" }}
                           title="Branches whose remote branch no longer exists — usually a merged PR that was tidied up">
-                          {onlyGone ? "✕ show all branches" : `⌫ ${goneCount} gone`}
+                          {onlyGone ? <IconLabel icon={<CrossIcon size={ICON.xs} />}>show all branches</IconLabel> : <IconLabel icon={<BranchIcon size={ICON.xs} />}>{goneCount} gone</IconLabel>}
                         </button>
                         {onlyGone && (() => {
                           // Composed, not concatenated. Each piece used to carry
@@ -3494,11 +3586,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                     {writeEnabled && (
                       <>
                         <input value={snapshotLabel} onChange={(e) => setSnapshotLabel(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") snapshotNow(); }} placeholder="snapshot label (optional) — tree is not touched" className="px-3 py-1.5 rounded-lg text-[11.5px] outline-none min-w-0 w-56 shrink-0" style={{ background: "color-mix(in srgb, var(--text) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", color: "var(--text)" }} />
-                        <button onClick={snapshotNow} disabled={busy || tree?.clean} className={`${CHIP} font-medium`} style={{ background: "color-mix(in srgb, var(--info) 16%, transparent)", border: "1px solid color-mix(in srgb, var(--info) 35%, transparent)", color: "var(--text)", opacity: tree?.clean ? 0.5 : 1 }} title="Copy the current tree into refs/agx/wip — nothing moves, restore anytime">⟳ snapshot now</button>
+                        <button onClick={snapshotNow} disabled={busy || tree?.clean} className={`${CHIP} font-medium`} style={{ background: "color-mix(in srgb, var(--info) 16%, transparent)", border: "1px solid color-mix(in srgb, var(--info) 35%, transparent)", color: "var(--text)", opacity: tree?.clean ? 0.5 : 1 }} title="Copy the current tree into refs/agx/wip — nothing moves, restore anytime"><IconLabel icon={<RefreshIcon size={ICON.xs} />}>snapshot now</IconLabel></button>
                       </>
                     )}
                     {writeEnabled && (
-                      <button onClick={() => { setPartialOpen(!partialOpen); }} className={`${CHIP} font-medium`} style={{ background: "color-mix(in srgb, var(--primary) 12%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 30%, transparent)", color: "var(--text)" }}>▣ stash some files…</button>
+                      <button onClick={() => { setPartialOpen(!partialOpen); }} className={`${CHIP} font-medium`} style={{ background: "color-mix(in srgb, var(--primary) 12%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 30%, transparent)", color: "var(--text)" }}><IconLabel icon={<StashIcon size={ICON.xs} />}>stash some files…</IconLabel></button>
                     )}
                     {/* The search belongs in the same strip as the controls
                         above it: they are all "what do I do with work set

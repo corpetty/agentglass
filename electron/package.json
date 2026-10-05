@@ -1,7 +1,7 @@
 {
   "name": "agentglass-electron",
   "private": true,
-  "version": "0.13.0",
+  "version": "0.22.0",
   "description": "Every AI coding agent on your machine, on one screen \u2014 live cost, tokens and tool calls across every provider, and a hold on anything dangerous until you say go.",
   "author": "SirAllap",
   "homepage": "https://github.com/SirAllap/agentglass",
@@ -12,13 +12,16 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "typecheck": "tsc --noEmit",
     "dist": "node build.mjs && electron-builder",
     "dist:linux": "node build.mjs && electron-builder --linux",
     "dist:dir": "node build.mjs && electron-builder --dir"
   },
   "devDependencies": {
+    "@types/node": "24.13.3",
     "electron": "^43.3.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "typescript": "5.9.3"
   },
   "build": {
     "appId": "app.agentglass.desktop",
@@ -37,6 +40,11 @@
     "files": [
       "main.js",
       "guest-guard.js",
+      "identify-header.js",
+      "egress-guard.js",
+      "browser-menu.js",
+      "power.js",
+      "server-probe.js",
       "preload.js",
       "icons/**"
     ],

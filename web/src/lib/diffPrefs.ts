@@ -13,8 +13,11 @@
  * every time you pressed it would be a control nobody could use for a glance.
  */
 
+import { THEME_KEY } from "./diffHighlight.ts";
+
 const SPLIT_KEY = "agentglass.diff.split";
 const WRAP_KEY = "agentglass.diff.wrap";
+const NOWS_KEY = "agentglass.diff.noWhitespace";
 
 const read = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
 const write = (k: string, on: boolean, dflt: boolean) => {
@@ -30,8 +33,19 @@ export const DEFAULT_SPLIT = true;
  *  makes a change scannable, so it is worth asking for rather than assuming. */
 export const DEFAULT_WRAP = false;
 
+/** On, because a whitespace-only change is a real change and a reader who has not
+ *  asked to hide one should not have it hidden. */
+export const DEFAULT_NO_WHITESPACE = false;
+
 export const diffSplit = (): boolean => (read(SPLIT_KEY) === null ? DEFAULT_SPLIT : read(SPLIT_KEY) === "1");
+export const diffNoWhitespace = (): boolean => (read(NOWS_KEY) === null ? DEFAULT_NO_WHITESPACE : read(NOWS_KEY) === "1");
 export const diffWrap = (): boolean => (read(WRAP_KEY) === null ? DEFAULT_WRAP : read(WRAP_KEY) === "1");
 
 export function setDiffSplit(on: boolean): void { write(SPLIT_KEY, on, DEFAULT_SPLIT); }
 export function setDiffWrap(on: boolean): void { write(WRAP_KEY, on, DEFAULT_WRAP); }
+export function setDiffNoWhitespace(on: boolean): void { write(NOWS_KEY, on, DEFAULT_NO_WHITESPACE); }
+
+/** The syntax theme every diff view reads at mount; "auto" follows light/dark.
+ *  Same key the diff views persist, so Settings and a diff toolbar are one store. */
+export const diffThemePref = (): string => read(THEME_KEY) || "auto";
+export const setDiffThemePref = (v: string): void => { try { localStorage.setItem(THEME_KEY, v); } catch { /* private mode */ } };

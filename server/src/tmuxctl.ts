@@ -19,12 +19,17 @@
  * a degraded one.
  */
 import { readFileSync, readlinkSync, readdirSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, statSync, realpathSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, normalize } from "node:path";
 import type { TmuxWindow, TmuxPane, AgentPane } from "../../shared/types.ts";
 import { parsePanes, PANE_FORMAT } from "./paneloc.ts";
+import { validSessionName } from "./tmuxpane.ts";
+import { isLocked } from "./tmuxlock.ts";
 import { findTmuxBelow } from "./procchildren.ts";
 import { recall } from "./tmuxmemory.ts";
+import { engineSocketArgs } from "./tmuxbin.ts";
+import { mirrorLeases, recordMirrorLease, forgetMirrorLease, type MirrorLease } from "./mirrorlease.ts";
 
 /** How long a tmux call may take before we give up on it. Generous for a local
  *  socket, and short enough that a wedged tmux server cannot stall the poll. */
@@ -116,24 +121,194 @@ function socketOf(pid: number): string[] {
     return socketFromArgv(readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean));
   } catch { return []; }
 }
+/**
+ * OBSERVE-ONLY: the switch that lets this module read the user's tmux and
+ * never write to it.
+ *
+ * Everything below this line talks to a tmux server somebody else started.
+ * That is the point of the file — the app follows the sessions the user is
+ * already working in rather than making its own — and it is also the whole of
+ * the risk, because a session we did not create is still one we can resize,
+ * rename, kill, rebind and switch away from. That risk is not theoretical
+ * here. A `resize-window -A` once wrote `window-size manual` across five
+ * windows somebody was working in, and a phone attaching at its own size once
+ * squeezed a real session to 80x24. Both are fixed. Neither was predicted, and
+ * the next one will not be either.
+ *
+ * So there is a way to run the whole app with its hands behind its back:
+ *
+ *   AGENTGLASS_TMUX_OBSERVE_ONLY=1
+ *
+ * With it set, every command that could change the server is refused at the
+ * one place they all pass through, and every command that only asks a question
+ * runs exactly as before. The tab strip still draws, the pane list still fills,
+ * the machine view still finds agents; clicking a tab does nothing, and says so
+ * on stderr. The classification is `tmuxWriteCommands` below, and it fails
+ * CLOSED: a verb it has never heard of counts as a write.
+ *
+ * A refused write answers `null`, which is what a tmux that said no answers
+ * too — see the note on `tmux()`. That is deliberate and it is why this can be
+ * a switch at all rather than a rewrite: every caller in this file is already
+ * written for a tmux that refuses, because every one of them is inside a poll
+ * that must survive a server going away mid-frame.
+ *
+ * NOT the default, and that is a decision rather than an oversight. Observing
+ * is the safe behaviour and writing is the useful one, so making this the
+ * default would turn a feature off for everyone already relying on it in order
+ * to protect them from a class of bug that is, today, closed. The switch and
+ * the honest inventory in `docs/BLAST-RADIUS.md` are the deliverable; flipping
+ * the default is a separate change with its own evidence to gather.
+ */
+const OBSERVE_ONLY_ENV = "AGENTGLASS_TMUX_OBSERVE_ONLY";
+
+/** Read per call and never latched at import: the app is long-lived, a test
+ *  turns this on and off inside one process, and a desktop launcher sets its
+ *  environment somewhere this module cannot see. A `function` rather than a
+ *  `const` arrow for the reason spelled out above `usableTmuxTmpdir` — `tmux()`
+ *  is reachable during module evaluation, and a const would be in its temporal
+ *  dead zone there. */
+function observeOnly(): boolean {
+  /*
+   * Generous about spelling, because the failure mode is not symmetric. Someone
+   * setting this has decided they do not want this app writing to their tmux;
+   * if they type `true` and get silence, the switch reads as broken and the
+   * writes land anyway — the one outcome the mode exists to prevent. Whereas a
+   * value that turns it on when it was meant to be off costs a tab strip that
+   * will not reorder, which announces itself immediately.
+   *
+   * `.trim()` for a stray space out of a `.env` or a systemd `Environment=`
+   * line, which is the mistake this actually meets in the wild.
+   */
+  const raw = (process.env[OBSERVE_ONLY_ENV] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
 
 /**
- * Run a tmux command against a specific server. stdout only; a failure is a
- * null, never a throw, because every caller is inside a poll.
+ * The tmux commands that only ask a question.
  *
- * With a locale, because every format in this file separates its fields with a
- * tab and tmux will not hand one back to a process that has none. Measured:
- * `list-panes -F "#{pane_active}\t#{pane_id}"` returns `1\t%0` from a normal
- * shell and `1_%0` under `env -i` — tmux sanitises what it cannot call
- * printable in the current locale, and the C locale is that. Nothing crashes;
- * every line simply becomes one field that no `split("\t")` can take apart, so
- * the tab strip empties and the machine reports no agents. Which environment
- * the server gets is not up to it — a desktop launcher hands over a full one, a
- * systemd unit or a test harness hands over almost nothing — so the answer must
- * not depend on that. An existing setting is kept: this is a floor, not a
- * preference.
+ * An allow-list and not a deny-list, because the two fail in opposite
+ * directions and only one of those directions is survivable. A deny-list that
+ * has not heard of `respawn-pane` lets it through onto somebody's session; an
+ * allow-list that has not heard of some new `list-` verb costs a frame that
+ * comes back empty. tmux has upwards of a hundred commands and this file uses
+ * nine of them, so the list is short on purpose and stays that way.
+ *
+ * `has-session` is in here for the same reason as the `list-` family: it is a
+ * question, and asking it starts no server that was not already running —
+ * measured, `has-session` on a dead socket answers "no server running" and
+ * leaves the socket dead.
  */
-function tmux(socket: string[], args: string[]): string | null {
+const READING_COMMANDS = new Set([
+  "list-clients", "list-commands", "list-keys", "list-panes", "list-sessions", "list-windows",
+  "show-options", "show-window-options", "show-environment", "show-buffer", "show-messages",
+  "has-session", "display-message", "display", "capture-pane",
+]);
+
+/**
+ * The three that read only with `-p`, and write without it.
+ *
+ * `display-message "hi"` paints a line over the top of whatever the user is
+ * looking at; `display-message -p "hi"` prints it to stdout and touches
+ * nothing. Same command, opposite blast radius. `capture-pane` is the same
+ * shape one layer along — without `-p` it fills a paste buffer on the server.
+ *
+ * The flag is matched as a cluster (`-pt`, not just `-p`) because tmux accepts
+ * both spellings and this file's habit of writing them apart is a habit, not a
+ * rule.
+ */
+const PRINTS_WITH_P = new Set(["display-message", "display", "capture-pane"]);
+
+function readsOnly(cmd: string[]): boolean {
+  const verb = cmd[0] ?? "";
+  if (!READING_COMMANDS.has(verb)) return false;
+  if (!PRINTS_WITH_P.has(verb)) return true;
+  return cmd.some((a) => /^-[a-zA-Z]*p[a-zA-Z]*$/.test(a));
+}
+
+/**
+ * Which commands in an argv would change the server, one entry per command.
+ *
+ * Exported so the question can be asked without a tmux server existing to
+ * answer it — the same reason `tmuxSocketAllowed` is exported, and not a
+ * cosmetic one: a test that has to spawn tmux to find out what this file would
+ * have sent is a test that has already sent it.
+ *
+ * A bare `;` is tmux's own separator and several calls here are command LISTS
+ * — the frame, the phone's attach, the popup remount — so the split happens on
+ * standalone `;` tokens and each command is judged on its own verb. A list
+ * with one write in it is refused whole, which matches what tmux does with a
+ * list anyway: it aborts at the first command that fails.
+ */
+export function tmuxWriteCommands(args: string[]): string[][] {
+  const writes: string[][] = [];
+  let cur: string[] = [];
+  for (const a of [...args, ";"]) {
+    if (a === ";") {
+      if (cur.length && !readsOnly(cur)) writes.push(cur);
+      cur = [];
+    } else cur.push(a);
+  }
+  return writes;
+}
+
+/**
+ * What observe-only has refused so far, newest last, as the command line it
+ * would have run.
+ *
+ * Kept because a mode whose only output is stderr cannot be asserted on, and
+ * "we did not write anything" is exactly the claim that has to be provable
+ * rather than believed. Capped, because this is a process that runs for days
+ * and a user who tabs around a tab strip all afternoon would otherwise be
+ * paying for a list nobody reads — the same reasoning as the tail cap in the
+ * ingest path.
+ */
+const SUPPRESSED: string[][] = [];
+const SUPPRESSED_MAX = 200;
+
+/** The refused writes, oldest first. A copy: the caller is usually a test and
+ *  the array is live. */
+export function suppressedTmuxWrites(): string[][] {
+  return SUPPRESSED.map((a) => [...a]);
+}
+
+/** Empty the record. For a test that wants to assert on one call rather than
+ *  on everything the process has ever refused. */
+export function forgetSuppressedTmuxWrites(): void {
+  SUPPRESSED.length = 0;
+}
+
+/** Record and report. The socket goes into both, because "would have run
+ *  `kill-session -t =agx-phone-x`" is a very different sentence depending on
+ *  whether that server is ours or the one holding somebody's afternoon. */
+function noteSuppressed(socket: string[], writes: string[][]): void {
+  for (const w of writes) {
+    SUPPRESSED.push(["tmux", ...socket, ...w]);
+    if (SUPPRESSED.length > SUPPRESSED_MAX) SUPPRESSED.shift();
+    console.warn(`[tmux] observe-only: did NOT run \`${w.join(" ")}\` on ${socketPath(socket)}`);
+  }
+}
+
+/** The doors every tmux command passes before it runs, in order; true is a refusal. */
+function tmuxRefused(socket: string[], args: string[]): boolean {
+  /*
+   * Observe-only, and it is asked FIRST — before the two socket rules below
+   * rather than after them.
+   *
+   * The order is the promise. This switch says "nothing this process runs can
+   * change your tmux", and a promise that only holds once some other guard has
+   * agreed is a weaker promise than the one advertised. Asking here also means
+   * the stderr line names what the process INTENDED, which is the thing an
+   * operator turned the mode on to find out; a command that two doors down
+   * would have been refused anyway is still a command this app tried to send.
+   *
+   * Reads walk straight past, which is what makes the mode worth running
+   * rather than merely quiet: the tab strip, the pane list and the machine
+   * view are all `list-` and `show-options`, and all of them keep working.
+   */
+  if (observeOnly()) {
+    const writes = tmuxWriteCommands(args);
+    if (writes.length) { noteSuppressed(socket, writes); return true; }
+  }
   /*
    * The backstop, at the one place every tmux command in this file goes
    * through: under `bun test` with no TMUX_TMPDIR, the DEFAULT socket is not
@@ -157,7 +332,7 @@ function tmux(socket: string[], args: string[]): string | null {
    * without a tmux command having to be issued to find out. See the note there
    * for why that distinction is not cosmetic.
    */
-  if (!tmuxSocketAllowed(socket)) return null;
+  if (!tmuxSocketAllowed(socket)) return true;
   /*
    * And the same door for a process that is NOT under `bun test`, which the
    * guard above cannot help with: its first line is `if (process.env.NODE_ENV
@@ -185,18 +360,79 @@ function tmux(socket: string[], args: string[]): string | null {
    * alternative is a rule that can be unset by the process it is meant to
    * confine.
    */
-  if (!tmuxSocketConfined(socket)) return null;
+  return !tmuxSocketConfined(socket);
+}
+
+/** The locale floor described on `tmux` below: an existing setting is kept. */
+function tmuxEnv(): Record<string, string | undefined> {
+  return process.env.LC_ALL || process.env.LANG || process.env.LC_CTYPE
+    ? process.env
+    : { ...process.env, LC_ALL: "C.UTF-8" };
+}
+
+/** What a finished tmux command answers, shared by `tmux` and `tmuxAsync`. */
+function tmuxResult(socket: string[], exitCode: number | null, out: string, err: string, keepPartial: boolean): string | null {
+  if (exitCode !== 0) noteDeadSocket(socket, err);
+  /*
+   * A command list ABORTS at the first command that fails, and tmux exits
+   * non-zero for the whole list — with everything the earlier commands printed
+   * already on stdout. Measured.
+   *
+   * For a single command that is the right answer: nothing useful came back.
+   * For the sweep's frame it is not, and the difference is the tab strip. A
+   * frame that answers null makes the sweep drop the client and tell the panel
+   * `active: false`, which empties the strip; and the frame is a list, so ONE
+   * unlucky command — an option a tmux is too old to have, a window that died
+   * between two lines of the same call — would take the strip down with it.
+   * `keepPartial` says: parse what did arrive. Every parser here already
+   * ignores lines it does not recognise, so a short answer is a smaller frame
+   * and never a wrong one.
+   */
+  if (exitCode !== 0) return keepPartial && out ? out : null;
+  return out;
+}
+
+/**
+ * Run a tmux command against a specific server. stdout only; a failure is a
+ * null, never a throw, because every caller is inside a poll.
+ *
+ * With a locale, because every format in this file separates its fields with a
+ * tab and tmux will not hand one back to a process that has none. Measured:
+ * `list-panes -F "#{pane_active}\t#{pane_id}"` returns `1\t%0` from a normal
+ * shell and `1_%0` under `env -i` — tmux sanitises what it cannot call
+ * printable in the current locale, and the C locale is that. Nothing crashes;
+ * every line simply becomes one field that no `split("\t")` can take apart, so
+ * the tab strip empties and the machine reports no agents. Which environment
+ * the server gets is not up to it — a desktop launcher hands over a full one, a
+ * systemd unit or a test harness hands over almost nothing — so the answer must
+ * not depend on that. An existing setting is kept: this is a floor, not a
+ * preference.
+ */
+function tmux(socket: string[], args: string[], keepPartial = false): string | null {
+  if (tmuxRefused(socket, args)) return null;
   try {
     const r = Bun.spawnSync(["tmux", ...socket, ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
-      timeout: TMUX_TIMEOUT_MS,
-      env: process.env.LC_ALL || process.env.LANG || process.env.LC_CTYPE
-        ? process.env
-        : { ...process.env, LC_ALL: "C.UTF-8" },
+      stdout: "pipe", stderr: "pipe", timeout: TMUX_TIMEOUT_MS, env: tmuxEnv(),
     });
-    if (r.exitCode !== 0) return null;
-    return r.stdout.toString();
+    return tmuxResult(socket, r.exitCode, r.stdout.toString(), r.stderr.toString(), keepPartial);
+  } catch { return null; }
+}
+
+/**
+ * `tmux` without holding the event loop: same guards, same environment, same
+ * timeout, same null-on-failure. For the paths the panels poll, where a
+ * blocking spawn per socket is a terminal that stops echoing.
+ */
+async function tmuxAsync(socket: string[], args: string[], keepPartial = false): Promise<string | null> {
+  if (tmuxRefused(socket, args)) return null;
+  try {
+    const p = Bun.spawn(["tmux", ...socket, ...args], {
+      stdout: "pipe", stderr: "pipe", timeout: TMUX_TIMEOUT_MS, env: tmuxEnv(),
+    });
+    const [out, err, code] = await Promise.all([
+      new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited,
+    ]);
+    return tmuxResult(socket, code, out, err, keepPartial);
   } catch { return null; }
 }
 
@@ -234,7 +470,7 @@ export function parseWindows(out: string): TmuxWindow[] {
     if (!line.trim()) continue;
     // Tab-separated, because window names routinely contain spaces and a
     // space-separated format would split "npm run dev" into three windows.
-    const [id, index, name, active, flags, ask, width, height] = line.split("\t");
+    const [id, index, name, active, flags, ask, width, height, , group, pin, cwd] = line.split("\t");
     const i = Number(index);
     if (!WINDOW_ID.test(id ?? "") || !Number.isInteger(i)) continue;
     const asked = (ask ?? "").trim();
@@ -249,6 +485,11 @@ export function parseWindows(out: string): TmuxWindow[] {
       // narrower than every client and put a "your phone is holding this
       // narrow" notice on a window nothing has touched.
       ...(Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0 ? { cols, rows } : {}),
+      // Held to the same shape a window name is: it is drawn on a chip and
+      // typed back into a tmux command.
+      ...(sanitizeGroupName(group) ? { group: sanitizeGroupName(group)! } : {}),
+      ...((pin ?? "").trim() === "1" ? { pinned: true } : {}),
+      ...((cwd ?? "").trim() ? { cwd: cwd!.trim() } : {}),
     });
   }
   return windows;
@@ -257,6 +498,33 @@ export function parseWindows(out: string): TmuxWindow[] {
 export interface TmuxFrame {
   target: TmuxTarget;
   windows: TmuxWindow[];
+  /** Every session on this socket with at least one window, so the strip can
+   *  offer them. Gathered from the sweep's own rows — no extra call. */
+  sessions: { id: string; name: string; windows: number }[];
+  /**
+   * The keys tmux is waiting for as its prefix, read on the same call.
+   *
+   * See `prefixKeys` for why it is re-read every sweep rather than kept from
+   * the attach. It rides here because the alternative was two more subprocesses
+   * per sweep per attached shell — measured, two thirds of this server's idle
+   * spawn rate — to answer a question the call that was already going out could
+   * carry for nothing.
+   */
+  prefix: string[];
+  /** A tmux popup is open over this terminal — see parseFrame. Anything this
+   *  app draws on a pane has to stand down while it is: the popup covers the
+   *  screen, and the pane under the pointer is not the pane on it. */
+  popup: boolean;
+  /**
+   * Every session on this server that has a client on it, off the same answer.
+   *
+   * A session is attached if and only if a client is on it, and the frame's
+   * first command already lists every client on the server with the session it
+   * is on — so this is a set the sweep was throwing away, and reading it here
+   * is one fewer `list-sessions` per tick per shell. Measured: it was half the
+   * idle spawns left after the prefix was folded in.
+   */
+  attached: Set<string>;
   /** The panes of the ACTIVE window only — the one the client is drawing, and
    *  so the only one whose geometry matches what is on screen. */
   panes: TmuxPane[];
@@ -320,42 +588,239 @@ export interface TmuxFrame {
  * lines are tagged because they come back concatenated.
  */
 export function readFrame(c: TmuxClient): TmuxFrame | null {
-  const out = tmux(c.socket, [
-    // The client's own grid, two fields further along a line that was already
-    // being asked for. Same argument as `@agx-ask` below: the size of a window
-    // against the size of the terminal showing it is a comparison the desk
-    // needs twice a second, and it costs nothing here and a subprocess a tick
-    // anywhere else.
-    //
-    // `#{status}` and `#{@agx-owned}` ride along for the same reason: the
-    // panel's answer to "whose bar is this" can be flipped by a keybinding,
-    // and the sweep that already reads the windows is where the re-assertion
-    // has to live. Both evaluate against the client's own session — measured,
-    // `list-clients` answers a session-local `status off` and `@agx-owned 1`
-    // for the client attached to that session and nobody else's.
-    "list-clients", "-F", "c\t#{client_tty}\t#{session_name}\t#{session_id}\t#{client_width}\t#{client_height}\t#{status}\t#{@agx-owned}",
-    ";",
-    "list-windows", "-a",
-    // `@agx-ask` rides along in the format string rather than in a second
-    // call: this is polled twice a second per attached client, and a prompt
-    // that costs an extra subprocess every sweep is a prompt that costs more
-    // than the feature is worth.
-    "-F", "w\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_raw_flags}\t#{@agx-ask}\t#{window_width}\t#{window_height}",
-    ";",
-    // Panes ride along for the same reason `@agx-ask` does: this runs twice a
-    // second per attached client, and it is already ONE subprocess with three
-    // commands in it. A separate `list-panes` would have doubled the process
-    // count of the sweep to answer a question the same call can.
-    //
-    // `-a` (every pane on the server) rather than the client's window, because
-    // this call has no target — it is resolving which session the client is on
-    // in its first line. Filtering happens in parseFrame, which by then knows.
-    "list-panes", "-a",
-    "-F", "p\t#{session_id}\t#{window_id}\t#{window_active}\t#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_right}\t#{pane_bottom}\t#{pane_active}\t#{window_zoomed_flag}",
-  ]);
-  if (!out) return null;
+  const out = tmux(c.socket, FRAME_ARGV, true);
+  return out ? frameFromRaw(out, c) : null;
+}
+
+/** The parse half of `readFrame`, split out so a shared raw answer can feed
+ *  more than one client without spawning again. See `readFrameCached`. */
+function frameFromRaw(out: string, c: TmuxClient): TmuxFrame | null {
   const f = parseFrame(out, c.tty);
-  return f ? { target: { pid: c.pid, socket: c.socket, session: f.session, id: f.id }, windows: f.windows, panes: f.panes, client: f.client, status: f.status, owned: f.owned, windowOfPane: f.windowOfPane } : null;
+  // parseFrame reads tagged lines and ignores the rest, so the prefix block can
+  // be handed the whole answer along with everything else.
+  return f ? { target: { pid: c.pid, socket: c.socket, session: f.session, id: f.id }, windows: f.windows, sessions: f.sessions, panes: f.panes, client: f.client, status: f.status, owned: f.owned, windowOfPane: f.windowOfPane, prefix: parsePrefix(out), attached: f.attached, popup: f.popup } : null;
+}
+
+const frameRawCache = new Map<string, { at: number; out: string | null }>();
+
+interface CachedParsedFrame {
+  at: number;
+  /** Only what is the session's: `client` and `popup` are per client and are
+   *  taken from each call's own parse, never from here. */
+  parsed: { session: string; id: string; status: string; owned: boolean; windows: TmuxWindow[]; panes: TmuxPane[]; windowOfPane: Map<string, string>; attached: Set<string>; sessions: { id: string; name: string; windows: number }[] };
+  prefix: string[];
+}
+
+const frameParsedCache = new Map<string, CachedParsedFrame>();
+
+/**
+ * `readFrame`, but the raw answer is shared for `ttlMs` across every client
+ * on the same socket — for the periodic sweep only.
+ *
+ * `list-windows -a` and `list-panes -a` are not scoped to the calling client;
+ * they answer the same thing for every attached shell on that tmux server at
+ * the same instant. The sweep runs once per attached client every 500ms, so a
+ * cockpit with twenty-six panes on one engine socket used to mean twenty-six
+ * spawns a tick for the same answer twenty-five other calls just got. Sharing
+ * the raw text and the parsed result — across every client on that session —
+ * turns that into one spawn and one parse per socket per tick, no matter how
+ * many panes or attached sessions are open.
+ *
+ * The parsed result is cached per (socket, session_id), so different clients
+ * on the same session reuse the same parse. Clients on different sessions get
+ * different parsed results (filtered by session_id). The target.pid may not
+ * match the calling client's pid, but target.socket and session/id are correct
+ * and are all that matters for tmux commands.
+ *
+ * `readFrame` itself is untouched and still spawns every call: a caller that
+ * just wrote to tmux and asks straight back — the watchdog tests do exactly
+ * this — needs the real answer, not a moment-old one. `ttlMs` should stay
+ * under the sweep's own interval, so a cached answer is never staler than an
+ * uncached sweep already tolerated between two ticks of its own.
+ */
+export function readFrameCached(c: TmuxClient, ttlMs: number): TmuxFrame | null {
+  const socketKey = c.socket.join(" ");
+  const now = Date.now();
+
+  // Get or fetch raw output (shared per socket)
+  const cachedRaw = frameRawCache.get(socketKey);
+  const out = cachedRaw && now - cachedRaw.at < ttlMs ? cachedRaw.out : (() => {
+    const fresh = tmux(c.socket, FRAME_ARGV, true);
+    frameRawCache.set(socketKey, { at: now, out: fresh });
+    return fresh;
+  })();
+
+  if (!out) return null;
+
+  // Parse the raw output to find this client's session
+  const parsed = parseFrame(out, c.tty);
+  if (!parsed) return null;
+
+  // Cache key combines socket and session_id; different sessions get different
+  // parsed results, same session reuses the parse across all its clients
+  const cacheKey = `${socketKey}\0${parsed.id}`;
+  const cachedParsed = frameParsedCache.get(cacheKey);
+
+  if (cachedParsed && now - cachedParsed.at < ttlMs) {
+    // Reuse cached parse, but build a new frame with this client's target.
+    //
+    // And this client's own fields. `client` is the size of THIS tty and
+    // `popup` is judged against it, so neither is the session's to share: two
+    // desks on one session at two widths each got whichever one parsed first,
+    // and the narrower was told a window at its own width was "152 columns to
+    // your terminal's 174" — a reflow card on the client that was driving the
+    // window, flipping tick by tick. `status` and `owned` are the session's
+    // (see FRAME_ARGV) and stay shared.
+    return {
+      target: { pid: c.pid, socket: c.socket, session: parsed.session, id: parsed.id },
+      windows: cachedParsed.parsed.windows,
+      sessions: cachedParsed.parsed.sessions,
+      panes: cachedParsed.parsed.panes,
+      client: parsed.client,
+      status: cachedParsed.parsed.status,
+      owned: cachedParsed.parsed.owned,
+      windowOfPane: cachedParsed.parsed.windowOfPane,
+      prefix: cachedParsed.prefix,
+      attached: cachedParsed.parsed.attached,
+      popup: parsed.popup,
+    };
+  }
+
+  // Not cached, parse and cache it
+  const prefix = parsePrefix(out);
+  frameParsedCache.set(cacheKey, {
+    at: now,
+    parsed: {
+      session: parsed.session,
+      id: parsed.id,
+      status: parsed.status,
+      owned: parsed.owned,
+      windows: parsed.windows,
+      panes: parsed.panes,
+      sessions: parsed.sessions,
+      windowOfPane: parsed.windowOfPane,
+      attached: parsed.attached,
+    },
+    prefix,
+  });
+
+  return {
+    target: { pid: c.pid, socket: c.socket, session: parsed.session, id: parsed.id },
+    windows: parsed.windows,
+    sessions: parsed.sessions,
+    panes: parsed.panes,
+    client: parsed.client,
+    status: parsed.status,
+    owned: parsed.owned,
+    windowOfPane: parsed.windowOfPane,
+    prefix,
+    attached: parsed.attached,
+    popup: parsed.popup,
+  };
+}
+
+/** The line `readFrame` puts between the prefix it asked for and the frame.
+ *  Declared above `FRAME_ARGV`, which reads it as the module loads.
+ *
+ *  The leading control byte is what makes the marker impossible to type as a
+ *  window name. How tmux PRINTS that byte back differs by version: 3.6 emits
+ *  it as is, 3.4 (the CI runner's) escapes it as the four characters `\001`
+ *  — so with only the raw spelling recognised, the parser on 3.4 never saw
+ *  the end of the prefix block and read the whole frame as prefix keys.
+ *  Both spellings end the block. */
+const PREFIX_END = "\u0001agx-prefix-end";
+const PREFIX_END_ESCAPED = "\\001agx-prefix-end";
+const isPrefixEnd = (line: string) => line === PREFIX_END || line === PREFIX_END_ESCAPED;
+
+/**
+ * Everything the sweep asks tmux, in one command list — exported so a test can
+ * put it to a real tmux and check the answer still splits the way the parsers
+ * below expect it to. Static: it has no target, and resolving which session the
+ * client is on is the first line's job.
+ */
+export const FRAME_ARGV: string[] = [
+  // The prefix, first, then a line nothing else emits to say where it ended.
+  //
+  // Positional would have been shorter and is wrong: `-q` prints NOTHING for
+  // an option a tmux is too old to have (measured, not assumed), so a missing
+  // `prefix2` would silently shift the frame up by a line. The marker makes
+  // the split hold whether tmux answers with two values, one, or none.
+  //
+  // These have to come BEFORE the frame rather than after it, so that a
+  // window whose name someone put a newline in cannot be mistaken for one.
+  "show-options", "-gqv", "prefix",
+  ";",
+  "show-options", "-gqv", "prefix2",
+  ";",
+  "display-message", "-p", PREFIX_END,
+  ";",
+  // The client's own grid, two fields further along a line that was already
+  // being asked for. Same argument as `@agx-ask` below: the size of a window
+  // against the size of the terminal showing it is a comparison the desk
+  // needs twice a second, and it costs nothing here and a subprocess a tick
+  // anywhere else.
+  //
+  // `#{status}` and `#{@agx-owned}` ride along for the same reason: the
+  // panel's answer to "whose bar is this" can be flipped by a keybinding,
+  // and the sweep that already reads the windows is where the re-assertion
+  // has to live. Both evaluate against the client's own session — measured,
+  // `list-clients` answers a session-local `status off` and `@agx-owned 1`
+  // for the client attached to that session and nobody else's.
+  /* `client_termname` rides along too, for one question the desk cannot answer
+     any other way: is a tmux POPUP open over this terminal right now?
+     A popup is a second client on the same server, drawn by tmux INTO our own
+     screen — the pane geometry does not change, only the pixels — so anything
+     this app paints on a pane keeps painting over the popup. A client started
+     inside tmux reports a tmux TERM, which is what tells the two apart. See
+     parseFrame. */
+  "list-clients", "-F", "c\t#{client_tty}\t#{session_name}\t#{session_id}\t#{client_width}\t#{client_height}\t#{status}\t#{@agx-owned}\t#{client_termname}",
+  ";",
+  "list-windows", "-a",
+  // `@agx-ask` rides along in the format string rather than in a second
+  // call: this is polled twice a second per attached client, and a prompt
+  // that costs an extra subprocess every sweep is a prompt that costs more
+  // than the feature is worth.
+  /* `session_name` rides along so the strip can offer the OTHER sessions
+     without a second call. A window opened for a different checkout lands in a
+     different session and never appears on the strip — reported as "that tab
+     does not show up in the terminal" — and the fix that moves the client instead took
+     four windows of somebody's own work off their screen. */
+  /* The tab-group fields are appended, never inserted: the ones before them
+     are read positionally. `@agx-group` and `@agx-pin` are window options the
+     strip writes (see runAction) so they outlive agentglass and can be set
+     from tmux's own command line; `pane_current_path` is the ACTIVE pane's
+     directory, which is what a window is grouped by. */
+  "-F", "w\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_raw_flags}\t#{@agx-ask}\t#{window_width}\t#{window_height}\t#{session_name}\t#{@agx-group}\t#{@agx-pin}\t#{pane_current_path}",
+  ";",
+  // Panes ride along for the same reason `@agx-ask` does: this runs twice a
+  // second per attached client, and it is already ONE subprocess with three
+  // commands in it. A separate `list-panes` would have doubled the process
+  // count of the sweep to answer a question the same call can.
+  //
+  // `-a` (every pane on the server) rather than the client's window, because
+  // this call has no target — it is resolving which session the client is on
+  // in its first line. Filtering happens in parseFrame, which by then knows.
+  "list-panes", "-a",
+  //
+  // `pane_tty` is last, and it is what tells a POPUP apart from an ordinary
+  // `tmux attach` typed inside a pane — see parseFrame. Appended rather than
+  // inserted: the fields before it are read positionally.
+  "-F", "p\t#{session_id}\t#{window_id}\t#{window_active}\t#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_right}\t#{pane_bottom}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_tty}",
+];
+
+/**
+ * The prefix keys off the head of a frame's answer: every line before the
+ * marker, minus the ones tmux uses to say "unset".
+ */
+export function parsePrefix(out: string): string[] {
+  const keys: string[] = [];
+  for (const line of out.split("\n")) {
+    if (isPrefixEnd(line)) break;
+    const v = line.trim();
+    // "None" is how tmux says a second prefix is unset.
+    if (v && v !== "None") keys.push(v);
+  }
+  return keys;
 }
 
 /**
@@ -366,17 +831,48 @@ export function readFrame(c: TmuxClient): TmuxFrame | null {
  * *names* are not unique enough to bet a `kill-window` on — resurrect happily
  * restores a second session called `main` — and the id is what tmux itself uses.
  */
-export function parseFrame(out: string, tty: string): { session: string; id: string; client: { cols: number; rows: number } | null; status: string; owned: boolean; windows: TmuxWindow[]; panes: TmuxPane[]; windowOfPane: Map<string, string> } | null {
+export function parseFrame(out: string, tty: string): { session: string; id: string; client: { cols: number; rows: number } | null; status: string; owned: boolean; popup: boolean; windows: TmuxWindow[]; panes: TmuxPane[]; windowOfPane: Map<string, string>; attached: Set<string>; sessions: { id: string; name: string; windows: number }[] } | null {
   let session: string | null = null;
   let id: string | null = null;
   let client: { cols: number; rows: number } | null = null;
   let status = "";
   let owned = false;
+  /* Clients that LOOK like a popup, resolved at the end of the loop.
+     A second client with a tmux TERM is one of two very different things, and
+     the pane list is what separates them — which is why this cannot be decided
+     on the client line itself. See below. */
+  const suspect: string[] = [];
+  const paneTtys = new Set<string>();
   const windowRows: string[] = [];
+  /* Every session with at least one window, gathered as the rows go by. The
+     strip needs it to offer the OTHER sessions — a window opened for a
+     different checkout lands in one, and moving the client there instead took
+     four windows of somebody's own work off their screen. */
+  const sessionsSeen = new Map<string, { id: string; name: string; windows: number }>();
   const paneRows: string[] = [];
+  /** Every session a client is on — see TmuxFrame.attached. */
+  const attached = new Set<string>();
   for (const line of out.split("\n")) {
     if (line.startsWith("c\t")) {
-      const [, clientTty, name, sid, width, height, st, own] = line.split("\t");
+      const [, clientTty, name, sid, width, height, st, own, term] = line.split("\t");
+      /*
+       * Somebody else's client, started INSIDE tmux: a popup.
+       *
+       * `display-popup -E "tmux attach -t scratch"` is a whole second client on
+       * this server, and tmux draws it over our screen. Nothing else changes —
+       * same windows, same panes, same geometry — so the buttons this app draws
+       * on a pane went on being drawn over the popup, following a pointer whose
+       * pane is no longer the one on screen. Reported with six screenshots.
+       *
+       * A phone is also a second client and is NOT this: it attaches from a pty
+       * this server made, on a mirror session of its own, and it does not cover
+       * anybody's screen.
+       */
+      if (clientTty !== tty && /^(tmux|screen)/.test((term ?? "").trim()) && !isPhoneSession(name) && clientTty) suspect.push(clientTty);
+      // Every client's session, not just ours: this is the whole server's
+      // answer, and "is anything attached to session X" is a question about
+      // somebody else's client by definition.
+      if (name) attached.add(name);
       if (clientTty === tty && name && sid) {
         session = name; id = sid;
         // Only ours. Every other client on this server is on the same list and
@@ -389,11 +885,38 @@ export function parseFrame(out: string, tty: string): { session: string; id: str
       }
     } else if (line.startsWith("w\t")) {
       windowRows.push(line);
+      /* Every session with at least one window, counted as they pass. Free:
+         these rows were already being read. */
+      const f = line.split("\t");
+      const sid = (f[1] ?? "").trim(), sname = (f[10] ?? "").trim();
+      if (sid && sname) {
+        const row = sessionsSeen.get(sid) ?? { id: sid, name: sname, windows: 0 };
+        row.windows += 1;
+        sessionsSeen.set(sid, row);
+      }
     } else if (line.startsWith("p\t")) {
       paneRows.push(line);
+      const tty2 = line.split("\t")[11];
+      if (tty2) paneTtys.add(tty2.trim());
     }
   }
   if (!session || !id) return null;
+  /*
+   * A popup, or somebody's `tmux attach` in a pane?
+   *
+   * Both are a second client with a tmux TERM, and only one of them is drawn
+   * over this terminal. A popup's pty belongs to no pane — tmux makes it for
+   * the popup and draws it across the client that opened it. An attach typed
+   * inside a pane has that PANE's tty, and it is content: it covers nothing,
+   * it is a picture inside a rectangle we are already drawing on.
+   *
+   * Measured on his own machine, an agent left `fish -c tmux attach -t scratch`
+   * running in a background session for seven minutes, and the pane bar was
+   * gone from every pane of an unrelated session the whole time — "I think
+   * something happened with the last piece of work, the little bar is gone now". The
+   * client was real, the popup was not.
+   */
+  const popup = suspect.some((t) => !paneTtys.has(t.trim()));
   const mine = windowRows
     .filter((r) => r.startsWith(`w\t${id}\t`))
     // Drop the tag and the session id; what is left is what parseWindows reads.
@@ -408,7 +931,16 @@ export function parseFrame(out: string, tty: string): { session: string; id: str
     if (tag !== "p" || sid !== id || !winId || !paneId || !PANE_ID.test(paneId)) continue;
     windowOfPane.set(paneId, winId);
   }
-  return { session, id, client, status, owned, windows: parseWindows(mine.join("\n")), panes: parsePaneGeometry(paneRows, id), windowOfPane };
+  return {
+    session, id, client, status, owned, popup,
+    windows: parseWindows(mine.join("\n")),
+    panes: parsePaneGeometry(paneRows, id),
+    windowOfPane, attached,
+    /* Every session with a window in it, so the strip can OFFER the others
+       rather than the app moving somebody into one. Ordered by name so the
+       list does not reshuffle between sweeps. */
+    sessions: [...sessionsSeen.values()].sort((a, b) => a.name.localeCompare(b.name)),
+  };
 }
 
 /**
@@ -467,6 +999,47 @@ export function prefixKeys(t: TmuxTarget): string[] {
   return keys;
 }
 
+/*
+ * The engine's own prefix, put back when its server came up without our config.
+ *
+ * `-f <conf>` is only read when the command STARTS the server. Anything that
+ * reaches a live engine server afterwards — an attach, a grouped session, a
+ * window opened from the phone — inherits whatever that first command set up,
+ * and if the server was born some other way it is on tmux's defaults: `C-b`,
+ * and the chip in the tab strip says so while the settings panel says `C-f`.
+ * Reported exactly that way: "sometimes it switches itself to ctrl b".
+ *
+ * So the prefix is checked against the setting rather than trusted, and a
+ * server that disagrees is handed the config it should have had. `source-file`
+ * on a server that already has it is a no-op, which is why the check is the
+ * cheap half and the fix is the rare half.
+ *
+ * Once every half minute per socket at most: a conf that cannot take (a broken
+ * override, a tmux that refuses a line) must not turn every attach into a
+ * re-source. Returns the keys as they are AFTER the attempt, or null when
+ * there was nothing to do.
+ *
+ * `seen` is the prefix the caller already holds. The sweep has it from its own
+ * frame, and reading it again here was two `show-options` spawns per engine
+ * shell every half second, measured on an idle server, to learn nothing new.
+ */
+const healedAt = new Map<string, number>();
+const HEAL_EVERY_MS = 30_000;
+
+export function healPrefix(t: TmuxTarget, want: string, conf: string, seen: string[] = prefixKeys(t)): string[] | null {
+  const now = Date.now();
+  const key = t.socket.join(" ");
+  if (seen[0] === want) return null;
+  if (now - (healedAt.get(key) ?? 0) < HEAL_EVERY_MS) return null;
+  healedAt.set(key, now);
+  tmux(t.socket, ["source-file", conf]);
+  return prefixKeys(t);
+}
+
+/** Test seam: the throttle is per socket and per process, and a suite that
+ *  heals twice in a row is testing the throttle rather than the fix. */
+export function __resetHeal(): void { healedAt.clear(); }
+
 /**
  * The commands a tab strip is allowed to send.
  *
@@ -478,7 +1051,7 @@ export function prefixKeys(t: TmuxTarget): string[] {
  * terminal is already the widest thing this server hands out, and "the panel
  * can run arbitrary tmux commands" would quietly widen it further.
  */
-export type TmuxAction = "select" | "new" | "kill" | "rename" | "move" | "takeover" | "fit";
+export type TmuxAction = "select" | "new" | "kill" | "rename" | "move" | "takeover" | "fit" | "group" | "pin";
 
 /**
  * Windows the desk has just taken its width back on.
@@ -539,6 +1112,9 @@ export const sanitizeWindowName = (s: unknown): string | null => {
   return name || null;
 };
 
+/** A tab group's name: a window name, shorter — it is a chip's label. */
+export const sanitizeGroupName = (s: unknown): string | null => sanitizeWindowName(s)?.slice(0, 32).trim() || null;
+
 /**
  * Does this window actually exist on THIS server?
  *
@@ -562,6 +1138,36 @@ function windowOnSocket(socket: string[], windowId: string): boolean {
   return out.split("\n").some((l) => l.trim() === windowId);
 }
 
+/**
+ * The next free `AI0N` for a session.
+ *
+ * "I want them to always be AI0X" — a tab you can name out loud, and that still
+ * names the same thing an hour later. The two halves of that are separate
+ * problems and both are solved here:
+ *
+ *   STABLE means assigned once, at creation, and never recomputed. A number
+ *   derived from a position would renumber the whole strip every time somebody
+ *   closes a tab in the middle, which is exactly the thing that makes a name
+ *   useless as an address. So a closed tab leaves a GAP, and AI01 stays AI01
+ *   for as long as it is open — until it closes, and its number is free again.
+ *
+ *   FREE means free among the names that are there now, so a fresh session
+ *   starts at AI01 rather than counting from a number nobody can see.
+ *
+ * Two digits because a strip nobody scrolls does not reach a hundred, and a
+ * ragged `AI1`/`AI10` column is harder to read than a padded one.
+ */
+export function nextAgentName(taken: readonly string[]): string {
+  const used = new Set<number>();
+  for (const t of taken) {
+    const m = /^AI(\d{2,})$/.exec((t || "").trim());
+    if (m) used.add(Number(m[1]));
+  }
+  let n = 1;
+  while (used.has(n)) n++;
+  return `AI${String(n).padStart(2, "0")}`;
+}
+
 export function runAction(
   t: TmuxTarget, action: TmuxAction, window?: string, name?: string,
   /** The asking client's grid. Only `fit` uses it — see that case for why an
@@ -573,6 +1179,10 @@ export function runAction(
   /** `new` only: where the window starts. Already validated by the caller —
    *  see the `new` case for why the absence of one is not a fallback. */
   cwd?: string,
+  /** The client that asked, when the caller knows it — the terminal always
+   *  does. Used to close a floating scratch that would otherwise be drawn on
+   *  top of the tab this is about to select, holding the keyboard. */
+  clientTty?: string | null,
 ): boolean {
   // Windows are addressed by tmux's id, never by the index the tab is showing.
   // The strip is up to a poll out of date, and an index is not a name: kill
@@ -585,11 +1195,16 @@ export function runAction(
      verbs that change something: `select` landing on nothing is a no-op, while
      `kill` landing on the wrong window is somebody's work. */
   const changes = action === "kill" || action === "rename" || action === "move"
-    || action === "fit" || action === "takeover";
+    || action === "fit" || action === "takeover" || action === "group" || action === "pin";
   const id = shaped !== null && (!changes || windowOnSocket(t.socket, shaped)) ? shaped : null;
   switch (action) {
     case "select":
-      return id === null ? false : tmux(t.socket, ["select-window", "-t", id]) !== null;
+      if (id === null) return false;
+      // A tab you clicked has to be the thing you end up looking at. With a
+      // floating scratch open it is drawn underneath it, and the keyboard stays
+      // with the popup — see closePopup().
+      closePopup(t.socket, clientTty ?? outerClientTty(t.socket));
+      return tmux(t.socket, ["select-window", "-t", id]) !== null;
     case "new":
       // At the end, which is tmux's default and where the button is.
       //
@@ -608,12 +1223,37 @@ export function runAction(
       // starts the window in the SESSION's directory — where the server was
       // launched from, which on a desktop build is agentglass's own install
       // checkout. Every new tab opened there while the panel said `orbit`.
-      // "SIEMPRE SIEMPRE SIEMPRE debe abrirse desde la raíz del proyecto
-      // seleccionado", and the panel is the only thing that knows which that
+      // "It must ALWAYS ALWAYS ALWAYS open from the root of the selected
+      // project", and the panel is the only thing that knows which that
       // is. No path means tmux's old behaviour rather than a guess: a shell in
       // the wrong tree is the failure this is fixing, and a home directory
       // would be a different one.
-      return tmux(t.socket, ["new-window", "-t", t.id, ...(cwd ? ["-c", cwd] : [])]) !== null;
+      // Same as `select`: a new tab that opens behind the floating scratch is a
+      // tab nobody can type into.
+      closePopup(t.socket, clientTty ?? outerClientTty(t.socket));
+      {
+        /*
+         * NAMED AT BIRTH, AND TMUX IS NOT ALLOWED TO CHANGE IT.
+         *
+         * tmux ships `automatic-rename on`, so a window is called whatever the
+         * program in it last set its title to — `node`, then `bun`, then the
+         * name of a file. That is why the strip could not be read: the tabs
+         * renamed themselves under the person looking at them.
+         *
+         * `-n` gives the window its name and `automatic-rename off` makes it
+         * stick. Set on the window rather than the session, so nothing here
+         * changes what any window somebody else opened is called; a rename by
+         * hand still works and still wins, because it writes the same field.
+         */
+        const names = (tmux(t.socket, ["list-windows", "-t", t.id, "-F", "#{window_name}"]) ?? "")
+          .split("\n").map((l) => l.trim()).filter(Boolean);
+        const mine = nextAgentName(names);
+        const made = tmux(t.socket, ["new-window", "-P", "-F", "#{window_id}", "-n", mine, "-t", t.id, ...(cwd ? ["-c", cwd] : [])]);
+        if (made === null) return false;
+        const born = made.trim().split("\n").find((l) => WINDOW_ID.test(l.trim()))?.trim();
+        if (born) tmux(t.socket, ["set-window-option", "-t", born, "automatic-rename", "off"]);
+        return true;
+      }
     case "kill":
       return id === null ? false : tmux(t.socket, ["kill-window", "-t", id]) !== null;
     case "rename": {
@@ -621,6 +1261,25 @@ export function runAction(
       if (id === null || !clean) return false;
       return tmux(t.socket, ["rename-window", "-t", id, clean]) !== null;
     }
+    /*
+     * Which tab group a window is in, overriding its folder — or, with no
+     * name, back to its folder. A window option, so it survives agentglass
+     * restarting and anyone can set it from tmux (`set -w @agx-group ops`).
+     * Nothing about the window itself moves: its index is still tmux's.
+     */
+    case "group": {
+      if (id === null) return false;
+      const clean = sanitizeGroupName(name);
+      return tmux(t.socket, clean
+        ? ["set-option", "-w", "-t", id, "@agx-group", clean]
+        : ["set-option", "-w", "-u", "-t", id, "@agx-group"]) !== null;
+    }
+    /* First in its group, whatever its index. `after` is the switch. */
+    case "pin":
+      if (id === null) return false;
+      return tmux(t.socket, after
+        ? ["set-option", "-w", "-t", id, "@agx-pin", "1"]
+        : ["set-option", "-w", "-u", "-t", id, "@agx-pin"]) !== null;
     case "move": {
       // A destination index, and nothing else. `name` carries it because the
       // wire already has that field, but it is parsed as a number here rather
@@ -1285,9 +1944,30 @@ function inheritedSocket(): string | null {
  * black window in this app, and cost a day finding out why.
  */
 function usableTmuxTmpdir(): string | null {
-  const named = process.env.TMUX_TMPDIR;
-  if (!named) return null;
-  try { return statSync(named).isDirectory() ? named : null; } catch { return null; }
+  /*
+   * SET MEANS SET, even when the directory is not there.
+   *
+   * This returned null for a named directory that did not exist, and
+   * `socketDir()` then quietly used the machine's real one — `/tmp/tmux-1000`,
+   * with the owner's own servers in it. Whoever exported TMUX_TMPDIR did it to
+   * be somewhere else; falling back lands every socket operation, including
+   * the sweeps that KILL servers, on the sessions they were trying to avoid.
+   *
+   * Not hypothetical here. Three times already: a test that restored his
+   * sessions through continuum, a probe that rewrote his prefix, and a pane id
+   * resolved against the wrong server that shrank a window he was working in.
+   * Each one isolated the environment, and something resolved back to the real
+   * path anyway. `blindTmuxBanned` does not cover this one: it only bites when
+   * NODE_ENV is "test", and the place it matters most is a child spawned with
+   * NODE_ENV=production on purpose.
+   *
+   * Returned rather than thrown, deliberately. A missing directory is not an
+   * error to a reader — `tmuxSockets()` finds nothing in it and answers "no
+   * servers", `tmuxSocketAllowed()` refuses — and those are answers a boot
+   * path can carry. A throw here would turn "you are isolated and there is
+   * nothing there" into a crash on a machine that is behaving correctly.
+   */
+  return process.env.TMUX_TMPDIR || null;
 }
 
 /**
@@ -1320,18 +2000,31 @@ function machineSocketDir(): string {
  *     landed on `/tmp/tmux-1000/default`. Falling back here makes the modelled
  *     path and the real one the same path again.
  *
- *   * With TMUX_TMPDIR unset this answers `tmpdir()`, which tmux would not.
- *     Kept on purpose: `tmux-test-isolation.test.ts` builds its stand-in socket
- *     directory by pointing TMPDIR at a scratch path precisely because tmux
- *     ignores TMPDIR, so the fixture's own server and the code under test reach
- *     the same directory through different variables without either of them
- *     going near /tmp/tmux-<uid>. That divergence is safe ONLY because
- *     `tmuxSocketAllowed` now refuses the real socket outright instead of
- *     inferring it from this function — see the note there. Nothing in this
- *     file may go back to deriving safety from how well this models tmux. */
+ *   * With TMUX_TMPDIR unset, UNDER TEST, this answers `tmpdir()`, which tmux
+ *     would not. Kept on purpose: `tmux-test-isolation.test.ts` builds its
+ *     stand-in socket directory by pointing TMPDIR at a scratch path precisely
+ *     because tmux ignores TMPDIR, so the fixture's own server and the code
+ *     under test reach the same directory through different variables without
+ *     either of them going near /tmp/tmux-<uid>. That divergence is safe ONLY
+ *     because `tmuxSocketAllowed` now refuses the real socket outright instead
+ *     of inferring it from this function — see the note there. Nothing in this
+ *     file may go back to deriving safety from how well this models tmux.
+ *
+ *     In the app the divergence was a bug on a Mac, where the two directories
+ *     are never the same: `os.tmpdir()` is `/var/folders/<2>/<30>/T` and tmux's
+ *     `_PATH_TMP` is `/tmp`, so `tmuxSockets()` read a `tmux-501/` no tmux had
+ *     ever written to, and "where is that agent sitting" found nothing on a
+ *     machine with a server full of panes. On Linux the two agree whenever
+ *     TMPDIR is unset, which is why nobody saw it. Outside a test run the
+ *     answer is therefore the directory tmux actually uses, on every platform;
+ *     the `tmpdir()` reading stays for the fixture that needs it. Gated on
+ *     NODE_ENV rather than on the platform, so a Linux user who exports TMPDIR
+ *     gets the same correct answer a Mac does. */
 function socketDir(): string {
   const named = usableTmuxTmpdir();
-  return join(named ?? tmpdir(), `tmux-${process.getuid?.() ?? 0}`);
+  if (named) return join(named, `tmux-${process.getuid?.() ?? 0}`);
+  if (process.env.NODE_ENV !== "test") return machineSocketDir();
+  return join(tmpdir(), `tmux-${process.getuid?.() ?? 0}`);
 }
 
 /**
@@ -1537,6 +2230,123 @@ export function tmuxSocketConfined(socket: string[]): boolean {
  * user is demonstrably using, so its panes are the likeliest match and the
  * ordering costs nothing.
  */
+/**
+ * The unix socket paths something is LISTENING on, out of `/proc/net/unix`.
+ *
+ * A dead socket file costs a spawned `tmux` that fails: 3.2ms each, blocking,
+ * and a socket directory collects them (127 measured: ~450ms per poll). The
+ * kernel's table answers for all of them at once, with no process. Listening
+ * rows carry flag `00010000` (__SO_ACCEPTCON); the path is the rest of the line
+ * after the seventh field, so a path with a space survives.
+ */
+// The inode field is printed "%5lu": an inode under 5 digits is padded with
+// spaces, not zeros, so splitting on a single space shifts every field after
+// it and the path column disappears into empty strings. Match on whitespace
+// runs instead, with the path as one capture (its own spaces survive).
+const UNIX_ROW = /^\S+:\s+\S+\s+\S+\s+(\S+)\s+\S+\s+\S+\s+\d+\s(.*)$/;
+
+export function listeningUnixPaths(procText: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of procText.split("\n")) {
+    const m = UNIX_ROW.exec(line);
+    if (!m || m[1] !== "00010000") continue;
+    const path = m[2]!;
+    if (path.startsWith("/")) out.add(path);
+  }
+  return out;
+}
+
+/*
+ * Where /proc/net/unix cannot be read (a Mac, a locked-down sandbox): remember
+ * a socket tmux could not connect to, keyed by its mtime so a server started on
+ * the same path afterwards is asked again. Sixty seconds, a bounded map.
+ */
+const DEAD_TTL_MS = 60_000;
+const DEAD_MAX = 1024;
+const deadSockets = new Map<string, { mtimeMs: number; until: number }>();
+// "error connecting to <path> (<strerror>)" fires for ANY connect error, not
+// only a dead server: EAGAIN on a busy live server, EACCES, and friends print
+// it too. Only "no server running" reliably means ENOENT/ECONNREFUSED, i.e.
+// the server is actually gone; matching the broader phrase marked live
+// servers dead for DEAD_TTL_MS on a transient connect failure.
+/** Test seam: exported so the classification can be asserted directly. */
+export const NO_SERVER = /no server running/;
+
+function noteDeadSocket(socket: string[], stderr: string): void {
+  if (!NO_SERVER.test(stderr)) return;
+  const path = socketPath(socket);
+  try {
+    if (deadSockets.size >= DEAD_MAX) deadSockets.delete(deadSockets.keys().next().value!);
+    deadSockets.set(path, { mtimeMs: statSync(path).mtimeMs, until: Date.now() + DEAD_TTL_MS });
+  } catch { /* the file is gone: nothing left to skip */ }
+}
+
+function knownDead(path: string, now: number): boolean {
+  const d = deadSockets.get(path);
+  if (!d) return false;
+  try { if (now < d.until && statSync(path).mtimeMs === d.mtimeMs) return true; } catch { /* gone */ }
+  deadSockets.delete(path);
+  return false;
+}
+
+/**
+ * The files of `dir` a server is listening on. `null` when the kernel's table
+ * cannot be read; the caller then falls back to the dead-verdict cache.
+ *
+ * CEILING: a filesystem unix socket connects across network namespaces, but
+ * /proc/net/unix only lists sockets visible in THIS process's netns. A tmux
+ * server run inside its own netns (`unshare -n`, firejail `--net=none`,
+ * flatpak `--unshare=network`) is invisible here and only caught by the
+ * dead-verdict fallback below, when /proc cannot be read at all. Not fixed in
+ * this pass -- accepted, not solved.
+ */
+let procNetUnix = "/proc/net/unix";
+/** Test seam: point at an unreadable path to exercise the fallback. */
+export function __setProcNetUnixPath(p: string | null): void {
+  procNetUnix = p ?? "/proc/net/unix";
+  deadSockets.clear();
+  procUnixMemo = null;
+}
+
+// A poll burst (desktop + phone + extra tabs, each asking within the same
+// second) re-read and re-parsed /proc/net/unix once per caller. One second is
+// short enough that a server starting mid-burst is still seen by the next
+// poll, and long enough to collapse the burst to one read.
+//
+// Keyed on `dir` + the exact `names` asked for, not merely time: a socket
+// directory that has just gained a new file (a server that started between
+// polls) must never be answered from a snapshot taken before that file
+// existed, whatever the clock says. A `names` list that was not the one the
+// memo was built from is always a cache MISS and forces a fresh read, so the
+// only thing the memo ever collapses is genuinely repeated questions.
+const PROC_UNIX_MEMO_MS = 1000;
+let procUnixMemo: { at: number; key: string; live: Set<string> } | null = null;
+/** Test seam: counts real reads of `procNetUnix`, i.e. memo misses. */
+export let __procNetUnixReadCount = 0;
+export function __resetProcNetUnixReadCount(): void { __procNetUnixReadCount = 0; }
+
+function listeningIn(dir: string, names: string[]): Set<string> | null {
+  // No socket file exists to match against, so there is nothing /proc/net/unix
+  // could tell us: skip the read (and its parse) entirely.
+  if (names.length === 0) return new Set();
+  const now = Date.now();
+  const key = `${dir}\0${[...names].sort().join("\0")}`;
+  let live: Set<string>;
+  if (procUnixMemo && procUnixMemo.key === key && now - procUnixMemo.at < PROC_UNIX_MEMO_MS) {
+    live = procUnixMemo.live;
+  } else {
+    let text: string;
+    try { text = readFileSync(procNetUnix, "utf8"); } catch { procUnixMemo = null; return null; }
+    __procNetUnixReadCount++;
+    live = listeningUnixPaths(text);
+    procUnixMemo = { at: now, key, live };
+  }
+  // tmux may bind the realpath of its directory, so match either spelling.
+  let real = dir;
+  try { real = realpathSync(dir); } catch { /* absent: nothing listens there */ }
+  return new Set(names.filter((n) => live.has(join(dir, n)) || live.has(join(real, n))));
+}
+
 export function tmuxSockets(known?: string[]): string[][] {
   // Discovery is exactly how this process would learn about the developer's own
   // server: nothing else in the app knows that socket's name. See
@@ -1544,9 +2354,16 @@ export function tmuxSockets(known?: string[]): string[][] {
   // resolved out of /proc, and /proc on this machine has his tmux in it.
   if (blindTmuxBanned()) return [];
   const dir = socketDir();
-  let found: string[] = [];
-  try { found = readdirSync(dir).map((n) => join(dir, n)); }
+  let names: string[] = [];
+  try { names = readdirSync(dir); }
   catch { /* no socket directory: no tmux has ever run here */ }
+  // Only sockets something listens on: every file here is otherwise one tmux
+  // spawn per poll, and a dead one is a spawn that can only fail. See
+  // listeningUnixPaths.
+  const listening = listeningIn(dir, names);
+  const now = Date.now();
+  const found = names.map((n) => join(dir, n))
+    .filter((p, i) => listening ? listening.has(names[i]!) : !knownDead(p, now));
 
   // The known client's server first when there is one — it is demonstrably the
   // one the user is on, so its panes are the likeliest match — and then the
@@ -1594,19 +2411,60 @@ export function tmuxSockets(known?: string[]): string[][] {
  * you are, and a picker listing four of those beside the one you work in is a
  * picker you have to read every time.
  */
-function attachedSessions(socket: string[]): Set<string> {
-  const out = tmux(socket, ["list-sessions", "-F", "#{session_name}\t#{session_attached}"]);
-  if (out === null) return new Set();
+/**
+ * Sessions somebody is looking at — through ANY session in their group.
+ *
+ * `session_attached` alone counts the clients whose session is this one by
+ * name, and the phone's never is: attaching groups a new `agx-phone-…` session
+ * onto the target, so the client sits on that name instead. For most rows the
+ * difference costs nothing, because the row was listed on its own merits
+ * anyway.
+ *
+ * It costs everything for the scratch. That one is listed BECAUSE somebody is
+ * attached (see the popup rule in the phone's tabs.ts), so the moment the desk
+ * dismisses the popup, `session_attached` drops to 0 while the phone is still
+ * reading it — the row leaves the strip, the phone's open tab stops matching
+ * anything, and TerminalView unmounts into "Nothing open". Measured on an
+ * isolated server: with the phone grouped on and the popup gone,
+ * `session_attached` was 0 and `session_group_attached` was 1.
+ *
+ * Losing the screen you are reading because somebody at the desk pressed
+ * Escape is the appear-and-disappear that the panes route's own note calls
+ * worse than either answer. The group is the honest unit: those sessions are
+ * one set of windows, and a client on any of them is a client on all of them.
+ */
+export const ATTACHED_FORMAT =
+  "#{session_name}\t#{session_attached}\t#{session_group_attached}";
+
+/**
+ * Which of those rows means "somebody is looking", split out from the call so
+ * it can be asserted against the five states this was measured in rather than
+ * against a running tmux.
+ *
+ * Both counts are strings from tmux. An ungrouped session answers the third
+ * field with the EMPTY string and a grouped one nobody is on answers `0`, and
+ * neither is a reason to skip the row — only a reason not to count it.
+ */
+export function attachedFrom(out: string): Set<string> {
   const live = new Set<string>();
   for (const line of out.split("\n")) {
-    const [name, count] = line.split("\t");
-    if (name && count && count !== "0") live.add(name);
+    const [name, count, group] = line.split("\t");
+    if (!name) continue;
+    const some = (n?: string) => !!n && n !== "0";
+    if (some(count) || some(group)) live.add(name);
   }
   return live;
 }
 
-function nestedSessions(socket: string[]): Set<string> {
-  const clients = tmux(socket, ["list-clients", "-F", "#{client_session}\t#{client_termname}"]);
+function attachedSessions(socket: string[]): Set<string> {
+  const out = tmux(socket, ["list-sessions", "-F", ATTACHED_FORMAT]);
+  return out === null ? new Set() : attachedFrom(out);
+}
+
+const NESTED_FORMAT = "#{client_session}\t#{client_termname}";
+
+/** `list-clients -F NESTED_FORMAT` read as the sessions shown only inside another. */
+function nestedFrom(clients: string | null): Set<string> {
   if (clients === null) return new Set();
 
   const outer = new Set<string>();
@@ -1641,12 +2499,122 @@ function nestedSessions(socket: string[]): Set<string> {
  */
 export type PaneWireRow = Omit<AgentPane, "agentSession"> & { socket: string[] };
 
-export function listPanes(known?: string[]): PaneWireRow[] {
+/**
+ * The server a socket reaches, spelt as the hook spells it: `$TMUX` without
+ * its session field, `<socket_path>,<pid>` (`notePaneFromHook`). "" when the
+ * server cannot be read.
+ *
+ * Pane ids are per server — two servers both answering `%0` is the normal
+ * case — so a pane's note has to be read with this, or the newest note for
+ * the id on any server answers for it.
+ */
+export function tmuxServerName(socket: string[]): string {
+  const out = tmux(socket, ["list-sessions", "-F", "#{socket_path},#{pid}"])?.split("\n")[0]?.trim() ?? "";
+  return /^\/.+,\d+$/.test(out) ? out : "";
+}
+
+/** Rows with their server's name added, one ask per socket. Kept off
+ *  `PaneWireRow` because the name is a filesystem path, and the rows that
+ *  carry that type are spread onto the wire. */
+export function withTmuxServer<T extends { socket: string[] }>(rows: T[]): (T & { server: string })[] {
+  const named = new Map<string, string>();
+  return rows.map((r) => {
+    const key = r.socket.join("\0");
+    let server = named.get(key);
+    if (server === undefined) named.set(key, server = tmuxServerName(r.socket));
+    return { ...r, server };
+  });
+}
+
+const CLIENT_TTYS = ["list-clients", "-F", "#{client_tty}"];
+
+/*
+ * Servers are asked a few at a time, not all at once. `Bun.spawn` does its fork
+ * on this thread: measured, 100 spawns issued together held the loop 71ms
+ * before the first await and let no timer through until all had answered
+ * (131ms), where one at a time let the loop run between every spawn. Four lanes
+ * keep that yield and still overlap the waits. Answers keep socket order.
+ */
+const SOCKET_LANES = 4;
+async function perSocket<T>(sockets: string[][], ask: (socket: string[]) => Promise<T>): Promise<T[]> {
+  const out: T[] = new Array(sockets.length);
+  let next = 0;
+  const lane = async () => {
+    while (next < sockets.length) { const i = next++; out[i] = await ask(sockets[i]!); }
+  };
+  await Promise.all(Array.from({ length: Math.min(SOCKET_LANES, sockets.length) }, lane));
+  return out;
+}
+
+/** The rows one server answers, from the three reads `listPanes` makes of it. */
+function paneRowsOn(
+  socket: string[], ours: string | null, mine: boolean,
+  out: string | null, clients: string | null, sessions: string | null,
+): PaneWireRow[] {
+  if (!out) return [];
+  const nested = nestedFrom(clients);
+  const live = sessions === null ? new Set<string>() : attachedFrom(sessions);
   const rows: PaneWireRow[] = [];
+  // A plain loop rather than `push(...map(…))` so the object literal is
+  // checked against `PaneWireRow` at the point it is written: renaming a
+  // field here is then an unknown property on this line, which is exactly
+  // what did not happen while the shape lived in an inline return type.
+  for (const r of parsePanes(out)) {
+    /*
+     * `own` is `mine` on the wire, and it is the one fact the phone cannot
+     * work out for itself.
+     *
+     * The socket is a filesystem path and stays on this side — the panes
+     * route strips it deliberately. But WHICH SERVER a pane is on is the
+     * only thing that separates a session somebody works in from one a test
+     * left running: names do not (three servers on this machine each hold a
+     * session called `agentglass-understudy`) and pane ids do not, because
+     * they are per server — measured, two servers both answering `%0`.
+     *
+     * A boolean says which server without saying where it is. See the note
+     * on `AgentPane.own`.
+     */
+    rows.push({
+      ...r, socket,
+      /* Absent when there is nothing to compare against. `mine` is false both
+         for "another server" and for "this app has never attached anything",
+         and those are different answers: the first is a session to hide, the
+         second is a client that must keep seeing everything. Collapsing them
+         emptied the strip on a fresh profile. */
+      ...(mine ? { own: true } : ours === null ? {} : { own: false }),
+      popup: nested.has(r.session), attached: live.has(r.session),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Whether a socket is one this app has a claim on: the server it was last
+ * attached to, or the engine's own.
+ *
+ * The engine's server is the app's by construction. A shell opened from a
+ * phone is made there with nobody attached, and `tmux-last.json` only ever
+ * names a server a desk client was on, so a machine where the desk never
+ * attached had no memory at all and the pane list skipped the app's own
+ * server as somebody else's stray. Measured: the pane existed, the attach was
+ * refused with "that pane is gone", and the phone showed Disconnected.
+ */
+function isOurSocket(socket: string[], remembered: string | null): boolean {
+  const p = socketPath(socket);
+  return p === remembered || p === socketPath(engineSocketArgs());
+}
+
+/**
+ * Every pane on every server, asked a few servers at a time and without holding
+ * the event loop: the tab strip polls this, and a blocking spawn per socket was
+ * a terminal that stopped echoing for as long as the walk took. Rows come back
+ * in `tmuxSockets` order, the known server first.
+ */
+export async function listPanes(known?: string[]): Promise<PaneWireRow[]> {
   /* The server we were last on, read once rather than per socket. Null when
      nothing is remembered, which is exactly how this behaved before. */
   const ours = recall()?.socket ?? null;
-  for (const socket of tmuxSockets(known)) {
+  const per = await perSocket(tmuxSockets(known), async (socket) => {
     /*
      * Servers somebody is attached to — or the one we ourselves were last on.
      *
@@ -1667,21 +2635,37 @@ export function listPanes(known?: string[]): PaneWireRow[] {
      * the client count says now, and it is the ONE detached server that gets
      * through. Everything else is unchanged. See tmuxmemory.ts.
      */
-    const mine = ours !== null && socketPath(socket) === ours;
-    if (!mine && !tmux(socket, ["list-clients", "-F", "#{client_tty}"])?.trim()) continue;
+    const mine = isOurSocket(socket, ours);
+    if (!mine && !(await tmuxAsync(socket, CLIENT_TTYS))?.trim()) return [];
+    const [out, clients, sessions] = await Promise.all([
+      tmuxAsync(socket, ["list-panes", "-a", "-F", PANE_FORMAT]),
+      tmuxAsync(socket, ["list-clients", "-F", NESTED_FORMAT]),
+      tmuxAsync(socket, ["list-sessions", "-F", ATTACHED_FORMAT]),
+    ]);
+    return paneRowsOn(socket, ours, mine, out, clients, sessions);
+  });
+  return per.flat();
+}
+
+/**
+ * `listPanes`, blocking, for the two one-shot callers that cannot wait: the
+ * terminal's attach (a websocket open builds its command synchronously) and an
+ * alert's pane label (composed inside a synchronous notifier). Neither runs on
+ * a timer, and with dead sockets filtered out it costs one walk of the live
+ * servers. Same reads, same rules; see `listPanes` for why a detached server
+ * is skipped.
+ */
+export function listPanesSync(known?: string[]): PaneWireRow[] {
+  const ours = recall()?.socket ?? null;
+  return tmuxSockets(known).flatMap((socket) => {
+    const mine = isOurSocket(socket, ours);
+    if (!mine && !tmux(socket, CLIENT_TTYS)?.trim()) return [];
     const out = tmux(socket, ["list-panes", "-a", "-F", PANE_FORMAT]);
-    if (!out) continue;
-    const nested = nestedSessions(socket);
-    const live = attachedSessions(socket);
-    // A plain loop rather than `push(...map(…))` so the object literal is
-    // checked against `PaneWireRow` at the point it is written: renaming a
-    // field here is then an unknown property on this line, which is exactly
-    // what did not happen while the shape lived in an inline return type.
-    for (const r of parsePanes(out)) {
-      rows.push({ ...r, socket, popup: nested.has(r.session), attached: live.has(r.session) });
-    }
-  }
-  return rows;
+    if (!out) return [];
+    return paneRowsOn(socket, ours, mine, out,
+      tmux(socket, ["list-clients", "-F", NESTED_FORMAT]),
+      tmux(socket, ["list-sessions", "-F", ATTACHED_FORMAT]));
+  });
 }
 
 /**
@@ -1704,10 +2688,34 @@ export function listPanes(known?: string[]): PaneWireRow[] {
  * whichever the socket directory listed first would sometimes describe
  * somebody else's window with total confidence.
  */
-export function activePane(known: string[] | undefined, windowId: string): { paneId: string; pid: number; socket: string[] } | null {
+/**
+ * Every pane of a window with its pid, which is what any question about "what
+ * is running in there" needs.
+ *
+ * `activePane` below answers the same question for one pane and was the only
+ * way in, so the desk could only ever ask about the pane it had just selected —
+ * one round trip per hover, and after a restart six of them before a six-pane
+ * grid could say anything. This is the same single `list-panes` call, unpicked
+ * rather than filtered.
+ */
+export async function panesWithPids(known: string[] | undefined, windowId: string): Promise<{ paneId: string; pid: number; active: boolean; socket: string[] }[]> {
+  if (!WINDOW_ID.test(windowId)) return [];
+  for (const { socket, out } of await windowPanesEverywhere(known, windowId)) {
+    if (!out) continue;
+    const rows: { paneId: string; pid: number; active: boolean; socket: string[] }[] = [];
+    for (const line of out.split("\n")) {
+      const [active, paneId, pid] = line.split("\t");
+      const n = Number(pid);
+      if (paneId && PANE_ID.test(paneId) && Number.isFinite(n) && n > 0) rows.push({ paneId, pid: n, active: active === "1", socket });
+    }
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+export async function activePane(known: string[] | undefined, windowId: string): Promise<{ paneId: string; pid: number; socket: string[] } | null> {
   if (!WINDOW_ID.test(windowId)) return null;
-  for (const socket of tmuxSockets(known)) {
-    const out = tmux(socket, ["list-panes", "-t", windowId, "-F", "#{pane_active}\t#{pane_id}\t#{pane_pid}"]);
+  for (const { socket, out } of await windowPanesEverywhere(known, windowId)) {
     if (!out) continue;
     for (const line of out.split("\n")) {
       const [active, paneId, pid] = line.split("\t");
@@ -1718,6 +2726,29 @@ export function activePane(known: string[] | undefined, windowId: string): { pan
     }
   }
   return null;
+}
+
+/**
+ * `list-panes` of one window on every server, answers kept in `tmuxSockets`
+ * order — which is load-bearing, see above.
+ *
+ * The known socket — usually the only spawn there is — is asked alone first.
+ * Fanning `perSocket` out over every live server before looking at any answer
+ * spawned a `tmux` against each one even when the first (and almost always
+ * only relevant) answer already had the window's panes; a socket directory
+ * with a few live servers turned one hover into one spawn per server.
+ */
+async function windowPanesEverywhere(known: string[] | undefined, windowId: string): Promise<{ socket: string[]; out: string | null }[]> {
+  const sockets = tmuxSockets(known);
+  if (sockets.length === 0) return [];
+  const ask = (socket: string[]) =>
+    tmuxAsync(socket, ["list-panes", "-t", windowId, "-F", "#{pane_active}\t#{pane_id}\t#{pane_pid}"]);
+  const first = sockets[0]!;
+  const firstOut = await ask(first);
+  if (firstOut && firstOut.trim().length > 0) return [{ socket: first, out: firstOut }];
+  const rest = sockets.slice(1);
+  const restOuts = await perSocket(rest, ask);
+  return [{ socket: first, out: firstOut }, ...rest.map((socket, i) => ({ socket, out: restOuts[i] ?? null }))];
 }
 
 /**
@@ -1733,11 +2764,129 @@ export function activePane(known: string[] | undefined, windowId: string): { pan
  * hand tmux an arbitrary argument — the same rule the terminal's own command
  * paths follow.
  */
-export function focusPane(socket: string[], sessionId: string, windowId: string, paneId: string): boolean {
+/**
+ * The client somebody is actually sitting at, when a server has more than one.
+ *
+ * A floating scratch — `display-popup -E "tmux attach -t scratch"`, which is
+ * one keystroke away here — is a SECOND client on the same server, and it is
+ * the most recently used one for as long as it is open. That matters because
+ * every tmux command that moves "the client" and does not say which one moves
+ * that one.
+ *
+ * Told apart the way nestedSessions() does it, and for the same measured
+ * reason: a client started inside another tmux reports `tmux-256color`, a real
+ * terminal's client reports what the terminal is. Nothing else distinguishes
+ * them — a popup carries no flag of its own.
+ *
+ * Null when every client looks nested, which is the honest answer: better to
+ * fall back to tmux's own choice than to aim at a guess.
+ */
+export function outerClientTty(socket: string[]): string | null {
+  const out = tmux(socket, ["list-clients", "-F", "#{client_tty}\t#{client_termname}\t#{client_activity}"]);
+  if (out === null) return null;
+  let best: { tty: string; at: number } | null = null;
+  for (const line of out.split("\n")) {
+    const [tty, term, activity] = line.split("\t");
+    if (!tty || !term || term.startsWith("tmux")) continue;
+    const at = Number(activity) || 0;
+    if (!best || at > best.at) best = { tty, at };
+  }
+  return best?.tty ?? null;
+}
+
+/**
+ * Close the floating window covering a client, if one is open.
+ *
+ * Called before the app puts something in front of somebody — a tab, a pane it
+ * was asked to focus — because a popup is drawn ON TOP of the client's screen
+ * and owns its keyboard. Without this the app switches perfectly well to a tab
+ * nobody can see or type into, which is indistinguishable from the app being
+ * broken: "the tab shows up on top of the scratch and won't let me close it".
+ *
+ * Only the floating VIEW closes. The session it was showing survives with
+ * everything running in it — verified — so this costs one keystroke to undo
+ * and never any work.
+ */
+export function closePopup(socket: string[], tty?: string | null): void {
+  // Without `-c` this does nothing at all — measured on an isolated server,
+  // where `display-popup -C` with no client left both clients standing. tmux
+  // resolves "the client" to the popup itself, and a popup cannot close itself
+  // from outside its own command. So no client, no attempt: a silent no-op is
+  // better than a command that looks like it worked.
+  if (!tty) return;
+  // With one, `-C` closes any popup on that client and is a no-op when there is
+  // none — safe to call on every focus rather than asking first.
+  tmux(socket, ["display-popup", "-C", "-c", tty]);
+}
+
+/**
+ * Show a different session in this client's strip, because a person asked.
+ *
+ * The same `switch-client` the app used to make BY ITSELF when it opened a
+ * window in another session — which took four windows of somebody's own work
+ * off their screen with no warning. Asked for, it is the opposite act: they
+ * chose it, and they can choose back.
+ *
+ * `-c <tty>` for the reason `focusPane` spells out below: with no `-c`, tmux
+ * moves the most recently used client, which on a desk with a popup open is
+ * the popup.
+ *
+ * Exact-match target: a bare name prefix-matches its way onto a different
+ * session, and this one comes off a page.
+ */
+export function switchClientToSession(socket: string[], clientTty: string, session: string): boolean {
+  if (!clientTty || !validSessionName(session)) return false;
+  return tmux(socket, ["switch-client", "-c", clientTty, "-t", `=${session}`]) !== null;
+}
+
+/**
+ * End a session, and say where the client went if it was on it.
+ *
+ * The reason this exists: "there were two sessions with one tab open at root
+ * and that was it… it was doing nothing at all and ending that session was a
+ * nightmare". A picker that can only take you somewhere is half a tool; the
+ * sessions you find in it are frequently ones you want gone.
+ *
+ * REFUSES THE SESSION THE CLIENT IS ON. Killing it detaches the terminal the
+ * person is looking at, and tmux picks where they land — which is exactly the
+ * "the app moved me" they have already been burned by. Switch first, then end
+ * it, both as their own deliberate act.
+ *
+ * Exact-match target, because a bare name prefix-matches its way onto another
+ * session, and this one ends what it points at.
+ */
+export function killSessionByName(socket: string[], session: string, clientOn: string): boolean {
+  if (!validSessionName(session)) return false;
+  if (session === clientOn) return false;
+  /* A lock is checked HERE rather than only in the panel: the UI is one caller
+     of this, and a padlock that only greys out a button is a padlock on the
+     outside of the door. Fails closed — see `isLocked`. */
+  if (isLocked(session)) return false;
+  return tmux(socket, ["kill-session", "-t", `=${session}`]) !== null;
+}
+
+export function focusPane(socket: string[], sessionId: string, windowId: string, paneId: string, clientTty?: string | null): boolean {
   if (!SESSION_ID.test(sessionId) || !WINDOW_ID.test(windowId) || !PANE_ID.test(paneId)) return false;
-  // `switch-client` with no -c moves the most recently used client on this
-  // server, which is the one the user was last looking at.
-  if (tmux(socket, ["switch-client", "-t", sessionId]) === null) return false;
+  /*
+   * Which client, said explicitly.
+   *
+   * `switch-client` with no `-c` moves the most recently used client, and the
+   * comment that used to be here said that is "the one the user was last
+   * looking at". Measured on an isolated server, with a scratch popup open:
+   *
+   *     switch-client -t other        →  the POPUP's client moved
+   *     switch-client -c <desk> -t other  →  the desk moved, popup untouched
+   *
+   * So the popup swallowed every focus the app asked for, which is why a pull
+   * request opened from the board appeared inside a 60%-wide floating window
+   * instead of in the terminal.
+   */
+  // The caller's own client when it has one — the heuristic is a fallback, not
+  // the answer: a client that reports a tmux TERM for any other reason would
+  // make it guess wrong, and this decides where somebody's screen goes.
+  const desk = clientTty ?? outerClientTty(socket);
+  closePopup(socket, desk);
+  if (tmux(socket, ["switch-client", ...(desk ? ["-c", desk] : []), "-t", sessionId]) === null) return false;
   if (tmux(socket, ["select-window", "-t", windowId]) === null) return false;
   return tmux(socket, ["select-pane", "-t", paneId]) !== null;
 }
@@ -1851,7 +3000,7 @@ export function leaveCopyMode(socket: string[], paneId: string): boolean {
 /** Find the server holding this pane, then go there. The socket is never sent
  *  to the client and never accepted from it — a filesystem path from the UI is
  *  exactly what must not reach a spawn. */
-export function focusPaneAnywhere(known: string[] | undefined, _sessionId: string, _windowId: string, paneId: string): boolean {
+export async function focusPaneAnywhere(known: string[] | undefined, _sessionId: string, _windowId: string, paneId: string): Promise<boolean> {
   if (!PANE_ID.test(paneId)) return false;
   // A grouped session — a phone mirror, `agx-phone-…` — shares this pane's
   // window, so `list-panes -a` reports the pane under BOTH the real session and
@@ -1860,7 +3009,7 @@ export function focusPaneAnywhere(known: string[] | undefined, _sessionId: strin
   // exclude the mirror and aim at the real session that owns the pane, using
   // that row's own session and window ids rather than the ones the click
   // carried — which, coming from the same duplicated list, may be the mirror's.
-  const row = listPanes(known).find((r) => r.paneId === paneId && !PHONE_SESSION.test(r.session));
+  const row = (await listPanes(known)).find((r) => r.paneId === paneId && !PHONE_SESSION.test(r.session));
   return row ? focusPane(row.socket, row.sessionId, row.windowId, paneId) : false;
 }
 
@@ -2324,12 +3473,26 @@ function claimAlive(claim: string): boolean {
  *  declared above both readers rather than between them. */
 const PHONE_SESSION = /^agx-phone-(\d+)-[a-z0-9]+$/;
 
+/** The tmux user option a mirror session is stamped with the moment it is
+ *  made — session-scoped (no `-w`), the same idea `panelease.ts`'s
+ *  `LEASE_OPTION` is for a window. Read by `reapMirrorSessions` at startup:
+ *  `agx-phone-` in the name is still not proof of anything, only this is. */
+const MIRROR_LEASE_OPTION = "@agx_mirror_lease";
+
 /** Is this session name one of the mirrors this app makes? The mirror is the
  *  only session whose bar the panel may re-assert: it is ours, and hiding it
  *  costs nobody else anything. The session the mirror shares its windows with
  *  is the user's, and re-asserting there would take the desk's bar away. */
 export function isPhoneSession(session: string | null | undefined): boolean {
   return typeof session === "string" && PHONE_SESSION.test(session);
+}
+
+/** How many phones are attached: the mirror sessions among the ones a client
+ *  is on. The frame already carries that set, so this costs no tmux call. */
+export function phonesAttached(sessions: Iterable<string>): number {
+  let n = 0;
+  for (const name of sessions) if (isPhoneSession(name)) n++;
+  return n;
 }
 
 /**
@@ -2371,10 +3534,14 @@ export function remountPhoneClient(c: TmuxClient, target: TmuxTarget): boolean {
   // The digits the regex needs are the client's own pid; the suffix is random
   // so two remounts on the same client cannot collide.
   const name = `agx-phone-${c.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const token = randomBytes(16).toString("hex");
   const created = tmux(c.socket, [
     "new-session", "-d", "-t", target.id, "-s", name,
     ";", "set-option", "-t", name, "window-size", "largest",
     ";", "set-option", "-t", name, "status", "off",
+    // Stamped before anything else touches it, so the record below always
+    // names a session that really carries the token it claims to.
+    ";", "set-option", "-t", name, MIRROR_LEASE_OPTION, token,
   ]);
   if (created === null) return false;
   // Address our own client by its tty: `switch-client` run from the server has
@@ -2388,7 +3555,259 @@ export function remountPhoneClient(c: TmuxClient, target: TmuxTarget): boolean {
   }
   // The client is on it now, so the mirror dies when the phone leaves.
   tmux(c.socket, ["set-option", "-t", name, "destroy-unattached", "on"]);
+  // Recorded durably — on disk, not just in this process — the same reason
+  // `takeLease` writes through immediately: the failure this exists for is
+  // this server dying before the mirror does, and the record is what a
+  // restart's startup sweep has left to go on.
+  recordMirrorLease({ socket: c.socket, session: name, token, opened: Date.now() });
   return true;
+}
+
+/**
+ * Mirror sessions the record has FORGOTTEN, which is the case that filled a
+ * machine.
+ *
+ * `reapMirrorSessions` below kills what the lease file says is ours, and that
+ * is the right rule when the file is intact. Measured on 2026-08-25: the file
+ * held zero records while NINE `agx-phone-…` sessions were live, each carrying
+ * its own copy of four windows with a `claude --resume` inside every one. 525
+ * MCP processes and 13 GB of memory, on a machine nine hours from a cold boot,
+ * with the swap at 27 of 31 GB.
+ *
+ * The failure closes over itself: the record is the only memory of what to
+ * clean, it lives on disk, and when it goes the sweep cannot fail loudly — it
+ * finds nothing to do and reports success. A mirror whose record is lost is
+ * immortal.
+ *
+ * So this is the second rule, and it deliberately does NOT use the record. A
+ * session is killed only when ALL of these hold:
+ *
+ *   - the name matches `PHONE_SESSION`, so it is one this app makes;
+ *   - it carries our mirror stamp, so it is one THIS app made and not a name
+ *     somebody else chose;
+ *   - nothing is attached to it, so no phone is looking at it.
+ *
+ * The stamp is what keeps a phone-shaped heuristic out of a socket that may be
+ * the user's own — the same reason the lease sweep verifies it. A session with
+ * no stamp is left alone however much its name looks like ours.
+ */
+/**
+ * Keep looking, rather than looking once.
+ *
+ * `reapMirrorSessions` runs at startup and `destroy-unattached` fires when our
+ * own client detaches, and between them they were meant to cover everything.
+ * They did not: a phone that goes dark without a close frame leaves a mirror
+ * that only the next START of this server would notice, and if the lease
+ * record is gone by then, not even that.
+ *
+ * Measured before this existed: nine live mirrors, zero records, nine hours of
+ * uptime. Every one of them had been sitting there since the phone that opened
+ * it walked away.
+ *
+ * Two minutes is chosen against what it costs a person, not against how fast a
+ * phone disconnects — a mirror lingering for a minute is invisible; a mirror
+ * lingering for nine hours cost 8 GB. One `list-sessions` and one option read
+ * per phone-named session is not a poll worth optimising.
+ */
+const MIRROR_SWEEP_MS = 2 * 60_000;
+let mirrorSweep: ReturnType<typeof setInterval> | null = null;
+
+export function startMirrorSweeper(socket: string[], every = MIRROR_SWEEP_MS): void {
+  if (mirrorSweep) return;
+  mirrorSweep = setInterval(() => {
+    try {
+      /* Both rules, and in this order: the record is the cheaper and more
+         certain one, and what it leaves behind is what the second is for. */
+      for (const s of reapMirrorSessions()) {
+        console.log(`   tmux  → closed mirror session ${s}: the phone that opened it is gone`);
+      }
+      for (const s of reapOrphanedMirrors(socket)) {
+        console.log(`   tmux  → closed mirror session ${s}: ours by its stamp, with nobody attached and no record left`);
+      }
+    } catch { /* a sweeper that can throw is one more thing that stops */ }
+  }, every);
+  mirrorSweep.unref?.();
+}
+
+export function stopMirrorSweeper(): void {
+  if (mirrorSweep) { clearInterval(mirrorSweep); mirrorSweep = null; }
+}
+
+export function reapOrphanedMirrors(
+  socket: string[],
+  io: MirrorLeaseIo = REAL_MIRROR_IO,
+  names: (socket: string[]) => string[] = (sk) =>
+    (tmux(sk, ["list-sessions", "-F", "#{session_name}"]) ?? "").split("\n").map((n) => n.trim()).filter(Boolean),
+): string[] {
+  const killed: string[] = [];
+  for (const name of names(socket)) {
+    if (!isPhoneSession(name)) continue;
+    // Ours, provably — never the name alone.
+    if (!io.readStamp(socket, name)) continue;
+    if (io.attached(socket, name)) continue;
+    io.kill(socket, name);
+    forgetMirrorLease(socket, name);
+    killed.push(name);
+  }
+  return killed;
+}
+
+/** The tmux calls `reapMirrorSessions` makes, injectable so the rule can be
+ *  tested without a tmux server — the same reason `panelease.ts`'s `LeaseIo`
+ *  exists: a test that reached a real one would be reading, and killing in,
+ *  whatever the developer had open. */
+export interface MirrorLeaseIo {
+  /** The stamp currently on that session, or "" if it has none / is gone. */
+  readStamp: (socket: string[], session: string) => string;
+  attached: (socket: string[], session: string) => boolean;
+  kill: (socket: string[], session: string) => void;
+  /**
+   * Does that session exist at all?
+   *
+   * Split out from `readStamp` because the two questions had one answer and it
+   * cost a machine. An empty stamp used to mean BOTH "that session is not ours"
+   * and "we could not read it just now", and the record was dropped either way
+   * — irreversibly, since the record is the only memory of what to clean.
+   *
+   * Measured: the sweep runs at startup, a mirror registers its lease BEFORE
+   * the phone spawns the session, and a reinstall in that window read an empty
+   * stamp from a session that was about to exist. The record went; the session
+   * stayed; nothing would ever look at it again. Nine of them, 13 GB.
+   */
+  exists: (socket: string[], session: string) => boolean;
+}
+
+const REAL_MIRROR_IO: MirrorLeaseIo = {
+  readStamp: (socket, session) => (tmux(socket, ["show-options", "-v", "-t", session, MIRROR_LEASE_OPTION]) ?? "").trim(),
+  attached: (socket, session) => attachedSessions(socket).has(session),
+  kill: (socket, session) => { tmux(socket, ["kill-session", "-t", session]); },
+  exists: (socket, session) => (tmux(socket, ["has-session", "-t", `=${session}`]) ?? null) !== null,
+};
+
+/**
+ * Close mirror sessions this server made and can no longer prove are ours to
+ * keep — the session-scoped twin of `panelease.ts`'s `reapLeases`, called at
+ * startup for the same reason: `destroy-unattached` only fires when OUR
+ * client detaches, and a phone that goes dark without ever sending a close
+ * frame leaves nothing to fire it. The ping sweep in index.ts closes that gap
+ * going forward; this closes it for a mirror that predates the sweep, or for
+ * one whose detach the sweep never got to see because this process died
+ * first.
+ *
+ * Each recorded session is verified against its own stamp before anything is
+ * done to it, never matched by name — `agx-phone-` proves nothing on its own,
+ * and this is exactly the function a phone-shaped heuristic would be tempting
+ * in, on a socket that may be the user's own. A session with no attached
+ * client and a stamp that still matches is the one case left standing after
+ * that check: `endLease`'s three-way "not ours, already gone, or the stamp
+ * moved" collapses the same way here, and the record is dropped in all of
+ * them — a mirror lease we cannot verify is a lease this process will never
+ * act on again.
+ *
+ * A session that DOES still have a client attached is left alone rather than
+ * killed: at startup that can only mean the record is stale in a way the
+ * stamp check did not catch (a name reused on a server we cannot fully trust
+ * yet), and leaving an attached session up costs nothing next to the
+ * alternative.
+ */
+/** How long a recorded mirror may exist without its stamp before the record is
+ *  treated as stale rather than as a spawn in flight. The stamp is written in
+ *  the same argv that creates the session, so the real window is milliseconds;
+ *  a minute is slack for a loaded machine, and the sweeper runs every two. */
+const SPAWN_GRACE_MS = 60_000;
+
+/**
+ * Undo one mirror's zoom, with the same two skips a live teardown uses.
+ *
+ * A window another phone is still on keeps the zoom that phone is relying on,
+ * and a window the desk has taken back has already been unzoomed by the
+ * take-over — touching it again is how the width restore used to hand the
+ * window straight back. Both questions are asked here rather than assumed,
+ * because this runs at boot, when anything may have changed underneath.
+ */
+function unzoomFor(rec: MirrorLease): void {
+  const z = rec.zoomed;
+  if (!z) return;
+  try {
+    if (phoneWindows(rec.socket).has(z.windowId)) return;
+    if (deskClaimed(rec.socket, z.windowId)) return;
+    /* `unzoomWindow` already holds the rule this needs: only if the window is
+       STILL zoomed and still on the pane we zoomed it onto. A second copy of
+       that reasoning here is a second copy that can drift from it. */
+    unzoomWindow(rec.socket, z.sessionId, z.windowId, z.paneId);
+  } catch { /* the server went away: nothing left to unzoom */ }
+}
+
+export function reapMirrorSessions(io: MirrorLeaseIo = REAL_MIRROR_IO, now = Date.now()): string[] {
+  const killed: string[] = [];
+  for (const rec of mirrorLeases()) {
+    /*
+     * A SESSION WE CANNOT SEE IS NOT A SESSION WE MAY FORGET.
+     *
+     * The record is registered before the phone spawns its session, so there is
+     * a real window in which the lease names something that does not exist yet
+     * — and this sweep runs at startup, which is exactly when a reinstall lands
+     * in that window. Dropping the record there left the session immortal: it
+     * came up moments later, nothing named it, and the only sweep that could
+     * kill it reads the names. Nine of them, 13 GB, on a machine nine hours
+     * from a cold boot.
+     *
+     * So a record is only dropped once we can SEE that the session is gone, or
+     * that it is there and carrying somebody else's stamp. Anything else is
+     * left for the next pass, and the sweeper runs every two minutes now
+     * rather than once.
+     */
+    if (!io.exists(rec.socket, rec.session)) {
+      /*
+       * GONE — SO TAKE THE ZOOM OFF ON ITS WAY OUT.
+       *
+       * A phone gets one pane, so a window with a split is zoomed for it, and
+       * the zoom belongs to the WINDOW — shared with whoever else is looking at
+       * that session. It used to be undone from an object held in memory, which
+       * works right up until this process is not the one that put it there.
+       * Measured after a day of reinstalls: two windows sat zoomed with no
+       * phone attached and nothing left that knew they should not be. "It stays
+       * like that even after I have left the mobile app."
+       *
+       * Only what WE zoomed, read off the record rather than inferred: tmux
+       * offers no way to tell a phone's zoom from a person's, so a zoom nobody
+       * wrote down here is somebody's own and is never touched.
+       */
+      unzoomFor(rec);
+      forgetMirrorLease(rec.socket, rec.session);
+      continue;
+    }
+    const stamp = io.readStamp(rec.socket, rec.session);
+    /* AN EMPTY STAMP ON A SESSION THAT IS THERE means we could not read it, not
+       that it is not ours — the stamp is written in the same argv that makes
+       the session, so a session of ours without one is a session mid-spawn.
+       Kept for the next pass, which is two minutes away rather than a restart
+       away. A stamp that is present and DIFFERENT is a real answer: somebody
+       reused the name, and the record is stale. */
+    if (!stamp) {
+      /*
+       * There, and no stamp on it. Two different facts wear this face, and the
+       * one that cost a machine is the second:
+       *
+       *   the stamp MOVED — somebody reused the name, the record is stale;
+       *   the session is MID-SPAWN — the stamp rides in the same argv that
+       *     makes it, and the lease is written before the phone runs it.
+       *
+       * The clock is what tells them apart. A lease recorded seconds ago is
+       * the spawn window; one recorded long ago has had every chance to be
+       * stamped and was not.
+       */
+      if (now - rec.opened < SPAWN_GRACE_MS) continue;
+      forgetMirrorLease(rec.socket, rec.session);
+      continue;
+    }
+    if (stamp !== rec.token) { forgetMirrorLease(rec.socket, rec.session); continue; }
+    if (io.attached(rec.socket, rec.session)) continue;
+    io.kill(rec.socket, rec.session);
+    forgetMirrorLease(rec.socket, rec.session);
+    killed.push(rec.session);
+  }
+  return killed;
 }
 
 /**
@@ -2463,6 +3882,26 @@ function unzoomWindow(socket: string[], sessionId: string, windowId: string, onl
  */
 export function deskAttachArgv(socketPath: string, session: string): string[] | null {
   if (!socketPath) return null;
+  /*
+   * The second kind of write this file makes, and the one the guard inside
+   * `tmux()` cannot see: a command line handed BACK to a caller, which runs it
+   * in the pty it is about to open. Nothing here spawns tmux, so nothing here
+   * passes the choke point — and `attach-session` is a write whether we run it
+   * or the shell does. A client attaching is what resizes a window to the size
+   * of the thing that just attached, which is the exact shape of the 80x24
+   * report this module carries a paragraph about further down.
+   *
+   * Answering null is the honest refusal rather than a special one: the caller
+   * in terminal.ts already reads null as "that session is not there any more"
+   * and opens a plain shell instead, which is the same terminal the user would
+   * have had before this function existed. Stated in docs/BLAST-RADIUS.md as a
+   * cost of the mode, because a terminal that quietly stops resuming your
+   * session is a surprise if you were not told.
+   */
+  if (observeOnly()) {
+    noteSuppressed(["-S", socketPath], [["attach-session", "-t", session || "(most recent)"]]);
+    return null;
+  }
   /*
    * No tmux on this machine, so there is no command to build.
    *
@@ -2539,6 +3978,26 @@ export function deskAttachArgv(socketPath: string, session: string): string[] | 
   return ["tmux", ...socket, "attach-session"];
 }
 
+/**
+ * The session NAME a `#{session_id}` currently belongs to, or null.
+ *
+ * `PhoneAttach.sessionId` (this file's `groupedWith`) is a `$id`, stable
+ * across a rename and safe to hold across the gap between the attach and a
+ * later command — but tmux commands that pick a session to open a window IN
+ * (`new-session -A -s <name>`) want the name, not the id. Resolved fresh each
+ * time rather than cached: renaming the session is exactly the case this
+ * exists to survive.
+ */
+export function sessionNameOf(socket: string[], sessionId: string): string | null {
+  const out = tmux(socket, ["list-sessions", "-F", "#{session_id}\t#{session_name}"]);
+  if (!out) return null;
+  for (const line of out.split("\n")) {
+    const [id, name] = line.split("\t");
+    if (id === sessionId) return name ?? null;
+  }
+  return null;
+}
+
 export function attachArgvFor(
   known: string[] | undefined,
   paneId: string,
@@ -2593,6 +4052,23 @@ export function attachArgvFor(
 } | null {
   if (!PANE_ID.test(paneId)) return null;
   /*
+   * The phone's attach is the other argv this file hands out rather than runs,
+   * and it is the heavier of the two: a `new-session -t`, four `set-option`s,
+   * a `select-window`, a `select-pane` and — with a fit — a `resize-window` on
+   * a window that belongs to whoever is sitting at the desk. See the note in
+   * `deskAttachArgv` for why a returned command line is still a write, and
+   * `docs/BLAST-RADIUS.md` for what each of those commands costs.
+   *
+   * Null is a refusal the caller already understands: terminal.ts answers a
+   * tapped pane it cannot attach to with "that pane is gone — the list may be
+   * out of date". Wrong in this one case, and it is the wrong that closes the
+   * door rather than the one that leaves it ajar.
+   */
+  if (observeOnly()) {
+    noteSuppressed(known ?? [], [["new-session", "-t", "<session of>", paneId]]);
+    return null;
+  }
+  /*
    * Exactly one server may claim this id, or nothing happens.
    *
    * Pane ids are per SERVER, not per machine, so `%1` is an ordinary id on
@@ -2624,7 +4100,7 @@ export function attachArgvFor(
    * really does have two answers, and this still declines — that is the rule
    * above doing its job rather than an omission in this one.
    */
-  const rows = listPanes(known).filter((r) => r.paneId === paneId && !PHONE_SESSION.test(r.session));
+  const rows = listPanesSync(known).filter((r) => r.paneId === paneId && !PHONE_SESSION.test(r.session));
   if (rows.length !== 1) return null;
   const row = rows[0]!;
   if (!SESSION_ID.test(row.sessionId) || !WINDOW_ID.test(row.windowId)) return null;
@@ -2700,6 +4176,20 @@ export function attachArgvFor(
   const worth = !!zoom && zoom.panes > 1 && !deskClaimed(row.socket, row.windowId);
   const already = !!zoom && zoom.zoomed && zoom.active === row.paneId;
   const willZoom = worth && !already;
+  // Recorded now, ahead of the spawn the caller is about to make: the token
+  // below rides inside the same argv, so by the time this session is
+  // observable from anywhere it already carries the stamp the record names.
+  // Same reason `takeLease` writes through before returning — a mirror that
+  // outlives this process is exactly the case `reapMirrorSessions` exists for.
+  const mirrorToken = randomBytes(16).toString("hex");
+  recordMirrorLease({
+    socket: row.socket, session, token: mirrorToken, opened: Date.now(),
+    /* And what this attach is about to zoom, so the sweep can take it off even
+       if this process is not here to do it — see MirrorLease.zoomed. Only when
+       WE apply it: a window already zoomed onto this pane was somebody else's
+       doing and stays theirs. */
+    zoomed: willZoom ? { sessionId: row.sessionId, windowId: row.windowId, paneId: row.paneId } : null,
+  });
   return {
     // A lone `;` is tmux's own command separator. One command list, in order:
     // join the group under our own name, stop the shared window following the
@@ -2732,6 +4222,10 @@ export function attachArgvFor(
       // The row the app's own tab strip already draws, and on a phone the
       // scarcest one there is. Session-scoped, so the desk's bar stays up.
       ";", "set-option", "-t", session, "status", "off",
+      // Session-scoped, not `-w`: a mirror is a SESSION, and `reapMirrorSessions`
+      // reads this back the same way `endLease` reads a window's stamp — proof
+      // this exact session is the one this server made, never its name alone.
+      ";", "set-option", "-t", session, MIRROR_LEASE_OPTION, mirrorToken,
       ";", "select-window", "-t", row.windowId,
       ";", "select-pane", "-t", row.paneId,
       /*
@@ -2942,6 +4436,29 @@ export function reclaimPinnedWindow(socket: string[], sessionId: string, windowI
   // program that drew itself at 80 columns stays drawn that way.
   tmux(socket, ["refresh-client"]);
   return true;
+}
+
+/**
+ * Make a client draw its whole screen again.
+ *
+ * tmux repaints what CHANGED. After a resize that is not always the same thing
+ * as what is on screen: the client's grid has just been rebuilt underneath a
+ * frame that was drawn for the old one, and tmux has no reason to think the
+ * unchanged cells need sending again. What that looks like from the outside is
+ * a pane whose content sits a row out of place — the bottom line of the window
+ * painted at the top, and every click landing a line below the text it is on,
+ * because the pixels and the grid disagree by exactly one row.
+ *
+ * Measured on the machine that reported it: the pty said 249x62, the tmux
+ * client said 249x62 and the pane said 249x62 — nothing was the wrong size, so
+ * nothing was going to fix itself.
+ *
+ * `-t` names the client rather than letting tmux pick one: on a socket with a
+ * popup open, "the client" is the popup.
+ */
+export function redrawClient(socket: string[], tty: string): void {
+  if (!tty) return;
+  tmux(socket, ["refresh-client", "-t", tty]);
 }
 
 /**
@@ -3412,9 +4929,14 @@ export function sweepPinnedWindows(sockets: string[][]): number {
  * Attached only. A session left behind by a phone that lost its network is not
  * somebody looking, and marking it would make the mark mean nothing.
  */
-export function phoneWindows(socket: string[]): Set<string> {
+export function phoneWindows(socket: string[], attached?: Set<string>): Set<string> {
   const windows = new Set<string>();
-  const live = attachedSessions(socket);
+  // The sweep already knows: its frame lists every client on this server with
+  // the session it sits on, which is the same question `attachedSessions` asks
+  // in a command of its own. Passing it in costs one `list-sessions` less per
+  // tick per attached shell; leaving it out still works, for the callers that
+  // have no frame in hand.
+  const live = attached ?? attachedSessions(socket);
   const phones = [...live].filter((name) => PHONE_SESSION.test(name));
   if (!phones.length) return windows;
   /*

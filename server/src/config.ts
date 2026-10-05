@@ -6,10 +6,12 @@
 // find. Environment variables still win, so a one-off `AGENTGLASS_…=x bun run`
 // overrides the file without editing it.
 
-import type { Budget } from "../../shared/types.ts";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import type { Budget, GateRule } from "../../shared/types.ts";
+import { agentProvider } from "../../shared/agentKinds.ts";
+import { WORKER_ROLES, MODEL_RE, workerRole, type RoleChoice, type RoleId } from "../../shared/workerRoles.ts";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, realpathSync, readlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, dirname, sep, delimiter } from "node:path";
+import { join, resolve, dirname, relative, sep, delimiter } from "node:path";
 import { worktreeFamily } from "./worktree.ts";
 
 /**
@@ -24,6 +26,19 @@ import { worktreeFamily } from "./worktree.ts";
  * and `open-tool memo` failed on a machine with real projects and passed in CI,
  * where the file does not exist.
  */
+/**
+ * Has somebody pointed this process at a config dir that is not the machine's?
+ *
+ * The question a generated file has to ask before it writes to a SHARED path:
+ * an isolated instance materialises different settings, and writing them to the
+ * one file the real engine reads is how a probe changed the developer's tmux
+ * prefix from under him. See tmuxconf's confPath.
+ */
+export function configDirRedirected(): boolean {
+  const asked = process.env.XDG_CONFIG_HOME;
+  return !!asked && asked !== join(homedir(), ".config");
+}
+
 export function configPath(): string {
   return join(
     process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
@@ -50,10 +65,19 @@ function realConfigOffLimits(p: string): boolean {
 }
 
 interface Config {
-  /** Work on this one project and nothing else. */
-  root?: string;
-  /** Directories to sweep for git repos, e.g. ["~/code", "/mnt/hdd/code"]. */
+  /** Work on this project and nothing else — or on these, when it is a list.
+   *  One is written as a plain string, so a build that predates the list still
+   *  reads the commonest case. */
+  root?: string | string[];
+  /** The folders a person's projects live in, e.g. ["~/code", "/mnt/hdd/code"]:
+   *  the project picker lists what is under them and nothing else. Added and
+   *  removed from the picker, or by hand here. See setRepoDir(). No key at
+   *  all is a config from before there were folders: see seedRepoDirs(). */
   repoDirs?: string[];
+  /** Set when an upgrade wrote `repoDirs` from what the app knew rather than
+   *  a person adding folders. Such a list never holds the unscoped panels:
+   *  see panelRepoDirs(). */
+  repoDirsSeeded?: boolean;
   /** Offer `bypassPermissions` — `claude --dangerously-skip-permissions` — as a
    *  chat mode. Off unless stated, and stated *here* rather than only in the
    *  environment: a desktop launcher passes no env, so AGENTGLASS_CHAT_BYPASS
@@ -74,6 +98,13 @@ interface Config {
   /** Spending limits somebody set. See budget.ts. Hand-edited freely like the
    *  rest of this file, so every field is checked on read. */
   budgets?: Budget[];
+  /** What the gate decides without a person. See gaterules.ts. Hand-edited
+   *  only — there is no route that writes it — so every field is checked on
+   *  read, like budgets. */
+  gateRules?: GateRule[];
+  /** The older name for gateRules, `{ root, allow, deny }` rows. Read as
+   *  gateRules with the defaults filled in; see readGateRules(). */
+  gateTools?: unknown;
   /** Projects the picker should stop offering. Absolute paths. See
    *  hiddenProjects(). */
   hiddenProjects?: string[];
@@ -110,6 +141,31 @@ interface Config {
   /** Set when the validation gate rejected the generated conf. The pane
    *  engine degrades (chat still works) and the settings panel shows why. */
   tmuxConfBroken?: { broken: boolean; reason: string };
+  /** Ask each hooked session, now and then, to say what it is working on —
+   *  the line the Lantern draws under its name. On unless stated: the view
+   *  is a list of pane ids without it. See lanternNudge(). */
+  lanternNudge?: boolean;
+  /** How often that reminder may repeat for one session, in minutes. */
+  lanternNudgeMinutes?: number;
+  /** The Lantern's watch: re-read the field every N minutes and notify when
+   *  somebody is still stopped on a person, a worker's window vanished, or
+   *  work that was claimed has gone quiet. On by default. See lanternwatch.ts. */
+  lanternWatch?: boolean;
+  lanternWatchMinutes?: number;
+  /** How long the orchestrator's seat may sit without being woken, in hours.
+   *  The seat is woken when the field CHANGES; this is the floor under that,
+   *  so a quiet machine still gets a line saying it is quiet. Measured on the
+   *  hand-run version this replaced: of fourteen rounds on a fixed twenty
+   *  minutes, twelve said "no change" — a clock is the expensive way to learn
+   *  nothing happened. See seat.ts. */
+  seatWakeHours?: number;
+  /** How long the provider keeps a prompt cache warm after a turn, in minutes
+   *  — 5 on most plans, 60 on some. The Lantern's cards count it down, since
+   *  it decides whether the next turn is cheap now or cheap in five minutes. */
+  cacheTtlMinutes?: number;
+  /** Which CLI and model each worker role runs on — shared/workerRoles.ts.
+   *  A role left out, or one naming a CLI with no lock, is its default. */
+  workerRoles?: Partial<Record<RoleId, RoleChoice>>;
 }
 
 /** A configured Claude account, as it lives on disk in config.json. The `id`
@@ -150,8 +206,11 @@ function load(path: string): Config {
       return {};
     }
     const cfg = raw as Config;
-    if ("root" in cfg && cfg.root !== undefined && typeof cfg.root !== "string") {
-      console.error(`[config] ignoring non-string "root" in ${path}`);
+    // A string is one project; a list is several. Anything else is ignored
+    // whole, and a list keeps its strings and drops the rest — see
+    // workspaceRoots() for the per-entry reading.
+    if ("root" in cfg && cfg.root !== undefined && typeof cfg.root !== "string" && !Array.isArray(cfg.root)) {
+      console.error(`[config] ignoring "root" in ${path}: expected a path or a list of paths`);
       delete cfg.root;
     }
     return cfg;
@@ -212,6 +271,113 @@ export function readBudgets(): Budget[] {
       limit: r.limit,
       period: r.period,
     });
+  }
+  return out;
+}
+
+/**
+ * The gate rules on disk, checked field by field.
+ *
+ * A rule that cannot be read is not repaired, for the reason readBudgets gives:
+ * `"otherwise": "denny"` meaning deny is a guess. It is not dropped either. A
+ * dropped project rule hands its project to whatever the machine-wide rule
+ * says, and a strict project with one typo under a lax machine rule would then
+ * let through exactly what it was written to stop. So an unreadable rule keeps
+ * its root and holds everything there for a person — the one outcome that was
+ * already the gate's behaviour before rules existed. A typo costs an
+ * interruption, never a call that ran unseen.
+ *
+ * A root that is not absolute once `~` is expanded covers nothing a person
+ * could mean, so it is said about and skipped. Parsed once per read of the
+ * file: /gate calls this on every gated call, and a bad rule must be logged
+ * once, not once a call.
+ */
+const parsedGateRules = new WeakMap<Config, GateRule[]>();
+export function readGateRules(): GateRule[] {
+  const cfg = config();
+  const known = parsedGateRules.get(cfg);
+  if (known) return known;
+  const out = [...parseGateRules(cfg.gateRules), ...legacyGateTools(cfg.gateTools, cfg.gateRules !== undefined)];
+  parsedGateRules.set(cfg, out);
+  return out;
+}
+
+/**
+ * `gateTools`, the name an earlier build gave the same rules, read rather than
+ * ignored: a deny list somebody wrote under the old key and that silently
+ * stopped applying is a brake that is no longer there.
+ *
+ * Its rows are `{ root, allow, deny }` and map one to one: a tool on no list
+ * was held for a person, which is gateRules' default `otherwise: "hold"`. Each
+ * row goes through the same reader, so one that cannot be read holds every call
+ * at its root instead of being dropped. Said once per load, with the fix.
+ *
+ * Two things it may not do:
+ *  - with `gateRules` in the file as well, its rows only add denials. A
+ *    leftover row with a deeper root would otherwise become the rule that
+ *    speaks there, and its allow list would open what `gateRules` kept shut.
+ *  - the old key matched names exactly, and here a trailing `*` is a prefix.
+ *    On a deny list that only stops more; on an allow list `*` would let every
+ *    tool through, so a starred allow entry is dropped and said.
+ */
+function legacyGateTools(raw: unknown, alongside: boolean): GateRule[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    console.error(`[config] "gateTools" in ${configPath()} is not a list, so no rule from it applies — move its rows to "gateRules"`);
+    return [];
+  }
+  console.warn(`[config] "gateTools" in ${configPath()} is an old name: its ${raw.length} row(s) are read as "gateRules"`
+    + (alongside ? ", denials only, because \"gateRules\" is there too" : "") + " — move them to \"gateRules\"");
+  const rows = raw.map((r) => {
+    if (!r || typeof r !== "object" || Array.isArray(r)) return r;
+    const { root } = r as { root?: unknown };
+    // That key trimmed its names; a padded " Bash " on a deny list denied Bash.
+    const trim = (v: unknown) => (Array.isArray(v) ? v.map((n) => (typeof n === "string" ? n.trim() : n)) : v);
+    const allow = trim((r as { allow?: unknown }).allow), deny = trim((r as { deny?: unknown }).deny);
+    if (!Array.isArray(allow)) return { root, allow, deny };
+    const plain = allow.filter((n) => !(typeof n === "string" && n.includes("*")));
+    if (plain.length !== allow.length) console.error(`[config] a "gateTools" allow entry with a * is dropped: that key matched names exactly`);
+    return { root, allow: plain, deny };
+  });
+  const out = parseGateRules(rows);
+  return alongside ? out.map((r) => ({ ...r, denyOnly: true })) : out;
+}
+
+function parseGateRules(raw: unknown): GateRule[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    console.error(`[config] ignoring "gateRules" in ${configPath()}: expected an array`);
+    return [];
+  }
+  const names = (v: unknown): string[] | null =>
+    v === undefined ? [] : Array.isArray(v) && v.every((n) => typeof n === "string" && n.length > 0) ? v : null;
+  const out: GateRule[] = [];
+  for (const g of raw) {
+    if (!g || typeof g !== "object" || Array.isArray(g)) continue;
+    const r = g as Partial<Record<keyof GateRule, unknown>>;
+    const given = typeof r.root === "string" ? expand(r.root.trim()) : "";
+    if (given && !given.startsWith("/")) {
+      console.error(`[config] ignoring a gate rule whose root is not an absolute path: ${given}`);
+      continue;
+    }
+    // resolve() drops a trailing slash, which would otherwise stop a root from
+    // covering itself and count as one character "deeper" than its twin.
+    const root = given ? resolve(given) : "";
+    const allow = names(r.allow), deny = names(r.deny);
+    const otherwise = r.otherwise ?? "hold", overBudget = r.overBudget ?? "hold";
+    // A root that is there but is not a path is not "every project": reading it
+    // as one turned a rule meant for one checkout into the machine's.
+    const problem = r.root !== undefined && typeof r.root !== "string" ? "a root that is not a path"
+      : !allow || !deny ? "its allow or deny is not a list of tool names"
+      : otherwise !== "allow" && otherwise !== "hold" && otherwise !== "deny" ? `an unknown "otherwise": ${String(otherwise)}`
+      : overBudget !== "hold" && overBudget !== "deny" ? `an unknown "overBudget": ${String(overBudget)}`
+      : "";
+    if (problem) {
+      console.error(`[config] a gate rule for ${root || "every project"} has ${problem} — holding every call there for a person instead`);
+      out.push({ root, allow: [], deny: [], otherwise: "hold", overBudget: "hold" });
+      continue;
+    }
+    out.push({ root, allow: allow!, deny: deny!, otherwise: otherwise as GateRule["otherwise"], overBudget: overBudget as GateRule["overBudget"] });
   }
   return out;
 }
@@ -337,12 +503,13 @@ export function writeBudgets(budgets: Budget[]): { ok: boolean; persisted: boole
  * inference can only ever guess from history.
  */
 /**
- * The single project this instance is for, if it was opened for one.
+ * The projects this instance is for, if it was opened for any.
  *
- * Scoping to one directory is a different thing from listing several to search:
- * it means "this cockpit is about this project" — no sweeping, no other repos,
- * and the dashboard shows that project's work rather than everything on the
- * machine. Unset (the default) keeps the machine-wide behaviour.
+ * Scoping is a different thing from listing folders to search: it means "this
+ * cockpit is about these projects" — no sweeping, no other repos, and the
+ * dashboard shows their work rather than everything on the machine. Usually
+ * one; several when they were chosen together in the picker. Empty (the
+ * default) keeps the machine-wide behaviour.
  *
  * Only ever set on purpose: AGENTGLASS_ROOT, `root` in the config file, or the
  * directory passed to the app. Deliberately *not* inferred from the working
@@ -350,21 +517,69 @@ export function writeBudgets(budgets: Budget[]): { ok: boolean; persisted: boole
  * that checkout, which is a surprising way to lose the rest of your fleet.
  * Scoping is a decision, so it has to be stated.
  */
-let cachedRoot: string | null | undefined;
+let cachedRoots: string[] | undefined;
 let cachedFor: string | undefined;
-export function workspaceRoot(): string | null {
-  const asked = process.env.AGENTGLASS_ROOT || config().root;
+/** What the environment or the file asks for, before resolving. The
+ *  environment names one project, as it always has. The file may name several;
+ *  its entries are checked one by one, like every other list in this
+ *  hand-editable file, and a junk entry costs itself rather than the scope. */
+function askedRoots(): string[] {
+  const env = process.env.AGENTGLASS_ROOT;
+  return env ? [env] : askedInFile();
+}
+function askedInFile(): string[] {
+  const raw = config().root;
+  return typeof raw === "string" ? [raw]
+    : Array.isArray(raw) ? raw.filter((p): p is string => typeof p === "string" && !!p.trim())
+    : [];
+}
+/** The projects the config FILE opens, resolved, whatever the environment
+ *  says. What an upgrade seeds from: a scope given for one launch through
+ *  AGENTGLASS_ROOT is not a folder anybody asked to keep. */
+export function fileRoots(): string[] {
+  return [...new Set(askedInFile().map((a) => resolveScope(a)))];
+}
+export function workspaceRoots(): string[] {
+  const asked = askedRoots();
+  const key = asked.join("\0");
   // Keyed on what was asked for, not merely "have we answered before". The
   // scope never changes in a running server, so this costs one comparison —
   // but `bun test` shares a process, and the first suite to call this used to
   // pin the answer for every suite after it. A later file setting
   // AGENTGLASS_ROOT then got the earlier file's scope, silently, and only in
   // whatever file order the runner happened to pick.
-  if (cachedRoot !== undefined && cachedFor === asked) return cachedRoot;
-  cachedFor = asked;
-  cachedRoot = asked ? resolveScope(asked) : null;
-  return cachedRoot;
+  if (cachedRoots !== undefined && cachedFor === key) return cachedRoots;
+  cachedFor = key;
+  cachedRoots = [...new Set(asked.map((a) => resolveScope(a)))];
+  return cachedRoots;
 }
+
+/**
+ * The first of the open projects, or null when none is.
+ *
+ * Most callers need a directory rather than a scope: where a shell starts, whose
+ * name goes in the title, which repo a seat is for. With one project open that
+ * is the project; with several it is the first one chosen, which is a choice the
+ * person made rather than one this guesses at. Anything that ENFORCES scope —
+ * inScope, sessionInScope, scopeRoots, scopeClause — reads every root instead,
+ * and a new enforcement check has to as well: handing it this would open three
+ * projects and refuse work in two of them.
+ */
+export function workspaceRoot(): string | null {
+  return workspaceRoots()[0] ?? null;
+}
+
+/** The whole scope as one string, for a cache key. `workspaceRoot()` is not
+ *  one: opening a second project beside the first leaves it unchanged, and a
+ *  cache keyed on it would go on serving the one-project answer. */
+export function scopeKey(): string {
+  return workspaceRoots().join("\0");
+}
+
+/** What the scope helpers accept: one root, several, or none (unscoped). */
+export type Scope = string | readonly string[] | null | undefined;
+const scopeList = (scope: Scope): readonly string[] =>
+  scope == null ? [] : typeof scope === "string" ? (scope ? [scope] : []) : scope;
 
 /**
  * Is this path inside the open project?
@@ -403,14 +618,136 @@ export function isWithin(child: string, parent: string, s: string = sep): boolea
   return child.startsWith(prefix);
 }
 
-export function inScope(path: string | null | undefined, scope = workspaceRoot()): boolean {
-  if (!scope) return true; // whole-machine: nothing to enforce
+export function inScope(path: string | null | undefined, scope: Scope = workspaceRoots()): boolean {
+  const roots = scopeList(scope);
+  if (!roots.length) return true; // whole-machine: nothing to enforce
   if (!path) return false;
   const p = resolve(expand(path));
   // The plain prefix test first: it answers every non-worktree case without a
   // subprocess, including the container-folder scope where the family is moot.
-  if (isWithin(p, scope)) return true;
-  return worktreeFamily(scope).some((r) => isWithin(p, r));
+  if (roots.some((r) => isWithin(p, r))) return true;
+  return roots.some((root) => worktreeFamily(root).some((r) => isWithin(p, r)));
+}
+
+/**
+ * The path with its symlinks resolved — including for a file that does not
+ * exist yet, by resolving the deepest ancestor that does.
+ *
+ * A read of a missing file has to be refused with "no such file" rather than
+ * with "outside", and that difference is only knowable after the containment
+ * check has been given something real to check.
+ *
+ * A DANGLING link is followed by hand rather than climbed past. `realpath`
+ * fails on it exactly as it fails on a missing file, and climbing would join
+ * the link's own name back onto its directory — so `repo/x -> /elsewhere/new`
+ * would come back as `repo/x`, inside, and the first write through it would
+ * land outside. Bounded by the same 64 steps, which also ends a loop of links;
+ * a loop cannot be opened, so what it resolves to does not matter.
+ */
+export function realish(abs: string): string {
+  let head = abs;
+  const tail: string[] = [];
+  for (let i = 0; i < 64; i++) {
+    try { return join(realpathSync(head), ...tail); } catch { /* a link to nowhere, or missing */ }
+    let to: string | null = null;
+    try { to = readlinkSync(head); } catch { /* not a link: climb */ }
+    if (to !== null) { head = resolve(dirname(head), to); continue; }
+    const up = dirname(head);
+    if (up === head) return abs;
+    tail.unshift(head.slice(up.length + 1));
+    head = up;
+  }
+  return abs;
+}
+
+/**
+ * Does `abs` still land inside `root` once its links are resolved?
+ *
+ * The rule for a reader bound to one repository — a conflicted file, the
+ * CODEOWNERS, an untracked file's text. A repo tracks symlinks, git checks them
+ * out as symlinks, and `readFileSync` follows them: the path that `validRels`
+ * approved as a string is not the file the kernel opens.
+ */
+export function staysIn(root: string, abs: string): boolean {
+  return isWithin(realish(abs), realish(root));
+}
+
+/**
+ * Is this this app's own config, data, state or cache — whatever the scope says?
+ *
+ * The machine token lives there and carries full scope, so no read route may
+ * hand it to a narrower caller, and no scope choice changes that: not a project
+ * that happens to contain the directory, and not the whole-machine mode, where
+ * `inScope` answers yes to every path.
+ *
+ * Every `agentglass*` entry directly under each XDG base counts (plugins keep
+ * theirs beside ours), plus the two places the environment can move things
+ * to. Asked of the spelling and of the resolved path, against bases taken both
+ * ways, so neither a link to the directory nor a base behind a link gets past.
+ *
+ * What this cannot stop is a caller that already runs as this user — an
+ * understudy run or a plugin has a shell and reads the file with `cat`. This is
+ * the boundary for callers whose only way to the disk is these routes.
+ */
+/** The XDG bases, resolved both ways — memoised on the environment that names
+ *  them, because a listing asks this once per entry and they do not move. */
+let basesFor = "";
+let basesMemo: string[] = [];
+function privateBases(): string[] {
+  const h = homedir();
+  const named = [
+    process.env.XDG_CONFIG_HOME || join(h, ".config"),
+    process.env.XDG_DATA_HOME || join(h, ".local", "share"),
+    process.env.XDG_STATE_HOME || join(h, ".local", "state"),
+    process.env.XDG_CACHE_HOME || join(h, ".cache"),
+  ];
+  const key = named.join("\0");
+  if (key !== basesFor) {
+    basesFor = key;
+    basesMemo = named.flatMap((b) => [resolve(b), realish(resolve(b))]);
+  }
+  return basesMemo;
+}
+
+export function agentglassPrivate(path: string): boolean {
+  const lexical = resolve(expand(path));
+  const paths = [lexical, realish(lexical)];
+  const bases = privateBases();
+  if (paths.some((p) => bases.some((b) => {
+    const rel = relative(b, p);
+    return !!rel && !rel.startsWith("..") && !rel.startsWith(sep) && rel.split(sep)[0]!.startsWith("agentglass");
+  }))) return true;
+  const moved = [process.env.AGENTGLASS_STATE_DIR, process.env.AGENTGLASS_DB]
+    .filter((x): x is string => !!x)
+    .flatMap((x) => [resolve(x), realish(resolve(x))]);
+  // The database is a file with -wal and -shm beside it: the prefix is the rule.
+  return paths.some((p) => moved.some((m) => isWithin(p, m) || p.startsWith(m + "-")));
+}
+
+/**
+ * `inScope`, asked of what the kernel will actually open.
+ *
+ * `inScope` is a string test, and that is right for what most callers give it
+ * — a session's recorded cwd, a rule's root — which are names to match rather
+ * than files to open. It is wrong for a path that is about to be read: a
+ * symlink inside a checkout can point anywhere while its spelling stays inside
+ * the project. So anything that opens, lists, measures or stats a path off the
+ * wire asks this instead: the spelling must be in scope AND so must the real
+ * path, measured against the scope roots as written and as resolved (a root
+ * reached through a link of its own is not an escape).
+ *
+ * The ceiling is the usual one for a check-then-open: a link swapped in between
+ * this answer and the read wins the race. Closing that needs an open that
+ * refuses links (openat2 with RESOLVE_BENEATH), which Bun does not expose; the
+ * window is one syscall wide and needs write access inside the checkout, which
+ * is already more than a read-only caller has.
+ */
+export function inScopeReal(path: string | null | undefined, scope: Scope = workspaceRoots()): boolean {
+  if (!inScope(path, scope) || agentglassPrivate(path!)) return false;
+  const roots = scopeList(scope);
+  if (!roots.length) return true;
+  const real = realish(resolve(expand(path!)));
+  return inScope(real, scope) || inScope(real, roots.map((r) => realish(r)));
 }
 
 /**
@@ -431,17 +768,18 @@ export function inScope(path: string | null | undefined, scope = workspaceRoot()
  */
 export function sessionInScope(
   s: { project_path?: string | null; cwd_path?: string | null },
-  scope = workspaceRoot(),
+  scope: Scope = workspaceRoots(),
 ): boolean {
-  if (!scope) return true; // whole-machine: nothing to filter
+  if (!scopeList(scope).length) return true; // whole-machine: nothing to filter
   return inScope(s.project_path, scope) || inScope(s.cwd_path, scope);
 }
 
-/** The directories a scoped instance is about: the project plus its linked
- *  worktrees. Unscoped returns empty — "no scope" is not "a list of roots", and
- *  callers branch on that rather than being handed the whole machine. */
-export function scopeRoots(scope = workspaceRoot()): string[] {
-  return scope ? worktreeFamily(scope) : [];
+/** The directories a scoped instance is about: each open project plus its
+ *  linked worktrees. Unscoped returns empty — "no scope" is not "a list of
+ *  roots", and callers branch on that rather than being handed the whole
+ *  machine. */
+export function scopeRoots(scope: Scope = workspaceRoots()): string[] {
+  return [...new Set(scopeList(scope).flatMap((r) => worktreeFamily(r)))];
 }
 
 /** One rule for turning "what the user asked for" into a scope directory —
@@ -449,7 +787,43 @@ export function scopeRoots(scope = workspaceRoot()): string[] {
  *  same input to the same root. */
 function resolveScope(asked: string): string {
   const abs = resolve(expand(asked));
-  return repoTop(abs) ?? abs; // a path that isn't a repo is still a scope
+  const top = repoTop(abs);
+  if (!top) return abs; // a path that isn't a repo is still a scope
+  /*
+   * git answers with the REAL path, and the path we were asked about may be
+   * reached through a symlink. That matters because this string is not used as
+   * a path — it is used as a PREFIX, against `project_path` and `cwd_path` on
+   * rows written by hooks, which spell the directory however the agent was
+   * launched with it. Two spellings of the same directory share no prefix, so
+   * handing back git's spelling filters out the very rows the scope exists to
+   * select, and the cockpit comes up empty with nothing to say about why.
+   *
+   * It is not an exotic setup. `~/code` symlinked onto another volume, a home
+   * directory behind an automounter, and `os.tmpdir()` on a machine that is not
+   * ours are all this. The last one is how it was found: this suite passed for
+   * months, then failed on an unchanged commit when the runner's temp directory
+   * moved behind a link.
+   *
+   * So git is asked the question it is uniquely good at — HOW MUCH of this path
+   * is the repository — and the answer is re-spelled in the caller's terms by
+   * trimming the same tail. The segment names are identical either way; only
+   * the prefix differs, which is exactly the part being replaced.
+   */
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch {
+    return top; // the directory went away mid-question; git's answer is all there is
+  }
+  if (real === top) return abs;
+  if (real.startsWith(top + sep)) {
+    const tail = real.length - top.length;
+    const mapped = abs.slice(0, abs.length - tail);
+    // Only when the tail really is a shared suffix. A path where it is not is
+    // not something to guess at — git's own answer is the safer wrong.
+    if (mapped && real.slice(top.length) === abs.slice(abs.length - tail)) return mapped;
+  }
+  return top;
 }
 
 /** git's own answer for "which repo is this", or null. */
@@ -464,30 +838,45 @@ function repoTop(dir: string): string | null {
 }
 
 /**
- * Point this instance at one project (or back at the whole machine) while it
+ * Point this instance at some projects (or back at the whole machine) while it
  * runs — the project picker in the UI calls this. The choice is applied
  * immediately (the transcript scanner re-evaluates scope on its next sweep,
  * every few seconds) and persisted to the config file so the next launch opens
- * the same project. Passing null clears the scope.
+ * the same projects. An empty list clears the scope.
+ *
+ * All or nothing: one path that is not a directory refuses the whole choice. A
+ * cockpit that quietly opened two of the three projects asked for would look
+ * exactly like one that opened all three until the missing one's work failed
+ * to appear.
  *
  * Note the runtime cache is set directly: AGENTGLASS_ROOT from the environment
  * seeds the *initial* scope, but an explicit pick in the UI is newer intent and
  * wins for the rest of this process's life.
  */
-export function setWorkspaceRoot(rootIn: string | null): { ok: boolean; workspace: string | null; persisted: boolean; error?: string; note?: string } {
-  const fail = (error: string) => ({ ok: false as const, workspace: workspaceRoot(), persisted: false, error });
-  let next: string | null = null;
-  if (rootIn !== null) {
+/** More projects than anybody opens together. Each one is a stat and a git
+ *  call on the thread that serves the app, so a longer list is refused before
+ *  any of it is looked at. */
+const MAX_OPEN_PROJECTS = 200;
+
+export function setWorkspaceRoots(rootsIn: readonly unknown[] | null): { ok: boolean; workspaces: string[]; persisted: boolean; error?: string; note?: string } {
+  const fail = (error: string) => ({ ok: false as const, workspaces: workspaceRoots(), persisted: false, error });
+  if ((rootsIn?.length ?? 0) > MAX_OPEN_PROJECTS) return fail(`at most ${MAX_OPEN_PROJECTS} projects can be open together`);
+  const next: string[] = [];
+  for (const rootIn of rootsIn ?? []) {
     if (typeof rootIn !== "string" || !rootIn.trim() || rootIn.includes("\0")) return fail("invalid path");
     const abs = resolve(expand(rootIn.trim()));
     try {
-      if (!statSync(abs).isDirectory()) return fail("not a directory");
+      if (!statSync(abs).isDirectory()) return fail(`not a directory: ${abs}`);
     } catch {
-      return fail("directory does not exist");
+      return fail(`directory does not exist: ${abs}`);
     }
-    next = resolveScope(abs);
+    const r = resolveScope(abs);
+    if (!next.includes(r)) next.push(r);
   }
-  cachedRoot = next;
+  // Pinned to what is asked for right now, so the pick holds until the file or
+  // the environment says something new — which, once persisted below, is this.
+  cachedFor = askedRoots().join("\0");
+  cachedRoots = next;
   // Persist so the choice survives a restart. Re-read the file first — another
   // setting written there by hand must not be clobbered by a stale snapshot.
   let persisted = false;
@@ -495,9 +884,9 @@ export function setWorkspaceRoot(rootIn: string | null): { ok: boolean; workspac
   const path = configPath();
   // A test may choose a workspace; it may not rewrite the settings of the
   // machine it runs on. The switch still applies in memory, which is all any
-  // test needs, and cachedRoot above already carries it.
+  // test needs, and cachedRoots above already carries it.
   if (realConfigOffLimits(path)) {
-    return { ok: true, workspace: next, persisted: false, note: "not persisted: tests write settings only under os.tmpdir()" };
+    return { ok: true, workspaces: next, persisted: false, note: "not persisted: tests write settings only under os.tmpdir()" };
   }
   try {
     let cur: Config = {};
@@ -509,13 +898,18 @@ export function setWorkspaceRoot(rootIn: string | null): { ok: boolean; workspac
       // (repoDirs, future keys). The runtime switch still applies.
       if (existsSync(path)) {
         console.error(`[config] not persisting workspace — ${path} exists but can't be parsed: ${e instanceof Error ? e.message : e}`);
-        return { ok: true, workspace: next, persisted: false, note: `config file is malformed — fix ${path} to persist this choice` };
+        return { ok: true, workspaces: next, persisted: false, note: `config file is malformed — fix ${path} to persist this choice` };
       }
     }
-    if (next) cur.root = next; else delete cur.root;
+    // One project stays a plain string: it is the commonest case, and it is
+    // the shape every earlier build reads.
+    if (next.length === 1) cur.root = next[0]; else if (next.length) cur.root = next; else delete cur.root;
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify(cur, null, 2) + "\n");
     cached = null; // the file changed under us; next read picks it up
+    // The file now says what was just applied; pin the cache to that, or the
+    // next read would resolve every root again for the same answer.
+    cachedFor = askedRoots().join("\0");
     persisted = true;
   } catch (e) {
     console.error(`[config] could not persist workspace to ${path}: ${e instanceof Error ? e.message : e}`);
@@ -523,7 +917,14 @@ export function setWorkspaceRoot(rootIn: string | null): { ok: boolean; workspac
   // The env var is read before the config file at boot, so it will shadow this
   // choice on the next launch (e.g. the desktop app started with a directory).
   if (process.env.AGENTGLASS_ROOT) note = `AGENTGLASS_ROOT is set — it will override this choice on the next launch`;
-  return { ok: true, workspace: next, persisted, note };
+  return { ok: true, workspaces: next, persisted, note };
+}
+
+/** One project, or null for the whole machine — the shape the older callers
+ *  and the `/workspace` body's `root` field still use. */
+export function setWorkspaceRoot(rootIn: string | null): { ok: boolean; workspace: string | null; workspaces: string[]; persisted: boolean; error?: string; note?: string } {
+  const r = setWorkspaceRoots(rootIn === null ? [] : [rootIn]);
+  return { ...r, workspace: r.workspaces[0] ?? null };
 }
 
 /**
@@ -629,6 +1030,123 @@ export function patchConfig(mutate: (c: Config) => void): { ok: boolean; error?:
   }
 }
 
+/**
+ * The folders the unscoped panels are held to: the ones a person named.
+ *
+ * A list an upgrade seeded is every project the app knew that day, and holding
+ * the panels to it dropped a worktree beside its project, the projects agents
+ * work in later, and everything else the whole-machine view had shown. So
+ * once seeded, the file's list is the picker's alone — including folders added
+ * after, since they sit in the same list. The environment still holds them.
+ */
+export function panelRepoDirs(): string[] {
+  if (!process.env.AGENTGLASS_REPO_DIRS && config().repoDirsSeeded === true) return [];
+  return configuredRepoDirs();
+}
+
+/**
+ * Add a folder the picker lists projects from, or forget one.
+ *
+ * These are the folders a person's projects live in — `~/code`, or one repo on
+ * its own — and they are the picker's whole list: nothing is added by the app,
+ * and nothing is listed from outside them. Per-folder, like hiding a project,
+ * so two windows open at once cannot overwrite each other's answer.
+ *
+ * Entries somebody wrote by hand are kept as they were written (`~/code` stays
+ * `~/code`) and compared by where they point, so the folder chooser's absolute
+ * answer finds and removes them. Only the file is touched: forgetting a folder
+ * never goes near the folder.
+ */
+/** The whole disk, the home folder and the folder every home lives in: the
+ *  machine by another name. Every added folder is walked for repositories on
+ *  the thread that answers the picker, so none is taken as one. Compared by
+ *  where they really are, so a link to home — or a chooser that answers with
+ *  the real path of a linked home — is still home. */
+const real = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+function tooBroad(abs: string): boolean {
+  const home = resolve(homedir());
+  const broad = new Set([resolve("/"), home, dirname(home)].flatMap((p) => [p, real(p)]));
+  return broad.has(abs) || broad.has(real(abs));
+}
+
+export function setRepoDir(pathIn: unknown, added: boolean): { ok: boolean; roots: string[]; persisted: boolean; error?: string; note?: string } {
+  const fail = (error: string) => ({ ok: false as const, roots: configuredRepoDirs(), persisted: false, error });
+  if (typeof pathIn !== "string" || !pathIn.trim() || pathIn.includes("\0")) return fail("invalid path");
+  const target = resolve(expand(pathIn.trim()));
+  if (added) {
+    if (tooBroad(target)) return fail(`too broad to list projects from: ${target} — add the folder your projects live in`);
+    try {
+      if (!statSync(target).isDirectory()) return fail(`not a folder: ${target}`);
+    } catch {
+      return fail(`no such folder: ${target}`);
+    }
+  }
+  // Edited against the file as it is now, not this process's cached copy: a
+  // second server on the same config may have added a folder since.
+  const res = mergeConfig((existing) => {
+    const raw = existing.repoDirs;
+    const written = Array.isArray(raw) ? raw.filter((d): d is string => typeof d === "string" && !!d.trim()) : [];
+    const next = written.filter((d) => resolve(expand(d.trim())) !== target);
+    if (added) next.push(target);
+    // An empty list stays in the file: no key at all is a config from before
+    // the picker had folders, and reads as one to seed. See seedRepoDirs.
+    return { repoDirs: next };
+  }, "the project folders");
+  if (!res.ok) return fail(res.error ?? "could not save that");
+  // The environment wins over the file, so a folder added here is saved but not
+  // what this process lists until that variable is gone. Say so rather than
+  // look like a button that did nothing.
+  const note = process.env.AGENTGLASS_REPO_DIRS ? "AGENTGLASS_REPO_DIRS is set — it is what the picker lists, not the saved folders" : undefined;
+  return { ok: true, roots: configuredRepoDirs(), persisted: true, note };
+}
+
+/**
+ * Has nobody ever said which folders the picker lists from?
+ *
+ * True only for a config file with no `repoDirs` key at all — the shape every
+ * config had before the picker listed folders — and nothing in the
+ * environment. Once the key is there it stays, empty or not: removing the last
+ * folder leaves `[]`, so this is an upgrade's question and asked once.
+ */
+export function repoDirsUnstated(): boolean {
+  if (process.env.AGENTGLASS_REPO_DIRS) return false;
+  return !Object.prototype.hasOwnProperty.call(config(), "repoDirs");
+}
+
+/**
+ * Give an upgrading config the folders it would have had.
+ *
+ * The picker used to list every project the app had seen, and a scope could
+ * be a folder ("~/code for everything in it"). Read with the new rules alone,
+ * that folder listed its projects with none of them open and the first click
+ * narrowed the scope to one of them for good, and everybody else found the
+ * list cut down to what was open. So the first read writes down, once, what
+ * the old config and the old list knew: the caller hands the projects the
+ * file opens first (fileRoots) and then the ones an earlier run knew (see
+ * knownProjectRoots). A seeded list is marked, and never holds the unscoped
+ * panels: see panelRepoDirs.
+ *
+ * Kept as given, minus a path that is gone by now, the whole disk or home
+ * folder (see tooBroad), and a path inside one kept before it, so ~/code and
+ * ~/code/orbit are one folder. Written even when that
+ * is nothing, so a fresh install is not seeded later from what it learns since.
+ * Re-checked against the file as it is now: another server may have got there.
+ */
+export function seedRepoDirs(candidates: readonly string[]): { ok: boolean; roots: string[]; persisted: boolean; error?: string } {
+  const res = mergeConfig((existing) => {
+    if (Object.prototype.hasOwnProperty.call(existing, "repoDirs")) return {};
+    const kept: string[] = [];
+    for (const c of candidates) {
+      const abs = resolve(expand(c));
+      if (tooBroad(abs)) continue;
+      try { if (!statSync(abs).isDirectory()) continue; } catch { continue; }
+      if (!kept.some((k) => isWithin(abs, k))) kept.push(abs);
+    }
+    return { repoDirs: kept, repoDirsSeeded: kept.length ? true : undefined };
+  }, "the project folders");
+  return { ...res, roots: configuredRepoDirs() };
+}
+
 // --- tmux engine settings ---------------------------------------------------
 // Read one field at a time, each checked on read: config.json is hand-editable,
 // and every one of these reaches a spawned binary or a filesystem path.
@@ -731,6 +1249,25 @@ export function writeTmuxSettings(fields: {
   tmuxTerminal?: "engine" | "desk";
   tmuxConfBroken?: { broken: boolean; reason: string } | undefined;
 }): { ok: boolean; persisted: boolean; error?: string } {
+  return mergeConfig(fields, "tmux settings");
+}
+
+/**
+ * Write these fields into config.json, leaving every other key as it was.
+ *
+ * `undefined` deletes a key. One implementation for every settings pane that
+ * writes here: the tmux pane had this inline, and the second pane to need it
+ * would have been a second copy of the same read-check-merge-write, with the
+ * same three failure messages worded slightly differently.
+ */
+function mergeConfig(
+  /** The fields, or — for a setting that is edited rather than replaced, like
+   *  a list — a function of what the file says NOW, read just before writing.
+   *  This process's cached copy can be older than the file: another server on
+   *  the same config may have written it since. */
+  fields: Record<string, unknown> | ((existing: Record<string, unknown>) => Record<string, unknown>),
+  what: string,
+): { ok: boolean; persisted: boolean; error?: string } {
   const path = configPath();
   if (realConfigOffLimits(path)) {
     return { ok: false, persisted: false, error: "not persisted: tests write settings only under os.tmpdir()" };
@@ -740,17 +1277,17 @@ export function writeTmuxSettings(fields: {
     if (existsSync(path)) {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save tmux settings` };
+        return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save ${what}` };
       }
       existing = parsed as Record<string, unknown>;
     }
   } catch (e) {
-    return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save tmux settings (${e instanceof Error ? e.message : e})` };
+    return { ok: false, persisted: false, error: `config file is malformed — fix ${path} to save ${what} (${e instanceof Error ? e.message : e})` };
   }
   try {
     mkdirSync(dirname(path), { recursive: true });
     const merged: Record<string, unknown> = { ...existing };
-    for (const [k, v] of Object.entries(fields)) {
+    for (const [k, v] of Object.entries(typeof fields === "function" ? fields(existing) : fields)) {
       if (v === undefined) delete merged[k]; else merged[k] = v;
     }
     writeFileSync(path, JSON.stringify(merged, null, 2) + "\n");
@@ -759,4 +1296,110 @@ export function writeTmuxSettings(fields: {
   } catch (e) {
     return { ok: false, persisted: false, error: `could not write ${path}: ${e instanceof Error ? e.message : e}` };
   }
+}
+
+/*
+ * THE LANTERN REMINDER.
+ *
+ * Translated from Herdr's Lantern plugin, which gets a real "what is this
+ * agent working toward" onto its board by handing every agent it seats a
+ * rule to narrate `Goal: … Next: …` into its own output. Here the ask goes
+ * through the hook every session already runs: on a prompt, the server may
+ * answer with a one-line reminder to `POST /agents/status`, and the session
+ * reads it the way it reads the memory-save reminder. On by default, because
+ * the Lantern without it is a list of pane ids.
+ */
+export const LANTERN_NUDGE_DEFAULT_MIN = 20;
+export const LANTERN_NUDGE_MIN_MIN = 5;
+export const LANTERN_NUDGE_MAX_MIN = 180;
+
+export function lanternNudge(): boolean {
+  return config().lanternNudge !== false;
+}
+
+export function lanternNudgeMinutes(): number {
+  const n = config().lanternNudgeMinutes;
+  if (typeof n !== "number" || !Number.isFinite(n)) return LANTERN_NUDGE_DEFAULT_MIN;
+  return Math.min(LANTERN_NUDGE_MAX_MIN, Math.max(LANTERN_NUDGE_MIN_MIN, Math.round(n)));
+}
+
+export const LANTERN_WATCH_DEFAULT_MIN = 15;
+export const CACHE_TTL_DEFAULT_MIN = 5;
+export function cacheTtlMinutes(): number {
+  const n = config().cacheTtlMinutes;
+  if (typeof n !== "number" || !Number.isFinite(n)) return CACHE_TTL_DEFAULT_MIN;
+  return Math.min(120, Math.max(1, Math.round(n)));
+}
+export function lanternWatch(): boolean {
+  return config().lanternWatch !== false;
+}
+export function lanternWatchMinutes(): number {
+  const n = config().lanternWatchMinutes;
+  if (typeof n !== "number" || !Number.isFinite(n)) return LANTERN_WATCH_DEFAULT_MIN;
+  return Math.min(LANTERN_NUDGE_MAX_MIN, Math.max(LANTERN_NUDGE_MIN_MIN, Math.round(n)));
+}
+
+/** The floor under the seat's waking, in hours: 1 to 24, 4 by default. */
+export function seatWakeHours(): number {
+  const n = config().seatWakeHours;
+  if (typeof n !== "number" || !Number.isFinite(n)) return 4;
+  return Math.min(24, Math.max(1, Math.round(n)));
+}
+
+export function writeSeatSettings(fields: { seatWakeHours?: number }): { ok: boolean; persisted: boolean; error?: string } {
+  const out: Record<string, unknown> = {};
+  if (fields.seatWakeHours !== undefined) {
+    const n = Number(fields.seatWakeHours);
+    if (!Number.isFinite(n)) return { ok: false, persisted: false, error: "the floor has to be a number of hours" };
+    out.seatWakeHours = Math.min(24, Math.max(1, Math.round(n)));
+  }
+  return mergeConfig(out, "seat settings");
+}
+
+export function writeLanternSettings(fields: { lanternNudge?: boolean; lanternNudgeMinutes?: number; lanternWatch?: boolean; lanternWatchMinutes?: number; cacheTtlMinutes?: number }):
+{ ok: boolean; persisted: boolean; error?: string } {
+  const out: Record<string, unknown> = {};
+  if (fields.lanternNudge !== undefined) out.lanternNudge = fields.lanternNudge === true;
+  if (fields.lanternWatch !== undefined) out.lanternWatch = fields.lanternWatch === true;
+  if (fields.cacheTtlMinutes !== undefined) {
+    const n = Number(fields.cacheTtlMinutes);
+    if (!Number.isFinite(n)) return { ok: false, persisted: false, error: "the cache window has to be a number of minutes" };
+    out.cacheTtlMinutes = Math.min(120, Math.max(1, Math.round(n)));
+  }
+  for (const key of ["lanternNudgeMinutes", "lanternWatchMinutes"] as const) {
+    if (fields[key] === undefined) continue;
+    const n = Number(fields[key]);
+    if (!Number.isFinite(n)) return { ok: false, persisted: false, error: "the interval has to be a number of minutes" };
+    out[key] = Math.min(LANTERN_NUDGE_MAX_MIN, Math.max(LANTERN_NUDGE_MIN_MIN, Math.round(n)));
+  }
+  return mergeConfig(out, "lantern settings");
+}
+
+/** A choice a role may hold: a CLI this app has a lock for, and a model a CLI
+ *  can be handed as one argument. */
+function validRoleChoice(c: unknown): RoleChoice | null {
+  if (!c || typeof c !== "object") return null;
+  const { provider: id, model } = c as { provider?: unknown; model?: unknown };
+  if (typeof id !== "string" || !agentProvider(id)?.lock) return null;
+  const m = typeof model === "string" ? model.trim() : "";
+  if (m && !MODEL_RE.test(m)) return null;
+  return { provider: id, model: m };
+}
+
+/** Every role's provider and model, defaults filled in. A hand-edited entry
+ *  that does not validate reads as the default rather than as whatever it
+ *  says: it decides which binary runs. */
+export function workerRoles(): Record<RoleId, RoleChoice> {
+  const saved = config().workerRoles ?? {};
+  const out = {} as Record<RoleId, RoleChoice>;
+  for (const r of WORKER_ROLES) out[r.id] = validRoleChoice((saved as Record<string, unknown>)[r.id]) ?? { ...r.default };
+  return out;
+}
+
+export function writeWorkerRole(role: unknown, choice: unknown): { ok: boolean; persisted: boolean; error?: string } {
+  const r = workerRole(role);
+  if (!r) return { ok: false, persisted: false, error: "no such role" };
+  const c = validRoleChoice(choice);
+  if (!c) return { ok: false, persisted: false, error: "that CLI has no lock this app can apply, or the model is not one word" };
+  return mergeConfig({ workerRoles: { ...(config().workerRoles ?? {}), [r.id]: c } }, "worker roles");
 }

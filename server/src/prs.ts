@@ -15,16 +15,19 @@
 //    so every mutation goes through `writeGuard` and the irreversible ones are
 //    named separately from the rest.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { failed } from "./refused.ts";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { gitAsync, safeAbs, repoRootOf } from "./git.ts";
 import { makeViewTempDir } from "./viewtemp.ts";
-import { inScope } from "./config.ts";
+import { inScopeReal, staysIn } from "./config.ts";
 import { recipePromptText } from "./reviewPrompts.ts";
+import { boardHolding, knownStatuses } from "./clickupviews.ts";
 import type {
   PrRepoId, PrSummary, PrBranchSummary, PrDetail, PrListResponse, PrActionResult, PrCheck, PrCheckRollup,
   PrCheckState, PrThread, PrReview, PrComment, PrCommit, PrFile, PrChecklistItem, PrMergeState, CiVerdict,
-  PrAuthored, PrReaction, PrEvent, PrCheckJob, PrReviewer, PrMergePolicy, PrMergeMethod, PrLocalHead,
+  PrTalk, PrTalkNote,
+  PrAuthored, PrReaction, PrEvent, PrCheckJob, PrReviewer, PrMergePolicy, PrMergeGate, PrMergeMethod, PrLocalHead,
 } from "../../shared/types.ts";
 
 /** Same escape hatch the git writes use, so one variable disables both. */
@@ -526,6 +529,29 @@ const ID_TTL_MS = 5 * 60_000;
  * has filled it. Two `git remote get-url` each is nothing on its own and forty
  * of them at once, five minutes apart, is not nothing.
  */
+/**
+ * Which of these checkouts is `owner/name`?
+ *
+ * The panel reads a pull request through a local checkout, because that is
+ * where the remote — and so the repository's identity — comes from. A link to
+ * a pull request in another project therefore has nowhere to land until this
+ * has answered, and the answer is a path.
+ *
+ * Case-insensitively: GitHub treats `Acme/Orbit` and `acme/orbit` as the same
+ * repository, and a link copied out of a browser carries whichever spelling
+ * the page used. Sequential on purpose — `repoIdFor` caches per root and the
+ * first match usually arrives within a few checkouts, so firing forty `git
+ * remote get-url` at once buys nothing.
+ */
+export async function locateRepo(want: string, roots: string[]): Promise<string | null> {
+  const target = want.toLowerCase();
+  for (const root of roots) {
+    const id = await repoIdFor(root);
+    if (id?.nameWithOwner.toLowerCase() === target) return root;
+  }
+  return null;
+}
+
 const idInflight = new Map<string, Promise<PrRepoId | null>>();
 
 export async function repoIdFor(rootIn: unknown): Promise<PrRepoId | null> {
@@ -715,6 +741,67 @@ export function noteCi(repo: PrRepoId, pr: PrSummary): void {
     approved: pr.reviewDecision === "APPROVED",
   };
   for (const fn of ciListeners) { try { fn(v); } catch { /* a listener must not break the poll */ } }
+}
+
+/**
+ * The newest human remark we have seen on each pull request.
+ *
+ * A timestamp rather than a count: a comment that is deleted lowers the count
+ * and would otherwise be indistinguishable from nothing having happened, and a
+ * count that goes down then up announces the same remark twice.
+ */
+const talkLatch = new Map<string, number>();
+const talkListeners = new Set<(n: PrTalkNote) => void>();
+
+export function subscribeTalk(fn: (n: PrTalkNote) => void): () => void {
+  talkListeners.add(fn);
+  return () => { talkListeners.delete(fn); };
+}
+
+/** Only for tests: the latch is process-wide, and a suite that leaves marks in
+ *  it decides what the next one thinks it has already seen. */
+export function __resetTalkLatch(): void { talkLatch.clear(); }
+
+/**
+ * Somebody spoke on a pull request you have a stake in.
+ *
+ * One note per pull request per poll, and never more: a review with nine line
+ * comments is one thing that happened. The newest remark is named and the rest
+ * are counted, which is the same trade the CI latch makes for a suite of
+ * sixty-one checks.
+ *
+ * The first sight of a pull request is recorded and NOT announced, for the
+ * reason spelled out on `watched` above: telling you the standing state of
+ * everything you have a stake in is an inventory, not a notification, and it is
+ * what makes people stop reading the ones that matter. So opening the panel on a
+ * morning's worth of comments says nothing; the next one through says
+ * everything.
+ *
+ * Exported for the suite, because the failure mode here is one people feel
+ * immediately — a boot that announces a week of conversation.
+ */
+export function noteTalk(repo: PrRepoId, pr: PrSummary): void {
+  // No second pass yet: this row has no opinion about the conversation, and an
+  // absent answer must not be read as an empty one.
+  if (!pr.talk) return;
+  const key = `${repo.key}#${pr.number}`;
+  const theirs = pr.talk.filter((t) => !t.mine);
+  let newest = 0;
+  for (const t of theirs) newest = Math.max(newest, Date.parse(t.at) || 0);
+  const prev = talkLatch.get(key);
+  talkLatch.set(key, newest);
+  if (prev === undefined || !(newest > prev)) return;
+  const fresh = theirs.filter((t) => (Date.parse(t.at) || 0) > prev).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const top = fresh[0];
+  if (!top) return;
+  const n: PrTalkNote = {
+    repo: repo.nameWithOwner, number: pr.number, title: pr.title, url: pr.url,
+    who: top.who, kind: top.kind, at: top.at,
+    ...(top.state ? { state: top.state } : null),
+    ...(top.lines ? { lines: top.lines } : null),
+    ...(fresh.length > 1 ? { more: fresh.length - 1 } : null),
+  };
+  for (const fn of talkListeners) { try { fn(n); } catch { /* a listener must not break the poll */ } }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,18 +1051,233 @@ const SEARCH_ROWS = `query($q:String!,$first:Int!,$after:String){
  * extra ~1.15s. This is the slower half of the pair, so the four fields land in
  * the shadow of work that was happening anyway.
  */
+/**
+ * The tail of the conversation — who spoke and when, not what they said.
+ *
+ * Declared ABOVE the query that interpolates it. A template literal is built
+ * when the module loads, so a `const` used inside one and declared after it is a
+ * `ReferenceError` at import time — which in this app is a black window, and has
+ * been once already (see hook-tdz.test.ts).
+ *
+ * `last:` on both, because the question is "anything since I looked" and the
+ * answer to that is always at the end. Ten of each: enough that a busy morning
+ * is counted rather than capped, small enough that fifty rows of it is a few
+ * kilobytes. No bodies — a card cannot draw one, and one real machine comment on
+ * a real pull request is 46,551 characters (see digestBotComment).
+ *
+ * `reviews` carries the line comments too, and that is not an accident of the
+ * schema: GitHub records a review for every batch of them, so a reply on one
+ * line arrives here as a `COMMENTED` review with an empty body. Asking
+ * `reviewThreads` for the same information would cost a walk per pull request,
+ * which is precisely what the list cannot afford.
+ */
+/**
+ * The verdict of the PEOPLE who reviewed, ignoring bots.
+ *
+ * `reviewDecision` counts every reviewer GitHub counts, and the auto-review bot
+ * has write access here — so a pull request nobody has read reports APPROVED.
+ * The board drew that as a tick beside a card whose only human had commented.
+ *
+ * Latest-per-person, because a reviewer who asked for changes in August and
+ * approved in September has approved: only their last strong verdict stands. A
+ * bare comment is not a verdict and never replaces one.
+ *
+ * SIXTY REVIEWS, not ten, and the difference is not theoretical.
+ *
+ * A pull request with 37 commits and 48 comments had `okoro` asking for
+ * changes — and the ten most recent reviews were all the bot and the author
+ * talking on their own threads, so the verdict fell off the end and the card
+ * drew no header at all while its own page said "Changes requested by
+ * okoro". Ten is nothing on a review that has been going for a week.
+ *
+ * It costs no extra request: the same node, more of one connection. Sixty is
+ * what the pull request's own page already asks for, so the two cannot disagree
+ * about who decided what.
+ */
+export function humanVerdict(
+  nodes: unknown,
+  o: { author?: string; pending?: string[]; headAt?: string; viewer?: string } = {},
+): PrSummary["humanReview"] {
+  const rows = Array.isArray(nodes) ? nodes : [];
+  const author = (o.author || "").toLowerCase();
+  const strong = new Map<string, { state: string; at: string; url: string }>();
+  const spoke = new Set<string>();
+  for (const r of rows as { state?: string; author?: { login?: string }; submittedAt?: string; url?: string }[]) {
+    const who = r.author?.login || "";
+    if (!who || isBotLogin(who)) continue;
+    /*
+     * THE AUTHOR IS NOT A REVIEWER.
+     *
+     * Answering your own threads arrives here as `COMMENTED` reviews, and
+     * counting them reported a pull request as reviewed by the person who wrote
+     * it — while the reviewer it was actually waiting on had not replied at
+     * all. Seen on a real one: the row said "commented" over the author, and
+     * the timeline underneath read "the author requested a review from
+     * bjorn". Nobody had reviewed anything.
+     */
+    if (who.toLowerCase() === author) continue;
+    spoke.add(who);
+    if (r.state === "APPROVED" || r.state === "CHANGES_REQUESTED") {
+      strong.set(who, { state: r.state, at: r.submittedAt || "", url: r.url || "" });
+    } else if (r.state === "DISMISSED") strong.delete(who);
+  }
+
+  const pick = (want: string) => [...strong.entries()].filter(([, v]) => v.state === want);
+  const changes = pick("CHANGES_REQUESTED");
+  const approved = pick("APPROVED");
+
+  /* The newest of a set, because "when" on this row means "when was this
+     decided", and two approvals are decided at different times. */
+  const newest = (rows_: [string, { at: string; url: string }][]) =>
+    rows_.slice().sort((a, b) => (b[1].at || "").localeCompare(a[1].at || ""))[0];
+
+  const pendingLogins = new Set((o.pending ?? []).map((l) => l.toLowerCase()));
+
+  const build = (
+    kind: "approved" | "changes",
+    picked: [string, { state: string; at: string; url: string }][],
+    otherCount: number,
+  ): PrSummary["humanReview"] => {
+    const top = newest(picked)!;
+    return {
+      kind,
+      who: picked.map(([login]) => login),
+      at: top[1].at || undefined,
+      url: top[1].url || undefined,
+      /*
+       * A VERDICT THAT NO LONGER COVERS THE CODE.
+       *
+       * Somebody approved, and then commits landed. GitHub says so on the pull
+       * request's own page ("N files have changed since your review") and the
+       * board did not, so an approval of something else read as a green light.
+       * Compared against the head commit that came back in the same query.
+       */
+      stale: Boolean(o.headAt && top[1].at && o.headAt > top[1].at),
+      /* Said in the second person where it is the reader's own decision: your
+         own name in the third person is a line you read twice. */
+      mine: picked.some(([login]) => login.toLowerCase() === (o.viewer || "").toLowerCase()),
+      /*
+       * RE-REQUESTED AFTER THEIR OWN VERDICT — GitHub's ↻, read from the same
+       * `reviewRequests` this already threads in as `pending`.
+       *
+       * `changes.length` still wins the kind above, correctly: their review is
+       * still the standing one and still blocks the merge, exactly as GitHub's
+       * own page shows it. What was missing is the other half GitHub's page
+       * ALSO shows — a small ↻ beside their name — which this dropped
+       * entirely the moment `changes` outranked `awaiting`. Applying the
+       * changes and re-requesting a review left the banner reading exactly as
+       * it had before either happened: "Changes requested by X", full stop,
+       * as if nothing had moved since. It had — the ball just is not back in
+       * the author's court the wording implied.
+       */
+      askedAgain: picked.some(([login]) => pendingLogins.has(login.toLowerCase())),
+      ...(otherCount ? { others: otherCount } : null),
+    };
+  };
+
+  if (changes.length) return build("changes", changes, approved.length);
+  if (approved.length) return build("approved", approved, changes.length);
+  /*
+   * WAITING OUTRANKS COMMENTED, because it is the more useful half.
+   *
+   * A pull request with a review requested and nobody having answered is
+   * waiting on a person, whatever else was said in the meantime. Reporting it
+   * as "commented" describes the noise and hides the fact — "when what I am
+   * actually waiting for is a human review??".
+   */
+  const pending = o.pending ?? [];
+  if (pending.length) {
+    return {
+      kind: "awaiting",
+      who: pending,
+      mine: pending.some((l) => l.toLowerCase() === (o.viewer || "").toLowerCase()),
+    };
+  }
+  return spoke.size ? { kind: "commented", who: [...spoke], mine: false } : null;
+}
+
+/**
+ * The tracker card a pull request came from, from cache alone.
+ *
+ * The id is read off the branch — `ORBIT-1042-some-title` — which is a
+ * convention rather than a link, and then looked up in the saved boards this
+ * app already keeps. `boardHolding` matches `customId` as well as the internal
+ * id, so the convention-shaped name is enough.
+ *
+ * Never a network call. A pull request list is four hundred rows and a lookup
+ * per row is four hundred requests against a hundred-per-minute budget; the
+ * cache answered for eleven of fourteen on a real board, and the three it did
+ * not are drawn without a card rather than made to wait for one.
+ */
+/*
+ * NOTE: `SEARCH_CHECKS` has to ask for `headRefName` and `title`, and for a
+ * while it did not — so this read `undefined` on every row, found no card
+ * anywhere, and the card's line never appeared on a single pull request however
+ * many times it was asked for. Nothing failed; it just silently returned
+ * nothing. That is the shape of bug this repository keeps paying for, and the
+ * reason to check the SCREEN and not the bundle after an install.
+ */
+function cardFor(branch: unknown, title: unknown): PrSummary["card"] | undefined {
+  const text = `${typeof branch === "string" ? branch : ""} ${typeof title === "string" ? title : ""}`;
+  const ref = /\b([A-Za-z][A-Za-z0-9]{1,9}-\d{1,7})\b/.exec(text)?.[1];
+  if (!ref) return undefined;
+  let held: ReturnType<typeof boardHolding> = null;
+  /* A DAY, and the age travels with it. Hiding a reading from this morning
+     helps nobody; presenting it as current is what misleads. Older than a day
+     is dropped: at that point "we have not looked" is the whole truth. */
+  try { held = boardHolding(ref, { freshMs: 24 * 60 * 60_000 }); } catch { return undefined; }
+  if (!held) return undefined;
+  const t = held.task;
+  return {
+    id: t.id, customId: t.customId, title: t.title, url: t.url,
+    status: t.status, statusColor: t.statusColor, statusKind: t.statusKind,
+    priority: t.priority,
+    /* The people, with their pictures and their colours — the same shape the
+       tasks view draws. `assignees` is a list of names and a name is not a
+       portrait. */
+    people: Array.isArray(t.people) ? t.people.slice(0, 3) : undefined,
+    at: held.at || undefined,
+  };
+}
+
+const SEL_TALK = `
+      comments(last:10){nodes{createdAt viewerDidAuthor author{login}}}
+      reviews(last:60){nodes{
+        submittedAt state viewerDidAuthor author{login} url
+        comments(first:0){totalCount}
+      }}
+      reviewThreads(first:100){totalCount nodes{isResolved}}`;
+
+/**
+ * How many line threads are still open — the number a card most needed and
+ * did not have ("how many threads are unresolved"). Read off the same node as the
+ * verdict, in the same request: `reviewThreads` bounded to a hundred with one
+ * boolean each is a few hundred bytes per pull request, not the walk per
+ * pull request that fetching the threads themselves would be. Past a hundred
+ * the count is "at least", and the card says so with a plus.
+ */
+export function unresolvedThreads(node: { reviewThreads?: { totalCount?: number; nodes?: { isResolved?: boolean }[] } } | null | undefined): { open: number; more: boolean } | undefined {
+  const t = node?.reviewThreads;
+  if (!t || !Array.isArray(t.nodes)) return undefined;
+  const open = t.nodes.filter((n) => n && n.isResolved === false).length;
+  return { open, more: (t.totalCount ?? t.nodes.length) > t.nodes.length };
+}
+
 const SEARCH_CHECKS = `query($q:String!,$first:Int!,$after:String){
   search(query:$q, type:ISSUE, first:$first, after:$after){
     nodes{ ... on PullRequest {
       number additions deletions changedFiles reviewDecision mergeable
+      headRefName title
+      author{login}
       reviewRequests(first:5){nodes{requestedReviewer{
         ... on User{login}
         ... on Team{name}
       }}}
-      commits(last:1){nodes{commit{oid statusCheckRollup{
+      commits(last:1){nodes{commit{oid committedDate statusCheckRollup{
         state
         contexts(first:0){checkRunCountsByState{state count} statusContextCountsByState{state count}}
       }}}}
+      ${SEL_TALK}
     } }
   }
 }`;
@@ -1075,6 +1377,66 @@ function tokenize(input: string): string[] {
  * something it never had: a second page. `contexts(first: 0)` keeps the
  * rollup to its cheap aggregate counts (see fetchCheckRollups).
  */
+/**
+ * How many remarks a row carries.
+ *
+ * The query asks for ten comments and ten reviews; a row keeps the last twelve
+ * of the two merged. The number is not a display limit — a badge saying "12+"
+ * is as useful as one saying "12" — it is what stops one very busy pull request
+ * from making the list payload about itself.
+ */
+export const TALK_MAX = 12;
+
+/**
+ * The last few human remarks on a pull request, oldest first.
+ *
+ * Three rules, and each one is a thing that would otherwise light the badge for
+ * nothing:
+ *
+ *   bots        never here at all. See isBotLogin.
+ *   yours       here, flagged. It is not news, but it IS the fallback mark —
+ *               see PrTalk.mine.
+ *   unsubmitted a review you are still writing has no `submittedAt`. It is on
+ *               the author's screen, not in the conversation.
+ */
+export function mapTalk(n: any): PrTalk[] {
+  const out: PrTalk[] = [];
+  for (const c of n?.comments?.nodes ?? []) {
+    const who = c?.author?.login || "";
+    if (!c?.createdAt || isBotLogin(who)) continue;
+    out.push({ at: c.createdAt, who, kind: "comment", ...(c.viewerDidAuthor === true ? { mine: true } : null) });
+  }
+  for (const r of n?.reviews?.nodes ?? []) {
+    const who = r?.author?.login || "";
+    if (!r?.submittedAt || isBotLogin(who)) continue;
+    const lines = Number(r?.comments?.totalCount ?? 0) || 0;
+    /*
+     * Whether the review itself speaks, without fetching the body.
+     *
+     * The honest test is "has a body, or has a verdict other than COMMENTED" —
+     * `reviewSpeaks`, which the conversation panel applies to a detail that
+     * carries the text. Asking for ten review bodies on each of fifty rows is
+     * the one thing that would make this expensive, so the body is inferred:
+     * a COMMENTED review with line comments on it is the batch those comments
+     * arrived in, and has nothing of its own to read.
+     *
+     * Where that is wrong — a "Comment" review written with both a summary and
+     * line notes — the count is one short of the conversation's, which is the
+     * side to be wrong on: the panel is the authority and it is one click away.
+     */
+    const says = r.state !== "COMMENTED" || lines === 0;
+    out.push({
+      at: r.submittedAt, who, kind: "review",
+      state: r.state === "APPROVED" || r.state === "CHANGES_REQUESTED" || r.state === "DISMISSED" ? r.state : "COMMENTED",
+      ...(lines ? { lines } : null),
+      ...(says ? { says: true } : null),
+      ...(r.viewerDidAuthor === true ? { mine: true } : null),
+    });
+  }
+  out.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  return out.slice(-TALK_MAX);
+}
+
 type ListPage = { rows: PrSummary[]; total: number; hasNext: boolean; cursor: string | null };
 async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after?: string, onRows?: (p: ListPage) => void, query?: string): Promise<ListPage | null> {
   const vars = { q: searchExpr(repo, filter, state, query), first: LIST_PAGE, ...(after ? { after } : {}) };
@@ -1084,6 +1446,9 @@ async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after
   // as soon as there is a list to show.
   const rowsP = ghGraphql<any>(SEARCH_ROWS, vars);
   const checksP = ghGraphql<any>(SEARCH_CHECKS, vars);
+  /* Who is reading, for "You approved" / "Waiting on you". Cached by
+     `ghCapability` — this is a lookup, not a round trip per list. */
+  const me = (await ghCapability().catch(() => null))?.login || "";
   const rowsRes = await rowsP;
   const search = rowsRes?.data?.search;
   // null (gh failed / unparsable) and an empty page are different facts: keep
@@ -1105,7 +1470,7 @@ async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after
   // row is complete the moment this lands. A PR missing from the answer keeps
   // the first-pass row: `checksLoaded` stays false, the review chip stays off,
   // and the stats stay at zero — all of which read as "not yet", which is true.
-  type SecondPass = { rollup: PrCheckRollup; stats: Pick<PrSummary, "additions" | "deletions" | "changedFiles" | "reviewDecision" | "reviewers" | "headSha" | "mergeable"> };
+  type SecondPass = { rollup: PrCheckRollup; stats: Pick<PrSummary, "additions" | "deletions" | "changedFiles" |  "reviewDecision" | "humanReview" | "card" | "reviewers" | "headSha" | "mergeable" | "talk" | "openThreads"> };
   const second = new Map<number, SecondPass>();
   for (const n of checksRes?.data?.search?.nodes ?? []) {
     if (!n?.number) continue;
@@ -1119,6 +1484,22 @@ async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after
         deletions: n.deletions ?? 0,
         changedFiles: n.changedFiles ?? 0,
         reviewDecision: n.reviewDecision ?? null,
+        /* The bot excluded — see `humanReview` on PrSummary. `reviewDecision`
+           beside it is GitHub's own answer and stays untouched: some callers
+           want "can this merge", which is what it means. */
+        humanReview: humanVerdict(n.reviews?.nodes, {
+          author: n.author?.login,
+          /* Still-outstanding requests: GitHub drops a reviewer from this list
+             the moment they answer, so a non-empty one IS "somebody has not
+             looked yet". */
+          pending: mapReviewers(n.reviewRequests?.nodes).map((r) => r.login),
+          headAt: head?.committedDate,
+          viewer: me,
+        }),
+        /* The card, from the boards already on disk — no request. See `card`
+           on PrSummary for why the ones we have not cached draw nothing. */
+        card: cardFor(n.headRefName, n.title),
+        openThreads: unresolvedThreads(n),
         reviewers: mapReviewers(n.reviewRequests?.nodes),
         /* The commit the rollup above belongs to, read off the same node rather
            than asked for separately — which is the whole reason it can be
@@ -1139,9 +1520,35 @@ async function fetchList(repo: PrRepoId, filter: PrFilter, state: PrState, after
          * conflict flashing on and off.
          */
         mergeable: n.mergeable === "CONFLICTING" || n.mergeable === "MERGEABLE" ? n.mergeable : "UNKNOWN",
+        /* Who has spoken on it, so a card can say how much of that you have not
+           read — and so the poll can say when somebody just did. See mapTalk. */
+        talk: mapTalk(n),
       },
     });
   }
+  /*
+   * A FIELD GITHUB DID NOT SEND IS NOT AN ANSWER ABOUT IT.
+   *
+   * GraphQL answers HTTP 200 with `{data, errors}` when only PART of the query
+   * failed — a timed-out connection, a field over the rate limit — and the
+   * nodes come back with that field `null` and everything else filled in.
+   * `ghGraphql` passes the body straight through and nothing reads `errors`,
+   * so a node whose `reviews` failed reached `humanVerdict` as "no reviews"
+   * and the row went out as `checksLoaded: true` with no verdict. The board
+   * cannot tell that from a real answer, `keepLoadedChecks` only rescues rows
+   * that admit the second pass has not run, and every header on screen reset
+   * to "No review asked for yet" — reported as the headers resetting after a
+   * while, which is exactly when a busy list starts hitting partial failures.
+   *
+   * So the field is dropped rather than answered. Absent means "this pass did
+   * not learn it", the client keeps what it had, and the one thing that never
+   * happens is a verdict replaced by a blank.
+   */
+  for (const [num, hit] of second) {
+    const n = (checksRes?.data?.search?.nodes ?? []).find((x: { number?: number }) => x?.number === num);
+    if (!Array.isArray(n?.reviews?.nodes)) delete (hit.stats as Partial<typeof hit.stats>).humanReview;
+  }
+
   const rows: PrSummary[] = bare.map((r) => {
     const hit = second.get(r.number);
     /*
@@ -1250,8 +1657,31 @@ export function rollupFromCounts(checkRun: StateCount[] | undefined, statusCtx: 
  * (title, state, labels, assignees, `updatedAt`) IS fresher in the new row and
  * is taken from it.
  */
-function carryOver(old: PrSummary | undefined, next: PrSummary): PrSummary {
-  if (!old || next.checksLoaded) return next;
+export function carryOver(old: PrSummary | undefined, next: PrSummary): PrSummary {
+  if (!old) return next;
+  /*
+   * A FIELD THIS ANSWER DOES NOT CARRY IS NOT AN ANSWER ABOUT IT.
+   *
+   * Everything below handles the FIRST-pass row, and this guard used to send a
+   * completed second pass straight through on the reading that a finished pass
+   * knows everything. GitHub disagrees: it answers HTTP 200 with
+   * `{data, errors}` when part of a query fails, so a row comes back whole
+   * except for the field that timed out. `checksLoaded` is true, `humanReview`
+   * is gone, and this wrote that row into `listCache` — which `saveDiskCache`
+   * then persists. That is why the board's review headers reset to "No review
+   * asked for yet" after a while AND stayed reset on coming back to the view:
+   * the blank had been cached, on disk, across restarts.
+   *
+   * An absent field falls back to what was known; a field that is present
+   * wins, including `null`, which is GitHub saying nobody has reviewed it.
+   */
+  const carried = { ...next } as Record<string, unknown>;
+  const before = old as unknown as Record<string, unknown>;
+  for (const k of ["humanReview", "card", "headSha", "openThreads"] as const) {
+    if (carried[k] === undefined && before[k] !== undefined) carried[k] = before[k];
+  }
+  if (next.checksLoaded) return carried as unknown as PrSummary;
+  next = carried as unknown as PrSummary;
   return {
     ...next,
     checks: next.checksLoaded ? next.checks : old.checks,
@@ -1264,6 +1694,11 @@ function carryOver(old: PrSummary | undefined, next: PrSummary): PrSummary {
     /* Measured the same way: the early rows come back with nobody on them, and
        the card's reviewer chip blinked out and back on every refresh. */
     reviewers: next.reviewers?.length ? next.reviewers : old.reviewers,
+    /* `??`, not `||`: an empty array is the real answer for a pull request
+       nobody has said anything on, and taking the old one instead would keep a
+       badge alive on a conversation that has just been emptied by a delete. Only
+       "never asked" — undefined — falls back. */
+    talk: next.talk ?? old.talk,
   };
 }
 
@@ -1365,6 +1800,10 @@ function refreshList(repo: PrRepoId, filter: PrFilter, state: PrState, after?: s
       // Rows and their check rollups, in one request.
       // Put the rows on screen the moment they arrive; the checks land a beat
       // later and only fill in the dots.
+      /* The last full answer, taken before anything overwrites it: the early
+         callback below publishes into `listCache` itself, so by the time the
+         final write runs, what is in there is the half-loaded pass. */
+      const prior = new Map((listCache.get(key)?.prs ?? []).map((p) => [p.number, p]));
       const page = await fetchList(repo, filter, state, after, (early) => {
         /*
          * The early rows, with the last full answer laid underneath them.
@@ -1402,16 +1841,30 @@ function refreshList(repo: PrRepoId, filter: PrFilter, state: PrState, after?: s
       // on and nothing to carry over. Feed the per-PR cache anyway: the detail
       // view and the notification latch both read it.
       for (const r of page.rows) checkCache.set(`${repo.key}\u0000${r.number}`, { updatedAt: r.updatedAt, rollup: r.checks });
+      /* Through `carryOver` too. The comment above used to say there was
+         nothing to carry because the rollups came back with the rows — true of
+         the CHECKS, and not of a field GitHub failed to send at all. This is
+         the write `saveDiskCache` persists, so a blank that gets here outlives
+         the session that caused it. */
       listCache.set(key, {
-        at: Date.now(), prs: page.rows, loading: false, checksPending: false,
+        at: Date.now(), prs: page.rows.map((r) => carryOver(prior.get(r.number), r)),
+        loading: false, checksPending: false,
         total: page.total, hasNext: page.hasNext, cursor: page.cursor,
       });
       saveDiskCache();
       // Only open PRs raise CI notifications — a merged or closed PR's checks
       // are history, not something to alert on.
-      if (state === "open" && ciNotifiesFor(filter)) for (const r of page.rows) noteCi(repo, r);
+      if (state === "open" && ciNotifiesFor(filter)) {
+        for (const r of page.rows) noteCi(repo, r);
+        /* And the other half of "what happened while I was away". Same gate, and
+           for the same reason: a stake is what makes a remark worth interrupting
+           for, and `all` is fetched passively to fill the tab counts — every open
+           pull request in the repository, most of which are nothing to do with
+           you. See ciNotifiesFor. */
+        for (const r of page.rows) noteTalk(repo, r);
+      }
     } catch (e) {
-      listCache.set(key, keep({ loading: false, checksPending: false, error: String(e) }));
+      listCache.set(key, keep({ loading: false, checksPending: false, error: failed("prs/list", e, "the pull requests could not be read") }));
     } finally {
       inflight.delete(key);
     }
@@ -1514,6 +1967,18 @@ export type PrFacetOptions = {
   labels: { name: string; color: string }[];
   milestones: string[];
   bases: string[];
+  /**
+   * Every status the tracker boards on this machine know, with its colour.
+   *
+   * NOT derived from the pull requests on screen, which was the bug reported:
+   * a board showing two statuses offered two, out of a workflow with eleven —
+   * and "show me the ones I am not looking at" is exactly the question that
+   * needs the other nine.
+   *
+   * Empty for anybody with no tracker, which is what keeps the field out of
+   * their filter bar altogether.
+   */
+  cardStatuses?: { status: string; color?: string; type?: string }[];
 };
 const facetCache = new Map<string, { at: number; data: PrFacetOptions }>();
 const FACET_TTL_MS = 5 * 60_000;
@@ -1540,6 +2005,9 @@ export async function facetOptions(rootIn: unknown): Promise<{ ok: boolean; data
     labels: (labels ?? []).map((l: any) => ({ name: String(l?.name ?? ""), color: String(l?.color ?? "") })).filter((l) => l.name),
     milestones: (milestones ?? []).map((m: any) => String(m?.title ?? "")).filter(Boolean),
     bases: (branches ?? []).map((b: any) => String(b?.name ?? "")).filter(Boolean),
+    /* Free: the boards were cached with their own statuses beside their tasks,
+       so this is a read of a file this app keeps anyway. Nobody is asked. */
+    cardStatuses: knownStatuses().map((x) => ({ status: x.status, color: x.color, type: x.type })),
   };
   facetCache.set(repo.key, { at: Date.now(), data });
   return { ok: true, data };
@@ -1636,7 +2104,17 @@ export async function listPrs(rootIn: unknown, filterIn: unknown, stateIn: unkno
 // bot noise
 // ---------------------------------------------------------------------------
 
-const BOT_RE = /\[bot\]$|^(github-actions|dependabot|codecov|sonarcloud|claude)$/i;
+/*
+ * `github-advanced-security` is here because it was MEASURED, not guessed.
+ *
+ * GitHub's own code scanning reviews a pull request as a plain login with no
+ * `[bot]` suffix — checked against this repository, where three of the five most
+ * recently discussed pull requests have exactly one "review" on them and it is
+ * that. Every one of them would have counted as a person: an unread badge on the
+ * board, a notification, and a name in the Humans filter, for an alert that is
+ * already a check.
+ */
+const BOT_RE = /\[bot\]$|^(github-actions|dependabot|codecov|sonarcloud|claude|github-advanced-security)$/i;
 export const isBotLogin = (login: string): boolean => BOT_RE.test(login || "");
 
 /**
@@ -1938,7 +2416,7 @@ export const DETAIL_QUERY = `query($owner:String!,$name:String!,$number:Int!){
     files(first:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_FILES}}
     reviewThreads(first:80){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_THREADS}}
     timelineItems(last:80, itemTypes:${TIMELINE_TYPES}){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_TIMELINE}}
-    statusCheckRollup:commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_CHECKS}}}}}}
+    statusCheckRollup:commits(last:1){nodes{commit{committedDate statusCheckRollup{contexts(first:100){pageInfo{hasNextPage endCursor hasPreviousPage startCursor} ${SEL_CHECKS}}}}}}
   } } }`;
 
 /** The reaction tallies, "edited", standing and ownership that ride on
@@ -2106,6 +2584,138 @@ export function mergePolicyOf(r: any): PrMergePolicy {
   };
 }
 
+/**
+ * The rules on the base branch, asked for in a query of their own.
+ *
+ * Separate from DETAIL_QUERY on purpose. These fields are the newest in the
+ * schema (`isRequired`, `rules`) and the ones an older GitHub Enterprise does
+ * not have; one unknown field fails a whole GraphQL document, and the pull
+ * request is worth more than the explanation of why it will not merge. So this
+ * runs beside the detail, and when it fails the gate is simply absent — the
+ * panel then says what it said before, rather than nothing.
+ */
+export const GATE_QUERY = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    viewerPermission
+    pullRequest(number:$number){
+      viewerCanMergeAsAdmin isMergeQueueEnabled isInMergeQueue
+      baseRef{
+        branchProtectionRule{
+          lockBranch requiresApprovingReviews requiredApprovingReviewCount dismissesStaleReviews
+          requireLastPushApproval requiresCodeOwnerReviews requiresStrictStatusChecks requiredStatusCheckContexts
+          requiresConversationResolution requiresCommitSignatures requiresDeployments requiredDeploymentEnvironments
+        }
+        refUpdateRule{
+          requiredApprovingReviewCount requiresCodeOwnerReviews requiresConversationResolution
+          requiresSignatures viewerCanPush requiredStatusCheckContexts
+        }
+        rules(first:50){nodes{
+          type
+          repositoryRuleset{name enforcement}
+          parameters{
+            ... on PullRequestParameters{requiredApprovingReviewCount dismissStaleReviewsOnPush requireCodeOwnerReview requireLastPushApproval requiredReviewThreadResolution}
+            ... on RequiredStatusChecksParameters{strictRequiredStatusChecksPolicy requiredStatusChecks{context}}
+            ... on RequiredDeploymentsParameters{requiredDeploymentEnvironments}
+          }
+        }}
+      }
+      commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
+        ... on CheckRun{name isRequired(pullRequestNumber:$number) checkSuite{workflowRun{workflow{name}}}}
+        ... on StatusContext{context isRequired(pullRequestNumber:$number)}
+      }}}}}}
+    }
+  }
+}`;
+
+/**
+ * What the base branch demands, out of GATE_QUERY's answer.
+ *
+ * Classic protection and rulesets are merged into one answer, because GitHub
+ * enforces both and a pull request has to satisfy the stricter of the two.
+ * What differs is visibility: `branchProtectionRule` comes back null for
+ * anybody who is not an admin — including on a branch that has one — so its
+ * fields become `null` ("not said") rather than `false`. Measured on a
+ * repository whose base was locked for a deploy: to a writer the rule was
+ * null, `rules` was empty and `refUpdateRule.viewerCanPush` was true, while
+ * GitHub's own page said "Cannot change this locked branch". Nothing a writer
+ * can ask the API for names that lock, which is why `locked` can be `null`.
+ *
+ * Rulesets only count when `enforcement` is ACTIVE; EVALUATE is GitHub's dry
+ * run and blocks nothing.
+ */
+export function mergeGateOf(repo: any): PrMergeGate | null {
+  const pr = repo?.pullRequest;
+  if (!pr) return null;
+  const base = pr.baseRef || {};
+  const bpr = base.branchProtectionRule || null;
+  /* To an admin a null rule is an answer — there is no classic protection —
+     where to anybody else it is a refusal to say. Measured on a repository
+     protected only by a ruleset: the admin's rule came back null too. */
+  const visible = !!bpr || repo.viewerPermission === "ADMIN";
+  const ru = base.refUpdateRule || null;
+  const rules: any[] = (base.rules?.nodes || [])
+    .filter((r: any) => r && (r.repositoryRuleset?.enforcement ?? "ACTIVE") === "ACTIVE");
+  const ofType = (t: string) => rules.filter((r) => r.type === t);
+  const prRules = ofType("PULL_REQUEST").map((r) => r.parameters || {});
+
+  const lockRule = [...ofType("LOCK_BRANCH"), ...ofType("UPDATE")][0];
+  const locked = bpr?.lockBranch === true || !!lockRule ? true
+    : visible ? false
+    : null;
+
+  const approvals = Math.max(0,
+    bpr?.requiresApprovingReviews ? Number(bpr.requiredApprovingReviewCount ?? 0) : 0,
+    Number(ru?.requiredApprovingReviewCount ?? 0),
+    ...prRules.map((p) => Number(p.requiredApprovingReviewCount ?? 0)));
+
+  const anyTrue = (...xs: unknown[]) => xs.some((x) => x === true);
+  const stale = anyTrue(bpr?.dismissesStaleReviews, ...prRules.map((p) => p.dismissStaleReviewsOnPush));
+  const strict = anyTrue(bpr?.requiresStrictStatusChecks,
+    ...ofType("REQUIRED_STATUS_CHECKS").map((r) => r.parameters?.strictRequiredStatusChecksPolicy));
+
+  return {
+    permission: repo.viewerPermission || undefined,
+    canBypass: pr.viewerCanMergeAsAdmin === true,
+    protectionVisible: visible,
+    locked,
+    lockedBy: bpr?.lockBranch ? "branch protection" : lockRule?.repositoryRuleset?.name || undefined,
+    viewerCanPush: typeof ru?.viewerCanPush === "boolean" ? ru.viewerCanPush : undefined,
+    approvals,
+    codeOwners: anyTrue(bpr?.requiresCodeOwnerReviews, ru?.requiresCodeOwnerReviews, ...prRules.map((p) => p.requireCodeOwnerReview)),
+    lastPushApproval: anyTrue(bpr?.requireLastPushApproval, ...prRules.map((p) => p.requireLastPushApproval)),
+    // A ruleset that says so is an answer whoever you are; silence from the
+    // rulesets is only an answer when the classic rule was readable too.
+    dismissStale: stale ? true : visible ? false : null,
+    conversationResolution: anyTrue(bpr?.requiresConversationResolution, ru?.requiresConversationResolution,
+      ...prRules.map((p) => p.requiredReviewThreadResolution), ofType("REQUIRED_REVIEW_THREAD_RESOLUTION").length > 0),
+    upToDate: strict ? true : visible ? false : null,
+    signatures: anyTrue(bpr?.requiresCommitSignatures, ru?.requiresSignatures, ofType("REQUIRED_SIGNATURES").length > 0),
+    deployments: [...new Set([
+      ...(bpr?.requiresDeployments ? bpr.requiredDeploymentEnvironments || [] : []),
+      ...ofType("REQUIRED_DEPLOYMENTS").flatMap((r) => r.parameters?.requiredDeploymentEnvironments || []),
+    ] as string[])],
+    requiredContexts: [...new Set([
+      ...(bpr?.requiredStatusCheckContexts || []),
+      ...(ru?.requiredStatusCheckContexts || []),
+      ...ofType("REQUIRED_STATUS_CHECKS").flatMap((r) => (r.parameters?.requiredStatusChecks || []).map((c: any) => c?.context)),
+    ].filter(Boolean) as string[])],
+    mergeQueue: pr.isMergeQueueEnabled === true || ofType("MERGE_QUEUE").length > 0,
+    inQueue: pr.isInMergeQueue === true,
+  };
+}
+
+/**
+ * The checks GitHub says it will not merge without, keyed the way
+ * latestPerName keys them — workflow and name — so that a required `build` in
+ * one workflow does not mark an optional `build` in another.
+ */
+export const checkKey = (workflow: string | undefined, name: string) => `${workflow || ""}\u0001${name}`;
+export function requiredCheckKeys(repo: any): Set<string> {
+  const nodes = repo?.pullRequest?.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes || [];
+  return new Set((nodes as any[]).filter((n) => n?.isRequired === true)
+    .map((n) => checkKey(n.checkSuite?.workflowRun?.workflow?.name, String(n.name || n.context || ""))));
+}
+
 function mergeStateOf(s: string | undefined, isDraft: boolean): PrMergeState {
   if (isDraft) return "DRAFT";
   const v = (s || "").toUpperCase();
@@ -2193,12 +2803,11 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
   if (!cap.available || !cap.authed) return { ok: false, error: cap.reason };
 
   const viewerLogin = cap.login || "";
-  const data = await ghJson<any>([
-    "api", "graphql",
-    "-f", `query=${DETAIL_QUERY}`,
-    "-F", `owner=${repo.owner}`,
-    "-F", `name=${repo.name}`,
-    "-F", `number=${number}`,
+  const vars = ["-F", `owner=${repo.owner}`, "-F", `name=${repo.name}`, "-F", `number=${number}`];
+  // In parallel: the gate costs a round trip, not a second wait. See GATE_QUERY.
+  const [data, gateData] = await Promise.all([
+    ghJson<any>(["api", "graphql", "-f", `query=${DETAIL_QUERY}`, ...vars]),
+    ghJson<any>(["api", "graphql", "-f", `query=${GATE_QUERY}`, ...vars]),
   ]);
   const p = data?.data?.repository?.pullRequest;
   if (!p) return { ok: false, error: "pull request not found, or gh could not reach the host" };
@@ -2213,6 +2822,14 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     workflowName: c.checkSuite?.workflowRun?.workflow?.name || "",
   }));
   const { rollup, all } = rollupChecks(normalised);
+  const gate = mergeGateOf(gateData?.data?.repository) ?? undefined;
+  if (gate) {
+    // Marked only when GitHub was asked. An unmarked check on a detail without
+    // a gate means "unknown", and the panel reads it that way.
+    const required = requiredCheckKeys(gateData?.data?.repository);
+    // `rollup.failing` holds these same objects, so it is marked too.
+    for (const c of all) c.required = required.has(checkKey(c.workflow, c.name));
+  }
 
   const reviews: PrReview[] = (p.reviews?.nodes || []).map((r: any) => ({
     author: r.author?.login || "",
@@ -2332,6 +2949,31 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     url: p.url || "",
     updatedAt: p.updatedAt || "",
     reviewDecision: p.reviewDecision || null,
+    /*
+     * THE SAME VERDICT THE BOARD SHOWS, computed here too.
+     *
+     * The detail did not carry humanReview at all, so the Overview fell back to
+     * building its own answer from the reviewer roster — and the two screens
+     * disagreed on one screen: the card said "Waiting on bjorn" while
+     * this page said "Reviewed, no verdict by the author", about one pull request.
+     *
+     * One source, computed where the author's login and the outstanding
+     * requests are both known. The reviews here are the full set rather than
+     * the list's last ten, so this page can only be more right than the board,
+     * never differently right.
+     */
+    humanReview: humanVerdict(p.reviews?.nodes, {
+      author: p.author?.login,
+      pending: mapReviewers(p.reviewRequests?.nodes).map((r) => r.login),
+      /* Off the commit the rollup already carries, rather than a second
+         `commits(...)` — every list in this query has to offer a cursor, and a
+         head commit is not a list anybody pages through. */
+      headAt: p.statusCheckRollup?.nodes?.[0]?.commit?.committedDate,
+      viewer: viewerLogin,
+    }),
+    /* And the tracker card, from the same cache the list reads, so opening a
+       pull request cannot lose the line the board was showing. */
+    card: cardFor(p.headRefName, p.title),
     additions: p.additions ?? 0,
     deletions: p.deletions ?? 0,
     changedFiles: p.changedFiles ?? 0,
@@ -2342,6 +2984,7 @@ export async function prDetail(rootIn: unknown, numberIn: unknown, force = false
     body: p.body || "",
     mergeable: p.mergeable || "UNKNOWN",
     mergeState: mergeStateOf(p.mergeStateStatus, !!p.isDraft),
+    gate,
     checklist: parseChecklist(p.body || ""),
     reviewers: mapReviewers(p.reviewRequests?.nodes),
     assignees: (p.assignees?.nodes || []).map((n: any) => n.login),
@@ -2596,6 +3239,8 @@ export async function prDiff(rootIn: unknown, numberIn: unknown, force = false):
 
 /** For a test, and for a Refresh that means it. */
 export function __clearDiffCache(): void { diffCache.clear(); diffInflight.clear(); }
+/** For a test: a pull request as if it had just been read. */
+export function __seedDetail(key: string, detail: PrDetail): void { detailCache.set(key, { at: Date.now(), detail }); }
 
 // ---------------------------------------------------------------------------
 // asset proxy
@@ -2631,15 +3276,15 @@ export function assetAllowed(raw: string): URL | null {
  *
  * A separate, narrower question than `assetAllowed`: that one decides what we
  * will fetch, this one decides what we will hand a credential to. It has to be
- * an exact domain match — `hostname.endsWith("github.com")`, which is what
- * stood here, is also true of `evilgithub.com`. Nothing reachable today gets
- * through `assetAllowed` to ask, but a substring test on a hostname is one
- * allowlist edit away from posting `gh auth token` to somebody else's server,
- * and the edit would look harmless.
+ * an exact host match. A suffix test — `endsWith("github.com")` was here first,
+ * `endsWith(".github.com")` after it — admits every subdomain, and a subdomain
+ * is a name somebody else may be able to register or point elsewhere (a
+ * dangling `*.github.com` record is a known kind of takeover). Only `github.com`
+ * itself serves an attachment that needs the credential, so it is the only
+ * host that gets it; a new host is a line added here, on purpose.
  */
 export function tokenAllowedHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/\.$/, "");
-  return h === "github.com" || h.endsWith(".github.com");
+  return hostname.toLowerCase().replace(/\.$/, "") === "github.com";
 }
 
 let tokenCache: { at: number; token: string } | null = null;
@@ -2686,6 +3331,39 @@ async function ghToken(): Promise<string> {
 }
 
 /**
+ * Is this exact URL in a pull request this server has fetched?
+ *
+ * Asked of the detail cache: body, comments and reviews as GitHub returned
+ * them. Each string is read as text — markdown or HTML — and every https URL in
+ * it is taken whole, up to where a URL in text ends; the answer is set
+ * membership, never a substring, so neither `https://github.com/` nor a path
+ * spliced out of a longer URL counts. The ceiling is the cache: an image in a
+ * pull request that has aged out of it loads for the desk and not for a phone
+ * until the phone opens that pull request again.
+ */
+const detailUrls = new WeakMap<PrDetail, Set<string>>();
+const URL_IN_TEXT = /https:\/\/[^\s"'<>()[\]]+/g;
+
+function urlsIn(value: unknown, into: Set<string>): Set<string> {
+  if (typeof value === "string") for (const m of value.match(URL_IN_TEXT) ?? []) into.add(m);
+  else if (Array.isArray(value)) for (const v of value) urlsIn(v, into);
+  else if (value && typeof value === "object") for (const v of Object.values(value)) urlsIn(v, into);
+  return into;
+}
+
+export function assetReferenced(raw: string): boolean {
+  if (!raw) return false;
+  for (const { detail } of detailCache.values()) {
+    // Collected once per detail object: a page of screenshots asks this once
+    // per image, and a refresh replaces the object, which drops the entry.
+    let urls = detailUrls.get(detail);
+    if (!urls) detailUrls.set(detail, urls = urlsIn(detail, new Set()));
+    if (urls.has(raw)) return true;
+  }
+  return false;
+}
+
+/**
  * Fetch an image in a PR body on the user's behalf.
  *
  * `https://github.com/user-attachments/assets/<uuid>` — which is what GitHub
@@ -2694,28 +3372,58 @@ async function ghToken(): Promise<string> {
  * before/after screenshots that carry the actual evidence in a review, without
  * this every one of them is a broken box.
  */
-export async function prAsset(rawUrl: unknown): Promise<Response> {
-  const u = assetAllowed(String(rawUrl || ""));
+export async function prAsset(rawUrl: unknown, referencedOnly = false): Promise<Response> {
+  const raw = String(rawUrl || "");
+  const u = assetAllowed(raw);
   if (!u) return new Response("blocked", { status: 400 });
   const token = await ghToken();
   const headers: Record<string, string> = { accept: "image/*" };
   // Only GitHub gets the credential. ClickUp is public and has no business
   // receiving a GitHub token. Redirects stay safe on their own: fetch drops
   // Authorization when a redirect crosses to another origin.
-  if (token && tokenAllowedHost(u.hostname)) headers.authorization = `token ${token}`;
+  //
+  // `referencedOnly` is a caller short of `full`. With the token, any URL on
+  // github.com is an image out of any private repository the user can read,
+  // so such a caller gets it lent only for a URL a pull request it was shown
+  // actually carries. Anything else is still fetched, anonymously: a public
+  // image loads, a private one comes back 404.
+  const lend = !referencedOnly || assetReferenced(raw);
+  if (token && lend && tokenAllowedHost(u.hostname)) headers.authorization = `token ${token}`;
   let res: Response;
   try {
     res = await fetch(u.toString(), { headers, redirect: "follow", signal: AbortSignal.timeout(20_000) });
   } catch (e) {
-    return new Response(`upstream: ${String(e)}`, { status: 502 });
+    return new Response(failed("pr/asset", e, "upstream did not answer"), { status: 502 });
   }
   if (!res.ok) return new Response(`upstream ${res.status}`, { status: res.status === 404 ? 404 : 502 });
-  const type = res.headers.get("content-type") || "application/octet-stream";
-  // Refuse to relay anything that is not an image: this endpoint must not
-  // become a general-purpose fetcher for whatever a body links to.
-  if (!/^image\//i.test(type)) return new Response("not an image", { status: 415 });
+  return assetReply(res);
+}
+
+/** Types a PR-body image proxy will relay. Raster only: SVG is an image that
+ *  can carry script, and this response is served from the app's own origin. */
+const RASTER_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/bmp", "image/x-icon", "image/vnd.microsoft.icon"]);
+
+/**
+ * What the proxy hands back for an upstream image response.
+ *
+ * `image/*` was the test before, which passes `image/svg+xml`; opened as a
+ * document (a click on the image, a link to the proxy URL) an SVG runs its
+ * script on the server's origin, with the page's storage and its token. Only
+ * the raster types above pass, the type is rewritten to the bare type (no
+ * parameters), `nosniff` stops a browser reading a PNG as something else, and
+ * the CSP sandbox means that even a mis-typed body opened as a document has no
+ * script and no origin.
+ */
+export function assetReply(res: Response): Response {
+  const type = (res.headers.get("content-type") || "").split(";")[0]!.trim().toLowerCase();
+  if (!RASTER_TYPES.has(type)) return new Response("not a supported image", { status: 415 });
   return new Response(res.body, {
-    headers: { "content-type": type, "cache-control": "private, max-age=600" },
+    headers: {
+      "content-type": type,
+      "cache-control": "private, max-age=600",
+      "x-content-type-options": "nosniff",
+      "content-security-policy": "default-src 'none'; sandbox",
+    },
   });
 }
 
@@ -2728,7 +3436,7 @@ function writeGuard(rootIn: unknown): PrActionResult | null {
   const abs = safeAbs(rootIn);
   const root = abs ? repoRootOf(abs) : null;
   if (!root) return { ok: false, error: "not a git repository" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
   return null;
 }
 
@@ -2797,6 +3505,33 @@ export async function replyToThread(rootIn: unknown, number: unknown, commentId:
 }
 
 /**
+ * A GitHub node id, and nothing else.
+ *
+ * Every mutation below takes one — a thread, a comment, a review, a pull
+ * request — and passes it to `gh api graphql` as a field. The field flag was
+ * `-F`, which is gh's TYPED field: it turns "42" into an integer, "true" into a
+ * boolean, and reads `@/path` as "the contents of this local file". The id
+ * arrived from the request body as `String(b.nodeId)` with no check, so a
+ * local page could post `nodeId: "@/home/someone/.config/agentglass/token"`
+ * and have this server read the file and send its contents to GitHub as the
+ * subject of a mutation — an error reply, but an error reply with the token
+ * in it, in gh's stderr and in GitHub's logs.
+ *
+ * Two fixes, both applied: the ids go through `-f` (raw string, no `@` and no
+ * coercion), AND the id is checked against the alphabet GitHub's ids are made
+ * of — base64 and the `PREFIX_` form — refusing a leading `@` or `-` by
+ * construction. Either alone would do; both, because the next mutation added
+ * here will copy one of the two lines and it should not matter which.
+ *
+ * Exported so the route in index.ts can refuse before dispatching, and answer
+ * 400 with a reason instead of gh's usage text.
+ */
+const NODE_ID = /^[A-Za-z0-9_=+/:-]{4,200}$/;
+export function nodeIdOk(id: unknown): id is string {
+  return typeof id === "string" && NODE_ID.test(id) && !id.startsWith("@") && !id.startsWith("-");
+}
+
+/**
  * Resolve or unresolve a review thread.
  *
  * There is no `gh pr` subcommand for this — it is a GraphQL mutation and
@@ -2806,12 +3541,12 @@ export async function replyToThread(rootIn: unknown, number: unknown, commentId:
 export async function setThreadResolved(rootIn: unknown, threadId: unknown, resolved: unknown): Promise<PrActionResult> {
   const g = writeGuard(rootIn); if (g) return g;
   const id = String(threadId || "");
-  if (!id) return { ok: false, error: "invalid thread id" };
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid thread id" };
   const want = resolved !== false && resolved !== "false";
   const mutation = want
     ? `mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}`
     : `mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}`;
-  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-F", `id=${id}`]);
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`]);
   const repo = await repoIdFor(rootIn);
   if (repo) invalidate(repo);
   if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not change the thread" };
@@ -2836,13 +3571,13 @@ export async function react(rootIn: unknown, nodeId: unknown, content: unknown, 
   const g = writeGuard(rootIn); if (g) return g;
   const id = String(nodeId || "");
   const c = String(content || "THUMBS_UP").toUpperCase();
-  if (!id) return { ok: false, error: "invalid comment" };
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid comment" };
   if (!REACTIONS.includes(c)) return { ok: false, error: "invalid reaction" };
   const add = on !== false && on !== "false";
   const mutation = add
     ? `mutation($id:ID!,$c:ReactionContent!){addReaction(input:{subjectId:$id,content:$c}){clientMutationId}}`
     : `mutation($id:ID!,$c:ReactionContent!){removeReaction(input:{subjectId:$id,content:$c}){clientMutationId}}`;
-  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-F", `id=${id}`, "-F", `c=${c}`]);
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`, "-f", `c=${c}`]);
   // Drop the cached detail either way: a reaction that does not show up until
   // the 45s TTL expires reads as a button that did nothing.
   const repo = await repoIdFor(rootIn);
@@ -2856,13 +3591,16 @@ export async function editComment(rootIn: unknown, nodeId: unknown, body: unknow
   const g = writeGuard(rootIn); if (g) return g;
   const id = String(nodeId || "");
   const text = String(body ?? "");
-  if (!id) return { ok: false, error: "invalid comment" };
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid comment" };
   if (!text.trim()) return { ok: false, error: "a comment cannot be empty" };
   const review = kind === "review";
   const mutation = review
     ? `mutation($id:ID!,$b:String!){updatePullRequestReviewComment(input:{pullRequestReviewCommentId:$id,body:$b}){clientMutationId}}`
     : `mutation($id:ID!,$b:String!){updateIssueComment(input:{id:$id,body:$b}){clientMutationId}}`;
-  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-F", `id=${id}`, "-F", `b=${text}`]);
+  /* `-f` for the body too, and this one is a bug fix as well as a fence: under
+     `-F`, a comment edited to begin with a mention — "@sam thanks" — made gh
+     look for a file called "sam thanks" and fail the edit. */
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`, "-f", `b=${text}`]);
   const repo = await repoIdFor(rootIn);
   if (repo) invalidate(repo);
   if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not edit the comment" };
@@ -2873,15 +3611,64 @@ export async function editComment(rootIn: unknown, nodeId: unknown, body: unknow
 export async function deleteComment(rootIn: unknown, nodeId: unknown, kind: unknown = "issue"): Promise<PrActionResult> {
   const g = writeGuard(rootIn); if (g) return g;
   const id = String(nodeId || "");
-  if (!id) return { ok: false, error: "invalid comment" };
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid comment" };
   const review = kind === "review";
   const mutation = review
     ? `mutation($id:ID!){deletePullRequestReviewComment(input:{id:$id}){clientMutationId}}`
     : `mutation($id:ID!){deleteIssueComment(input:{id:$id}){clientMutationId}}`;
-  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-F", `id=${id}`]);
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`]);
   const repo = await repoIdFor(rootIn);
   if (repo) invalidate(repo);
   if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not delete the comment" };
+  return { ok: true };
+}
+
+/**
+ * Fold a comment away, the way github.com's "Hide" does.
+ *
+ * Not a delete, and the difference is the whole point: a minimised comment is still
+ * there, still linkable, still readable by anybody who presses to unfold it — and
+ * GitHub records WHY it was hidden, which is what makes the fold legible to the next
+ * reader rather than looking like censorship. So a reason is required, from GitHub's
+ * own list, and "outdated" is the one this panel offers by default because it is the
+ * one a review thread actually accumulates.
+ *
+ * Works on anything with a node id — an issue comment, a review, a line comment —
+ * because the mutation takes a `subjectId` rather than a kind. Which is also why
+ * this one does not need the `kind` its neighbours above do.
+ */
+export type HideReason = "OUTDATED" | "OFF_TOPIC" | "RESOLVED" | "DUPLICATE" | "SPAM" | "ABUSE";
+
+const HIDE_REASONS: HideReason[] = ["OUTDATED", "OFF_TOPIC", "RESOLVED", "DUPLICATE", "SPAM", "ABUSE"];
+
+export async function hideComment(rootIn: unknown, nodeId: unknown, reason: unknown = "OUTDATED"): Promise<PrActionResult> {
+  const g = writeGuard(rootIn); if (g) return g;
+  const id = String(nodeId || "");
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid comment" };
+  const why = String(reason || "OUTDATED").toUpperCase() as HideReason;
+  // Checked against the list rather than passed through: an unknown classifier is
+  // rejected by GitHub with a schema error, and a schema error is not a sentence to
+  // put in front of somebody who pressed "Hide".
+  if (!HIDE_REASONS.includes(why)) return { ok: false, error: `"${reason}" is not a reason GitHub accepts` };
+  const mutation = `mutation($id:ID!,$why:ReportedContentClassifiers!){minimizeComment(input:{subjectId:$id,classifier:$why}){minimizedComment{isMinimized}}}`;
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`, "-f", `why=${why}`]);
+  const repo = await repoIdFor(rootIn);
+  if (repo) invalidate(repo);
+  if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not hide the comment" };
+  return { ok: true };
+}
+
+/** And put it back. The same subject id, and no reason to give: unhiding is not a
+ *  judgement about the content. */
+export async function unhideComment(rootIn: unknown, nodeId: unknown): Promise<PrActionResult> {
+  const g = writeGuard(rootIn); if (g) return g;
+  const id = String(nodeId || "");
+  if (!nodeIdOk(id)) return { ok: false, error: "invalid comment" };
+  const mutation = `mutation($id:ID!){unminimizeComment(input:{subjectId:$id}){unminimizedComment{isMinimized}}}`;
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`]);
+  const repo = await repoIdFor(rootIn);
+  if (repo) invalidate(repo);
+  if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not unhide the comment" };
   return { ok: true };
 }
 
@@ -3052,11 +3839,11 @@ export async function setFileViewed(rootIn: unknown, prNodeId: unknown, path: un
   const g = writeGuard(rootIn); if (g) return g;
   const id = String(prNodeId || "");
   const p = String(path || "");
-  if (!id || !p) return { ok: false, error: "invalid file" };
+  if (!nodeIdOk(id) || !p) return { ok: false, error: "invalid file" };
   const mutation = viewed !== false && viewed !== "false"
     ? `mutation($id:ID!,$p:String!){markFileAsViewed(input:{pullRequestId:$id,path:$p}){clientMutationId}}`
     : `mutation($id:ID!,$p:String!){unmarkFileAsViewed(input:{pullRequestId:$id,path:$p}){clientMutationId}}`;
-  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-F", `id=${id}`, "-F", `p=${p}`]);
+  const r = await gh(["api", "graphql", "-f", `query=${mutation}`, "-f", `id=${id}`, "-f", `p=${p}`]);
   if (r.code !== 0) return { ok: false, error: (r.stderr || r.stdout).trim().split("\n")[0] || "could not mark the file" };
   return { ok: true };
 }
@@ -3116,28 +3903,43 @@ export async function setDraft(rootIn: unknown, number: unknown, draft: unknown)
   return runPr(rootIn, Number(number), args);
 }
 
+/**
+ * The refusals from `gh pr update-branch` that deserve a better sentence than
+ * gh's, or null for the ones that do not.
+ *
+ * The merge runs on GitHub's side, so there is never a half-merged local tree
+ * to clean up — but when base and head conflict the API refuses, and gh's raw
+ * error ("failed to update branch: …") is a dead end. A conflict is the one
+ * refusal with somewhere to go: the panel can make the merge in a worktree of
+ * its own and open it. So it comes back marked with `conflict`, and the panel
+ * keys its resolve actions on the mark rather than on this wording — which is
+ * also why the wording names no button: API callers read it too.
+ *
+ * A locked or protected branch, or no write access: gh returns "not
+ * authorized"/"locked"/403, and the raw text is another dead end. The button is
+ * gated on BEHIND + viewerCanUpdate so this should rarely surface, but the two
+ * can race — the branch locks between the read and the click — and a bare
+ * "failed to update branch" is exactly the confusing error to avoid.
+ */
+export function updateBranchRefusal(raw: string): PrActionResult | null {
+  const conflicts = "can't update automatically — this branch conflicts with its base. merge the base into it locally, resolve the conflict, then push.";
+  // Only the word "conflict" earns the mark: the mark takes the update and
+  // merge buttons away, and "not mergeable" is not sure enough of the reason
+  // to do that — it keeps the better sentence and nothing else.
+  if (/conflict/i.test(raw)) return { ok: false, conflict: true, error: conflicts };
+  if (/mergeable/i.test(raw)) return { ok: false, error: conflicts };
+  if (/lock|protect|not authoriz|forbidden|permission|\b403\b/i.test(raw)) {
+    return { ok: false, error: "can't update this branch — it is locked or protected, or you do not have write access. update it on GitHub, or ask someone who can." };
+  }
+  return null;
+}
+
 /** Merge the base into the PR branch — the button whose absence is why half a
  *  branch list carries hand-made "Merge origin/master into …" commits. */
 export async function updateBranch(rootIn: unknown, number: unknown, syncLocal?: unknown): Promise<PrActionResult> {
   const r = await runPr(rootIn, Number(number), ["pr", "update-branch", String(Number(number))]);
-  // The merge runs on GitHub's side, so there is never a half-merged local tree
-  // to clean up — but when base and head conflict the API refuses, and gh's raw
-  // error ("failed to update branch: …") is a dead end. Turn it into an
-  // actionable one. (A future "resolve in terminal" flow can drop the user into
-  // the merge in a worktree; for now, tell them what to do.)
-  if (!r.ok && /conflict|mergeable/i.test(r.error || "")) {
-    return { ok: false, error: "can't update automatically — this branch conflicts with its base. pull the base branch and resolve the merge locally, then push." };
-  }
-  // A locked or protected branch, or no write access: gh returns "not
-  // authorized"/"locked"/403, and the raw text is another dead end. The button
-  // is gated on BEHIND + viewerCanUpdate so this should rarely surface, but the
-  // two can race — the branch locks between the read and the click — and a bare
-  // "failed to update branch" is exactly the confusing error we are trying to
-  // avoid here.
-  if (!r.ok && /lock|protect|not authoriz|forbidden|permission|\b403\b/i.test(r.error || "")) {
-    return { ok: false, error: "can't update this branch — it is locked or protected, or you do not have write access. update it on GitHub, or ask someone who can." };
-  }
-  if (!r.ok || !(syncLocal === true || syncLocal === "true")) return r;
+  if (!r.ok) return updateBranchRefusal(r.error || "") ?? r;
+  if (!(syncLocal === true || syncLocal === "true")) return r;
   const abs = safeAbs(rootIn);
   const root = abs ? repoRootOf(abs) : null;
   if (!root) return r;
@@ -3462,7 +4264,7 @@ export async function prepareReviewPrompt(rootIn: unknown, numberIn: unknown, re
   // No `writeGuard`: nothing here writes, so a read-only scope can still review
   // a pull request. The scope check is still owed, because the chat is about to
   // be pointed at this directory.
-  if (!inScope(root)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
   const repo = await repoIdFor(rootIn);
   if (!repo) return { ok: false, error: "no GitHub remote on this repository" };
 
@@ -3585,6 +4387,102 @@ export async function branchUrl(rootIn: unknown, branchIn: unknown, goneIn?: unk
  * pull request, which may be from a fork or simply not fetched here, and
  * "review this commit" should not depend on whether you happen to have it.
  */
+/**
+ * The repository's own answer to "who should look at this".
+ *
+ * CODEOWNERS is a file in the checkout, so it is read from disk rather than asked of
+ * GitHub — no request, no token, and it works on a branch that has changed it before
+ * anybody has merged that change.
+ *
+ * GitHub looks in three places, in this order, and the FIRST one that exists wins
+ * even if it is empty. That order is theirs, not a preference: a repository with a
+ * stale root CODEOWNERS and a live `.github/` one behaves differently depending on
+ * which you read, and the one it actually enforces is the one to show.
+ *
+ * The rules are handed over as written, unparsed beyond splitting the line. Matching
+ * belongs to the caller — see codeowners.ts on the web side — because the question
+ * "who owns these forty paths" is asked while a picker is open, against a list the
+ * client already has, and shipping the file is smaller than shipping the answer.
+ */
+export async function codeowners(rootIn: unknown): Promise<{
+  ok: boolean; path?: string; rules?: { pattern: string; owners: string[] }[]; error?: string;
+}> {
+  const asked = safeAbs(rootIn);
+  const root = asked ? repoRootOf(asked) : null;
+  if (!root) return { ok: false, error: "not a git checkout" };
+  const WHERE = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+  for (const rel of WHERE) {
+    const full = join(root, rel);
+    let text: string;
+    if (!staysIn(root, full)) continue;
+    try { text = readFileSync(full, "utf8"); } catch { continue; }
+    const rules: { pattern: string; owners: string[] }[] = [];
+    for (const raw of text.split("\n")) {
+      const line = raw.replace(/#.*$/, "").trim();
+      if (!line) continue;
+      const [pattern, ...owners] = line.split(/\s+/);
+      /* A pattern with nobody after it is legal and MEANS something: it takes the
+         path back off whoever owned it. Kept, with an empty owner list. */
+      if (pattern) rules.push({ pattern, owners });
+    }
+    return { ok: true, path: rel, rules };
+  }
+  return { ok: true, rules: [] };
+}
+
+/**
+ * Which files have moved since a given commit — "what changed since I reviewed".
+ *
+ * The question a second pass at a pull request opens with, and the panel had no
+ * answer to it: you come back to forty files, three of which moved since the review
+ * you left, and nothing on screen knows which three. So the whole thing gets read
+ * again, which is the cost this is about.
+ *
+ * ASKED OF THE LOCAL CLONE, not of GitHub, and that is measured rather than
+ * preferred. The obvious implementation is `GET /repos/{o}/{r}/compare/A...B`, and
+ * against the repository this is for it answers 404 on every call — a token with
+ * `repo` that GraphQL is perfectly happy with, because REST on an SSO organisation
+ * refuses by pretending the resource is not there. On a personal repository the same
+ * call alternated between 200 and 404 across five consecutive tries. Neither is a
+ * foundation for a mark somebody is meant to trust.
+ *
+ * Git has the answer, exactly, offline, in one process: `diff --name-only A..B`. Two
+ * dots rather than three because both ends are commits of one branch here; when the
+ * branch was force-pushed after the review, `A` may not be an ancestor any more and
+ * git still answers — with the symmetric truth about both tips, which is what a
+ * reviewer wants to see.
+ *
+ * `missing` rather than an error when a commit is not in this clone: the reviewed
+ * commit can be one that was force-pushed away and never fetched, and "fetch and I
+ * can tell you" is a different sentence from "something went wrong".
+ */
+export async function filesSince(rootIn: unknown, fromIn: unknown, toIn: unknown): Promise<{
+  ok: boolean; paths?: string[]; missing?: string; error?: string;
+}> {
+  const from = String(fromIn || "").trim();
+  const to = String(toIn || "").trim();
+  const hex = /^[0-9a-f]{7,40}$/i;
+  // Shape-checked before either reaches an argument list: both come from the client,
+  // which read them off a payload we sent — and a value that has been out of the
+  // process is a value from outside it.
+  if (!hex.test(from) || !hex.test(to)) return { ok: false, error: "invalid commit" };
+  if (from.toLowerCase() === to.toLowerCase()) return { ok: true, paths: [] };
+  /* The same resolution every other local read in this file uses: an absolute path
+     inside the configured scope, then its repository root. */
+  const asked = safeAbs(rootIn);
+  const root = asked ? repoRootOf(asked) : null;
+  if (!root) return { ok: false, error: "not a git checkout" };
+  for (const sha of [from, to]) {
+    const has = await gitAsync(root, ["cat-file", "-e", `${sha}^{commit}`]);
+    if (has.code !== 0) return { ok: true, missing: sha };
+  }
+  const r = await gitAsync(root, ["diff", "--name-only", "-z", `${from}..${to}`]);
+  if (r.code !== 0) return { ok: false, error: (r.stderr || "").trim().split("\n")[0] || "could not compare those commits" };
+  // `-z`, because a path with a newline in it is legal and a line-split parser turns
+  // one file into two — one of which does not exist.
+  return { ok: true, paths: r.stdout.split("\0").filter(Boolean) };
+}
+
 export async function commitDiff(rootIn: unknown, shaIn: unknown): Promise<{ ok: boolean; text?: string; error?: string }> {
   const sha = String(shaIn || "").trim();
   if (!/^[0-9a-f]{7,40}$/i.test(sha)) return { ok: false, error: "invalid commit" };

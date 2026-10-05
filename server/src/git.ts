@@ -13,7 +13,7 @@
 import { resolve, dirname, relative, sep } from "node:path";
 // readFileSync: /etc/wsl.conf, for the Windows drive translation below.
 import { readFileSync, statSync } from "node:fs";
-import { inScope } from "./config.ts";
+import { inScopeReal } from "./config.ts";
 import { record } from "./gitlog.ts";
 import { currentLabel, resumedAs } from "./loopwatch.ts";
 import { withSpawnSlot } from "./spawnpool.ts";
@@ -49,12 +49,61 @@ const PINNED: string[] = [
   "-c", "color.ui=false",
 ];
 
+/**
+ * Configuration that must not come from the repository, because it names a
+ * command git will run.
+ *
+ * A directory holding HEAD, objects/, refs/ and a config is a repository to
+ * git, even when it is ordinary files committed inside a project, and git run
+ * from inside it adopts that config, some keys of which name commands.
+ * `safe.bareRepository=explicit` keeps git from discovering such a directory at
+ * all; `core.fsmonitor=false` keeps a status from starting a monitor named by
+ * a checkout's own .git/config. The tests pin both.
+ *
+ * The limit: a real checkout's own config is still the user's, and anything
+ * else it names — a diff textconv, a clean filter — runs here exactly as it
+ * would in their terminal. So do the raw spawns outside this wrapper; the ones a
+ * request can aim (the /files search) run `git grep` over a tree or with
+ * `--untracked`, and neither asks fsmonitor — measured.
+ */
+const GIT_SAFE: string[] = [
+  "-c", "safe.bareRepository=explicit",
+  "-c", "core.fsmonitor=false",
+];
+
+/**
+ * Commands that only read, where a hook is never what anybody meant.
+ *
+ * They can still fire one: `status` refreshes the index and a refresh runs
+ * `post-index-change`. So these run with hooks off. Everything else — commit,
+ * merge, push, worktree add — keeps the user's hooks, because a pre-commit
+ * check silently skipped by the app is a check the user thinks they have.
+ */
+const READ_VERBS = new Set([
+  "rev-parse", "for-each-ref", "status", "log", "rev-list", "diff", "ls-files", "symbolic-ref",
+  "merge-base", "ls-tree", "cherry", "cat-file", "show", "reflog", "merge-tree", "describe",
+  "count-objects", "blame", "grep", "shortlog", "check-ignore", "show-ref", "name-rev", "config",
+]);
+
+function verbOf(args: string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "-c" || args[i] === "-C") { i++; continue; }
+    if (!args[i]!.startsWith("-")) return args[i]!;
+  }
+  return "";
+}
+
+function argv(cwd: string, args: string[]): string[] {
+  const hooks = READ_VERBS.has(verbOf(args)) ? ["-c", "core.hooksPath=/dev/null"] : [];
+  return ["git", ...PINNED, ...GIT_SAFE, ...hooks, "-C", cwd, ...args];
+}
+
 export function git(cwd: string, args: string[]): GitResult {
   const t0 = performance.now();
   try {
     // A hung git call (index.lock contention, a repo on a stalled mount) would
     // otherwise freeze the whole single-threaded server indefinitely.
-    const proc = Bun.spawnSync(["git", ...PINNED, "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
+    const proc = Bun.spawnSync(argv(cwd, args), { stdout: "pipe", stderr: "pipe", timeout: 15_000 });
     const r = {
       code: proc.exitCode ?? 1,
       stdout: proc.stdout?.toString() ?? "",
@@ -145,6 +194,22 @@ export function __resetGitCapForTest(): void {
  */
 const gitTimeoutMs = () => Number(process.env.AGENTGLASS_GIT_TIMEOUT_SECONDS ?? 120) * 1000;
 
+/**
+ * How long past the budget we go on waiting for git's output to end.
+ *
+ * Killing git at the budget does not close its pipes. A child git started —
+ * the ssh of a fetch — has git's stderr as its own, is not killed with it, and
+ * holds the pipe open until it exits by itself: measured at the full 30 s of a
+ * test remote that sleeps, and a real ssh stuck connecting to a dead host lasts
+ * until its TCP timeout. Waiting for the pipe was waiting for that ssh, with the
+ * pool slot held. Past this grace the call ends without the rest of the output.
+ *
+ * The ceiling, chosen: the orphaned ssh is left to die on its own. Killing it
+ * would need git in a process group of its own, which also takes it out of the
+ * server's — a bigger change than returning the slot on time.
+ */
+const PIPE_GRACE_MS = 2_000;
+
 async function runGit(cwd: string, args: string[]): Promise<GitResult> {
   const t0 = performance.now();
   // Whose work this is, read while we are still standing inside the caller —
@@ -152,7 +217,7 @@ async function runGit(cwd: string, args: string[]): Promise<GitResult> {
   // arrive in the meantime. See loopwatch.
   const owner = currentLabel();
   try {
-    const proc = Bun.spawn(["git", ...PINNED, "-C", cwd, ...args], {
+    const proc = Bun.spawn(argv(cwd, args), {
       stdout: "pipe",
       stderr: "pipe",
       // A git that never returns used to cost one hung request: bad, bounded,
@@ -168,11 +233,25 @@ async function runGit(cwd: string, args: string[]): Promise<GitResult> {
       // this path — prs.ts fetches PR refs from the network through here.
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS_REQUIRE: "never" },
     });
-    const [stdout, stderr, code] = await Promise.all([
+    const budget = gitTimeoutMs();
+    const output = Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    output.catch(() => {}); // it may settle after we stopped listening
+    let late: ReturnType<typeof setTimeout> | undefined;
+    const gaveUp = new Promise<null>((done) => { late = setTimeout(done, budget + PIPE_GRACE_MS, null); });
+    const settled = await Promise.race([output, gaveUp]);
+    clearTimeout(late);
+    if (!settled) {
+      proc.kill("SIGKILL"); // a no-op on the usual path, where git is already dead
+      resumedAs(owner);
+      const err = `git ${args[0] ?? ""} gave up after ${budget / 1000}s — killed, and a process it started still held its output`;
+      record(cwd, args, 1, performance.now() - t0, err);
+      return { code: 1, stdout: "", stderr: err };
+    }
+    const [stdout, stderr, code] = settled;
     // Everything after this line is synchronous parsing of what git said, on
     // behalf of whoever asked.
     resumedAs(owner);
@@ -180,7 +259,7 @@ async function runGit(cwd: string, args: string[]): Promise<GitResult> {
     // first line in front of the user verbatim — an empty one reads as a bug in
     // us rather than as a remote that never answered.
     const err = proc.signalCode && !stderr.trim()
-      ? `git ${args[0] ?? ""} gave up after ${gitTimeoutMs() / 1000}s — killed with ${proc.signalCode}`
+      ? `git ${args[0] ?? ""} gave up after ${budget / 1000}s — killed with ${proc.signalCode}`
       : stderr;
     record(cwd, args, code ?? 1, performance.now() - t0, err);
     return { code: code ?? 1, stdout, stderr: err };
@@ -288,6 +367,27 @@ export function projectRootOf(anchor: string): string | null {
   }
   // Not a repo (or gone): the worktree strip is still a better answer than the
   // raw path, but a plain non-repo directory has no project to roll up to.
+  return wt === -1 ? null : base;
+}
+
+/**
+ * Awaited twin of {@link projectRootOf}, for the tab strip's sweep, which runs
+ * twice a second on the thread the terminal shares. Same answer, the rev-parse
+ * through the pool.
+ */
+export async function projectRootOfAsync(anchor: string): Promise<string | null> {
+  const abs = safeAbs(anchor);
+  if (!abs) return null;
+  const wt = abs.indexOf("/.worktrees/");
+  const base = wt === -1 ? abs : abs.slice(0, wt);
+  let dir = base;
+  try { if (!statSync(base).isDirectory()) dir = dirname(base); } catch { dir = dirname(base); }
+  const r = await gitAsync(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (r.code === 0) {
+    const common = r.stdout.trim();
+    if (common.endsWith("/.git")) return dirname(common);
+    if (common) return common;
+  }
   return wt === -1 ? null : base;
 }
 
@@ -418,7 +518,7 @@ export function commit(root: string, files: string[], title: string, body: strin
   // Source Control panel's own commit. This is the older commit-composer path
   // and it was the one mutating git endpoint that never checked: a cockpit
   // opened for one project could still commit into any repo on the machine.
-  if (!inScope(absRoot)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
+  if (!inScopeReal(absRoot)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
   if (!title.trim()) return { ok: false, error: "commit title required" };
 
   const rels = (Array.isArray(files) ? files : []).map((f) => String(f)).filter(Boolean);
@@ -460,7 +560,7 @@ export function amend(root: string, files: string[], title: string, body: string
   if (!COMMIT_ENABLED) return { ok: false, error: "commit is disabled (AGENTGLASS_COMMIT_DISABLED=1)" };
   const absRoot = safeAbs(root);
   if (!absRoot) return { ok: false, error: "invalid repo path" };
-  if (!inScope(absRoot)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
+  if (!inScopeReal(absRoot)) return { ok: false, error: "outside the open project — open the parent folder to work across repos" };
   if (!title.trim()) return { ok: false, error: "commit title required" };
   // The mirror of gitwork's own guard: never rewrite HEAD in the middle of a
   // merge, rebase, cherry-pick or revert.

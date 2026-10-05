@@ -1,0 +1,469 @@
+/*
+ * THE SIX VERBS, END TO END, THROUGH THE CLI A SCRIPT WOULD RUN.
+ *
+ * A real server on its own port, an isolated tmux engine, and a `claude` that
+ * is a bash script drawing a Claude-shaped screen — the input box, the "esc to
+ * interrupt" of a turn in flight — and writing what it was launched with and
+ * what it was told to two files. Every assertion is on an EFFECT: the argv the
+ * CLI got, the text that reached its stdin, the pane that exists and then does
+ * not. The verbs are exercised through bin/agentglass-agent rather than fetch,
+ * because a verb that answers "ok" without doing the thing is the failure this
+ * repo has had before, and the CLI is what the worker actually calls.
+ */
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
+import { freePort } from "./freePort.ts";
+
+const SOCKET = `agx-agentops-${process.pid}`;
+const CLI = new URL("../../bin/agentglass-agent", import.meta.url).pathname;
+const have = Bun.which("tmux") && Bun.which("python3");
+
+let dir: string, base: string, stubDir: string, wt: string, log: string;
+let proc: ReturnType<typeof Bun.spawn> | null = null;
+
+/* A Claude with the two things the verbs read: an input box that starts with
+   `❯`, and "esc to interrupt" once it has taken a message. It clears the
+   screen on submit so the taken text is no longer sitting in the box, which is
+   exactly what the real one does and what `__submitVerdict` reads as "sent". */
+const STUB = `#!/usr/bin/env bash
+# The real one is asked \`--help\` once, to learn whether it takes --name.
+case " $* " in *" --help "*) echo "  -n, --name <name>  session name"; exit 0;; esac
+# A CLI that fails at launch — a missing binary's wrapper, a bad flag.
+[ -e "$AGX_STUB_LOG.die" ] && exit 1
+# A one-shot — \`qwen -p\`, \`opencode run\` — that prints its answer and exits 0.
+[ -e "$AGX_STUB_LOG.oneshot" ] && { printf 'the answer is 42\\n'; exit 0; }
+printf '%s\\n' "$@" > "$AGX_STUB_LOG.argv"
+printf '\\033[2J\\033[H'
+printf 'Welcome to the stub\\n\\n❯ '
+IFS= read -r line
+printf '%s\\n' "$line" > "$AGX_STUB_LOG.prompt"
+printf '\\033[2J\\033[H'
+printf '⏺ Working on it…\\n  (esc to interrupt)\\n\\n❯ \\n'
+sleep 300
+`;
+
+beforeAll(async () => {
+  if (!have) return;
+  dir = mkdtempSync(join(tmpdir(), "agx-agent-cli-"));
+  stubDir = join(dir, "stub");
+  mkdirSync(stubDir);
+  writeFileSync(join(stubDir, "claude"), STUB);
+  chmodSync(join(stubDir, "claude"), 0o755);
+  wt = join(dir, "wt");
+  mkdirSync(wt);
+  log = join(dir, "stub-log");
+  const port = await freePort();
+  base = `http://127.0.0.1:${port}`;
+  proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
+    env: {
+      PATH: `${stubDir}:${process.env.PATH ?? ""}`,
+      /* Without a UTF-8 locale tmux prints the TAB in `-P -F` as `_`, and the
+         pane/window ids come back as one unreadable token: measured, not
+         guessed — "%2_@2". The app always has one; a bare env here did not. */
+      LANG: process.env.LANG || "C.UTF-8",
+      TMUX_TMPDIR: TMUX_TEST_TMPDIR,
+      HOME: process.env.HOME ?? "",
+      XDG_CONFIG_HOME: dir,
+      // State (audit log, ledgers, engine conf) jailed too: without this a booted
+      // server writes into the developer's real ~/.local/state/agentglass.
+      AGENTGLASS_STATE_DIR: `${dir}/state`,
+      AGENTGLASS_ROOT: dir,
+      AGENTGLASS_DB: join(dir, "agents.db"),
+      AGENTGLASS_SCAN_DISABLED: "1",
+      AGENTGLASS_PORT: String(port),
+      AGENTGLASS_TMUX_SOCKET: SOCKET,
+      AGENTGLASS_CHAT_BYPASS: "1",
+      AGX_STUB_LOG: log,
+    },
+    stdout: "ignore", stderr: "pipe",
+  });
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(base + "/health")).ok) return; } catch { /* not up yet */ }
+    await Bun.sleep(100);
+  }
+  throw new Error("server did not start");
+}, SERVER_BOOT_MS);
+
+afterAll(async () => {
+  if (!have) return;
+  await Bun.spawn(["tmux", "-L", SOCKET, ...TMUX_ISOLATED, "kill-server"], { env: { ...process.env, TMUX_TMPDIR: TMUX_TEST_TMPDIR }, stdout: "ignore", stderr: "ignore" }).exited;
+  proc?.kill();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+type Answer = { ok: boolean; error?: string; result?: Record<string, unknown> & { agents?: Array<Record<string, unknown>>; agent?: Record<string, unknown> } };
+async function cli(...args: string[]): Promise<{ code: number; out: Answer }> {
+  const p = Bun.spawn(["python3", CLI, ...args], {
+    env: { PATH: process.env.PATH ?? "", HOME: dir, XDG_CONFIG_HOME: dir, AGENTGLASS_SERVER: base },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const [text, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+  let out: Answer;
+  try { out = JSON.parse(text.trim().split("\n").pop() ?? "{}"); } catch { out = { ok: false, error: `not json: ${text}` }; }
+  return { code, out };
+}
+const panes = async () => {
+  const p = Bun.spawn(["tmux", "-L", SOCKET, ...TMUX_ISOLATED, "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}\t#{window_name}"], {
+    env: { ...process.env, TMUX_TMPDIR: TMUX_TEST_TMPDIR }, stdout: "pipe", stderr: "ignore",
+  });
+  return (await new Response(p.stdout).text()).trim().split("\n").filter(Boolean);
+};
+
+const SLOW = 30_000;
+describe.skipIf(!have)("bin/agentglass-agent against a live server", () => {
+  test("nothing is listed before anything is started, in the worker's shape", async () => {
+    const { code, out } = await cli("list");
+    expect(code).toBe(0);
+    expect(out.ok).toBe(true);
+    expect(out.result?.agents).toEqual([]);
+  }, SLOW);
+
+  test("a bad name is refused with exit 1", async () => {
+    const { code, out } = await cli("start", "no good", "--cwd", wt);
+    expect(code).toBe(1);
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("name");
+  }, SLOW);
+
+  test("a checkout outside the open project is refused", async () => {
+    const { code, out } = await cli("start", "w0", "--cwd", tmpdir());
+    expect(code).toBe(1);
+    expect(out.error).toContain("not in the open project");
+  }, SLOW);
+
+  test("start seats the CLI in the checkout, in the agents session, and waits until its box is drawn", async () => {
+    const { code, out } = await cli("start", "w1", "--cwd", wt, "--yolo", "--remote-control", "w1", "--timeout", "20000", "--", "--model", "sonnet");
+    expect(out.error).toBeUndefined();
+    expect(code).toBe(0);
+    expect(out.result?.state).toBe("ready");
+    expect(out.result?.ready).toBe(true);
+    const agent = out.result?.agent as Record<string, string>;
+    expect(agent.name).toBe("w1");
+    expect(agent.cwd).toBe(wt);
+    expect(agent.paneId).toMatch(/^%\d+$/);
+    expect(agent.windowId).toMatch(/^@\d+$/);
+    // The window really exists, in the session named for scripts' agents, named after the agent.
+    const rows = await panes();
+    expect(rows.some((r) => r.startsWith(`${agent.paneId}\tagents\tw1`))).toBe(true);
+    // The CLI got the yolo flag (granted: bypass is on here), the remote-control name, and the pass-through flags.
+    const argv = readFileSync(`${log}.argv`, "utf8").split("\n");
+    expect(argv).toContain("--dangerously-skip-permissions");
+    expect(argv.slice(argv.indexOf("--remote-control"), argv.indexOf("--remote-control") + 2)).toEqual(["--remote-control", "w1"]);
+    expect(argv.slice(argv.indexOf("--model"), argv.indexOf("--model") + 2)).toEqual(["--model", "sonnet"]);
+  }, SLOW);
+
+  test("the same name again is refused while it runs, and the existing agent is in the answer", async () => {
+    const { code, out } = await cli("start", "w1", "--cwd", wt, "--timeout", "0");
+    expect(code).toBe(1);
+    expect(out.error).toContain("still running");
+    expect((out.result?.agent as Record<string, string> | undefined)?.name).toBe("w1");
+  }, SLOW);
+
+  test("the raw yolo flag after -- is refused even though bypass is on", async () => {
+    const { code, out } = await cli("start", "w2", "--cwd", wt, "--timeout", "0", "--", "--dangerously-skip-permissions");
+    expect(code).toBe(1);
+    expect(out.error).toContain("Settings");
+    expect((await cli("list")).out.result?.agents?.map((a) => a.name)).toEqual(["w1"]);
+  }, SLOW);
+
+  test("prompt pastes the text and presses Enter until the CLI takes it — the text reaches its stdin", async () => {
+    const text = "Reproduce first: it's the failing test that decides, not the plan";
+    const { code, out } = await cli("prompt", "w1", text);
+    expect(out.error).toBeUndefined();
+    expect(code).toBe(0);
+    expect(out.result?.outcome).toBe("sent");
+    for (let i = 0; i < 50 && !existsSync(`${log}.prompt`); i++) await Bun.sleep(100);
+    expect(readFileSync(`${log}.prompt`, "utf8")).toContain(text);
+  }, SLOW);
+
+  test("wait --until working returns once the turn is in flight", async () => {
+    const { code, out } = await cli("wait", "w1", "--until", "working", "--timeout", "5000");
+    expect(code).toBe(0);
+    expect(out.result?.state).toBe("working");
+    expect(out.result?.reached).toBe(true);
+  }, SLOW);
+
+  test("read shows the screen, and --lines trims it", async () => {
+    const { code, out } = await cli("read", "w1", "--lines", "3");
+    expect(code).toBe(0);
+    expect(out.result?.state).toBe("working");
+    expect(String(out.result?.text)).toContain("esc to interrupt");
+    expect(String(out.result?.text).split("\n").length).toBeLessThanOrEqual(3);
+  }, SLOW);
+
+  test("send-keys presses one named key and refuses anything else", async () => {
+    expect((await cli("send-keys", "w1", "enter")).code).toBe(0);
+    const bad = await cli("send-keys", "w1", "C-d");
+    expect(bad.code).toBe(1);
+    expect(bad.out.error).toContain("enter");
+  }, SLOW);
+
+  test("list carries the live agent with its pane; a name nobody started is 404", async () => {
+    const { out } = await cli("list");
+    const w1 = out.result?.agents?.find((a) => a.name === "w1") as Record<string, unknown>;
+    expect(w1).toBeDefined();
+    expect(String(w1.paneId)).toMatch(/^%\d+$/);
+    expect(w1.endedAt).toBeNull();
+    const { code, out: none } = await cli("read", "nobody");
+    expect(code).toBe(1);
+    expect(none.error).toContain("no agent");
+  }, SLOW);
+
+  test("stop kills the window; the name leaves the live list and is free to start again", async () => {
+    const { code } = await cli("stop", "w1");
+    expect(code).toBe(0);
+    for (let i = 0; i < 30 && (await panes()).some((r) => r.includes("\tagents\tw1")); i++) await Bun.sleep(100);
+    expect((await panes()).some((r) => r.includes("\tagents\tw1"))).toBe(false);
+    expect((await cli("list")).out.result?.agents).toEqual([]);
+    const all = (await cli("list", "--all")).out.result?.agents ?? [];
+    expect(all.map((a) => a.name)).toEqual(["w1"]);
+    expect(typeof all[0]?.endedAt).toBe("number");
+    const again = await cli("start", "w1", "--cwd", wt, "--timeout", "20000");
+    expect(again.out.error).toBeUndefined();
+    expect(again.code).toBe(0);
+    expect((await cli("list")).out.result?.agents?.map((a) => a.name)).toEqual(["w1"]);
+  }, SLOW);
+
+  test("schedule writes a row for later, schedules lists it waiting, unschedule takes it back — through the CLI", async () => {
+    const add = await cli("schedule", "night", "--cwd", wt, "--at", "+30m", "--prompt", "run the suite");
+    expect(add.out.error).toBeUndefined();
+    expect(add.code).toBe(0);
+    const sched = add.out.result?.schedule as Record<string, unknown>;
+    expect(sched.name).toBe("night");
+    expect(Number(sched.due)).toBeGreaterThan(Date.now() + 29 * 60_000);
+    const list = await cli("schedules");
+    expect(list.code).toBe(0);
+    const rows = (list.out.result as { schedules: Record<string, unknown>[] }).schedules;
+    expect(rows.map((r) => r.name)).toEqual(["night"]);
+    expect(rows[0]!.firedAt).toBeNull();
+    const bad = await cli("schedule", "late", "--cwd", wt, "--at", "yesterday");
+    expect(bad.code).toBe(1);
+    expect(bad.out.error).toContain("when:");
+    const gone = await cli("unschedule", String(sched.id));
+    expect(gone.code).toBe(0);
+    expect((await cli("schedules")).out.result).toEqual({ schedules: [] });
+    expect((await cli("unschedule", String(sched.id))).code, "cancelled once, not twice").toBe(1);
+  }, SLOW);
+
+  test("a CLI that fails at launch leaves no corpse in the agents session", async () => {
+    /*
+     * The engine keeps a pane whose command failed (tmuxconf.ts), and the
+     * window this app opens for a named agent is put back to closing itself
+     * only AFTER it exists. A CLI that fails at once — a bad flag, a wrapper
+     * for a binary that is not there — is dead before that second call, and
+     * setting the option late does not reap it (measured on the lease path,
+     * which checks). It sat in the agents session as a dead window, and
+     * `reconcile` marked the agent ended without ever closing it.
+     */
+    writeFileSync(`${log}.die`, "");
+    try {
+      const { out } = await cli("start", "wdie", "--cwd", wt, "--timeout", "3000");
+      /* Either the launch was seen failing (refused), or the window closed
+         itself a moment later (gone). Never a corpse. */
+      if (out.ok) expect(out.result?.state).toBe("gone");
+      else expect(out.error).toContain("exited");
+      await Bun.sleep(300);
+      const rows = await panes();
+      expect(rows.filter((r) => r.endsWith("\tagents\twdie")), "a dead window was left in the agents session").toEqual([]);
+      expect((await cli("list")).out.result?.agents?.some((a) => a.name === "wdie")).toBe(false);
+    } finally { rmSync(`${log}.die`, { force: true }); }
+  }, SLOW);
+
+  test("--keep: a one-shot that exits 0 leaves its tab to be read, and leaves the list", async () => {
+    /*
+     * The orchestrator opened its one-shots with a bare `tmux new-window
+     * "cli …"`: nothing kept the pane, so a CLI that finished — exit 0 —
+     * took its tab and its answer with it in the same second. `--keep`
+     * runs it through the wrapper every other window this app opens uses:
+     * the answer stays on screen under a line saying the CLI exited.
+     */
+    writeFileSync(`${log}.oneshot`, "");
+    try {
+      const { out } = await cli("start", "wkeep", "--cwd", wt, "--keep", "--timeout", "5000");
+      expect(out.ok, out.error).toBe(true);
+      expect(out.result?.state, "the wait ends when the CLI does").toBe("gone");
+      const paneId = String((out.result?.agent as Record<string, string> | undefined)?.paneId ?? "");
+      for (let i = 0; i < 30 && (await cli("list")).out.result?.agents?.some((a) => a.name === "wkeep"); i++) await Bun.sleep(100);
+      expect((await cli("list")).out.result?.agents?.some((a) => a.name === "wkeep"), "an agent whose CLI has exited is not live").toBe(false);
+      expect((await panes()).some((r) => r.endsWith("\tagents\twkeep")), "the tab is still there").toBe(true);
+      const screen = Bun.spawnSync(["tmux", "-L", SOCKET, ...TMUX_ISOLATED, "capture-pane", "-p", "-t", paneId], { env: { ...process.env, TMUX_TMPDIR: TMUX_TEST_TMPDIR } }).stdout.toString();
+      expect(screen).toContain("the answer is 42");
+      expect(screen).toContain("the CLI exited (0)");
+      /* The name is free again, as for any agent that has ended. */
+      expect((await cli("list", "--all")).out.result?.agents?.find((a) => a.name === "wkeep")?.endedAt).not.toBeNull();
+      /* And the answer is read by name, which is what --keep is for; the
+         agent in the tab is gone, and says so. */
+      const read = await cli("read", "wkeep");
+      expect(read.out.ok, read.out.error).toBe(true);
+      expect(String(read.out.result?.text)).toContain("the answer is 42");
+      expect(read.out.result?.state).toBe("gone");
+      /* Nothing to prompt, and nothing to enlist: the pane holds a sleep. */
+      expect((await cli("prompt", "wkeep", "anything")).code).toBe(1);
+      const enlisted = await cli("enlist", "wkeep2", "--pane", paneId);
+      expect(enlisted.out.ok, "a finished CLI's tab is not an agent to enlist").toBe(false);
+      /* And closed by name once it has been read: otherwise it stays for the
+         wrapper's day, and a seat that keeps every one-shot piles them up. */
+      const stop = await cli("stop", "wkeep");
+      expect(stop.out.ok, stop.out.error).toBe(true);
+      expect((await panes()).some((r) => r.endsWith("\tagents\twkeep")), "the tab is closed").toBe(false);
+      expect((await cli("read", "wkeep")).code, "and nothing is left to read").toBe(1);
+    } finally { rmSync(`${log}.oneshot`, { force: true }); }
+  }, SLOW);
+
+  test("--keep: a CLI that fails at launch is refused, and its kept tab is read by name", async () => {
+    /* The tab stays to say why, but the refusal came before the name was
+       recorded, so the reason could be read only through raw tmux. */
+    writeFileSync(`${log}.die`, "");
+    try {
+      const { out } = await cli("start", "wkdie", "--cwd", wt, "--keep", "--timeout", "3000");
+      expect(out.ok).toBe(false);
+      expect(out.error).toContain("exited");
+      expect(out.error, "the refusal says where the reason is").toContain("read wkdie");
+      const read = await cli("read", "wkdie");
+      expect(read.out.ok, read.out.error).toBe(true);
+      expect(String(read.out.result?.text)).toContain("the CLI exited (1)");
+      expect((await cli("list")).out.result?.agents?.some((a) => a.name === "wkdie"), "never live").toBe(false);
+      expect((await cli("stop", "wkdie")).out.ok).toBe(true);
+      expect((await panes()).some((r) => r.endsWith("\tagents\twkdie"))).toBe(false);
+    } finally { rmSync(`${log}.die`, { force: true }); }
+  }, SLOW);
+
+  test("without --keep the tab goes with the CLI, as a watched agent's always has", async () => {
+    writeFileSync(`${log}.oneshot`, "");
+    try {
+      await cli("start", "wgone", "--cwd", wt, "--timeout", "0");
+      for (let i = 0; i < 30 && (await panes()).some((r) => r.endsWith("\tagents\twgone")); i++) await Bun.sleep(100);
+      expect((await panes()).some((r) => r.endsWith("\tagents\twgone"))).toBe(false);
+    } finally { rmSync(`${log}.oneshot`, { force: true }); }
+  }, SLOW);
+
+  test("an agent whose CLI exits on its own is gone from the list without anybody stopping it", async () => {
+    const { out } = await cli("list");
+    const w1 = out.result?.agents?.find((a) => a.name === "w1") as Record<string, string>;
+    await Bun.spawn(["tmux", "-L", SOCKET, ...TMUX_ISOLATED, "kill-pane", "-t", w1.paneId], { env: { ...process.env, TMUX_TMPDIR: TMUX_TEST_TMPDIR }, stdout: "ignore", stderr: "ignore" }).exited;
+    for (let i = 0; i < 30 && (await cli("list")).out.result?.agents?.length; i++) await Bun.sleep(100);
+    expect((await cli("list")).out.result?.agents).toEqual([]);
+    const w = await cli("wait", "w1");
+    expect(w.code).toBe(1);
+    expect(w.out.error).toContain("no agent");
+  }, SLOW);
+});
+
+/*
+ * THE QUEUE, FROM THE CLI.
+ *
+ * The orchestrator could claim a task and finish one, and had no way at all to
+ * PUT one there: the only door was the view. Found by exercising all twenty-one
+ * verbs — a seat whose whole job is noticing things could not write one down.
+ */
+describe.skipIf(!have)("the queue through the CLI", () => {
+  test("a task can be added, listed and dropped without opening the view", async () => {
+    const root = process.env.AGENTGLASS_ROOT_FOR_TEST ?? dir;
+    const added = await cli("task", "the retry drops the last page", "--proof", "a failing test named in the report", "--root", root);
+    expect(added.out.ok, added.out.error).toBe(true);
+
+    const listed = await cli("tasks", "--root", root);
+    expect(listed.out.ok, JSON.stringify(listed.out)).toBe(true);
+    /* The queue answers at the top level, not under `result`: these routes are
+       the seat's own and predate the worker CLI's envelope. */
+    const tasks = ((listed.out as unknown as { tasks?: Array<Record<string, unknown>> }).tasks ?? []);
+    const mine = tasks.find((t) => t.title === "the retry drops the last page");
+    expect(mine, "the task did not come back in the queue").toBeDefined();
+    expect(mine?.proof).toBe("a failing test named in the report");
+
+    const dropped = await cli("drop", String(mine?.id ?? ""), "--root", root);
+    expect(dropped.out.ok).toBe(true);
+    const after = await cli("tasks", "--root", root);
+    const still = ((after.out as unknown as { tasks?: Array<Record<string, unknown>> }).tasks ?? [])
+      .find((t) => t.title === "the retry drops the last page");
+    expect(still, "a dropped task is still on the queue").toBeUndefined();
+  }, SLOW);
+});
+
+/*
+ * A TAB SOMEBODY OPENED THEMSELVES.
+ *
+ * The registry held only what `startAgent` opened, so for the orchestrator
+ * running a real project here — whose whole fleet is tmux tabs it opened by
+ * hand — `list` answered zero with two agents alive, and `broadcast`, its
+ * first ask, reached nobody. One message to N agents, with N of zero.
+ */
+describe.skipIf(!have)("enlisting a pane this app did not open", () => {
+  const tmuxCmd = (...args: string[]) => Bun.spawn(["tmux", "-L", SOCKET, ...TMUX_ISOLATED, ...args], {
+    env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, TMUX_TMPDIR: TMUX_TEST_TMPDIR },
+    stdout: "pipe", stderr: "pipe",
+  });
+
+  test("a hand-made window becomes an agent the verbs can reach, and stop lets it go", async () => {
+    /* A window this app did not make, running the same stub every other test
+       drives, named the way a person names a tab. */
+    const mk = tmuxCmd("new-session", "-d", "-s", "mine", "-n", "by-hand", "-c", wt, "claude");
+    expect(await mk.exited).toBe(0);
+    await Bun.sleep(600);
+
+    /* Before: it does not exist. */
+    const before = await cli("list");
+    expect((before.out.result?.agents ?? []).some((a) => a.name === "by-hand")).toBe(false);
+
+    const took = await cli("enlist", "by-hand");
+    expect(took.out.ok, took.out.error).toBe(true);
+
+    const after = await cli("list");
+    const row = (after.out.result?.agents ?? []).find((a) => a.name === "by-hand");
+    expect(row, "an enlisted tab is not in the list").toBeDefined();
+    expect(row?.cwd).toBe(wt);
+
+    /* And the verbs reach it: this is the whole point. */
+    const said = await cli("prompt", "by-hand", "PING-ENLISTED");
+    expect(said.out.ok, said.out.error).toBe(true);
+
+    /* Stop LETS GO of a window somebody else made: the row closes, the tab
+       stays. Killing it would be killing a day of somebody's context because a
+       verb was called on the name they lent it. */
+    const stopped = await cli("stop", "by-hand");
+    expect(stopped.out.ok).toBe(true);
+    expect(stopped.out.result?.killed).toBe(false);
+    const still = tmuxCmd("has-session", "-t", "=mine");
+    expect(await still.exited, "the tab was killed after being let go").toBe(0);
+
+    await tmuxCmd("kill-session", "-t", "=mine").exited;
+  }, SLOW);
+
+  test("a worker role starts its CLI with the lock and the model Settings picked for it", async () => {
+    // Nothing is saved in this server's config, so the scout is on its
+    // default: Claude, haiku, read-only.
+    const { code, out } = await cli("start", "r1", "--cwd", wt, "--role", "scout", "--timeout", "20000");
+    expect(out.error).toBeUndefined();
+    expect(code).toBe(0);
+    const argv = readFileSync(`${log}.argv`, "utf8").split("\n");
+    const at = argv.indexOf("--settings");
+    expect(at).toBeGreaterThan(-1);
+    const deny = (JSON.parse(argv[at + 1]!) as { permissions: { deny: string[] } }).permissions.deny;
+    expect(deny).toContain("Bash(git push:*)");
+    expect(deny).toContain("Bash(git commit:*)");
+    expect(deny).toContain("Edit");
+    expect(argv.slice(argv.indexOf("--model"), argv.indexOf("--model") + 2)).toEqual(["--model", "haiku"]);
+    await cli("stop", "r1");
+  }, SLOW);
+
+  test("a role with a different CLI named beside it is refused, so a role cannot come unlocked", async () => {
+    const { code, out } = await cli("start", "r2", "--cwd", wt, "--role", "scout", "--kind", "codex", "--timeout", "0");
+    expect(code).toBe(1);
+    expect(out.error).toContain("this role runs on claude");
+  }, SLOW);
+
+  test("a plain shell is refused, because prompting one types into somebody's command line", async () => {
+    const mk = tmuxCmd("new-session", "-d", "-s", "plain", "-n", "just-a-shell", "-c", wt);
+    expect(await mk.exited).toBe(0);
+    await Bun.sleep(400);
+    const r = await cli("enlist", "just-a-shell");
+    expect(r.out.ok).toBe(false);
+    expect(r.out.error).toContain("not an agent");
+    await tmuxCmd("kill-session", "-t", "=plain").exited;
+  }, SLOW);
+});

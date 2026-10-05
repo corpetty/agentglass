@@ -59,7 +59,74 @@ export const BASE: Record<Polarity, Palette> = {
   },
 };
 
-export type AccentId = "neutral" | "blue" | "violet" | "green" | "amber" | "rose" | "cyan";
+/*
+ * The phone's own ground and ink, which are no longer the desk's.
+ *
+ * `BASE` above is github-dark and github-light, and it stays that on the desk:
+ * a browser tab beside GitHub's own should not argue with it about what a
+ * surface is. A phone has no such neighbour. It is held in one hand, in the
+ * dark, at arm's length, and the two things it is mostly showing are a terminal
+ * and a list of rows — so it is worth its own values.
+ *
+ * What changed and why, rather than "we picked nicer greys":
+ *
+ *   The ground goes DARKER and slightly cooler (#0a0c10 against #0d1117).
+ *   github-dark is tuned to sit beside white browser chrome; a phone at night
+ *   has nothing beside it, and the darker ground is what stops a full-screen
+ *   terminal glowing in a dark room.
+ *
+ *   The hairline goes QUIETER (#232833 against #30363d) and the raised surface
+ *   goes UP (#1a1f27 against #21262d). The desk separates things with borders
+ *   because it has the pixels; the phone separates them with surface, because
+ *   at 393 points a visible border around every row is most of what you see.
+ *
+ *   The mid ink goes UP (#a6b0bd against #c9d1d9 for secondary), because a
+ *   phone is read outdoors and github-dark's third and fourth inks are close
+ *   enough to disappear in sunlight.
+ *
+ * The light half is not github-light either, and not a photographic negative of
+ * the dark one: it is warm where the dark one is cool. A cool near-white reads
+ * as a screen that has been left on; a warm one reads as paper, which is what
+ * a light mode is for.
+ *
+ * ── info stays a blue, and that is not an oversight ──────────────────────
+ * The obvious move is to set `info` to the teal, since the teal is what this
+ * palette is. It is wrong twice. In the UI it collapses two meanings into one
+ * hex — an informational tone and a button you press stop being tellable apart,
+ * and `info` is a semantic slot for the same reason `error` is. In the terminal
+ * it is worse and it is silent: `deriveAnsi` picks ANSI blue by HUE, taking
+ * `info` when it is near 220 and falling through to `primary` when it is not.
+ * Teal is 171, so ANSI blue would become the accent — and on the NEUTRAL accent
+ * the accent is the body text, which put the same hex in two of the sixteen
+ * slots and made a `ls` colour vanish. Sixteen distinct slots is asserted in
+ * mobile/test/term-ansi.test.ts, which is how this was found.
+ */
+export const PANE: Record<Polarity, Palette> = {
+  dark: {
+    bg: "#0a0c10", bg2: "#12161d", bg3: "#1a1f27", bg4: "#232833",
+    // text3 is #838d9a and not #7b8593: at 12 points on bg2 the older grey
+    // measured 4.43:1, under the 4.5 a line of small type needs. text4 is the
+    // disabled ink and is not used for anything somebody has to read.
+    text: "#e8ecf1", text2: "#a6b0bd", text3: "#838d9a", text4: "#6b7683",
+    border: "#232833", border2: "#2f3540",
+    // Replaced by the chosen accent — see paletteFor. These are what the shipped
+    // one resolves to, so a palette read before a choice is made is not blue.
+    primary: "#4dd6c1", primaryHover: "#7ce4d4",
+    success: "#3fb950", warning: "#d9a441", error: "#f0776c", info: "#6aa9f5",
+  },
+  light: {
+    // Cards are white on a warm ground, not a darker warm on a lighter one:
+    // with bg2 below bg the grouped lists read as holes in the page. text3 is
+    // #62676f because #6d727b on the old bg2 measured 4.29:1.
+    bg: "#f4f3f0", bg2: "#ffffff", bg3: "#e8e5e0", bg4: "#dbd7d1",
+    text: "#16181c", text2: "#4a4e56", text3: "#62676f", text4: "#8b9099",
+    border: "#e2ded8", border2: "#cdc8c1",
+    primary: "#0f9b88", primaryHover: "#0c8071",
+    success: "#1a7f4b", warning: "#9a6a00", error: "#c2402f", info: "#1a63c8",
+  },
+};
+
+export type AccentId = "neutral" | "blue" | "violet" | "green" | "amber" | "rose" | "cyan" | "teal";
 
 export interface Accent { id: AccentId; name: string; primary: string; hover: string }
 
@@ -79,6 +146,13 @@ export const ACCENTS: Accent[] = [
   { id: "amber", name: "Amber", primary: "#f59e0b", hover: "#fbbf24" },
   { id: "rose", name: "Rose", primary: "#f43f5e", hover: "#fb7185" },
   { id: "cyan", name: "Cyan", primary: "#06b6d4", hover: "#22d3ee" },
+  /* Teal is the phone's default and is not cyan with a nudge: cyan is a blue
+     that has warmed up, and against a near-black ground it reads as another
+     GitHub blue. This one is far enough round the wheel to be its own colour,
+     and far enough from `success` green that a filled button is never mistaken
+     for a passing check — the one confusion an accent on this app must not
+     have. */
+  { id: "teal", name: "Teal", primary: "#4dd6c1", hover: "#7ce4d4" },
 ];
 
 /**
@@ -106,16 +180,24 @@ export const PHONE_ACCENTS: Accent[] = [
  * own near-white, Porcelain's is its own near-black — so this is that idea
  * rather than a fourth constant nobody would keep in step.
  */
-export function accentFor(polarity: Polarity, id: AccentId): { primary: string; hover: string } {
+export function accentFor(
+  polarity: Polarity, id: AccentId, base: Record<Polarity, Palette> = BASE,
+): { primary: string; hover: string } {
   if (id === "neutral") {
-    const base = BASE[polarity];
-    return { primary: base.text, hover: polarity === "dark" ? "#ffffff" : "#000000" };
+    // The ink of THIS page, which is why the base is a parameter: the phone's
+    // near-white is not the desk's, and a neutral accent resolved against the
+    // wrong one is an accent that does not match the text beside it.
+    const surface = base[polarity];
+    return { primary: surface.text, hover: polarity === "dark" ? "#ffffff" : "#000000" };
   }
   const accent = ACCENTS.find((a) => a.id === id);
   // An unknown id paints the base's own primary rather than throwing: this
   // value arrives from storage, and a phone that will not start because a
   // preference file says "purple" is worse than a phone with a blue cursor.
-  if (!accent) return { primary: BASE[polarity].primary, hover: BASE[polarity].primaryHover };
+  // The BASE it falls back to is the caller's, not this file's — reading the
+  // module constant here would answer a phone on PANE with the desk's blue,
+  // which is the one case where the fallback is visible.
+  if (!accent) return { primary: base[polarity].primary, hover: base[polarity].primaryHover };
   return { primary: accent.primary, hover: accent.hover };
 }
 
@@ -126,9 +208,9 @@ export function accentFor(polarity: Polarity, id: AccentId): { primary: string; 
  * warning, error and info stay the base's. Same rule as the desk's applyAccent:
  * an accent is a taste, and a red that means "this failed" is not.
  */
-export function paletteFor(polarity: Polarity, accent: AccentId): Palette {
-  const { primary, hover } = accentFor(polarity, accent);
-  return { ...BASE[polarity], primary, primaryHover: hover };
+export function paletteFor(polarity: Polarity, accent: AccentId, base: Record<Polarity, Palette> = BASE): Palette {
+  const { primary, hover } = accentFor(polarity, accent, base);
+  return { ...base[polarity], primary, primaryHover: hover };
 }
 
 /** The mode as a surface. `systemIsDark` is asked for rather than read here
@@ -219,4 +301,46 @@ export function inkOn(face: string): string {
   const dark = (Math.max(l, luminance(INK_DARK)) + 0.05) / (Math.min(l, luminance(INK_DARK)) + 0.05);
   const light = (Math.max(l, luminance(INK_LIGHT)) + 0.05) / (Math.min(l, luminance(INK_LIGHT)) + 0.05);
   return dark >= light ? INK_DARK : INK_LIGHT;
+}
+
+/** The WCAG contrast ratio of two colours. */
+export function contrastRatio(a: string, b: string): number {
+  const la = luminance(a);
+  const lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/** `hex` moved `amount` of the way towards `to`, in sRGB. */
+function mix(hex: string, to: string, amount: number): string {
+  const read = (h: string): number[] => {
+    const n = Number.parseInt(h.replace("#", "").slice(0, 6), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  };
+  const [a, b] = [read(hex), read(to)];
+  return `#${a.map((c, i) => Math.round(c + (b[i]! - c) * amount).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/**
+ * The phone's palette, with an accent that can be read.
+ *
+ * The accents are the desk's hexes, chosen for the desk's surfaces, and two
+ * failures came from wearing them unchanged on the phone's. On dark, ink on a
+ * violet button measured 4.48:1 — the light member of the pair, #a78bfa, is
+ * 6.96:1 with the same ink. On light it was worse: the accent is also TEXT (a
+ * link, a selected tab, a count), and teal #4dd6c1 on a white card is 1.7:1.
+ *
+ * So the accent is walked, for the phone only: on dark, to the lighter of its
+ * pair when that reads and then towards white; on light, towards black. It
+ * stops at the first shade that is 4.5:1 against both grounds as text and
+ * 4.5:1 under its own ink as a fill. Neutral already is — it is the ink.
+ */
+export function phonePalette(polarity: Polarity, accent: AccentId): Palette {
+  const p = paletteFor(polarity, accent, PANE);
+  const reads = (c: string): boolean =>
+    contrastRatio(c, p.bg) >= 4.5 && contrastRatio(c, p.bg2) >= 4.5 && contrastRatio(inkOn(c), c) >= 4.5;
+  let primary = p.primary;
+  if (!reads(primary) && polarity === "dark" && reads(p.primaryHover)) primary = p.primaryHover;
+  for (let i = 0; i < 40 && !reads(primary); i++) primary = mix(primary, polarity === "dark" ? "#ffffff" : "#000000", 0.05);
+  if (primary === p.primary) return p;
+  return { ...p, primary, primaryHover: mix(primary, polarity === "dark" ? "#ffffff" : "#000000", 0.15) };
 }

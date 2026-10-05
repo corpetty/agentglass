@@ -2,7 +2,7 @@
   "expo": {
     "name": "agentglass",
     "slug": "agentglass-mobile",
-    "version": "0.13.0",
+    "version": "0.22.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "agentglass",
@@ -11,15 +11,14 @@
     "newArchEnabled": true,
     "android": {
       "package": "app.agentglass.mobile",
-      "versionCode": 5,
+      "versionCode": 9,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0f0a1a"
       },
       "edgeToEdgeEnabled": true,
       "allowBackup": false,
-      "usesCleartextTraffic": true,
-      "permissions": ["android.permission.POST_NOTIFICATIONS"]
+      "permissions": ["android.permission.POST_NOTIFICATIONS", "android.permission.RECORD_AUDIO"]
     },
     "plugins": [
       "expo-router",
@@ -35,18 +34,10 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "agentglass uses the camera once, to scan the pairing code on your computer's screen.",
-          "recordAudioAndroid": false
+          "cameraPermission": "agentglass uses the camera once, to scan the pairing code on your computer's screen."
         }
       ],
-      [
-        "expo-build-properties",
-        {
-          "android": {
-            "usesCleartextTraffic": true
-          }
-        }
-      ],
+      "./plugins/with-network-security.js",
       "./plugins/with-release-signing.js"
     ]
   }

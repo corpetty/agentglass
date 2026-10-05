@@ -2,13 +2,12 @@
  * The strip keeps up with the computer on its own, and costs nothing when the
  * computer stands still.
  *
- * Reported from a phone: "cuando tengo la app de movil abierta y en el pc en
- * una tab que solo tiene un pane meto uno mas… tengo que refresh para que se
- * haga, no es un auto sync como tiene que ser." Measured, and he was exactly
- * right: `load()` ran once on mount and after that only from the two refresh
- * buttons. The desk does not have the problem because the server sweeps tmux
- * twice a second and pushes it a `t:"tmux"` frame; the phone's socket carries
- * `events`, `notify` and pty bytes and nothing that says the panes moved.
+ * Open a pane at the computer with the phone watching, and the phone's strip
+ * did not know until you pulled it down: measured, `load()` ran once on mount
+ * and after that only from the two refresh buttons. The desk does not have the
+ * problem because the server sweeps tmux twice a second and pushes it a
+ * `t:"tmux"` frame; the phone's socket carries `events`, `notify` and pty bytes
+ * and nothing that says the panes moved.
  *
  * The fix is a poll while the screen is focused, and a poll has one dangerous
  * half: the answer is a fresh array every couple of seconds, so adopting it
@@ -69,18 +68,27 @@ describe("a tick that changes nothing", () => {
     expect(again.changed).toBe(false);
   });
 
-  test("even when a pane moved somewhere the strip does not show", () => {
+  test("even when a pane's ids moved, which the strip does not show", () => {
     /*
-     * `pane_current_path` moves with every `cd` and the strip shows nothing of
-     * it but the last segment; the session and window IDS are on the wire and
-     * are drawn nowhere at all. Repainting on those would be repainting on
-     * somebody typing `cd ..` at the desk.
+     * The session and window IDS are on the wire and are drawn nowhere at all.
+     * Repainting on those would be repainting on somebody's tmux housekeeping.
+     * The directory is NOT in this list any more: the tab carries it whole,
+     * because Source control and Files open from it, and a `cd` to another
+     * checkout has to reach them. The next test holds that.
      */
     const again = readStrip(first(ONE), {
       canAttach: true,
-      panes: [pane({ path: "/somewhere/else/work", sessionId: "$7", windowId: "@9" })],
+      panes: [pane({ sessionId: "$7", windowId: "@9" })],
     });
     expect(again.changed).toBe(false);
+  });
+
+  test("but a pane that changed directory is a change", () => {
+    const again = readStrip(first(ONE), {
+      canAttach: true,
+      panes: [pane({ path: "/somewhere/else/work" })],
+    });
+    expect(again.changed).toBe(true);
   });
 
   test("even when an agent's cwd list churns under a pane", () => {

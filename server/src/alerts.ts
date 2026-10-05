@@ -1,7 +1,7 @@
 // Push alerts: fire on notable events (human-in-the-loop waits, errors).
 // Delivery channels are opt-in via env:
 //   AGENTGLASS_WEBHOOK   — POST {text} to this URL (Slack/Discord-compatible)
-//   AGENTGLASS_NOTIFY=1  — run `notify-send` (Linux desktop) if available
+//   AGENTGLASS_NOTIFY=1  — run `notify-send` (Linux desktop) or `osascript` (macOS) if available
 //
 // A client attached to the live socket gets every alert regardless — that is
 // the frame the desktop raises a native notification from, and the one the
@@ -17,11 +17,27 @@
 // desktop setting can suppress. Treat everything below as best-effort reach
 // for when nobody is looking at agentglass at all.
 import type { WatchEvent, AlertNote } from "../../shared/types.ts";
-import { paneForSession, paneAgentNote } from "./panewt.ts";
-import { listPanes } from "./tmuxctl.ts";
+import { paneForSession, noteForSession } from "./panewt.ts";
+import { listPanesSync } from "./tmuxctl.ts";
+import { ErrorStreaks, STOP_QUIET_MS, lanternStep, lanternState, type ErrorAlert, type LanternFinding } from "./notePolicy.ts";
+import { webhookDestination } from "./egress.ts";
+import { kindOfNotification, type NotifyKind } from "../../shared/notifyPrefs.ts";
+import { readNotifyPrefs } from "./notifyPrefs.ts";
 
-const WEBHOOK = process.env.AGENTGLASS_WEBHOOK;
+// Resolved once, here, because the boot line below reports it and a boot line
+// that describes a destination the process is no longer using would be worse
+// than none. `prnudge.ts` re-reads per call instead: a nudge is a person
+// pressing a button, and the answer it gives them ("no channel", "that host
+// needs AGENTGLASS_ALLOW_REMOTE=1") should describe the environment now.
+const WEBHOOK = webhookDestination();
 const DESKTOP = process.env.AGENTGLASS_NOTIFY === "1";
+
+// A configured channel is visible at boot without ever printing its path,
+// which commonly contains the webhook credential itself.
+if (process.env.AGENTGLASS_WEBHOOK) {
+  if (WEBHOOK.configured) console.info(`[alerts] webhook destination: ${WEBHOOK.host}`);
+  else console.warn(`[alerts] webhook disabled: ${WEBHOOK.error}`);
+}
 
 // A connected client can raise a NATIVE OS notification, which Electron routes
 // to macOS and Windows too — the cross-platform replacement for notify-send,
@@ -114,18 +130,31 @@ async function deliver(
   pane?: string,
   /** What kind of thing this is, when it is not ordinary news. Travels on the
    *  frame so the app can raise an alarm rather than another row. */
-  extra?: { kind: "reminder"; id: string },
+  extra?: Pick<AlertNote, "kind" | "id" | "key" | "update" | "clear" | "panes" | "source">,
+  /** Which of the seven notification kinds this is (shared/notifyPrefs.ts) —
+   *  the gate below and the client both key off this, not off the text. */
+  kind: NotifyKind = "idle",
 ) {
-  if (WEBHOOK && !IS_TEST) {
-    try {
-      await fetch(WEBHOOK, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: `*${title}*\n${body}` }),
-      });
-    } catch (e) {
-      console.warn("[alerts] webhook failed:", e);
-    }
+  // A redraw or a removal of a row the client already has. It is not news, so
+  // it goes only where that row lives: never to a webhook, never to
+  // notify-send, and never to a client that is not attached to see it.
+  const redraw = !!(extra?.key && (extra.update || extra.clear));
+  // The diet, checked once, here, rather than in every push* function: every
+  // alert in this file funnels through deliver, so this is the one place a
+  // kind turned off actually has to stop something. `none` short-circuits
+  // everything, `blocked` by default is the only kind that reaches here at
+  // all — the rest are off until a person turns them on in Settings.
+  const prefs = readNotifyPrefs();
+  if (prefs.none || !prefs.kinds[kind]) return;
+  // Not awaited. The clients' frames go out in the order things happened, and
+  // a slow or hung webhook ahead of them would deliver an announcement after
+  // the clear that followed it — bringing back a card for work that finished.
+  if (WEBHOOK.configured && !IS_TEST && !redraw) {
+    fetch(WEBHOOK.url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: `*${title}*\n${body}` }),
+    }).catch((e) => console.warn("[alerts] webhook failed:", e));
   }
   // An attached client is not an operating-system side effect.
   //
@@ -158,16 +187,29 @@ async function deliver(
   // pings keeps `live > 0`, so this returns before `notify-send` exactly as it
   // always did.
   const { attached, live } = sink?.census() ?? { attached: 0, live: 0 };
-  if (sink && attached > 0) sink.broadcast({ title, body, urgency, ...(pane ? { pane } : {}), ...(extra ?? {}) });
-  if (live > 0) return;
+  if (sink && attached > 0) sink.broadcast({ title, body, urgency, notifyKind: kind, ...(pane ? { pane } : {}), ...(extra ?? {}) });
+  if (live > 0 || redraw) return;
+  // `notify-send` paints the desktop, which is what the "desktop" channel
+  // means — gated on top of the kind check above, not instead of it, so
+  // turning the channel off never turns "desktop" into "everywhere else too".
+  if (DESKTOP && !prefs.channels.desktop) return;
   if (DESKTOP) {
+    // Urgency 0 is a row in a list, not a thing to put on somebody's screen.
+    // With no window open there is no list to put it in either, so it waits
+    // there until one opens rather than being drawn over his work.
+    //
+    // ABOVE the seam on purpose. Behind it is the real `notify-send` in the
+    // app and an injected recorder in the suite, and a guard that only covered
+    // the real one would have left the suite unable to see this rule at all.
+    if (urgency === 0) return;
     if (notifier) { notifier({ title, body, urgency }); return; }
     // No seam installed and this is a test run: say nothing. A suite must never
     // put an approval prompt on somebody's desktop for a hold that never
     // happened, and a test that wants to check this path installs a notifier.
     if (IS_TEST) return;
+    const argv = desktopNotifyArgv(title, body, urgency);
     try {
-      Bun.spawn(["notify-send", "-a", "agentglass", "-u", "critical", "--", title, body], { stdout: "ignore" });
+      Bun.spawn(argv, { stdout: "ignore" });
     } catch (e) {
       // Said once, not on every alert: the cause is a missing binary, so it
       // will be just as true the next thousand times and the log is the only
@@ -175,13 +217,66 @@ async function deliver(
       // not installed" look exactly like "your ping was delivered".
       if (!warnedNoNotifySend) {
         warnedNoNotifySend = true;
-        console.warn("[alerts] AGENTGLASS_NOTIFY=1 but notify-send could not be run:", e);
+        console.warn(`[alerts] AGENTGLASS_NOTIFY=1 but ${argv[0]} could not be run:`, e);
       }
     }
   }
 }
 
 let warnedNoNotifySend = false;
+
+/**
+ * Text as an AppleScript string literal.
+ *
+ * AppleScript strings are double-quoted and know two escapes, `\\` and `\"`,
+ * so those are the two characters that could end the literal early — and a
+ * notification's text is agent output: a tool's stderr, a file path, a
+ * commit subject, anything. Escaped here and never interpolated raw; the
+ * script is one line built from two of these.
+ */
+export function appleScriptString(text: string): string {
+  return `"${text.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * The command that puts an alert on the desktop when no window is open to
+ * show it — per platform, as an argv.
+ *
+ * Linux: `notify-send`, exactly as before. `-u critical` used to be hardcoded,
+ * so every alert reached the desktop as the freedesktop urgency that never
+ * expires on its own — a tool error and an agent blocked on a permission,
+ * drawn identically and both dismissed by hand. `--` because a title can start
+ * with a dash.
+ *
+ * macOS: `osascript -e 'display notification <body> with title <title>'`.
+ * There is no `notify-send` on a Mac, so the spawn threw ENOENT and the
+ * warning below fired — once, and the alert was gone; the person in the
+ * other room was not told. The text goes in as AppleScript string literals
+ * (`appleScriptString`), never spliced in raw: `osascript -e` runs whatever it
+ * is handed, and the text is not ours. No urgency: Notification Center has no
+ * such knob, and no `--`: `osascript` takes the script after `-e`, not a list
+ * of positional strings. When neither binary exists the spawn fails as it
+ * always did and the same one-line warning says so.
+ *
+ * `platform` is a parameter for the suite, which runs on Linux.
+ */
+export function desktopNotifyArgv(title: string, body: string, urgency: number, platform: string = process.platform): string[] {
+  if (platform === "darwin") {
+    return ["osascript", "-e", `display notification ${appleScriptString(body)} with title ${appleScriptString(title)}`];
+  }
+  const level = urgency === 2 ? "critical" : "normal";
+  /*
+   * `-t`, because "normal" is not a lifetime.
+   *
+   * The daemon picks how long a popup lives when nobody says, and the one on
+   * this desk keeps them until they are dismissed by hand — so a week of
+   * "waiting for your input" stacked up on screen. Eight seconds for news, a
+   * minute for something that is actually blocking. The durable copy is the
+   * bell, not the popup.
+   */
+  const ms = urgency === 2 ? 60_000 : 8_000;
+  return ["notify-send", "-a", "agentglass", "-u", level, "-t", String(ms), "--", title, body];
+}
 
 /**
  * A tool call is being held at the control-plane gate — ping the human.
@@ -204,6 +299,8 @@ export function pushGate(agent: string, tool: string, summary: string, pane?: st
       // So the one alert that stops an agent dead also says where to go and
       // takes you there. It is the notification with the most reason to.
       pane,
+      { source: "gate" },
+      "blocked",
     );
 }
 
@@ -240,11 +337,107 @@ export function pushAccountPaused(account: string, until: number) {
  * it is dismissed instead of expiring it after a few seconds, which is the
  * behaviour anybody setting an alarm is asking for — and the mark is what lets
  * the app raise its own alarm rather than adding a seventeenth grey row to the
- * list behind the bell. Reported exactly that way: "es una alarma que yo he
- * programado, tiene que ser más invasiva".
+ * list behind the bell. Reported exactly that way: "it is an alarm I set
+ * myself, it has to be more intrusive".
  */
+/**
+ * The understudy cannot go on, and needs a person.
+ *
+ * Urgency 2, and the reason is the same one written above `pushReminder`:
+ * freedesktop keeps a CRITICAL notification on screen until it is dismissed
+ * instead of expiring it in a few seconds. This is not news — it is a machine
+ * that has STOPPED and will stay stopped until somebody looks, which is the
+ * exact shape `pushGate` uses for an approval. Anything quieter and the clone
+ * spends the night idle while its report sits behind a bell nobody opened:
+ * "we cannot let this happen, otherwise nobody will want to use the clone".
+ *
+ * One call rather than a delivery path of its own, so it inherits the webhook,
+ * the native notification while a window is open, and `notify-send` when none
+ * is. A parallel path is the bug this file already fixed once.
+ */
+export function pushUnderstudyStuck(what: string, question: string, tried: string) {
+  if (shouldSend(`understudy:${what}`)) {
+    deliver(
+      "🙋 The deputy is stuck",
+      `${question} Tried: ${tried}.`.slice(0, 300),
+      2,
+      /* Where to go, so the alert that says a machine is waiting also takes
+         you to the screen where you can answer it. */
+      "understudy",
+      { kind: "understudy", source: "understudy" },
+      "autopilot",
+    );
+  }
+}
+
+/** A scheduled start reporting how it went. Named for the Lantern because it
+ *  used to share its channel; the watch itself goes through
+ *  `pushLanternFindings` below. */
+export function pushLantern(title: string, body: string, pane?: string) {
+  if (shouldSend("lantern:watch")) deliver(title, body, 2, pane, { source: "schedule" }, "autopilot");
+}
+
+/**
+ * The Lantern's watch, said once per finding — see notePolicy.ts for the rule.
+ *
+ * One card, keyed `lantern`: an announcement interrupts (critical only when
+ * something new is BLOCKED, normal for a prompt left open, a forgotten claim or
+ * a window gone), a change with nothing new redraws the card without a sound,
+ * and an empty board removes it.
+ */
+let lanternMemory = lanternState();
+/** The card as the clients should have it now, for one that attaches later. */
+let lanternCard: AlertNote | null = null;
+export function __resetLanternMemory() { lanternMemory = lanternState(); lanternCard = null; }
+export function pushLanternFindings<F extends LanternFinding>(
+  all: F[],
+  notice: (f: F[]) => { title: string; body: string; pane?: string } | null,
+  now = Date.now(),
+) {
+  const step = lanternStep(all, lanternMemory, now);
+  if (step.act === "none") return;
+  if (step.act === "clear") {
+    lanternCard = null;
+    deliver("", "", 0, undefined, { key: "lantern", clear: true, source: "lantern" }, "autopilot");
+    return;
+  }
+  const n = notice(step.findings);
+  if (!n) return;
+  const extra = { key: "lantern", panes: step.panes, source: "lantern" };
+  lanternCard = { title: n.title, body: n.body, urgency: step.urgency, ...(n.pane ? { pane: n.pane } : {}), ...extra, update: true };
+  if (step.act === "update") { deliver(n.title, n.body, step.urgency, n.pane, { ...extra, update: true }, "autopilot"); return; }
+  deliver(n.title, n.body, step.urgency, n.pane, extra, "autopilot");
+}
+
+/**
+ * The Lantern card for a client that has just attached.
+ *
+ * A keyed card is only ever redrawn or cleared after it is announced, and both
+ * of those reach only the clients attached at that moment. A window that was
+ * closed or reloading when the announcement went out would otherwise show
+ * nothing until the next new finding, and one that missed the clear would keep
+ * a persisted "needs you" row for work that finished. So every attach is told
+ * the card as it stands: a silent upsert, or a clear when there is none.
+ */
+export function lanternSnapshot(): AlertNote {
+  return lanternCard ?? { title: "", body: "", urgency: 0, key: "lantern", clear: true, source: "lantern" };
+}
+
+/** The paired-devices file changed behind the server's back (devices.ts). Critical:
+ *  somebody may have tried to give themselves a device, and the person should know. */
+export function pushDeviceStoreChanged(path: string) {
+  if (shouldSend("devices:tampered")) {
+    deliver("⚠ Paired devices changed outside agentglass",
+      `${path} was edited by something other than pairing. The change is ignored; check Settings › Remote.`, 2,
+      // "blocked", the one kind on by default: this is a security warning, and
+      // filing it under "failures" (off by default) silenced it for everybody
+      // who never opened Settings › Notifications. "None" still silences it.
+      undefined, { source: "devices" }, "blocked");
+  }
+}
+
 export function pushReminder(id: string, title: string, when: string) {
-  if (shouldSend(`remind:${id}`)) deliver(`⏰ ${title}`, when, 2, undefined, { kind: "reminder", id });
+  if (shouldSend(`remind:${id}`)) deliver(`⏰ ${title}`, when, 2, undefined, { kind: "reminder", id, source: "reminder" }, "reminders");
 }
 
 /**
@@ -289,7 +482,7 @@ export function describeAgent(e: WatchEvent): string {
  */
 export function describeSession(sourceApp: string, sessionId: string, cwdIn = ""): string {
   const pane = paneForSession(sessionId);
-  const cwd = cwdIn || (pane ? paneAgentNote(pane)?.cwd ?? "" : "");
+  const cwd = cwdIn || (noteForSession(sessionId)?.cwd ?? "");
   // Trailing slashes come from a shell that had one; `filter(Boolean)` so the
   // basename of "/home/u/repo/" is "repo" rather than "".
   const checkout = cwd.split("/").filter(Boolean).pop() ?? "";
@@ -319,7 +512,7 @@ function paneLabel(pane: string): string {
   try {
     // Cached for a few seconds because this spawns tmux, and a burst of alerts
     // from one stopped agent would otherwise spawn one per alert.
-    paneCache ??= listPanes();
+    paneCache ??= listPanesSync();
     const row = paneCache.find((r) => r.paneId === pane);
     if (!row) return pane;
     const name = row.windowName ? ` «${row.windowName}»` : "";
@@ -328,25 +521,30 @@ function paneLabel(pane: string): string {
     return pane;
   }
 }
-let paneCache: ReturnType<typeof listPanes> | null = null;
+let paneCache: ReturnType<typeof listPanesSync> | null = null;
 let paneCacheAt = 0;
 /** Long enough to absorb a burst, short enough that a renamed window is right
  *  by the time anybody looks. */
 const PANE_CACHE_MS = 5_000;
+
+const errorStreaks = new ErrorStreaks();
 
 /** Inspect an event and fire an alert if it warrants one. */
 export function maybeAlert(e: WatchEvent) {
   const agent = describeAgent(e);
   const pane = paneForSession(e.session_id) ?? undefined;
 
+  // Kept, and it has never once run. `PermissionRequest` is not in the hook
+  // vocabulary this database has ever seen: zero rows over its whole life,
+  // against nine event types that do appear. The real article arrives as a
+  // `Notification` whose message is "Claude needs your permission", and is
+  // handled one branch below — which is why the promotion there exists.
   if (e.hook_event_type === "PermissionRequest") {
     if (shouldSend(`perm:${e.session_id}`))
       deliver(
         "⏳ Approval needed",
         `${agent} is waiting on a permission request${e.tool_name ? ` (${e.tool_name})` : ""}.`,
-        // The other one an agent is stopped on. Everything below this line is
-        // news rather than a blockage, and says so with a lower urgency.
-        2, pane,
+        2, pane, { source: "gate" }, "blocked",
       );
     return;
   }
@@ -355,11 +553,66 @@ export function maybeAlert(e: WatchEvent) {
     // The message leads and the agent follows. It was the other way round —
     // the title was the opaque identifier and the message was the body — so a
     // stack of these read as a column of hashes with the actual news underneath.
-    if (shouldSend(`notify:${e.session_id}:${msg}`)) deliver(`🔔 ${msg}`, agent, 1, pane);
+    //
+    // The one place a string test earns its keep. Everything here is already
+    // true when he looks — an agent that said it is waiting is still waiting —
+    // so the question is only which of them is a BLOCKAGE. Measured over 7
+    // days: 279 "waiting for your input", 6 "needs your permission", 3 "needs
+    // your approval", 2 "usage limit reset". The middle nine are the only ones
+    // he cannot ignore, and they were shipping at the same urgency as the rest.
+    //
+    // Safe in a way the stdout marker scan was not: an unrecognised message
+    // falls through to 1 and still lands in the list with its pane. A stale
+    // string here loses a promotion; a stale string there INVENTED an urgent
+    // interrupt out of a command that had worked.
+    //
+    // "Waiting for your input" is 0 as well, and it is the bulk of these: the
+    // turn ended and the prompt is open, which the board already shows on the
+    // agent's own row. A prompt left open for an hour is the Lantern's to say,
+    // once. At 1 it was a sound and a badge per turn per agent — the largest
+    // single source of rows on a desk running five of them.
+    const blocking = /needs your (permission|approval)/i.test(msg);
+    const urgency: 0 | 1 | 2 = blocking ? 2
+      : /usage limit reset|waiting for your input/i.test(msg) ? 0
+        : 1;
+    if (shouldSend(`notify:${e.session_id}:${msg}`))
+      deliver(`🔔 ${msg}`, agent, urgency, pane, { source: blocking ? "gate" : "agents" }, kindOfNotification(msg));
     return;
   }
-  if (e.is_error) {
-    if (shouldSend(`err:${e.session_id}:${e.tool_name}`))
-      deliver("❌ Tool error", `${agent} — ${e.tool_name ?? "tool"} failed${e.error_text ? `: ${e.error_text.slice(0, 200)}` : ""}.`, 2, pane);
+  // A failed tool call is never news by itself — see the measurement below and
+  // notePolicy.ts. What reaches a person is a streak of them in one session, or
+  // a turn that ENDED on one; everything else is the session's own activity.
+  //
+  // It used to be a row per failure at urgency 0: silent, but still a card in
+  // the list for every grep that matched nothing, and on a busy desk the list
+  // was mostly those. The measurement that demoted them stands, and is why they
+  // are now gone rather than quiet:
+  //
+  // Over 8 days, 465 error events: 464 were followed by another event from the
+  // same session within 60 seconds and all 465 within five minutes. ZERO were
+  // the last thing a session ever did. The agent had already recovered before
+  // the popup finished animating.
+  const failed = errorStreaks.note(e);
+  if (failed && shouldSend(`streak:${e.session_id}`)) sayFailed(failed, agent, pane);
+  // A Stop after a failure is only the end of the turn if nothing follows it.
+  // Asked again once the quiet period is over; see notePolicy.ts for why a
+  // Stop alone is not enough.
+  if (e.hook_event_type === "Stop") {
+    const session = e.session_id;
+    const t = setTimeout(() => {
+      const ended = errorStreaks.settle(session);
+      if (ended && shouldSend(`stopped:${session}`)) sayFailed(ended, agent, pane);
+    }, STOP_QUIET_MS + 50);
+    (t as { unref?: () => void }).unref?.();
+  }
+}
+
+function sayFailed(failed: ErrorAlert, agent: string, pane?: string) {
+  const why = failed.text ? `: ${failed.text}` : "";
+  const extra = { key: `errors:${failed.session}`, source: "errors" };
+  if (failed.kind === "streak") {
+    deliver("❌ Keeps failing", `${agent} — ${failed.count} ${failed.tool} calls failed in a row${why}`, 1, pane, extra, "failures");
+  } else {
+    deliver("⏹ Stopped on an error", `${agent} — the turn ended right after ${failed.tool} failed${why}`, 1, pane, extra, "failures");
   }
 }

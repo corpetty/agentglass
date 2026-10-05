@@ -7,10 +7,16 @@ import type { AgentCard, AgentStatus } from "../lib/derive.ts";
 const STATUS_COLOR: Record<string, string> = {
   working: "var(--success)",
   waiting: "var(--warning)",
+  stalled: "var(--warning)",
   errored: "var(--error)",
+  failed: "var(--error)",
   idle: "var(--text4)",
 };
-const STATUS_ORDER: AgentStatus[] = ["working", "waiting", "errored", "idle"];
+/** Legend order. `stalled` and `failed` share a hue with the state above them,
+ *  which is deliberate — the dial has no room for a sixth colour anybody could
+ *  learn, and the shape carries the difference: a stalled blip wears a broken
+ *  ring nothing else on the dial has. */
+const STATUS_ORDER: AgentStatus[] = ["working", "waiting", "stalled", "errored", "failed", "idle"];
 /**
  * A finished blip, tinted by how it finished.
  *
@@ -41,6 +47,22 @@ const P = (deg: number, rad: number): [number, number] => [
   C + rad * Math.cos((deg * Math.PI) / 180),
   C + rad * Math.sin((deg * Math.PI) / 180),
 ];
+
+/** How full this session's context is, as a share of ITS OWN model's window
+ *  (0..1), or null before its first turn. The share, not the token count: 180K
+ *  is a 200K session about to compact and a 1M session with most of its room
+ *  left, and the dial answers "how close is this one to compacting". */
+export function ctxShare(a: Pick<AgentCard, "ctxTokens" | "ctxLimit">): number | null {
+  return a.ctxTokens > 0 && a.ctxLimit > 0 ? Math.min(1, a.ctxTokens / a.ctxLimit) : null;
+}
+
+/** A blip's tooltip: the share hides the absolute size, so it says both. */
+export function blipTitle(a: Pick<AgentCard, "ctxTokens" | "ctxLimit" | "title" | "source_app">): string {
+  const name = a.title || a.source_app;
+  const share = ctxShare(a);
+  if (share == null) return `${name} · no turn yet`;
+  return `${name} · ${fmtTokens(a.ctxTokens)} / ${fmtTokens(a.ctxLimit)} tokens · ${Math.round(share * 100)}% of its window`;
+}
 
 /** A session's fixed bearing on the dial — hashed from its key so a blip
  *  keeps its angle for its whole life instead of jumping every re-sort. */
@@ -81,8 +103,8 @@ export function Radar({ agents, onSelect }: { agents: AgentCard[]; onSelect?: (a
   const now = Date.now();
 
   const blips = agents.slice(0, 24).map((a) => {
-    // Raw fraction of model max, then re-anchor so 1.0 == compaction threshold.
-    const rawFrac = a.ctxTokens > 0 && a.ctxLimit > 0 ? Math.min(1, a.ctxTokens / a.ctxLimit) : null;
+    // Share of this model's own window, then re-anchor so 1.0 == compaction threshold.
+    const rawFrac = ctxShare(a);
     const compactFrac = rawFrac == null ? null : Math.min(1, rawFrac / COMPACT_FRAC);
     // Mild ease-in: expand the outer band where compaction decisions live.
     const eased = compactFrac == null ? null : Math.pow(compactFrac, 0.7);
@@ -98,7 +120,12 @@ export function Radar({ agents, onSelect }: { agents: AgentCard[]; onSelect?: (a
     return { a, x, y, frac: rawFrac, size: 3.4 + busy * 4.2, color };
   });
 
-  const counts = STATUS_ORDER.map((s) => ({ s, n: agents.filter((a) => a.status === s).length }));
+  // Every state the dial can show, minus the two exceptional ones when nothing
+  // is in them: a legend line reading "stalled 0" teaches nothing and costs the
+  // four everyday states a row of width on a narrow panel.
+  const counts = STATUS_ORDER
+    .map((s) => ({ s, n: agents.filter((a) => a.status === s).length }))
+    .filter(({ s, n }) => n > 0 || (s !== "stalled" && s !== "failed"));
 
   // Sweep trail: a fan of radial lines fading behind the leading edge.
   const TRAIL = 66;
@@ -211,6 +238,7 @@ export function Radar({ agents, onSelect }: { agents: AgentCard[]; onSelect?: (a
                   onMouseEnter={() => setHover(b.a.key)}
                   onClick={() => onSelect?.(b.a)}
                 >
+                  <title>{blipTitle(b.a)}</title>
                   {/* generous invisible hit area */}
                   <circle cx={b.x} cy={b.y} r={Math.max(b.size + 5, 8)} fill="transparent" />
                   {/* halo — a soft translucent disc (no SVG filter: filters
@@ -218,6 +246,14 @@ export function Radar({ agents, onSelect }: { agents: AgentCard[]; onSelect?: (a
                   <circle cx={b.x} cy={b.y} r={b.size + (active ? 4 : 2.6)} fill={b.color} opacity={active ? 0.4 : 0.2} />
                   {/* core — dimmed when the position is recency fallback, not context */}
                   <circle cx={b.x} cy={b.y} r={active ? b.size + 1 : b.size} fill={b.color} opacity={b.frac == null ? 0.55 : 1} />
+                  {/* A stalled session wears a broken ring. Colour cannot carry
+                      it here — amber already means "waiting on you" — and at
+                      four pixels a blip has no room for a silhouette, so the
+                      difference goes outside the blip instead of inside it. */}
+                  {b.a.status === "stalled" && (
+                    <circle cx={b.x} cy={b.y} r={b.size + 4.5} fill="none" stroke={b.color}
+                      strokeWidth="1.2" strokeDasharray="2.4 2.4" opacity={0.9} />
+                  )}
                 </motion.g>
               );
             })}
@@ -319,7 +355,7 @@ function Dossier({ b, wide, auto }: {
         </div>
         <div className="truncate" title={a.key}>{a.session_id}</div>
         {toCompact != null
-          ? <div className="flex items-center gap-2 min-w-0">{meter}<span className="tabular-nums shrink-0" title={eqTitle(a.tokens)}>{fmtEq(a.tokens)}</span></div>
+          ? <div className="flex items-center gap-2 min-w-0">{meter}<span className="tabular-nums shrink-0" title="cost of the newest main-thread event with token counts — usually one model request, more than one when no hook fired between them; not the whole prompt when tools loop">last {fmtUsd(a.turnCost)}</span><span className="tabular-nums shrink-0" title={eqTitle(a.tokens)}>{fmtEq(a.tokens)}</span></div>
           : <div>ctx unknown — placed by recency</div>}
       </div>
     );
@@ -341,6 +377,7 @@ function Dossier({ b, wide, auto }: {
         <div className="flex flex-col gap-1.5">
           {meter}
           <Row k="context" v={`${fmtTokens(a.ctxTokens)} / ${fmtTokens(a.ctxLimit)}`} />
+          <Row k="last turn" v={fmtUsd(a.turnCost)} />
         </div>
       ) : (
         <div className="leading-snug">ctx unknown — placed by recency</div>

@@ -22,11 +22,12 @@
 // bar is the one thing the UI replaces), and in append mode that line is
 // re-asserted after the user's override so a stray `set -g status on` in it
 // cannot fight the UI. Replace mode is the user's config and their call.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { resolveTmuxBin, tmuxStateDir } from "./tmuxbin.ts";
-import { tmuxConfMode, tmuxOverride, writeTmuxSettings, tmuxConfBroken, setTmuxConfBroken, tmuxPrefix } from "./config.ts";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { resolveTmuxBin, tmuxStateDir, tmuxVersion } from "./tmuxbin.ts";
+import { tmuxConfMode, tmuxOverride, writeTmuxSettings, tmuxConfBroken, setTmuxConfBroken, tmuxPrefix, configPath, configDirRedirected } from "./config.ts";
 
 /** The generated base config. Kept here rather than in tmuxpane.ts because the
  *  generation, the validation gate and the override all belong to one seam. */
@@ -68,11 +69,143 @@ set -g renumber-windows on
 set -g focus-events on
 `;
 
-/** The config file we write. `confPath()` and `writeConf()` are separate
- *  because tmuxpane's `tmux()` needs the path on every call while the write
- *  only happens when something changed. */
+/**
+ * A tab whose PROGRAM failed stays, dead, with the status on it. A shell that
+ * exits closes as it always did.
+ *
+ * tmux's default closes a window the instant its command exits, and for a
+ * program that crashed that is a tab gone from the strip in the same second
+ * with nothing to say why: five tabs running agent CLIs, each started by hand
+ * with `tmux new-window "cli …"` and so without the wrapper this app's own
+ * windows carry, vanished over one afternoon (2026-09-21). `failed` keeps the
+ * pane for a non-zero status or a signal, so the tab reads "Pane is dead
+ * (status 1, …)" where the program was.
+ *
+ * Not for a pane born as a plain shell, and that is the hook: an interactive
+ * shell exits with the status of its LAST command, so `false` then Ctrl-D
+ * would leave every Terminal tab, console and bench as a corpse (measured).
+ * A pane tmux started with no command has an empty `pane_start_command`, and
+ * `pane-died` — which only fires for a pane kept by this option — closes it
+ * on the spot. The windows this app opens and watches for their exit set the
+ * option back to off on themselves (panelease.ts, agentops.ts).
+ *
+ * `pane-died` alone is not enough, so a shell pane is also born with the option
+ * off. Under `failed`, tmux keeps a pane until it has the exit status, and a
+ * tmux built with libutempter — Debian's and Ubuntu's are — can lose that
+ * SIGCHLD: the library resets the handler to SIG_DFL around its own helper, a
+ * child that exits in that window is never reaped, and the pane stays dead
+ * with no status and no `pane-died`. Measured on Ubuntu 24.04's tmux 3.4 with
+ * `exit 0`: a corpse 8 times in 10; the same source built without utempter,
+ * 0 in 10. Off from birth, a shell's pane closes on the pty's end and never
+ * waits for the status. A pane with a command still waits, and on such a
+ * build can still be kept when it ended cleanly; that is the next thing and
+ * it is not here.
+ *
+ * `failed` is a tmux 3.2 value; an older tmux would refuse the whole line and
+ * report it on the first attach, so it is left out there.
+ */
+export function keepFailedPanesLines(): string {
+  const bin = resolveTmuxBin();
+  const m = /(\d+)\.(\d+)/.exec(bin ? tmuxVersion(bin) ?? "" : "");
+  const known = m ? Number(m[1]) * 100 + Number(m[2]) : 0;
+  if (known < 302) return "# remain-on-exit failed: needs tmux 3.2, and this tmux is older.\n";
+  return "# A tab whose program failed stays with the status on it; a shell that exits\n"
+    + "# closes as always (see keepFailedPanesLines in tmuxconf.ts).\n"
+    + "set -g remain-on-exit failed\n"
+    + "set-hook -g pane-died 'if-shell -F \"#{==:#{pane_start_command},}\" \"kill-pane\"'\n"
+    + ["after-new-session", "after-new-window", "after-split-window"].map((h) =>
+      `set-hook -g ${h} 'if-shell -F "#{==:#{pane_start_command},}" "set -p remain-on-exit off"'\n`).join("");
+}
+
+/**
+ * The config file we write. `confPath()` and `writeConf()` are separate because
+ * tmuxpane's `tmux()` needs the path on every call while the write only happens
+ * when something changed.
+ *
+ * NAMED AFTER THE SETTINGS IT MATERIALISES, and that is not decoration.
+ *
+ * This file is generated from config.json, which lives under XDG_CONFIG_HOME —
+ * but it was written to the STATE dir, which follows XDG_STATE_HOME. Redirect
+ * one and not the other, as every harness in this repo did, and a second
+ * instance with different settings silently rewrites the conf the real engine
+ * runs on. Then anything that re-sources it — the settings panel's Save, or the
+ * prefix heal in tmuxctl — pushes those settings into the live server.
+ *
+ * Measured on the developer's own machine, twice in one afternoon: a probe with
+ * an isolated config (and therefore no prefix set) rewrote `tmux.conf` with
+ * `set -g prefix C-b` at 13:30 and again at 14:15, and the desk's engine — which
+ * had been on C-f since 08:42 and never restarted — came back reporting C-b.
+ * Reported as "tmux has changed on its own again".
+ *
+ * So a non-default config dir gets a conf of its own. The default path is
+ * untouched, which matters: an installed app must not orphan the file its
+ * running server was started with.
+ */
 export function confPath(): string {
-  return join(tmuxStateDir(), "tmux.conf");
+  /*
+   * AN ISOLATED INSTANCE KEEPS ITS CONF WHERE ITS CONFIG LIVES.
+   *
+   * The hashed name below was right about the collision and wrong about the
+   * place: it wrote `tmux-<hash>.conf` into the SHARED state directory, one per
+   * distinct config dir, and a probe or a test run gets a fresh temporary
+   * config dir every time. Nothing ever removed them. Measured on the
+   * developer's machine: 136 files, 772 KB, none of them referenced by any
+   * running tmux, growing since the day the hash was introduced.
+   *
+   * So when the config dir is redirected and no state dir was named, the conf
+   * goes beside that config — and dies with it, which is what a temporary
+   * directory is for. The ordinary install is untouched: same path, same file,
+   * and an installed app must not orphan the file its running server was
+   * started with.
+   */
+  if (configDirRedirected() && !process.env.AGENTGLASS_STATE_DIR) {
+    return join(dirname(configPath()), "tmux.conf");
+  }
+  return join(tmuxStateDir(), confName());
+}
+
+/**
+ * Clear out the hashed confs the old placement left behind.
+ *
+ * Only files matching the shape it wrote, only in our own state directory, and
+ * only ones no live tmux was started with — the live check is what makes this
+ * safe to run at boot rather than a thing somebody has to remember.
+ *
+ * Returns how many it removed, for a log line worth reading once.
+ */
+export function sweepStaleConfs(): number {
+  let gone = 0;
+  try {
+    const dir = tmuxStateDir();
+    const live = new Set<string>();
+    /* Whatever is running RIGHT NOW, by the `-f` it was started with. A conf in
+       use is a conf that must not be removed, however old the file looks. */
+    try {
+      const ps = Bun.spawnSync(["ps", "-eo", "args"], { stdout: "pipe", stderr: "pipe" });
+      for (const m of ps.stdout.toString().matchAll(/-f\s+(\S*tmux-[0-9a-f]{8}\.conf)/g)) live.add(m[1]!);
+    } catch { /* no ps: the age check below still holds */ }
+    for (const name of readdirSync(dir)) {
+      if (!/^tmux-[0-9a-f]{8}\.conf$/.test(name)) continue;
+      const full = join(dir, name);
+      if (live.has(full)) continue;
+      /* An hour, not a day: these belong to a process that either has one open
+         or does not, and the only reason to wait at all is a server that is
+         mid-start while this runs. */
+      try {
+        if (Date.now() - statSync(full).mtimeMs < 60 * 60_000) continue;
+      } catch { continue; }
+      try { rmSync(full, { force: true }); gone++; } catch { /* somebody else's */ }
+    }
+  } catch { /* no state dir yet */ }
+  return gone;
+}
+
+/** `tmux.conf` for the ordinary install; `tmux-<8 hex>.conf` when somebody has
+ *  redirected XDG_CONFIG_HOME. The hash is over the resolved config dir, so the
+ *  same isolated instance keeps its own file across restarts. */
+function confName(): string {
+  if (!configDirRedirected()) return "tmux.conf";
+  return `tmux-${createHash("sha256").update(dirname(configPath())).digest("hex").slice(0, 8)}.conf`;
 }
 
 /** Path of the user's override file. Written from the settings panel, read at
@@ -128,7 +261,7 @@ export function confContent(): string {
   // cannot hand the status bar back to tmux — the UI owns it.
   const user = override.trim();
   const body = user ? `\n# --- user override (settings panel) ---\n${user}\n` : "";
-  return `${BASE}${prefixLines()}${body}\n# The UI owns the status line. Re-asserted after any override.\nset -g status off\n`;
+  return `${BASE}${keepFailedPanesLines()}${prefixLines()}${body}\n# The UI owns the status line. Re-asserted after any override.\nset -g status off\n`;
 }
 
 let written: string | null = null;
@@ -139,11 +272,63 @@ let written: string | null = null;
 export function ensureConf(): string {
   const content = confContent();
   if (written === content) return confPath();
-  const dir = tmuxStateDir();
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(confPath(), content);
+  const path = confPath();
+  /* The conf's OWN directory, not the state directory. Those were the same
+     place until an isolated instance started keeping its conf beside its
+     config, and this line kept making the other one — so the write threw
+     ENOENT and the server never finished starting. Twenty-six route tests
+     went red at once, every one of them "a beforeEach hook timed out", which
+     is what a server that cannot boot looks like from a test. */
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content);
   written = content;
-  return confPath();
+  return path;
+}
+
+/**
+ * The longest Unix socket path the check may create. `sun_path` is 108 bytes
+ * on Linux and 104 on macOS. The margin is deliberate: the path below is a
+ * model of the one tmux builds, and a uid with more digits than the model
+ * assumed, or a `T` directory one character longer, must not be the difference
+ * between a gate that runs and one that reports every config broken.
+ */
+export const SOCKET_PATH_BUDGET = 90;
+
+/**
+ * Where the throwaway server for one validation lives, and the socket tmux
+ * will create in it.
+ *
+ * tmux puts a `-L name` socket at `$TMUX_TMPDIR/tmux-<uid>/<name>`, and a Unix
+ * socket path is bounded by `sun_path` — 104 bytes on macOS. `os.tmpdir()`
+ * there is `/var/folders/<2>/<30 random>/T`, 49 bytes before this function has
+ * added a word. Measured against that shape with the names this file used to
+ * use:
+ *
+ *     /var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/agentglass-conf-check-1757000000000/tmux-501/agx-val-1757000000000
+ *
+ * is 115 bytes, so `new-session` failed with "File name too long", the gate
+ * reported the config broken, and the pane engine never started on a Mac. With
+ * the directory name shortened it is exactly 100 — inside the limit by four
+ * bytes, and one extra uid digit from failing again. The base itself is the
+ * problem, not the names.
+ *
+ * So the base is `os.tmpdir()` where the whole socket path fits the budget and
+ * `/tmp` where it would not. Measured, not decided by platform: a Linux user
+ * with a long `TMPDIR` gets the same fallback, and a Mac whose tmpdir happened
+ * to be short would keep it. `/tmp` is the one directory tmux itself falls
+ * back to (`_PATH_TMP`), so it exists wherever tmux runs.
+ *
+ * `base` and `uid` are parameters for the suite, which cannot run on a Mac and
+ * states that machine's shape instead.
+ */
+export function validationSandbox(now: number, socket: string, base = tmpdir(), uid = process.getuid?.() ?? 0): { sandbox: string; socketPath: string } {
+  const place = (root: string) => {
+    const sandbox = join(root, `agx-cc-${now}`);
+    return { sandbox, socketPath: join(sandbox, `tmux-${uid}`, socket) };
+  };
+  const preferred = place(base);
+  if (Buffer.byteLength(preferred.socketPath, "utf8") <= SOCKET_PATH_BUDGET) return preferred;
+  return place("/tmp");
 }
 
 /**
@@ -171,7 +356,7 @@ export function ensureConf(): string {
 export function validateConf(text: string, now = Date.now(), socket = `agx-val-${now}`): { ok: boolean; stderr: string } {
   const bin = resolveTmuxBin();
   if (!bin) return { ok: false, stderr: "tmux is not installed" };
-  const sandbox = join(tmpdir(), `agentglass-conf-check-${now}`);
+  const { sandbox } = validationSandbox(now, socket);
   try { mkdirSync(sandbox, { recursive: true }); } catch { /* raced */ }
   const conf = join(sandbox, "tmux.conf");
   writeFileSync(conf, text);

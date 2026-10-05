@@ -439,7 +439,7 @@ export function gitBranches(): { current: string; branches: GitBranch[] } {
   ] };
 }
 export function gitGraph(): { lines: GitGraphLine[] } {
-  const c = (graph: string, hash: string, subject: string, refs = ""): GitGraphLine => ({ graph, hash, author: "David", date: "2h", subject, refs });
+  const c = (graph: string, hash: string, subject: string, refs = ""): GitGraphLine => ({ graph, hash, author: "Ada", date: "2h", subject, refs });
   return { lines: [
     c("* ", "9f2c1a7", "checkout hardening: qty-aware totals", "HEAD -> feat/git-panel"),
     c("* ", "3b7d0e2", "fix: guard empty coupon so it can't double-discount"),
@@ -458,7 +458,7 @@ export function gitWorktrees(): { worktrees: GitWorktree[] } {
   ] };
 }
 export function gitLog(): { commits: GitCommit[] } {
-  const c = (h: string, s: string, d: string, refs = ""): GitCommit => ({ hash: h + "0000000000000000000000000000000000", shortHash: h, subject: s, author: "David", date: d, refs });
+  const c = (h: string, s: string, d: string, refs = ""): GitCommit => ({ hash: h + "0000000000000000000000000000000000", shortHash: h, subject: s, author: "Ada", date: d, refs });
   return { commits: [
     c("9f2c1a7", "checkout hardening: qty-aware totals", "2 hours ago", "HEAD -> feat/git-panel"),
     c("3b7d0e2", "fix: guard empty coupon so it can't double-discount", "5 hours ago"),
@@ -555,7 +555,7 @@ export function insights(): { insights: Insight[] } {
   ] };
 }
 
-export function search(q: string): { hits: SearchHit[] } {
+export function search(q: string, _opts?: { since?: number; provider?: string }): { hits: SearchHit[] } {
   if (!q.trim()) return { hits: [] };
   const now = Date.now();
   return { hits: Array.from({ length: 12 }, (_, i) => {
@@ -1144,14 +1144,14 @@ const ISSUES: IssueDetail[] = [
     number: 214, title: "Cart total is a cent low on 3-for-2 bundles", state: "OPEN", author: "mira",
     labels: [{ name: "bug", color: "d73a4a" }, { name: "pricing", color: "0e8a16" }], assignees: ["you"], comments: 4,
     updatedAt: isoAgo(2 * 3600_000), url: "https://github.com/acme/shop-api/issues/214",
-    createdAt: isoAgo(2 * 86400_000), milestone: "Checkout hardening", work: null,
+    thread: [], createdAt: isoAgo(2 * 86400_000), milestone: "Checkout hardening", work: null,
     body: "Rounding runs per line and again on the subtotal. Repro: three of SKU-8841 under the 3-for-2 promo — the total lands a cent low. Round once, on the order total.",
   },
   {
     number: 209, title: "Idempotency keys on the payments webhook", state: "OPEN", author: "you",
     labels: [{ name: "reliability", color: "1d76db" }], assignees: [], comments: 1,
     updatedAt: isoAgo(6 * 3600_000), url: "https://github.com/acme/payments-svc/issues/209",
-    createdAt: isoAgo(4 * 86400_000), milestone: null,
+    thread: [], createdAt: isoAgo(4 * 86400_000), milestone: null,
     work: { number: 209, repo: "payments-svc", branch: "209-webhook-idempotency", path: "/home/dev/code/payments-svc-209", mode: "worktree", startedAt: Date.now() - 3600_000 },
     body: "A retried Stripe event double-credits the wallet. Store the event id and short-circuit a repeat inside the same transaction.",
   },
@@ -1159,21 +1159,21 @@ const ISSUES: IssueDetail[] = [
     number: 198, title: "Inventory count drifts after a partial refund", state: "OPEN", author: "ana",
     labels: [{ name: "bug", color: "d73a4a" }, { name: "inventory", color: "5319e7" }], assignees: ["you"], comments: 7,
     updatedAt: isoAgo(26 * 3600_000), url: "https://github.com/acme/inventory-svc/issues/198",
-    createdAt: isoAgo(9 * 86400_000), milestone: "Checkout hardening", work: null,
+    thread: [], createdAt: isoAgo(9 * 86400_000), milestone: "Checkout hardening", work: null,
     body: "A partial refund restocks the full quantity. The restock should mirror the refunded lines, not the original order.",
   },
   {
     number: 187, title: "Skeleton the product grid while it loads", state: "OPEN", author: "you",
     labels: [{ name: "ux", color: "fbca04" }, { name: "good first issue", color: "7057ff" }], assignees: [], comments: 0,
     updatedAt: isoAgo(3 * 86400_000), url: "https://github.com/acme/shop-web/issues/187",
-    createdAt: isoAgo(5 * 86400_000), milestone: null, work: null,
+    thread: [], createdAt: isoAgo(5 * 86400_000), milestone: null, work: null,
     body: "The grid pops in. A skeleton for the first paint would settle the layout.",
   },
   {
     number: 176, title: "Checkout 500s on an empty cart instead of redirecting", state: "OPEN", author: "sam",
     labels: [{ name: "bug", color: "d73a4a" }], assignees: [], comments: 2,
     updatedAt: isoAgo(4 * 86400_000), url: "https://github.com/acme/shop-web/issues/176",
-    createdAt: isoAgo(7 * 86400_000), milestone: null, work: null,
+    thread: [], createdAt: isoAgo(7 * 86400_000), milestone: null, work: null,
     body: "Hitting /checkout with nothing in the cart throws. It should bounce to the cart with a note.",
   },
 ];
@@ -1274,13 +1274,13 @@ export function filesFind(q: string): FindReport {
 const GB = 1024 ** 3, MB = 1024 ** 2;
 export function machinePorts(): PortsReport {
   const ports: PortEntry[] = [
-    { port: 5173, addr: "127.0.0.1", proc: "vite", pid: 48213, cwd: "/home/dev/code/shop-web", mine: true, ageSec: 5400, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 48090, name: "bun" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
-    { port: 3000, addr: "127.0.0.1", proc: "bun", pid: 48090, cwd: "/home/dev/code/shop-api", mine: true, ageSec: 5460, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
-    { port: 8080, addr: "0.0.0.0", proc: "node", pid: 47771, cwd: "/home/dev/code/inventory-svc", mine: true, ageSec: 12600, fromAgent: true, cwdGone: false, publicBind: true, exeGone: false, ancestry: [{ pid: 46050, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
-    { port: 4317, addr: "127.0.0.1", proc: "otelcol", pid: 4102, cwd: null, mine: true, ageSec: 86400, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, ancestry: [] },
-    { port: 5432, addr: "127.0.0.1", proc: "postgres", pid: 1893, cwd: null, mine: false, ageSec: 259200, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, ancestry: [] },
-    { port: 9229, addr: "127.0.0.1", proc: "node", pid: 41220, cwd: "/home/dev/code/payments-svc-209", mine: true, ageSec: 640, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, ancestry: [{ pid: 41100, name: "bash" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
-    { port: 4173, addr: "127.0.0.1", proc: "node", pid: 30112, cwd: "/home/dev/code/shop-web-old", mine: true, ageSec: 46800, fromAgent: true, cwdGone: true, publicBind: false, exeGone: false, ancestry: [{ pid: 30000, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 5173, addr: "127.0.0.1", proc: "vite", pid: 48213, cwd: "/home/dev/code/shop-web", mine: true, ageSec: 5400, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, dir: null, tmpLeftover: false, duplicate: false, idleSec: null, ancestry: [{ pid: 48090, name: "bun" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 3000, addr: "127.0.0.1", proc: "bun", pid: 48090, cwd: "/home/dev/code/shop-api", mine: true, ageSec: 5460, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, dir: null, tmpLeftover: false, duplicate: false, idleSec: null, ancestry: [{ pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 8080, addr: "0.0.0.0", proc: "node", pid: 47771, cwd: "/home/dev/code/inventory-svc", mine: true, ageSec: 12600, fromAgent: true, cwdGone: false, publicBind: true, exeGone: false, dir: "/home/dev/code/inventory-svc", tmpLeftover: false, duplicate: false, idleSec: 15300, ancestry: [{ pid: 46050, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 4317, addr: "127.0.0.1", proc: "otelcol", pid: 4102, cwd: null, mine: true, ageSec: 86400, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, dir: null, tmpLeftover: false, duplicate: false, idleSec: null, ancestry: [] },
+    { port: 5432, addr: "127.0.0.1", proc: "postgres", pid: 1893, cwd: null, mine: false, ageSec: 259200, fromAgent: false, cwdGone: false, publicBind: false, exeGone: false, dir: null, tmpLeftover: false, duplicate: false, idleSec: null, ancestry: [] },
+    { port: 9229, addr: "127.0.0.1", proc: "node", pid: 41220, cwd: "/home/dev/code/payments-svc-209", mine: true, ageSec: 640, fromAgent: true, cwdGone: false, publicBind: false, exeGone: false, dir: "/tmp/report-preview", tmpLeftover: true, duplicate: true, idleSec: null, ancestry: [{ pid: 41100, name: "bash" }, { pid: 46001, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
+    { port: 4173, addr: "127.0.0.1", proc: "node", pid: 30112, cwd: "/home/dev/code/shop-web-old", mine: true, ageSec: 46800, fromAgent: true, cwdGone: true, publicBind: false, exeGone: false, dir: null, tmpLeftover: false, duplicate: false, idleSec: null, ancestry: [{ pid: 30000, name: "claude" }, { pid: 1201, name: "tmux: server" }] },
   ];
   return { ports, mine: ports.filter((p) => p.mine).length, external: ports.filter((p) => p.addr === "0.0.0.0").length };
 }

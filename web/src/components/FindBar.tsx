@@ -15,6 +15,8 @@ import { useEffect, useRef, useSyncExternalStore } from "react";
 import { closeFind, findState, runQuery, stepFind, subscribeFind } from "../lib/findScope.ts";
 import { CloseButton } from "./CloseButton.tsx";
 import { clear as clearHighlights } from "../lib/mdFind.ts";
+import { SearchIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 export function FindBar() {
   const st = useSyncExternalStore(subscribeFind, findState, findState);
@@ -41,7 +43,7 @@ export function FindBar() {
     <div className="fixed z-[10050] flex items-center gap-1.5 rounded-lg px-2 py-1.5 agx-menu"
       style={{ top: 8, right: 12, boxShadow: "0 8px 24px rgba(0,0,0,0.35)" }}
       role="search" aria-label="Find on this screen">
-      <span aria-hidden className="text-[11px]" style={{ color: "var(--text3)" }}>⌕</span>
+      <span aria-hidden className="flex" style={{ color: "var(--text3)" }}><SearchIcon size={ICON.xs} /></span>
       <input ref={box} value={st.query} spellCheck={false} autoComplete="off"
         onChange={(e) => runQuery(e.target.value)}
         onKeyDown={(e) => {
@@ -60,17 +62,20 @@ export function FindBar() {
       <span className="tabular-nums text-[10px] shrink-0" style={{ color: nothing ? "var(--error)" : "var(--text4)" }}>
         {st.total ? `${st.at}/${st.total}` : st.query ? "0/0" : ""}
       </span>
-      <Arrow dir={-1} disabled={!st.total} />
-      <Arrow dir={1} disabled={!st.total} />
+      <FindArrow dir={-1} disabled={!st.total} onClick={() => stepFind(-1)} />
+      <FindArrow dir={1} disabled={!st.total} onClick={() => stepFind(1)} />
       <CloseButton onClick={closeFind} title="Close (Esc)" className="rounded hover:bg-white/10 shrink-0"
         style={{ color: "var(--text3)" }} />
     </div>
   );
 }
 
-function Arrow({ dir, disabled }: { dir: 1 | -1; disabled: boolean }) {
+/** Exported because the terminal's own find wears the same face: it searches a
+ *  canvas rather than the document, so it cannot share the logic, and there is
+ *  no reason for it to look like a different feature. */
+export function FindArrow({ dir, disabled, onClick }: { dir: 1 | -1; disabled: boolean; onClick: () => void }) {
   return (
-    <button onClick={() => stepFind(dir)} disabled={disabled}
+    <button onClick={onClick} disabled={disabled}
       title={dir === 1 ? "Next (Enter)" : "Previous (Shift+Enter)"}
       aria-label={dir === 1 ? "Next match" : "Previous match"}
       className="inline-flex items-center justify-center rounded hover:bg-white/10 shrink-0"

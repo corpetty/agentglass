@@ -21,7 +21,7 @@
 // the header. So the shell now reports its own failures and they are rendered
 // here, with the reason and the fix, beside the guess-check that came first.
 import { useEffect, useState } from "react";
-import { IS_DEMO, SERVER, SERVER_GUESSED, probeServer, sidecarFailure, onSidecarFailure, type ServerIdentity, type SidecarFailure } from "../lib/api.ts";
+import { IS_DEMO, SERVER, SERVER_GUESSED, probeServer, sidecarFailure, onSidecarFailure, onDeskTaken, retryDesk, type ServerIdentity, type SidecarFailure, whenServerUp } from "../lib/api.ts";
 
 /** How often to look again while the answer is wrong. Often enough that
  *  starting the server clears the banner without a reload, rare enough that a
@@ -42,6 +42,11 @@ export default function ServerBanner() {
     let stop = false;
     let timer: ReturnType<typeof setTimeout>;
     const look = async () => {
+      // The gate first, then the probe. Asking the network before the shell
+      // has a server is one refused /health per launch — and this component's
+      // whole job is to report a server that is NOT coming, which the gate
+      // already waits for and releases on.
+      await whenServerUp();
       const now = await probeServer();
       if (stop) return;
       setIdentity(now);
@@ -61,7 +66,14 @@ export default function ServerBanner() {
     return onSidecarFailure(setShell);
   }, []);
 
+  const [desk, setDesk] = useState<{ port: number } | null>(null);
+  useEffect(() => {
+    if (IS_DEMO) return;
+    return onDeskTaken(setDesk);
+  }, []);
+
   if (shell) return <ShellBanner failure={shell} />;
+  if (desk) return <DeskBanner port={desk.port} />;
   if (identity === "ours") return null;
 
   // Two different problems, two different fixes. Telling them apart is most of
@@ -110,6 +122,29 @@ function ShellBanner({ failure }: { failure: SidecarFailure }) {
       {failure.detail ? (
         <code className="opacity-70 max-w-full truncate" title={failure.detail}>{failure.detail}</code>
       ) : null}
+    </Bar>
+  );
+}
+
+/**
+ * An adopted server whose desk another process claimed before this app did.
+ * The server works, so the rest of the app does; this window cannot drive the
+ * browser or release a held call there. Retry claims again once whatever holds
+ * it has let go.
+ */
+function DeskBanner({ port }: { port: number }) {
+  return (
+    <Bar tone="warning" label="Desk unavailable">
+      <span>
+        The desk of the server on <code>:{port}</code> is held by another process, so this window cannot drive the
+        browser or release a held call there.
+      </span>
+      <span style={{ color: "var(--text3)" }}>
+        Stop the other process, or restart that server, then retry.
+      </span>
+      <button type="button" className="px-2 py-0.5 rounded border" style={{ borderColor: "var(--border)" }} onClick={retryDesk}>
+        Retry
+      </button>
     </Bar>
   );
 }

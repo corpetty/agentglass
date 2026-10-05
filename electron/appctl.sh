@@ -32,12 +32,13 @@
 APPCTL_DERIVED=(
   AGENTGLASS_TOKEN AGENTGLASS_PORT AGENTGLASS_BIND AGENTGLASS_TRUST_LAN
   AGENTGLASS_WEB_DIR AGENTGLASS_DIE_WITH_PARENT AGENTGLASS_PTY_SIZE_FILE
+  AGENTGLASS_DESK_FD
 )
 APPCTL_UNSET=()
 for _n in "${APPCTL_DERIVED[@]}"; do APPCTL_UNSET+=(-u "$_n"); done
 unset _n
 # `^AGENTGLASS_(TOKEN|PORT|…)=`, built from the list above so there is nowhere
-# for a seventh variable to be added to one of them and not the other.
+# for another variable to be added to one of them and not the other.
 APPCTL_DERIVED_RE="^($(IFS='|'; printf '%s' "${APPCTL_DERIVED[*]}"))="
 
 # The resolved binary behind a pid, or nothing.
@@ -262,9 +263,9 @@ start_app() {
   # spawned with the sidecar's environment — and that difference is the whole
   # bug. Both doors, or neither is shut.
   if command -v setsid >/dev/null 2>&1; then
-    setsid env "${APPCTL_UNSET[@]}" "${env[@]}" "$APP/agentglass" "${args[@]}" </dev/null >/dev/null 2>&1 &
+    setsid env "${APPCTL_UNSET[@]}" "${env[@]}" "$APP/agentglass" "${args[@]}" </dev/null >/dev/null 2>&1 9>&- &
   else
-    env "${APPCTL_UNSET[@]}" "${env[@]}" "$APP/agentglass" "${args[@]}" </dev/null >/dev/null 2>&1 &
+    env "${APPCTL_UNSET[@]}" "${env[@]}" "$APP/agentglass" "${args[@]}" </dev/null >/dev/null 2>&1 9>&- &
     disown 2>/dev/null || true
   fi
   return 0
@@ -319,6 +320,40 @@ restore_after_failed_install() {
   return 1
 }
 
+# One install at a time, from here to the reopen.
+#
+# Two installs that overlap lose the app: the second starts while the first has
+# it down, finds nothing running and so captures nothing to reopen, then
+# replaces the files under the instance the first has just reopened. Measured
+# with three installs a few minutes apart: the reopened instance lived
+# twenty-one seconds and nothing brought it back.
+#
+# So the second waits, and when its turn comes it stops, captures and reopens
+# what the first put back. A lock rather than a refusal because a queued install
+# is what the person asked for; flock rather than a lock directory because the
+# kernel drops it when the holder dies, so a killed install cannot wedge the
+# next one. fd 9 must not reach the app start_app launches, or the app would
+# hold it for as long as it runs.
+#
+# Taken after packaging, so installs from different worktrees still build in
+# parallel; two installs from the SAME worktree share its dist-app and are not
+# protected while they build. Give one of them AGENTGLASS_DIST_DIR.
+#
+# No flock (it is util-linux), no lock: the install runs as it did before.
+take_install_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$(dirname "$APP")"
+  if ! { exec 9>"$APP.install.lock"; } 2>/dev/null; then
+    echo "cannot create the install lock ($APP.install.lock)" >&2
+    return 1
+  fi
+  flock -n 9 && return 0
+  echo "==> another install is replacing this app; waiting for it to finish"
+  flock -w "${APPCTL_LOCK_WAIT_S:-600}" 9 && return 0
+  echo "gave up after ${APPCTL_LOCK_WAIT_S:-600}s waiting for the other install ($APP.install.lock)" >&2
+  return 1
+}
+
 # Stop the running instance, politely first. Returns 1 if anything survives,
 # because the caller's next move is rm -rf over these very files.
 stop_app() {
@@ -354,4 +389,36 @@ stop_app() {
   fi
 
   [ -z "$(app_pids)" ]
+}
+
+# How many runs the deputy has going right now — 0 when nobody answers.
+#
+# `grep -o` exits 1 when it matches nothing, and this script runs under
+# `set -euo pipefail`, so the honest answer "none" used to abort the caller
+# before it printed anything: the install refused EXACTLY when it was safe,
+# with no message, and a whole afternoon of work sat unpacked because of it.
+#
+# Counted with awk rather than `grep -c`: the run table arrives as one line, so
+# grep would answer 1 for any number of runs, and "is anything running" is the
+# only question here — but a wrong count is what gets printed at a person.
+deputy_runs() {
+  local body n
+  body=$(curl -sf -m 4 "http://127.0.0.1:${AGENTGLASS_PORT:-4000}/understudy/work/next?token=${AGENTGLASS_TOKEN:-}" 2>/dev/null) || { echo 0; return 0; }
+  n=$(printf '%s' "$body" | awk -v RS='"state":"running"' 'END{ print (NR > 0 ? NR - 1 : 0) }')
+  echo "${n:-0}"
+}
+
+# Stopping the app kills the agent inside a run, and what it leaves is a branch
+# with half a change on it and a row nobody can complete. Refused rather than
+# warned: the damage is silent, and it shows up an hour later on somebody
+# else's screen. AGENTGLASS_INSTALL_ANYWAY=1 is the way past it for a person
+# who has decided the run does not matter.
+refuse_if_deputy_busy() {
+  [ -z "${AGENTGLASS_INSTALL_ANYWAY:-}" ] || return 0
+  local runs
+  runs=$(deputy_runs)
+  [ "${runs:-0}" -gt 0 ] || return 0
+  echo "refusing to install: the deputy has $runs run(s) going — stopping the app now kills the agent mid-change." >&2
+  echo "  wait for it, halt it in the app, or AGENTGLASS_INSTALL_ANYWAY=1 make desktop-install" >&2
+  return 1
 }

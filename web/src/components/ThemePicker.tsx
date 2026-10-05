@@ -1,11 +1,14 @@
-import { useState } from "react";
-import { SettingRow } from "./SettingRow.tsx";
+import { useEffect, useState } from "react";
+import { SettingRow, Switch } from "./SettingRow.tsx";
 import {
-  THEMES, pickTheme, applyTheme, isDarkTheme, EXPERIMENTAL_THEME_IDS,
-  themeMode, applyThemeMode, persistThemeMode, SERIOUS_DARK, SERIOUS_LIGHT,
+  THEMES, chooseTheme, applyTheme, isDarkTheme, EXPERIMENTAL_THEME_IDS,
+  themeMode, applyThemeMode, desktopPaletteName, onDesktopPalette,
   type Theme, type ThemeMode,
 } from "../lib/themes.ts";
-import { ACCENTS, currentAccent, setAccentPref } from "../lib/accent.ts";
+import { ACCENTS, currentAccent, setAccentPref, lastAccent } from "../lib/accent.ts";
+import { SERVER, authHeaders } from "../lib/api.ts";
+import { DoneIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 /* Settings → Appearance.
  *
@@ -49,7 +52,7 @@ function ThemeBtn({ t, current, onPick }: { t: Theme; current: string; onPick: (
       <span className="flex items-center gap-1.5 px-2 py-1 text-[11.5px]"
         style={{ background: "color-mix(in srgb, var(--bg3) 30%, transparent)", color: on ? "var(--primary-hover)" : "var(--text3)" }}>
         <span className="truncate">{t.name}</span>
-        {on && <span className="ml-auto shrink-0">✓</span>}
+        {on && <span className="ml-auto shrink-0 flex"><DoneIcon size={ICON.xs} /></span>}
       </span>
     </button>
   );
@@ -102,7 +105,9 @@ export function ThemePicker({ current, onChange }: { current: string; onChange: 
   const rest = THEMES.filter((t) => !featured.some((f) => f.id === t.id));
 
   return (
-    <div>
+    /* Bottom padding of its own: this is the last thing in the card, and without
+       it the "N more" row sat directly on the card's bottom border. */
+    <div className="pb-3">
       <Grid items={featured} current={current} onPick={onChange} />
 
       <button
@@ -134,32 +139,78 @@ const MODES: { m: ThemeMode; label: string }[] = [
   { m: "light", label: "Light" },
 ];
 
+/**
+ * The desktop's own mark, as the label of its segment.
+ *
+ * Inlined, so it takes the segment's text colour — dim at rest, bright when on
+ * — like the words beside it. The first version drew it as a CSS mask and it
+ * drew nothing. What comes back is safe to inline because the server rebuilds
+ * it from geometry alone (see rebuildMark); if it cannot be had the button says
+ * the name instead, because a blank button is worse than a word.
+ */
+function DesktopMark({ source }: { source: string }) {
+  const name = source === "omarchy" ? "Omarchy" : source;
+  const [svg, setSvg] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetch(`${SERVER}/desktop/logo`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.text() : ""))
+      .then((t) => { if (live && t.startsWith("<svg")) setSvg(t); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
+  if (!svg) return <>{name}</>;
+  return (
+    <span role="img" aria-label={name} className="inline-flex items-center align-middle"
+      style={{ height: 12 }}
+      /* Sized by height; the view box gives the width. */
+      dangerouslySetInnerHTML={{ __html: svg.replace("<svg ", '<svg height="12" style="display:block" ') }} />
+  );
+}
+
 /** The whole Appearance page: mode segment on top, palette grid below. Owns the
  *  one decision — a mode click applies the matching serious theme, a grid click
  *  applies that palette and re-labels the segment — and keeps app state in step
  *  through `onChange`. */
-export function AppearancePane({ current, onChange }: { current: string; onChange: (id: string) => void }) {
+export function AppearancePane({ current, onChange, onAccent }: {
+  current: string; onChange: (id: string) => void;
+  /** Told when the accent changes, so a page-level Reset can tell it moved. */
+  onAccent?: (id: string) => void;
+}) {
   const [mode, setMode] = useState<ThemeMode>(() => themeMode());
+  /* Which desktop palette is on offer, if any — re-read when it moves, so the
+     line under the switch names the theme that is actually on. */
+  const [desk, setDesk] = useState(() => desktopPaletteName());
+  useEffect(() => onDesktopPalette(() => { setDesk(desktopPaletteName()); setMode(themeMode()); }), []);
 
   const chooseMode = (m: ThemeMode) => {
     const id = applyThemeMode(m);
     setMode(m);
     if (id) onChange(id);
   };
-  const chooseTheme = (id: string) => {
-    pickTheme(id);
-    const m: ThemeMode = id === SERIOUS_DARK ? "dark" : id === SERIOUS_LIGHT ? "light" : "custom";
-    persistThemeMode(m);
-    setMode(m);
+  const choose = (id: string) => {
+    setMode(chooseTheme(id));
     onChange(id);
   };
 
   const [accent, setAccentState] = useState(() => currentAccent());
+  /* The colour the theme brings by itself, for the swatch beside the switch.
+     `--theme-primary` is stamped by `applyAccent` before the overlay goes on,
+     so this is the theme's own even while an accent is laid over it. */
+  const [own, setOwn] = useState("");
+  useEffect(() => {
+    setOwn(getComputedStyle(document.documentElement).getPropertyValue("--theme-primary").trim());
+  }, [accent, current, desk]);
   const chooseAccent = (id: string) => {
     setAccentPref(id);
     applyTheme(current); // re-assert the theme so the overlay (or its removal) lands
     setAccentState(id);
+    onAccent?.(id);
   };
+  /* Following is the absence of an override, so the switch writes "" going on
+     and the last colour going off — never nothing, or the row would look
+     broken with every circle dark. */
+  const following = accent === "";
 
   /* Mode and accent are settings and read as rows; the palette grid is a
      picker and stays a grid. Both used a label floated left with the control
@@ -169,48 +220,71 @@ export function AppearancePane({ current, onChange }: { current: string; onChang
     <>
       <SettingRow
         label="Mode"
-        hint={<>A serious neutral pair. <b style={{ color: "var(--text3)" }}>System</b> follows your OS.</>}
+        hint={desk && mode === "desktop"
+          ? <>Wearing <b style={{ color: "var(--text3)" }}>{desk.name}</b>, your desktop's theme — it follows when you switch there.</>
+          : desk
+            ? <>Your desktop's theme is {desk.name}, one click away. <b style={{ color: "var(--text3)" }}>System</b> follows your OS's dark or light.</>
+            : <>A serious neutral pair. <b style={{ color: "var(--text3)" }}>System</b> follows your OS.</>}
         control={<span className="flex p-0.5 rounded-lg" style={{ background: "color-mix(in srgb, var(--bg3) 40%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}>
-          {MODES.map(({ m, label }) => {
+          {[...(desk ? [{ m: "desktop" as ThemeMode, label: "" }] : []), ...MODES].map(({ m, label }) => {
             const on = mode === m;
             return (
               <button key={m} onClick={() => chooseMode(m)}
+                title={m === "desktop" && desk ? `Wear ${desk.name}, your desktop's theme, and follow it when you switch` : undefined}
                 className="px-3 py-1 rounded-md text-[12px] transition-colors"
                 style={on
                   ? { background: "var(--bg2)", color: "var(--text)", boxShadow: "0 1px 2px rgba(0,0,0,0.25)" }
                   : { color: "var(--text3)" }}>
-                {label}
+                {m === "desktop" && desk ? <DesktopMark source={desk.source} /> : label}
               </button>
             );
           })}
         </span>}
       />
 
-      {/* Accent — a colour laid over the theme's grey primary, for the things
-          that read as "live". "Theme" (dashed) is no override. */}
+      {/* Accent. The switch is the decision — follow the theme, or choose —
+          and the circles are only the second half of it. It was a dashed
+          circle in the row with the other seven, which reads as an eighth
+          colour: somebody ran this app for weeks laying a hand-picked green
+          over a desktop theme whose own accent they wanted, because nothing on
+          that circle said what it did. A sentence can say it; a swatch cannot. */}
       <SettingRow
-        label="Accent"
-        hint="Laid over the theme's own primary, for the things that read as live."
-        control={<span className="flex items-center gap-1.5">
-          {ACCENTS.map((a) => {
-            const on = accent === a.id;
-            const isDefault = !a.primary;
-            return (
-              <button key={a.id || "theme"} onClick={() => chooseAccent(a.id)} title={a.name}
-                className="w-5 h-5 rounded-full transition-transform hover:scale-110"
-                style={{
-                  background: isDefault ? "transparent" : a.primary,
-                  border: isDefault ? "1.5px dashed color-mix(in srgb, var(--text4) 80%, transparent)" : "none",
-                  outline: on ? "2px solid var(--text)" : "none",
-                  outlineOffset: "1.5px",
-                }} />
-            );
-          })}
+        label="Accent" modified={!following}
+        hint={following
+          ? <>Following your theme{desk && mode === "desktop" ? <> — <b style={{ color: "var(--text3)" }}>{desk.name}</b> brings its own</> : <>'s own primary</>}.</>
+          : <>Laid over the theme's own primary, for the things that read as live.</>}
+        control={<span className="flex items-center gap-4">
+          <button onClick={() => chooseAccent(following ? lastAccent() : "")}
+            role="switch" aria-checked={following} aria-label="Follow the theme's accent"
+            title="Follow the theme's accent" className="flex items-center gap-1.5">
+            <Switch on={following} />
+            {own
+              /* Smaller than the seven on purpose: it is the colour being
+                 followed, not an eighth colour to pick. The wider gap before
+                 the row says the same thing again. */
+              ? <span className="w-3.5 h-3.5 rounded-full shrink-0" style={{ background: own, opacity: following ? 1 : 0.35 }} />
+              : null}
+          </button>
+          <span className="flex items-center gap-1.5" aria-hidden={following}
+            style={{ opacity: following ? 0.3 : 1, pointerEvents: following ? "none" : undefined }}>
+            {ACCENTS.filter((a) => a.primary).map((a) => {
+              const on = accent === a.id;
+              return (
+                <button key={a.id} onClick={() => chooseAccent(a.id)} title={a.name}
+                  className="w-5 h-5 rounded-full transition-transform hover:scale-110"
+                  style={{
+                    background: a.primary,
+                    outline: on ? "2px solid var(--text)" : "none",
+                    outlineOffset: "1.5px",
+                  }} />
+              );
+            })}
+          </span>
         </span>}
       />
 
       <div className="panel-eyebrow pt-3 pb-1.5">Or pick a palette</div>
-      <ThemePicker current={current} onChange={chooseTheme} />
+      <ThemePicker current={current} onChange={choose} />
     </>
   );
 }

@@ -31,7 +31,8 @@ import { AnimatePresence, motion } from "motion/react";
 import { api } from "../lib/api.ts";
 import { subscribe as subscribeChats, listChats } from "../lib/chatStore.ts";
 import { subscribeGitChanged } from "../lib/gitBus.ts";
-import { subscribeNewGates } from "../lib/gateStore.ts";
+import { notesWorthyRepos } from "../lib/gitNote.ts";
+import { answerGate, gateForNote, listGates, subscribeGates, subscribeNewGates } from "../lib/gateStore.ts";
 import { enqueue, dequeue } from "../lib/toastQueue.ts";
 import {
   subscribeNotifyHistory, notifyHistory, notifyUnread,
@@ -45,6 +46,13 @@ import { openPr, openPrs } from "../lib/openPrs.ts";
 import { Portal } from "./Portal.tsx";
 import { CloseButton } from "./CloseButton.tsx";
 import { appLinkFor } from "../lib/appLink.ts";
+import { ICON, MIN_BOX } from "../lib/iconSize.ts";
+import { GearIcon } from "./workspace/icons.tsx";
+import { openSettings } from "../lib/openSettings.ts";
+import {
+  canMute, groupNotes, laneOf, mutedSources, setMuted, sourceLabel, sourceOf, subscribeMuted,
+  type Lane,
+} from "../lib/notePolicy.ts";
 
 export type NoteKind = "done" | "blocked" | "pull";
 export type Note = {
@@ -144,10 +152,17 @@ export function useAmbientNotes(): { note: Note | null; behind: number; ahead: n
         if (c.attention === "blocked") {
           // Blocked, not merely finished: the chat cannot continue without you.
           push({ id: `${c.id}-b-${c.messages.length}`, kind: "blocked", color: "var(--error)", title: c.title || "Chat", sub: c.blockedTool ? `Needs "${c.blockedTool}"` : "Waiting on you", urgent: true });
-          recordNote({ app: "chat", summary: c.title || "Chat", body: c.blockedTool ? `Blocked — needs "${c.blockedTool}"` : "Blocked — waiting on you", urgency: 2 , goto: { kind: "chat", id: c.id } });
+          // The summary differs from the "Turn finished" one on purpose.
+          // `supersede` keys a chat note on id + summary, so while both said
+          // just the chat title, a turn ending QUIETLY DELETED the urgent
+          // "Blocked" row above it — the one note in this loop he had to act on.
+          recordNote({ app: "chat", summary: `${c.title || "Chat"} — blocked`, body: c.blockedTool ? `Blocked — needs "${c.blockedTool}"` : "Blocked — waiting on you", urgency: 2, goto: { kind: "chat", id: c.id } });
         } else if (c.attention === "done") {
           push({ id: `${c.id}-d-${c.messages.length}`, kind: "done", color: "var(--success)", title: c.title || "Chat", sub: "Turn finished" });
-          recordNote({ app: "chat", summary: c.title || "Chat", body: "Turn finished" , goto: { kind: "chat", id: c.id } });
+          // Silent, and it always should have been: a turn that ended is not a
+          // task. The chat's own green dot says the same thing without a sound,
+          // and with nine sessions this is the highest-volume note in the app.
+          recordNote({ app: "chat", summary: c.title || "Chat", body: "Turn finished", urgency: 0, goto: { kind: "chat", id: c.id } });
         }
       }
       first = false;
@@ -183,9 +198,9 @@ export function useAmbientNotes(): { note: Note | null; behind: number; ahead: n
   // The lane is one slot in the middle of the bar, and the "needs you" chip owns
   // that slot whenever anything is held — so the mirrored ping arrived exactly
   // when it was least likely to be shown. And a caption cannot carry someone
-  // else's message: "New message from Alejandro García / Avisa cuando lo tengas"
-  // is prose, and truncating prose to 10px of bar is how you end up opening
-  // Slack to find out what Slack already told you.
+  // else's message: a chat notification is a name and a sentence of prose, and
+  // truncating prose to 10px of bar is how you end up opening Slack to find
+  // out what Slack already told you.
   //
   // Our own events keep the lane, because they genuinely are captions.
 
@@ -199,11 +214,18 @@ export function useAmbientNotes(): { note: Note | null; behind: number; ahead: n
     let dead = false;
     const poll = async () => {
       try {
-        const { repos } = await api.gitRepos();
+        const { repos, roots } = await api.gitRepos();
         if (dead) return;
+        // With no project open, `/git/repos` is a whole-machine sweep — every
+        // repo this install has ever seen an agent touch, not the folders
+        // this window was pointed at. A note about a checkout nobody here
+        // added is a wrong number, not news — see gitNote.ts's
+        // notesWorthyRepos. Applied to the chip too: a "to pull" count that
+        // disagreed with the filtered rows would be the next bug report.
+        const worthy = notesWorthyRepos(repos, roots ?? []);
         let total = 0;
         let mine = 0;
-        for (const r of repos) {
+        for (const r of worthy) {
           total += r.behind;
           mine += r.ahead;
           const prev = seen.get(r.root) ?? 0;
@@ -214,7 +236,11 @@ export function useAmbientNotes(): { note: Note | null; behind: number; ahead: n
             // passed: mirrored git notes get one derived from their *text*
             // (gitDestination), while ours — which hold the repo and the branch
             // as facts — arrived with nothing and could not be clicked.
-            recordNote({ app: "git", summary: r.name, body: `${r.behind} commit${r.behind === 1 ? "" : "s"} to pull on ${r.branch}`,
+            // Silent: the same number already sits permanently in the "to
+            // pull" chip a few centimetres away in this very bar, and it grows
+            // on its own because the server autofetches. Being behind is never
+            // something to do THIS SECOND.
+            recordNote({ app: "git", summary: r.name, body: `${r.behind} commit${r.behind === 1 ? "" : "s"} to pull on ${r.branch}`, urgency: 0,
               goto: { kind: "git", repo: r.name, branch: r.branch, root: r.root } });
           }
         }
@@ -346,7 +372,24 @@ export function useClipped(els: React.RefObject<HTMLElement | null>[], enabled: 
 /** Branches that are the base rather than a piece of work. */
 const TRUNK = new Set(["master", "main", "trunk", "develop"]);
 
-function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; onGoto: (g: NonNullable<SystemNote["goto"]>) => void }) {
+/** A bell with a stroke through it: "stop telling me about these". */
+export function MuteGlyph() {
+  return (
+    <svg width={ICON.xs} height={ICON.xs} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M8.7 3.9A6 6 0 0 1 18 9c0 3 .5 4.9 1.1 6M6 9c0 6-2 7-2 7h12" />
+      <path d="M10.5 20a2 2 0 0 0 3 0M3 3l18 18" />
+    </svg>
+  );
+}
+
+function HistoryRow({ n, onGone, onGoto, onMute }: {
+  n: SystemNote;
+  onGone: () => void;
+  onGoto: (g: NonNullable<SystemNote["goto"]>) => void;
+  /** Present when this row's source can be muted. */
+  onMute?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const bodyEl = useRef<HTMLSpanElement>(null);
   const sumEl = useRef<HTMLSpanElement>(null);
@@ -371,6 +414,12 @@ function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; 
    * which is the one thing this does not do. It stays here, in agentglass.
    */
   const card = n.goto?.kind === "card" ? n.goto : null;
+  /** The hold this row is for, while it is still live. `key` is `gate:<id>`
+   *  and only gateStore's own row carries one, so a card is never mistaken
+   *  for a hold — and it disappears on its own once the hold resolves,
+   *  because `gates` no longer has it. See gateStore.ts's gateForNote. */
+  const gates = useSyncExternalStore(subscribeGates, listGates, listGates);
+  const gate = gateForNote(n, gates);
   /** The destinations that are neither git nor a card: a pane, a chat, a
    *  settings page, a pull request. Each gets the same named button the other
    *  two have, because "click the row" is no longer a way to reach anything. */
@@ -438,8 +487,12 @@ function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; 
       <div className="flex items-start gap-2">
         <span className="flex flex-col min-w-0 flex-1 gap-1.5">
           <span className="flex items-center gap-2">
-            <Cap>{n.app}</Cap>
+            {/* The source, not the app: every alert agentglass raises itself
+                has the app "agentglass", which told a Lantern card from a
+                failing agent from a question about nothing at all. */}
+            <Cap>{sourceLabel(sourceOf(n))}</Cap>
             <Cap dim>{ago(n.at)}</Cap>
+            {(n.count ?? 1) > 1 && <Cap dim>×{n.count}</Cap>}
             {n.urgency === 2 && <span className="text-[10px] uppercase tracking-wider" style={{ color: "var(--error)" }}>urgent</span>}
           </span>
           {/* The title unwraps too. Expanding has to mean "show me all of it",
@@ -454,6 +507,23 @@ function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; 
               closed, unclamped open — so expanding grows downward. */}
           {n.body && (
             <span ref={bodyEl} className={open ? "agx-note-body" : "agx-note-body agx-note-body-clamp"}>{n.body}</span>
+          )}
+          {/* The decision itself, on the row that is already asking for it —
+              the dashboard's "What needs you" panel is the only other place
+              this exists, and it is one more view away from where the
+              question actually surfaced. Both call the same answerGate; there
+              is only the one decide path. */}
+          {gate && (
+            <span className="flex items-center gap-1 self-start">
+              <button className="agx-note-link self-start"
+                onClick={(e) => { e.stopPropagation(); void answerGate(gate, "allow"); }}>
+                Allow
+              </button>
+              <button className="agx-note-link self-start"
+                onClick={(e) => { e.stopPropagation(); void answerGate(gate, "deny"); }}>
+                Deny
+              </button>
+            </span>
           )}
           {/* Named, not a bare arrow. An unlabelled ↗ next to a Slack
               notification reads as "go to Slack", which is the one thing it
@@ -530,6 +600,13 @@ function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; 
               <Chevron up={open} />
             </button>
           )}
+          {onMute && (
+            <button className="agx-note-btn agx-note-icon" aria-label={`Mute ${sourceLabel(sourceOf(n))}`}
+              onClick={(e) => { e.stopPropagation(); onMute(); }}
+              title={`Mute ${sourceLabel(sourceOf(n))} — stop collecting these. Undo from the list's footer.`}>
+              <MuteGlyph />
+            </button>
+          )}
           <CloseButton onClick={(e) => { e.stopPropagation(); onGone(); }} title="Dismiss" className="agx-note-btn agx-note-icon" />
         </span>
       </div>
@@ -545,6 +622,37 @@ function HistoryRow({ n, onGone, onGoto }: { n: SystemNote; onGone: () => void; 
  * bar clips its own overflow — it has to, or a long project name would push the
  * clock off the end — and a dropdown drawn inside it would be sliced off at 30px.
  */
+type LaneFilter = "all" | "urgent" | Lane;
+const LANES: { id: LaneFilter; label: string; hint: string }[] = [
+  { id: "all", label: "All", hint: "Everything collected" },
+  { id: "urgent", label: "Needs you", hint: "Only what is stopped until you act" },
+  { id: "agents", label: "Agents", hint: "Approvals, the Lantern, agents asking or failing, chats" },
+  { id: "work", label: "Work", hint: "Branches, checks, pull requests, cards, updates" },
+  { id: "desktop", label: "Desktop", hint: "Mirrored from this machine's own notifications" },
+];
+const inLane = (n: SystemNote, l: LaneFilter): boolean =>
+  l === "all" ? true : l === "urgent" ? n.urgency === 2 : laneOf(sourceOf(n)) === l;
+function laneCounts(list: SystemNote[]): Record<LaneFilter, number> {
+  const c: Record<LaneFilter, number> = { all: list.length, urgent: 0, agents: 0, work: 0, desktop: 0 };
+  for (const n of list) {
+    if (n.urgency === 2) c.urgent++;
+    c[laneOf(sourceOf(n))]++;
+  }
+  return c;
+}
+/** The lane last read, per viewer — a convenience, so it lives in this
+ *  browser's storage and a missing one simply means "All". */
+const LANE_KEY = "agentglass.notes.lane";
+function readLaneFilter(): LaneFilter {
+  try {
+    const v = localStorage.getItem(LANE_KEY);
+    return LANES.some((l) => l.id === v) ? (v as LaneFilter) : "all";
+  } catch { return "all"; }
+}
+function writeLaneFilter(l: LaneFilter): void {
+  try { localStorage.setItem(LANE_KEY, l); } catch { /* the choice lasts the session */ }
+}
+
 export function NotifyBell({ noDrag, onGoto }: {
   noDrag?: React.CSSProperties;
   /** Take me to what this note is about. The bar does not know how; the shell
@@ -559,6 +667,10 @@ export function NotifyBell({ noDrag, onGoto }: {
   const quiet = useSyncExternalStore(subscribeNotifyQuiet, notifyQuiet, () => false);
   const mirroring = useSyncExternalStore(subscribeSysNotifyMode, sysNotifyOn, () => false);
   const own = useSyncExternalStore(subscribeAppNotify, appNotify, () => true);
+  const muted = useSyncExternalStore(subscribeMuted, mutedSources, mutedSources);
+  const [lane, setLane] = useState<LaneFilter>(readLaneFilter);
+  const pickLane = (l: LaneFilter) => { setLane(l); writeLaneFilter(l); };
+  const [unfolded, setUnfolded] = useState<ReadonlySet<string>>(new Set());
   // Asked only when the panel is opened, and only while the answer could change
   // what is on screen: an unsupported host must never be offered a switch that
   // cannot do anything.
@@ -602,7 +714,19 @@ export function NotifyBell({ noDrag, onGoto }: {
     };
   }, [open, place]);
 
-  const tint = quiet ? "var(--text4)" : unread > 0 ? "var(--primary)" : "var(--text3)";
+  // Unread wins over Quiet: Quiet is the default now, and a bell that stays
+  // grey with something new behind it is the one state that must not happen.
+  const tint = unread > 0 ? "var(--primary)" : quiet ? "var(--text4)" : "var(--text3)";
+
+  // A muted source's rows are hidden rather than deleted, so unmuting brings
+  // back what was already collected. Urgent rows are never hidden: nothing
+  // stopped can be muted.
+  const visible = hist.filter((n) => n.urgency === 2 || !muted.has(sourceOf(n)));
+  const lanes = laneCounts(visible);
+  const laneChoices = LANES.filter((l) => l.id === "all" || lanes[l.id] > 0);
+  const shown = visible.filter((n) => inLane(n, lane));
+  const groups = groupNotes(shown);
+  const mutedHere = [...muted].sort();
 
   return (
     <>
@@ -615,10 +739,20 @@ export function NotifyBell({ noDrag, onGoto }: {
             ? `${hist.length} notification${hist.length === 1 ? "" : "s"}${unread ? ` — ${unread} since you last looked` : ""}${quiet ? " (quiet)" : ""}`
             : "Notifications — nothing yet"
         }
+        /* 22x22 and a 14px bell, up from 20x18 and 12px.
+         *
+         * Measured across all fourteen views: this was the ONE icon-only
+         * control in the whole app below the house floor of a 14px glyph in a
+         * 20x20 target — every other small glyph either sits in a labelled
+         * control or already has the room. Two pixels short in one place is
+         * not a pattern, but this is the bell, which is the control you go
+         * for when something is waiting on you.
+         *
+         * The bar is 30px, so 22 leaves four either side. */
         className="relative shrink-0 grid place-items-center rounded hover:bg-white/10"
-        style={{ width: 20, height: 18, color: tint, ...noDrag }}
+        style={{ width: 22, height: 22, color: tint, ...noDrag }}
       >
-        <BellGlyph width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        <BellGlyph width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
           strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" />
         {/* The count sits on the bell rather than beside it: the bar has no width
             to spare, and a badge is read as "on the bell" wherever it is drawn. */}
@@ -647,29 +781,86 @@ export function NotifyBell({ noDrag, onGoto }: {
           >
             <div className="flex items-center gap-2 px-3 py-2.5" style={{ borderBottom: "1px solid var(--border)" }}>
               <Cap>notifications</Cap>
-              <Cap dim>{hist.length}</Cap>
+              <Cap dim>{visible.length}</Cap>
               {/* Silencing without saying so is how you end up asking why you
                   were never told. It is also the switch, so the place that
                   reveals the state is the place that undoes it. */}
               <button
                 className="agx-note-btn"
+                role="switch"
+                aria-checked={quiet}
                 onClick={() => setNotifyQuiet(!quiet)}
                 title={quiet
-                  ? "Mirrored notifications are quiet — they still collect here. Click to let them interrupt again."
-                  : "Quiet mirrored notifications: keep collecting them, stop letting them interrupt"}
-                style={quiet ? { color: "var(--warning)" } : undefined}
+                  ? "Quiet: only what is stopped — an approval, a blocked agent — interrupts. Everything else collects here. Click to let news interrupt too."
+                  : "News interrupts as well as what is stopped. Click for Quiet: only what is stopped interrupts."}
+                style={quiet ? { color: "var(--text2)" } : undefined}
               >
                 {quiet ? "Quiet on" : "Quiet"}
               </button>
               <button className="agx-note-btn ml-auto" onClick={() => { clearNotes(); setOpen(false); }}>Clear all</button>
+              <button type="button" onClick={() => { setOpen(false); openSettings("notifications"); }} aria-label="Notification settings…" title="Notification settings…"
+                className="shrink-0 grid place-items-center rounded hover:bg-white/10"
+                style={{ width: MIN_BOX, height: MIN_BOX, color: "var(--text3)" }}><GearIcon size={ICON.xs} /></button>
               <CloseButton onClick={() => setOpen(false)} title="Close (Esc)" className="agx-note-btn" />
             </div>
-            {hist.length ? (
-              <div className="agx-inbox-list">
-                {hist.map((n) => (
-                  <HistoryRow key={n.id} n={n} onGone={() => dismissNote(n.id)}
-                    onGoto={(g) => { setOpen(false); onGoto(g); }} />
+            {/* Which lane to read. Only drawn when there is more than one to
+                choose between, and each says how many it holds, so a filter
+                never hides a list you did not know was there. */}
+            {laneChoices.length > 2 && (
+              <div className="flex items-center gap-0.5 px-2 py-1.5 flex-wrap" role="tablist" aria-label="Show"
+                style={{ borderBottom: "1px solid var(--border)" }}>
+                {laneChoices.map((l) => (
+                  <button key={l.id} role="tab" aria-selected={lane === l.id}
+                    className="agx-note-btn tabular-nums"
+                    onClick={() => pickLane(l.id)}
+                    title={l.hint}
+                    // Tighter than the button's own padding: five lanes and their
+                    // counts fit one line of the 360px panel only this way.
+                    style={{ padding: "4px 6px", ...(lane === l.id ? { color: "var(--text)", background: "color-mix(in srgb, var(--text) 10%, transparent)" } : null) }}>
+                    {l.label} {lanes[l.id]}
+                  </button>
                 ))}
+              </div>
+            )}
+            {groups.length ? (
+              <div className="agx-inbox-list">
+                {groups.map((g) => {
+                  const mute = canMute(g.source) && g.lead.urgency < 2 ? () => setMuted(g.source, true) : undefined;
+                  const unfold = unfolded.has(g.lead.id);
+                  const toggle = () => setUnfolded((was) => {
+                    const next = new Set(was);
+                    if (next.has(g.lead.id)) next.delete(g.lead.id); else next.add(g.lead.id);
+                    return next;
+                  });
+                  return (
+                    <div key={g.lead.id} className="agx-note-group">
+                      <HistoryRow n={g.lead} onGone={() => dismissNote(g.lead.id)} onMute={mute}
+                        onGoto={(gt) => { setOpen(false); onGoto(gt); }} />
+                      {/* The digest line: the older rows from the same source,
+                          folded under the newest. One line instead of N cards,
+                          and one click to read them all. */}
+                      {g.more.length > 0 && (
+                        <button className="agx-note-fold" aria-expanded={unfold} onClick={toggle}>
+                          <Chevron up={unfold} size={ICON.xs} />
+                          {unfold ? "Fold" : `${g.more.length} more from ${sourceLabel(g.source)}`}
+                        </button>
+                      )}
+                      {unfold && g.more.map((n) => (
+                        <HistoryRow key={n.id} n={n} onGone={() => dismissNote(n.id)}
+                          onGoto={(gt) => { setOpen(false); onGoto(gt); }} />
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : visible.length ? (
+              <div className="px-3 py-4 text-[11px] flex flex-col gap-2.5 items-start" style={{ color: "var(--text3)" }}>
+                <span>Nothing in this lane.</span>
+                <button className="agx-note-link" onClick={() => pickLane("all")}>Show all</button>
+              </div>
+            ) : hist.length ? (
+              <div className="px-3 py-4 text-[11px]" style={{ color: "var(--text3)" }}>
+                Everything collected is from a muted source — unmute one below to see it.
               </div>
             ) : (
               // Says which of the two reasons it is empty for. "Nothing here"
@@ -705,6 +896,21 @@ export function NotifyBell({ noDrag, onGoto }: {
                 switches can silence this panel's sources and both of them are
                 elsewhere; a list that is empty because you muted it should never
                 look like a list that is empty because nothing happened. */}
+            {/* What is muted, said where the list is read, and undone here.
+                A mute hides rows rather than deleting them, so unmuting brings
+                back what was already collected. */}
+            {mutedHere.length > 0 && (
+              <div className="px-2.5 py-1.5 text-[10px] flex items-center gap-1 flex-wrap"
+                style={{ borderTop: "1px solid var(--border)", color: "var(--text4)" }}>
+                <span className="mr-1">Muted</span>
+                {mutedHere.map((src) => (
+                  <button key={src} className="agx-note-btn inline-flex items-center gap-1" onClick={() => setMuted(src, false)}
+                    title={`Unmute ${sourceLabel(src)}`} aria-label={`Unmute ${sourceLabel(src)}`}>
+                    <MuteGlyph />{sourceLabel(src)}
+                  </button>
+                ))}
+              </div>
+            )}
             {hist.length > 0 && (!own || !mirroring) && (
               <div className="px-2.5 py-1.5 text-[9.5px] flex items-center gap-2"
                 style={{ borderTop: "1px solid var(--border)", color: "var(--text4)" }}>

@@ -1,15 +1,19 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { motion } from "motion/react";
 import type { ConnState } from "../lib/useLive.ts";
+import { GearIcon } from "./workspace/icons.tsx";
 import { IS_DEMO, reauthPrompt } from "../lib/api.ts";
 import { subscribeUpdate, updateState, updateAvailable } from "../lib/updateStore.ts";
 import { MOD_KEY } from "../lib/format.ts";
-import { IS_MAC_DESKTOP } from "../lib/desktop.ts";
+import { IS_MAC_DESKTOP, powerReadout, powerStatus, setPowerMode, type PowerMode, type PowerStatus } from "../lib/desktop.ts";
+import { usePoll } from "../lib/usePoll.ts";
 import { Logo } from "./Logo.tsx";
 import { Select } from "./Select.tsx";
 import { subscribe as subscribeChats, attentionCount } from "../lib/chatStore.ts";
 import { WorkspaceIcon } from "./workspace/icons.tsx";
 import { ICON } from "../lib/iconSize.ts";
+import { sharedPhase } from "../lib/sharedPhase.ts";
+import { CrossIcon, HomeIcon, SparkleIcon } from "../lib/glyphIcons.tsx";
 
 // Sessions whose model never resolved carry the "unknown" provider value; it
 // stays lowercase everywhere it is compared (server sentinel, providerOf), but
@@ -50,6 +54,57 @@ function IconBtn({ title, active, onClick, children }: { title: string; active?:
   );
 }
 
+/** A moon becoming a sun-with-rays as it wakes — the ladder On/Agent/Off draws. */
+function PowerIcon({ size = ICON.sm }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="4.2" />
+      <path d="M12 2.5v2.4M12 19.1v2.4M4.7 4.7l1.7 1.7M17.6 17.6l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.7 19.3l1.7-1.7M17.6 6.4l1.7-1.7" />
+    </svg>
+  );
+}
+
+const POWER_LABEL: Record<PowerMode, string> = { on: "On", agent: "Agent", off: "Off" };
+const POWER_NEXT: Record<PowerMode, PowerMode> = { on: "agent", agent: "off", off: "on" };
+
+/**
+ * The machine's own sleep, three ways: always awake, awake only while an
+ * agent is working, or left to sleep normally. Absent (renders nothing) in a
+ * browser tab or on a shell built before it existed — `powerStatus` answers
+ * null in both cases, and there is nothing honest to show for either.
+ *
+ * Lives beside the other machine controls rather than inside Settings on
+ * purpose: a mode that silently stopped keeping the machine awake is a
+ * shift that silently stopped, and that has to be readable at a glance.
+ */
+function PowerModeButton() {
+  const [status, setStatus] = useState<PowerStatus | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void powerStatus().then((s) => { if (alive) setStatus(s); });
+    return () => { alive = false; };
+  }, []);
+  usePoll(true, () => { void powerStatus().then(setStatus); }, 5000);
+  if (!status) return null;
+  const { tone, title } = powerReadout(status);
+  const color = tone === "warn" ? "var(--warning)" : tone === "held" ? "var(--success)" : "var(--text3)";
+  return (
+    <button
+      onClick={() => { void setPowerMode(POWER_NEXT[status.mode]).then((s) => s && setStatus(s)); }}
+      title={title}
+      className="h-8 flex items-center gap-1.5 px-2.5 rounded-lg text-[11px] font-semibold transition-colors"
+      style={{
+        color,
+        border: `1px solid color-mix(in srgb, ${color} 45%, transparent)`,
+        background: `color-mix(in srgb, ${color} ${status.awake ? 18 : 8}%, transparent)`,
+      }}
+    >
+      <PowerIcon />
+      <span className="hidden sm:inline">{POWER_LABEL[status.mode]}</span>
+    </button>
+  );
+}
+
 function SkillsIcon() {
   return (
     <svg {...svg}>
@@ -68,14 +123,6 @@ function SkillsIcon() {
  *  you were already in. This button opens preferences, and every application
  *  ever written spells that with a cog, which is why it was the one control in
  *  the header nobody could find without hovering everything first. */
-function GearIcon({ size = ICON.md }: { size?: number }) {
-  return (
-    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="3.1" />
-      <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z" />
-    </svg>
-  );
-}
 
 /** A plug: something is listening on this machine. */
 export function PortsIcon({ size = ICON.md }: { size?: number }) {
@@ -216,7 +263,7 @@ export function Header({
             background: `color-mix(in srgb, var(--primary) ${workspace ? 14 : 7}%, transparent)`,
             border: `1px solid color-mix(in srgb, var(--primary) ${workspace ? 40 : 20}%, transparent)`,
           }}>
-          <span>⌂</span>
+          <span className="flex"><HomeIcon size={ICON.xs} /></span>
           <span className="truncate" style={{ maxWidth: 200 }}>{workspace ? workspace.split("/").pop() : "All repos/projects"}</span>
           <span className="opacity-60">▾</span>
         </button>
@@ -228,7 +275,7 @@ export function Header({
             {live && <span className="absolute inline-flex h-full w-full rounded-full opacity-70" style={{ background: "var(--success)", animation: "ping-ring 1.6s ease-out infinite" }} />}
             <span className="relative inline-flex rounded-full h-1.5 w-1.5" style={{ background: pillColor }} />
           </span>
-          {live ? "LIVE" : unauth ? "UNAUTHORIZED ⚿" : conn.toUpperCase()}
+          {live ? "LIVE" : unauth ? "UNAUTHORIZED" : conn.toUpperCase()}
         </span>
         {IS_DEMO && (
           <a
@@ -239,7 +286,7 @@ export function Header({
             className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold"
             style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}
           >
-            ✦ DEMO<span className="hidden sm:inline"> · sample data</span>
+            <SparkleIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />DEMO<span className="hidden sm:inline"> · sample data</span>
           </a>
         )}
       </div>
@@ -299,7 +346,7 @@ export function Header({
       {accounts.length > 1 && (
         <Select value={filter.account} style={selStyle} options={[{ value: "", label: "All accounts" }, ...accounts.map((a) => ({ value: a, label: a }))]} onChange={(v) => onFilter({ ...filter, account: v })} />
       )}
-      {hasFilter && <button onClick={onClear} className="text-[11px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap" style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>Clear ✕</button>}
+      {hasFilter && <button onClick={onClear} className="text-[11px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap" style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}><span className="inline-flex items-center gap-1">Clear<CrossIcon size={ICON.xs} /></span></button>}
       </div>{/* middle scroll zone */}
 
       <div className="shrink-0 flex items-center gap-1.5 sm:gap-2 ml-auto sm:ml-0 max-w-full overflow-x-auto agw-noscrollbar">
@@ -327,6 +374,7 @@ export function Header({
             background: `color-mix(in srgb, ${waiting ? "var(--success)" : "var(--primary)"} 18%, transparent)`,
             border: `1px solid color-mix(in srgb, ${waiting ? "var(--success)" : "var(--primary)"} ${waiting ? 70 : 50}%, transparent)`,
             animation: waiting ? "agx-attention 1.8s ease-in-out infinite" : undefined,
+            animationDelay: waiting ? sharedPhase(1800) : undefined,
           }}
         >
           <WorkspaceIcon />
@@ -336,6 +384,7 @@ export function Header({
               style={{ background: "color-mix(in srgb, var(--success) 30%, transparent)" }}>{waiting}</span>
           )}
         </button>
+        <PowerModeButton />
         {/* Skills demoted to a plain icon */}
         <IconBtn title="Skills explorer — browse every available skill (k)" onClick={onOpenSkills}><SkillsIcon /></IconBtn>
         <IconBtn title="Accounts — per-account usage meters & login status (a)" onClick={onOpenAccounts}>👥</IconBtn>

@@ -8,7 +8,7 @@
  * show and no way back.
  */
 import { beforeEach, describe, expect, it } from "bun:test";
-import { addTab, closeTab, MAX_TABS, newTab, patchTab, stepTab, tabLabel, __resetTabIds } from "../src/lib/browserTabs.ts";
+import { addTab, closeTab, isBlank, listable, MAX_TABS, newTab, patchTab, pruneBlank, stepTab, tabLabel, withInspected, __resetTabIds } from "../src/lib/browserTabs.ts";
 
 beforeEach(__resetTabIds);
 
@@ -98,6 +98,24 @@ describe("opening", () => {
     const r = addTab(tabs, "https://new.test/");
     if ("error" in r) throw new Error(r.error);
     expect(r.tabs.at(-1)!.id).toBe(r.tab.id);
+  });
+
+  it("carries an ephemeral tab's own partition, when `newtab --from-template` minted one", () => {
+    // `newtab --from-template`'s visible-tab jar: the partition is main's to
+    // mint (electron/main.js `ag:tabEphemeralOpen`), not derived from the
+    // tab's own id, so it travels as its own argument.
+    const { tabs } = three();
+    const r = addTab(tabs, "https://acme.example/", undefined, undefined, undefined, "agentglass-browser-eph-t1a2b3c4");
+    if ("error" in r) throw new Error(r.error);
+    expect(r.tab.partition).toBe("agentglass-browser-eph-t1a2b3c4");
+  });
+
+  it("leaves an ordinary tab with no partition of its own", () => {
+    // The webview falls back to `partitionFor(BROWSER_PARTITION, profile)` —
+    // this only ever carries a value for the ephemeral fork.
+    const r = addTab(three().tabs, "https://ordinary.example/");
+    if ("error" in r) throw new Error(r.error);
+    expect(r.tab.partition).toBeUndefined();
   });
 
   it("refuses past the cap, and says why and what to do", () => {
@@ -198,5 +216,86 @@ describe("profiles", () => {
     const r = closeTab([only], only.id);
     expect(r.tabs.length).toBe(1);
     expect(r.tabs[0]!.profile).toBe("work");
+  });
+});
+
+/*
+ * A blank tab is not a page.
+ *
+ * It is the state between pressing Ctrl+T and typing something, and the panel
+ * already says so in the middle of the screen. A row for it in the sidebar is
+ * the same sentence said again, in a list of pages you actually have — "it
+ * should not count as a tab".
+ */
+describe("blank tabs", () => {
+  const blank = { ...newTab(), id: "b1" };
+  const real = { ...newTab("https://orbit.example/"), id: "r1", title: "Orbit" };
+
+  it("a blank one is one with no address and no title", () => {
+    expect(isBlank(blank)).toBe(true);
+    expect(isBlank(real)).toBe(false);
+    // A tab that has started loading has a title or an address, so it is a page
+    // from that moment on rather than from when it finishes.
+    expect(isBlank({ ...blank, url: "https://orbit.example/" })).toBe(false);
+    expect(isBlank({ ...blank, title: "Loading…" })).toBe(false);
+  });
+
+  it("the list draws pages only", () => {
+    expect(listable([blank, real]).map((t) => t.id)).toEqual(["r1"]);
+  });
+
+  /* Not drawn means not reachable, so one left in the background would be a tab
+     with no way back to it. */
+  it("one you have walked away from is dropped", () => {
+    expect(pruneBlank([blank, real], "r1").map((t) => t.id)).toEqual(["r1"]);
+  });
+
+  it("the one you are on survives — that is where you are about to type", () => {
+    expect(pruneBlank([blank, real], "b1").map((t) => t.id)).toEqual(["b1", "r1"]);
+  });
+
+  it("never nothing", () => {
+    // An empty list has no active tab and nowhere to type.
+    expect(pruneBlank([blank], "somebody-else")).toHaveLength(1);
+  });
+});
+
+/*
+ * WHICH PAGE SOMEBODY ELSE IS INSPECTING.
+ *
+ * An agent can open the inspector from a terminal, and it opens hidden — so
+ * without a mark on the tab there is no pixel anywhere saying it is there, and
+ * the switch in the ⋯ menu stays off because that switch is about what the
+ * panel itself opened. Before it opened hidden you found out because it
+ * covered half the window: a bug, and by accident the only signal there was.
+ *
+ * The shell reports every open and close, including the panel's own, so this
+ * is told the same thing more than once by design. That is what the identity
+ * rule is for.
+ */
+describe("the inspector mark", () => {
+  it("adds and removes the page it is told about", () => {
+    const none: ReadonlySet<string> = new Set();
+    const one = withInspected(none, "t1", true);
+    expect([...one]).toEqual(["t1"]);
+    expect([...withInspected(one, "t2", true)].sort()).toEqual(["t1", "t2"]);
+    expect([...withInspected(one, "t1", false)]).toEqual([]);
+  });
+
+  it("hands back the SAME set when told what it already knows", () => {
+    /* Not an optimisation — the panel would re-render its whole tab list on
+       every repeat, and the shell repeats by design. `toBe`, not `toEqual`:
+       an equal set is a new object and React reads it as news. */
+    const one = withInspected(new Set(), "t1", true);
+    expect(withInspected(one, "t1", true)).toBe(one);
+    const none: ReadonlySet<string> = new Set();
+    expect(withInspected(none, "t9", false)).toBe(none);
+  });
+
+  it("ignores a guest it could not place on any tab", () => {
+    /* The panel passes "" when no mounted webview owns that guest — a page
+       that closed mid-flight. Adding it would light a mark on nothing. */
+    const one = withInspected(new Set(), "t1", true);
+    expect(withInspected(one, "", true)).toBe(one);
   });
 });

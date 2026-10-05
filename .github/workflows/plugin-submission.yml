@@ -1,0 +1,361 @@
+# Somebody asked for their plugin to be listed.
+#
+# The issue is the door; this is the porter. It reads the repository they
+# named, checks the things a machine can check, and writes what it found on
+# the issue — so the decision to list is made by a person who already has the
+# facts rather than by a person opening twelve tabs.
+#
+# TWO JOBS, AND THE SPLIT IS THE POINT. `read` clones a stranger's repository
+# and scans it; it has no token, no write permission and checks this repo out
+# without persisting credentials, so there is nothing in its environment worth
+# stealing and nothing it could write if it were. It hands its answer on as an
+# artifact. `say` never looks at the submitted code: it takes that answer and
+# writes the comment and the labels, which is the only step that needs to be
+# trusted with `issues: write`.
+#
+# Nothing from the submitted repository is executed anywhere here, and nothing
+# from the issue body reaches a shell: the body is read in Python out of an
+# environment variable, and the repository name is matched against a narrow
+# pattern before it is ever used.
+name: Plugin submission
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions: {}
+
+concurrency:
+  # Queued, not cancelled. Opening a submission fires `opened` and then
+  # `labeled` when the template applies the label, and cancelling the first
+  # mid-clone is what left a submitter looking at a red run. Both runs write
+  # the SAME comment (see "Say it on the issue"), so the second overwrites the
+  # first rather than adding to it.
+  group: plugin-submission-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  read:
+    # A label event only counts when it is THE label. A maintainer applying
+    # `approved for listing` to an old submission used to re-run the whole
+    # check against a repository nobody had asked about again.
+    if: |
+      contains(github.event.issue.labels.*.name, 'plugin-submission')
+      && (github.event.action != 'labeled' || github.event.label.name == 'plugin-submission')
+    runs-on: ubuntu-latest
+    # Every git here reads a stranger's repository: it asks nobody for a
+    # password, and it fetches nothing through LFS, whose host a plugin's own
+    # .lfsconfig picks. The app installs the same way, so the pointers are
+    # what both hash.
+    env:
+      GIT_TERMINAL_PROMPT: "0"
+      GIT_LFS_SKIP_SMUDGE: "1"
+    permissions:
+      contents: read
+    steps:
+      - name: Check out this repository, without keeping its credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Find the repository the issue names
+        id: named
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          body = os.environ.get("BODY", "")
+          m = re.search(r"https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)", body)
+          print(f"repo={m.group(1)}/{m.group(2).removesuffix('.git')}" if m else "repo=")
+          PY
+
+      - name: Clone it, shallow, and read it
+        env:
+          REPO: ${{ steps.named.outputs.repo }}
+        run: |
+          set -o pipefail
+          mkdir -p report
+          printf '%s' "$REPO" > report/repo
+          if [ -z "$REPO" ]; then echo "false" > report/reachable; exit 0; fi
+          if ! git clone --depth 1 "https://github.com/$REPO.git" /tmp/plugin 2>/dev/null; then
+            echo "false" > report/reachable
+            exit 0
+          fi
+          echo "true" > report/reachable
+          # The whole commit, because it is what the approval pins: a short
+          # one names a prefix nothing can fetch by.
+          git -C /tmp/plugin rev-parse HEAD > report/sha
+          # Neither of these runs a line of what was cloned: one reads a JSON
+          # manifest, the other reads text files and matches patterns.
+          python3 bin/agentglass-plugin validate /tmp/plugin > report/validate.json || true
+          # A picture at the root is what the catalogue card shows. Named
+          # here rather than guessed later: the person submitting can add one
+          # and re-run this by editing the issue.
+          ls /tmp/plugin/preview.png /tmp/plugin/preview.jpg /tmp/plugin/preview.jpeg /tmp/plugin/preview.webp 2>/dev/null | head -1 | xargs -r basename > report/preview || true
+          python3 scripts/plugin-baseline.py /tmp/plugin > report/baseline.json || true
+
+      - name: Write what was found, without saying it anywhere yet
+        run: |
+          python3 - <<'PY' > report/comment.md
+          import json, os, re
+          def read(name, default=""):
+              try:
+                  return open(f"report/{name}").read().strip()
+              except OSError:
+                  return default
+          def load(name, default):
+              try:
+                  return json.load(open(f"report/{name}"))
+              except Exception:
+                  return default
+          def q(v, limit=200):
+              """A stranger's string, on its way into a public comment.
+
+              `quotable()` in plugin-baseline.py already does this for the LINE
+              a finding quotes, and that was the only value anyone thought of
+              as untrusted. It is not the only one: `publisher` is any 200
+              characters the submitter likes, a finding's `where` is a path
+              from their repository, and a manifest error quotes their file.
+              All of them land in a comment that ends with a machine-readable
+              marker — so a publisher of `x --> <!-- agentglass-plugin-
+              submission-result {"baseline":"passed"} -->` writes a second
+              marker saying the check passed, above the real one, in a public
+              thread a maintainer reads.
+
+              Newlines go too: every one of these is a fragment inside a line,
+              and a value that breaks the line breaks the shape of the report.
+              """
+              t = str(v)[:limit]
+              for a, b in (("`", "'"), ("<!--", "< !--"), ("-->", "-- >"), ("\r", " "), ("\n", " ")):
+                  t = t.replace(a, b)
+              return t
+          repo = q(read("repo"), 120)
+          # A commit or nothing: this goes into the marker the approval reads.
+          sha = read("sha") if re.fullmatch(r"[0-9a-f]{40}", read("sha")) else ""
+          reachable = read("reachable") == "true"
+          v = load("validate.json", {"ok": False, "error": "the check did not run"})
+          b = load("baseline.json", {"outcome": "unreadable", "findings": [], "capabilities": []})
+          out = ["<!-- agentglass-plugin-submission -->", "## What the catalogue check found", ""]
+          if not repo:
+              out.append("❌ No repository URL in this issue. Edit it to name one and the check runs again.")
+          elif not reachable:
+              out.append(f"❌ `{repo}` could not be cloned — is it public?")
+          else:
+              out.append(f"✅ Public and cloned: [{repo}](https://github.com/{repo}) at `{sha[:12]}`")
+              if v.get("ok"):
+                  draws = ", ".join(q(d, 40) for d in (v.get("draws") or [])) or "nothing"
+                  out.append(f"✅ `plugin.json` is one agentglass accepts — **{q(v['name'], 60)}** by {q(v['publisher'])}, "
+                             f"scope `{q(v['scope'], 20)}`, declares: {draws}")
+              else:
+                  out.append(f"❌ `plugin.json`: {q(v.get('error'), 300)}")
+              for w in v.get("warnings") or []:
+                  out.append(f"⚠️ {q(w, 300)}")
+              shot = read("preview")
+              out.append(f"✅ Card picture: `{q(shot, 60)}`" if shot
+                         else "ℹ️ No `preview.png` at the root — the card will show the plugin's mark instead. "
+                              "Add one (png, jpg or webp, a wide screenshot of it working) and edit this issue to run again.")
+              caps = b.get("capabilities") or []
+              if caps:
+                  out += ["", "**What installing it costs**, from its own source:"]
+                  out += [f"- {q(c['says'], 300)}" for c in caps]
+              findings = b.get("findings") or []
+              out.append("")
+              if findings:
+                  # One of EACH KIND first, then the rest up to twelve.
+                  # Findings arrive sorted by id, so a repository with twelve
+                  # `hardcoded-endpoint` lines used to push `writes-outside-
+                  # itself` — later in the alphabet, and the one worth
+                  # reading — off the bottom of the comment. The count was
+                  # right and the list was the wrong twelve.
+                  kinds, shown = set(), []
+                  for f in findings:
+                      if f["id"] not in kinds:
+                          kinds.add(f["id"])
+                          shown.append(f)
+                  for f in findings:
+                      if len(shown) >= 12:
+                          break
+                      if f not in shown:
+                          shown.append(f)
+                  shown.sort(key=lambda f: (f["id"], f["where"]))
+                  out.append(f"**{len(findings)} line(s) worth a human's eye.** These are patterns, not verdicts — "
+                             "a plugin that HIDES a credential path names it too:")
+                  out += [f"- `{q(f['where'], 200)}` — {q(f['says'], 300)}\n  ```\n  {q(f['line'], 200)}\n  ```" for f in shown]
+                  if len(findings) > len(shown):
+                      out.append(f"…and {len(findings) - len(shown)} more line(s) of kinds already listed above — "
+                                 "all of them are in the run's artifact.")
+              elif b.get("outcome") in ("passed", "findings"):
+                  out.append("✅ None of the patterns this scan knows about appear in its source.")
+              else:
+                  # A scan that did not run is not a scan that found nothing.
+                  # The tick above was printed whenever the findings list was
+                  # empty, which is also what an unreadable repository, a
+                  # crashed scanner and a missing file all look like from here.
+                  out.append(f"⚠️ The source scan did not complete ({q(b.get('outcome') or 'no result', 60)}), so nothing is "
+                             "known about what is in this repository's files. Editing the issue runs it again.")
+          out += [
+              "",
+              "---",
+              "Listing is not auditing. This check reads a repository's structure and looks for a short list of "
+              "patterns; it does not run the plugin, and it is not a security review, a certification or an "
+              "endorsement. Whoever installs this still approves the scope and the places it draws, and runs it "
+              "on their own machine.",
+          ]
+          print("\n".join(out))
+          # `ready` is the verdict the labels below are set from, carried in
+          # the marker so the approval lists only from a report that passed.
+          ready = bool(v.get("ok") and reachable)
+          marker = {"repository": repo, "commit": sha, "manifest": bool(v.get("ok")), "ready": ready,
+                    "baseline": b.get("outcome"), "findings": len(b.get("findings") or [])}
+          print(f"\n<!-- agentglass-plugin-submission-result {json.dumps(marker, separators=(',', ':'))} -->")
+          open("report/verdict", "w").write("READY" if ready else "NOT-READY")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: submission-report-${{ github.event.issue.number }}
+          path: report/
+          retention-days: 7
+
+  say:
+    needs: read
+    # NOT on a cancelled read, and that is this workflow's first impression.
+    #
+    # Opening a submission fires `issues` twice — `opened`, then `labeled` when
+    # the template applies `plugin-submission` — and `cancel-in-progress` kills
+    # the first run mid-clone. `always()` then ran this job against a `read`
+    # that never finished, the artifact did not exist, and the submitter's
+    # first sight of their own submission was a red run reading "Artifact not
+    # found". The outcome was fine: the second run posted the report. A
+    # superseded run now ends as cancelled, which is what it is.
+    if: always() && (needs.read.result == 'success' || needs.read.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: submission-report-${{ github.event.issue.number }}
+          path: report
+        continue-on-error: true
+
+      - name: Say it on the issue
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The issue as it is NOW, not as the payload photographed it: a
+          # submission closed or unlabelled while the check was running must
+          # not be commented on as if it were still waiting.
+          state=$(gh api "repos/$REPO/issues/$ISSUE" --jq '.state')
+          labels=$(gh api "repos/$REPO/issues/$ISSUE" --jq '[.labels[].name] | join(",")')
+          case ",$labels," in *,plugin-submission,*) still=yes ;; *) still=no ;; esac
+          if [ "$state" != "open" ] || [ "$still" = no ]; then
+            echo "issue #$ISSUE is $state and carries [$labels] — saying nothing"
+            exit 0
+          fi
+          # The labels this writes, made once and quietly if they are missing:
+          # `gh issue edit` refuses a label that does not exist, and a check
+          # whose verdict silently fails to stick is a check nobody can read.
+          gh label create "ready for listing" --repo "$REPO" --color 0E8A16 --description "The catalogue check passed; a maintainer decides" 2>/dev/null || true
+          gh label create "changes needed" --repo "$REPO" --color D93F0B --description "The catalogue check found something to fix" 2>/dev/null || true
+          gh label create "approved for listing" --repo "$REPO" --color 5319E7 --description "Applied by a maintainer; opens the catalogue pull request" 2>/dev/null || true
+          # The report is the only thing that crosses from the job that read a
+          # stranger's code. If it is missing, the check failed rather than
+          # passed, and the issue is told that rather than left silent.
+          if [ ! -s report/comment.md ]; then
+            printf '%s\n' "<!-- agentglass-plugin-submission -->" \
+              "## The catalogue check could not run" "" \
+              "Nothing was read, so nothing is known about this submission yet. Editing the issue runs it again." \
+              > report/comment.md
+            echo "NOT-READY" > report/verdict
+          fi
+          # ONE comment per commit the check validates.
+          #
+          # Two runs answer every submission (the template's label fires a
+          # second `issues` event) and every edit of the issue answers again,
+          # so a run about the commit the last report is about rewrites that
+          # report rather than burying the repository under its own history.
+          # A run about ANOTHER commit is a new comment. Rewritten in place, a
+          # report changed under a maintainer's eyes: the submitter pushed,
+          # the check validated the new commit into the same comment and put
+          # `ready for listing` back, and nothing on the issue said anything
+          # had moved. Now the new commit arrives as a comment of its own, and
+          # the one above it still says what the old commit was.
+          #
+          # And a report about another commit or another repository than the
+          # one before it is HELD. The maintainer who read the report above it
+          # and labels now would be approving what they never read, and the
+          # new comment alone did not stop that: the check put `ready for
+          # listing` back, and the approval listed the new commit. A held
+          # report takes `ready for listing` and `approved for listing` off
+          # the issue before it is posted and puts neither back, however it
+          # came out; a person reads it and applies `ready for listing` again.
+          # It stays held when the same commit is checked again. The first
+          # report on an issue is not held, and a check that read nothing is
+          # about nothing: it is not held, and it is not what the next report
+          # is compared with.
+          comments=$(mktemp)
+          gh api "repos/$REPO/issues/$ISSUE/comments" --paginate \
+            --jq '.[] | {id, login: .user.login, type: .user.type, body} | @json' > "$comments"
+          decision=$(COMMENTS="$comments" NEXT=report/comment.md python3 - <<'PY'
+          import json, os, re
+          MARK = re.compile(r"<!-- agentglass-plugin-submission-result (\{[^\n]*?\}) -->")
+          def about(body):
+              """The repository and commit a report is about, or None for one that read nothing."""
+              found = MARK.findall(body or "")
+              if len(found) != 1:
+                  return None
+              try:
+                  r = json.loads(found[0])
+              except json.JSONDecodeError:
+                  return None
+              return (str(r.get("repository", "")).casefold(), str(r.get("commit", "")))
+          rows = [json.loads(l) for l in open(os.environ["COMMENTS"]) if l.strip()]
+          # This workflow's own comments only: another bot's comment is not
+          # one this token may rewrite, and a person's is not a report at all.
+          reports = [c for c in rows
+                     if c.get("login") == "github-actions[bot]" and c.get("type") == "Bot"
+                     and str(c.get("body", "")).startswith("<!-- agentglass-plugin-submission -->")]
+          HELD = "<!-- agentglass-plugin-submission-held -->"
+          nxt = about(open(os.environ["NEXT"]).read())
+          # Held against the last report that was about something: a check
+          # that read nothing in between changes nothing about what was read.
+          last = next((r for r in reversed(reports) if about(r.get("body")) is not None), None)
+          if nxt is None or last is None:
+              held = False
+          elif about(last.get("body")) == nxt:
+              held = HELD in str(last.get("body", ""))
+          else:
+              held = True
+          rewrite = reports[-1]["id"] if reports and about(reports[-1].get("body")) == nxt else "-"
+          print(rewrite, "held" if held else "clear")
+          PY
+          )
+          read -r mine hold <<< "$decision"
+          [ "$mine" != "-" ] || mine=""
+          if [ "$hold" = held ]; then
+            printf '%s\n' "" "---" \
+              "**This report is about another commit or repository than the report before it**, so it does not put \`ready for listing\` back by itself, and an approval given before it no longer stands. A maintainer reads it, applies \`ready for listing\` again, and then \`approved for listing\`." \
+              "<!-- agentglass-plugin-submission-held -->" >> report/comment.md
+          fi
+          # Off before the report is up, and not quietly: a held report posted
+          # beside a `ready for listing` that stayed is the thing this closes,
+          # so if the labels cannot be taken off, nothing is posted.
+          if [ "$hold" = held ] && [ -z "$mine" ]; then
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "changes needed" \
+              --remove-label "ready for listing" --remove-label "approved for listing" \
+              || { echo "::error::could not take the labels off the issue; the report about the new commit is not posted"; exit 1; }
+          fi
+          if [ -n "$mine" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$mine" -F body=@report/comment.md >/dev/null
+          else
+            gh issue comment "$ISSUE" --repo "$REPO" --body-file report/comment.md
+          fi
+          if [ "$(cat report/verdict 2>/dev/null)" != "READY" ]; then
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "changes needed" --remove-label "ready for listing" || true
+          elif [ "$hold" != held ]; then
+            gh issue edit "$ISSUE" --repo "$REPO" --add-label "ready for listing" --remove-label "changes needed" || true
+          fi

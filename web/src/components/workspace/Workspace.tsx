@@ -18,10 +18,14 @@
 // opened does not exist yet. On a fresh window that is one view rather than
 // eight, and the dashboard — fourteen panels and a poll every four seconds — is
 // not among them until you ask for it.
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { PluginsView } from "../plugins/PluginsView.tsx";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
+import { hiddenOnly } from "./hiddenOnly.ts";
 import { ViewRail, type RailPip } from "./ViewRail.tsx";
 import { pushScope } from "../../lib/findScope.ts";
 import { VIEWS, saveLastView, type ViewId } from "./views.ts";
+import { ViewBoundary } from "./ViewBoundary.tsx";
 import { subscribe as subscribeChats, attentionCount, listChats, newChat, requestChatFocus, seedChat, setActiveChatId, update as updateChat } from "../../lib/chatStore.ts";
 import { FilesView } from "../FilesPanel.tsx";
 import { TasksView } from "../TasksPanel.tsx";
@@ -30,10 +34,17 @@ import { GitView } from "../GitPanel.tsx";
 import { DiffPage } from "../diff/DiffPage.tsx";
 import { PrView } from "../PrPanel.tsx";
 import { DockerView } from "../DockerPanel.tsx";
-import { TermView, subscribeSessions, liveSessionCount } from "../TerminalPanel.tsx";
+import { TermView } from "../TerminalPanel.tsx";
 import { ChatView } from "../ChatPanel.tsx";
 import { BrowserView } from "../BrowserPanel.tsx";
+import { LanternView } from "../LanternView.tsx";
+import { SeatView } from "../SeatView.tsx";
+import { subscribeLantern, lanternNeed } from "../../lib/lanternStore.ts";
 import { requestTermReview } from "../../lib/termReview.ts";
+import { benchWants, boardActive, boardNode, boardPlace, subscribeBoards, type BoardKind } from "../../lib/boardHost.ts";
+import { BoardSlot } from "./BoardSlot.tsx";
+import { PortalFloor } from "../Portal.tsx";
+import { LAYER } from "../../lib/layers.ts";
 
 /**
  * Views that keep running with the door shut.
@@ -44,7 +55,18 @@ import { requestTermReview } from "../../lib/termReview.ts";
  * either would kill a session nobody asked to end. The cost is real, and it is
  * the price of them being sessions rather than screens.
  */
-const KEEP_RUNNING = new Set<ViewId>(["term", "chat"]);
+/*
+ * Mounted whether or not anybody has been there.
+ *
+ * The terminal and the chat because they hold a live session. The BROWSER for a
+ * different reason: it is the only view an AGENT drives, and until its panel is
+ * mounted nothing can answer one — so the first `agentglass-browser` call of a
+ * session was answered with "the view is not open", which the CLI fixes by
+ * opening it, which takes the screen off whoever was typing. Mounting it costs
+ * nothing until it is looked at: its tabs come back asleep, and a sleeping tab
+ * is a name and an address with no guest behind it.
+ */
+const KEEP_RUNNING = new Set<ViewId>(["term", "chat", "browser"]);
 
 /*
  * There is no fleet column here, and there was one for about an hour.
@@ -78,6 +100,12 @@ export function Workspace({
   issueJump?: import("../../lib/openIssue.ts").IssueJump | null;
 }) {
   const openChat = useCallback(() => onView("chat"), [onView]);
+  /* Held, not inlined. The hidden views are behind a memo that compares props
+     by identity, and a fresh arrow on every render of this component makes that
+     comparison fail for all seven of them — which is the memo doing nothing at
+     all. Same shape as `openChat` above for the same reason. */
+  const openBrowser = useCallback(() => onView("browser"), [onView]);
+  const openLantern = useCallback(() => onView("lantern"), [onView]);
 
   /**
    * Start a chat already pointed at a directory, with a prompt waiting.
@@ -104,12 +132,16 @@ export function Workspace({
 
   const frameRef = useRef<HTMLDivElement>(null);
   const chatWaiting = useSyncExternalStore(subscribeChats, attentionCount, attentionCount);
-  const shells = useSyncExternalStore(subscribeSessions, liveSessionCount, liveSessionCount);
   const firedReminders = useSyncExternalStore(subscribeReminders, firedCount, firedCount);
+  const lanternWaiting = useSyncExternalStore(subscribeLantern, lanternNeed, lanternNeed);
 
   const pips: Partial<Record<ViewId, RailPip>> = {
     chat: chatWaiting > 0 ? { count: chatWaiting } : {},
-    term: shells > 0 ? { dot: true } : {},
+    // The lantern lights: how many agents are stopped on a person right now.
+    // Not how many agents there are — twenty working is a normal afternoon.
+    lantern: lanternWaiting > 0 ? { count: lanternWaiting } : {},
+    // No dot on the terminal. It lit whenever any shell was open, which is
+    // always, so it said nothing — and it sat off-centre on the icon.
     // The count of things shouting at you, not the size of your backlog: a
     // hundred open tasks is a normal Tuesday, and a badge that said so would
     // be ignored within a day.
@@ -130,6 +162,15 @@ export function Workspace({
     setVisited((cur) => (cur.has(view) ? cur : new Set(cur).add(view)));
     saveLastView(view);
   }, [view]);
+  /* A board opened in the bench counts as a visit to its view: the board is
+     rendered here, with the view, and the view's box is where it goes back to
+     when the bench lets go of it. See lib/boardHost.ts. */
+  const benchPr = useSyncExternalStore(subscribeBoards, () => benchWants("pr"), () => false);
+  const benchTasks = useSyncExternalStore(subscribeBoards, () => benchWants("tasks"), () => false);
+  useEffect(() => {
+    const want = [benchPr && "pr", benchTasks && "tasks"].filter(Boolean) as ViewId[];
+    setVisited((cur) => (want.every((k) => cur.has(k)) ? cur : new Set([...cur, ...want])));
+  }, [benchPr, benchTasks]);
 
   const mounted = useMemo(
     () => VIEWS.filter((v) => visited.has(v.id) || KEEP_RUNNING.has(v.id)),
@@ -164,13 +205,25 @@ export function Workspace({
               // hidden view on top would swallow clicks meant for the active one
               // beneath it. `visibility: hidden` does not.
             >
-              {v.id === "dash"
-                ? dashboard(active)
-                : <Body id={v.id} active={active} openChat={openChat} openChatWith={openChatWith} prJump={prJump}
-                    cardJump={cardJump} issueJump={issueJump} reviewInTerminal={reviewInTerminal} chatFocusId={chatFocusId} />}
+              {/* One boundary per view, INSIDE the box rather than around the
+                  map: a throw in Git leaves the rail, the terminal's sockets
+                  and every other view exactly where they were. Without it the
+                  whole tree unmounts and the window goes black — measured
+                  twice in a month, and the second time nothing on screen said
+                  which view had done it. */}
+              <ViewBoundary label={v.label}>
+                {v.id === "dash"
+                  ? dashboard(active)
+                  : <Body id={v.id} active={active} openChat={openChat}
+                      openBrowser={openBrowser} openLantern={openLantern} chatFocusId={chatFocusId} />}
+              </ViewBoundary>
             </ViewBox>
           );
         })}
+        {BOARDS.filter((k) => visited.has(k)).map((k) => (
+          <BoardInstance key={k} kind={k} openChatWith={openChatWith} reviewInTerminal={reviewInTerminal}
+            prJump={prJump} cardJump={cardJump} issueJump={issueJump} />
+        ))}
       </div>
     </div>
   );
@@ -207,6 +260,10 @@ function ViewBox({ active, children }: { active: boolean; children: React.ReactN
       className="absolute inset-0 flex flex-col min-h-0"
       style={{ visibility: active ? "visible" : "hidden" }}
       aria-hidden={!active}
+      /* Findable from outside React: a screenshot of a pane nobody is looking
+         at has to make that pane paint for a moment, and the thing it flips is
+         this box's visibility. See panePainting.ts. */
+      data-agx-viewbox=""
     >
       {children}
     </div>
@@ -215,26 +272,85 @@ function ViewBox({ active, children }: { active: boolean; children: React.ReactN
 
 /** The non-dashboard views, and the props each one wants. Split out so the map
  *  above stays about mounting rather than about plumbing. */
-function Body({ id, active, openChat, openChatWith, reviewInTerminal, chatFocusId, prJump, cardJump, issueJump }: {
+function BodyImpl({ id, active, openChat, openBrowser, openLantern, chatFocusId }: {
   id: ViewId; active: boolean;
   openChat: () => void;
-  openChatWith: (cwd: string, prompt: string, title: string) => void;
-  reviewInTerminal: (root: string, number: number, recipe?: string, card?: string) => void;
+  openLantern: () => void;
+  /** Bring the browser view forward — the Docker panel asks for it when you
+   *  open a container's port, so a dev server lands in a tab of this app
+   *  instead of somewhere else. */
+  openBrowser: () => void;
   chatFocusId?: string | null;
-  prJump?: import("../../lib/openPrs.ts").PrJump | null;
-  cardJump?: import("../../lib/openCard.ts").CardJump | null;
-  issueJump?: import("../../lib/openIssue.ts").IssueJump | null;
 }) {
   switch (id) {
     case "files": return <FilesView active={active} />;
-    case "tasks": return <TasksView active={active} onOpenChatWith={openChatWith} cardJump={cardJump} issueJump={issueJump} />;
+    /* The two boards are not drawn here: this is one of the two places they
+       can be shown, and the board itself is rendered once, below. */
+    case "tasks": return <BoardSlot kind="tasks" place="rail" visible={active} />;
     case "git": return <GitView active={active} onOpenChat={openChat} />;
     case "diff": return <DiffPage active={active} />;
-    case "pr": return <PrView active={active} onOpenChatWith={openChatWith} onReviewInTerminal={reviewInTerminal} jumpTo={prJump} />;
-    case "docker": return <DockerView active={active} />;
+    case "pr": return <BoardSlot kind="pr" place="rail" visible={active} />;
+    case "docker": return <DockerView active={active} onOpenBrowser={openBrowser} />;
     case "term": return <TermView active={active} />;
     case "chat": return <ChatView active={active} focusId={chatFocusId} />;
     case "browser": return <BrowserView active={active} />;
+    /* One errand, and only one: the Lantern is the field this post reads, so
+       the seat carries a way across to it rather than drawing the board a
+       second time. */
+    case "seat": return <SeatView onLantern={openLantern} />;
+    /* Its chat is a tab on the floating bench, not a seeded Chat view — see
+       lanternAsk.ts. Nothing to hand it. */
+    case "lantern": return <LanternView active={active} />;
+    case "plugins": return <PluginsView active={active} />;
     default: return null;
   }
 }
+
+const Body = memo(BodyImpl, hiddenOnly);
+
+const BOARDS: BoardKind[] = ["pr", "tasks"];
+
+/**
+ * The one pull-request board, or the one task board.
+ *
+ * Rendered into an element that boardHost moves between the view and the bench,
+ * so it is mounted exactly once whichever of them is showing it, and `active` is
+ * whether the place holding it is on screen. Its own boundary, because a portal
+ * is outside the view box's. While the bench holds it, what it opens through a
+ * Portal is lifted above the bench — see PortalFloor.
+ */
+function BoardInstance({ kind, ...props }: Omit<BoardBodyProps, "active">) {
+  /* Deferred, because the place that shows the board is already on screen with
+     the board in it: re-rendering the whole board for its new `active` inside
+     the same frame only held that frame back — measured at a third of the
+     first frame when the bench opened on a card with its activity showing. */
+  const active = useDeferredValue(useSyncExternalStore(subscribeBoards, () => boardActive(kind), () => false));
+  const inBench = useSyncExternalStore(subscribeBoards, () => boardPlace(kind) === "bench", () => false);
+  const node = boardNode(kind);
+  if (!node) return null;
+  return createPortal(
+    <PortalFloor.Provider value={inBench ? LAYER.benchOverlay : 0}>
+      <ViewBoundary label={VIEWS.find((v) => v.id === kind)?.label ?? kind}>
+        <BoardBody kind={kind} active={active} {...props} />
+      </ViewBoundary>
+    </PortalFloor.Provider>,
+    node,
+  );
+}
+
+interface BoardBodyProps {
+  kind: BoardKind; active: boolean;
+  openChatWith: (cwd: string, prompt: string, title: string) => void;
+  reviewInTerminal: (root: string, number: number, recipe?: string, card?: string) => void;
+  prJump?: import("../../lib/openPrs.ts").PrJump | null;
+  cardJump?: import("../../lib/openCard.ts").CardJump | null;
+  issueJump?: import("../../lib/openIssue.ts").IssueJump | null;
+}
+
+function BoardBodyImpl({ kind, active, openChatWith, reviewInTerminal, prJump, cardJump, issueJump }: BoardBodyProps) {
+  return kind === "pr"
+    ? <PrView active={active} onOpenChatWith={openChatWith} onReviewInTerminal={reviewInTerminal} jumpTo={prJump} />
+    : <TasksView active={active} onOpenChatWith={openChatWith} cardJump={cardJump} issueJump={issueJump} />;
+}
+
+const BoardBody = memo(BoardBodyImpl, hiddenOnly);

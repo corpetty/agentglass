@@ -82,3 +82,63 @@ export function tailOf(text: string, limit: number): { lines: string[]; total: n
   if (!total) return { lines: [], total: 0 };
   return { lines: total <= limit ? all : all.slice(-limit), total };
 }
+
+/**
+ * How long a job ran, or has been running: the second line of its row.
+ *
+ * "failed" alone does not say whether it fell over in the install step or
+ * after twelve minutes of tests, and the difference is most of what somebody
+ * needs to guess where in the log to look.
+ */
+export function ranFor(job: PrCheckJob, now: number): string {
+  const span = (ms: number): string => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  };
+  const started = job.startedAt ? Date.parse(job.startedAt) : NaN;
+  const ended = job.completedAt ? Date.parse(job.completedAt) : NaN;
+  const { standing, word } = standingOf(job);
+  if (standing === "running") return Number.isFinite(started) ? `Started ${span(now - started)} ago` : word[0]!.toUpperCase() + word.slice(1);
+  // GitHub's conclusion is a noun ("failure"); the row reads as a sentence.
+  const said = word === "failure" ? "failed" : word;
+  const label = said[0]!.toUpperCase() + said.slice(1);
+  return Number.isFinite(started) && Number.isFinite(ended) ? `${label} after ${span(ended - started)}` : label;
+}
+
+/** A log line worth tinting: where it says it failed. Conservative on
+ *  purpose — a tint on every line containing "error" in a path is noise. */
+export function looksFailed(line: string): boolean {
+  return /(^|\s)(✗|✕|×|FAIL\b|FAILED\b)|\b[Ee]rror:|##\[error\]|exited with code [1-9]|^\s*(Expected|Received):/.test(line);
+}
+
+/**
+ * GitHub Actions' own log, folded to what a phone can read.
+ *
+ * Every line arrives stamped with an ISO timestamp — about 28 characters,
+ * half the width of this screen before the log itself starts — and each step
+ * is wrapped in `##[group]` / `##[endgroup]`, GitHub's own markers for a
+ * collapsible section on its own log viewer, which this screen has no
+ * equivalent chrome for and drew as two more lines of noise instead. The web
+ * panel already folds on the same markers (PrPanel.tsx's `JobLog`); this is
+ * the same rule where there is no renderer to fold INTO steps, so the group
+ * marker becomes its title line and the close marker is dropped rather than
+ * built into a collapsible tree.
+ *
+ * `##[error]` is left exactly as GitHub wrote it — `looksFailed` matches that
+ * marker to tint the row, and stripping it here would blind the one styling
+ * this was asked to keep.
+ */
+export function foldJobLog(text: string): string {
+  const out: string[] = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, "");
+    const group = line.match(/^##\[group\](.*)$/);
+    if (group) { out.push(group[1] || "step"); continue; }
+    if (/^##\[endgroup\]/.test(line)) continue;
+    out.push(line);
+  }
+  return out.join("\n");
+}

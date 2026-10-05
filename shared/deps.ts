@@ -36,7 +36,7 @@ export type DepId =
   | "git" | "claude" | "codex" | "agy" | "python" | "tmux" | "gh" | "glab" | "docker" | "nvim" | "task"
   | "whisper"
   | "tailscale"
-  | "setsid" | "script" | "ss" | "dbus-monitor" | "notify-send" | "opener" | "pkexec" | "bash"
+  | "setsid" | "script" | "ss" | "dbus-monitor" | "notify-send" | "opener" | "pkexec" | "bash" | "bwrap"
   | "claude-desktop";
 
 export interface DepSpec {
@@ -276,6 +276,14 @@ export const DEPS: DepSpec[] = [
     url: "https://claude.ai/download",
     note: "Also tried under the community `claude-desktop-unofficial` name, which has no row of its own. Nothing else in the app needs it — Cowork/Desktop sessions are still ingested from disk either way; only launch/stop needs the binary.",
     platforms: ["linux", "darwin"],
+  },
+  {
+    id: "bwrap", bin: "bwrap", title: "Bubblewrap", required: false,
+    what: "Boxes a plugin that declares a sandbox, so it can see only its own folder, its data folder and the paths it was granted. Without it that plugin still runs, just as you, behind a warning that says why.",
+    url: "https://github.com/containers/bubblewrap",
+    platforms: ["linux"],
+    note: "Some distributions also require unprivileged user namespaces to be allowed for it to actually start a box; the app's own settings page names the fix when that is the reason.",
+    pkg: { apt: "bubblewrap", dnf: "bubblewrap", pacman: "bubblewrap", zypper: "bubblewrap", apk: "bubblewrap" },
   },
 ];
 

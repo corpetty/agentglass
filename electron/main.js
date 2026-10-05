@@ -1,10 +1,11 @@
+// @ts-check
 // agentglass Electron shell.
 //
 // Runs the EXACT web UI (web/dist) in Chromium, where GPU rasterisation keeps
 // the dashboard off the CPU — the previous WebKitGTK-based shell fell back to
-// software. On Linux the *final* frame is CPU-composited (see
-// disable-gpu-compositing below) to dodge a Wayland/GPU white-out; raster still
-// runs on the GPU, WebGL does not. Same pixels as the web app.
+// software. On Linux the final frame is GPU-composited too; AGENTGLASS_GPU=0 falls
+// back to CPU compositing (see disable-gpu-compositing below) for a stack that
+// paints the window white. Same pixels as the web app.
 //
 // It serves web/dist from the app's own `agentglass://` scheme and brings the
 // Bun server up with it unless one is already running.
@@ -19,7 +20,7 @@
 // origin and no port to contend for. Only one instance runs now (see the lock
 // below), but the origin is what makes the store survive a restart.
 
-const { app, BrowserWindow, Menu, clipboard, dialog, ipcMain, nativeImage, protocol, screen, session, shell } = require("electron");
+const { app, BrowserWindow, Menu, WebContentsView, clipboard, dialog, ipcMain, nativeImage, nativeTheme, protocol, screen, session, shell } = require("electron");
 const { spawn } = require("child_process");
 const http = require("http");
 const fs = require("fs");
@@ -28,8 +29,159 @@ const os = require("os");
 // The `<webview>` boundary, in its own file so it can be read and tested on its
 // own. Shipped inside the asar with this one — see build.files in package.json.
 const {
-  BROWSER_PARTITION, isBrowserPartition, safeGuestUrl, applyGuestGuard,
+  BROWSER_PARTITION, isBrowserPartition, ephemeralPartition, safeGuestUrl, applyGuestGuard, mayAttachOnMainWindow, permissionVerdict, permissionPrompt, uniqueSavePath,
 } = require("./guest-guard.js");
+const { startEgressProxy, literalRefusal, EGRESS_ENV } = require("./egress-guard.js");
+/* S9: the honest "an agent is driving this" header — see identify-header.js
+   for the decision and browser-phase3-plan-2026-09-25.md §S9/D8 for why. */
+const { IDENTIFY_HEADER, shouldIdentify, sanitizeAgentName } = require("./identify-header.js");
+
+/**
+ * The browser's egress guard, once it is listening — see egress-guard.js for
+ * what it is and why a proxy is the only place the URL policy can be held at
+ * connect time. Null while it is starting, and for good when it is switched
+ * off (AGENTGLASS_BROWSER_EGRESS=off) or could not bind, in which case the
+ * browser reaches the network directly as it did before it existed.
+ * @type {{ port: number, proxyRules: string, refusals: () => Array<{ at: number, host: string, reason: string }>, refuse: (host: string, reason: string) => void } | null} */
+let egress = null;
+/** Sessions already pointed at the guard. One per partition, like `coopFreed`:
+ *  `setProxy` twice is harmless but `onBeforeRequest` twice is the second
+ *  listener replacing the first. @type {WeakSet<Electron.Session>} */
+const egressArmed = new WeakSet();
+/** Sessions whose permission handlers are set. @type {WeakSet<Electron.Session>} */
+const permissionArmed = new WeakSet();
+/** S9: whether a session sends `X-Agentglass-Agent` to a dev origin. Absent
+ *  means off — a session nobody has touched must stay silent, and a `Map`
+ *  keyed by string would need a separate "does this partition exist yet"
+ *  check this does not.
+ *  @type {WeakMap<Electron.Session, boolean>} */
+const identifyEnabled = new WeakMap();
+/** Sessions whose `onBeforeSendHeaders` dispatcher is installed. One per
+ *  session, same reason as `egressArmed`: a second `onBeforeSendHeaders`
+ *  would replace the first rather than run alongside it, so a future header
+ *  feature belongs INSIDE the one dispatcher below, not a second listener.
+ *  @type {WeakSet<Electron.Session>} */
+const identifyHeaderArmed = new WeakSet();
+
+/** Where each tab's armed download is meant to land, set by the `download`
+ *  verb and consumed by the first download that tab starts. Module scope
+ *  because the window-open handler reads it too. @type {Map<Electron.WebContents, string>} */
+const guestDownloadDir = new Map();
+
+/** Guests that belong to a lane, an agent's own tab. @type {WeakSet<Electron.WebContents>} */
+const laneGuests = new WeakSet();
+/** What the person answered this session, by origin and thing: true = allowed.
+ *  Denials are kept too, so a page cannot ask again until he says yes.
+ *  @type {Map<string, boolean>} */
+const permissionAnswers = new Map();
+/** Dialogs on screen, so two asks for one thing raise one dialog. @type {Map<string, Promise<boolean>>} */
+const permissionPending = new Map();
+/** @param {string} what @param {string} origin */
+const permissionKey = (what, origin) => `${origin}\u0000${what}`;
+
+/** @param {Electron.WebContents | null} wc @param {string} permission @param {unknown} mediaTypes */
+function permissionAsk(wc, permission, mediaTypes) {
+  return permissionVerdict(permission, { frontTab: !!wc && !!browserGuest && wc === browserGuest, lane: !!wc && laneGuests.has(wc), mediaTypes });
+}
+
+/**
+ * Ask the person, natively, and remember what he said until the app closes.
+ * The dialog belongs to the window the tab lives in, and the page has no
+ * handle on it.
+ * @param {Electron.WebContents} wc @param {string | undefined} what @param {string | undefined} requestingUrl
+ * @returns {Promise<boolean>} */
+function askPermission(wc, what, requestingUrl) {
+  let origin = "";
+  try { origin = new URL(requestingUrl || wc.getURL()).origin; } catch { return Promise.resolve(false); }
+  if (!what || origin === "null") return Promise.resolve(false);
+  const key = permissionKey(what, origin);
+  const known = permissionAnswers.get(key);
+  if (known !== undefined) return Promise.resolve(known);
+  const open = permissionPending.get(key);
+  if (open) return open;
+  const host = wc.hostWebContents ? BrowserWindow.fromWebContents(wc.hostWebContents) : null;
+  const options = {
+    type: /** @type {const} */ ("question"),
+    buttons: ["Allow", "Deny"],
+    defaultId: 1,
+    cancelId: 1,
+    message: permissionPrompt(what, origin),
+    detail: "Until agentglass closes, this site is remembered for this. Agents' tabs are never asked.",
+  };
+  const shown = host ? dialog.showMessageBox(host, options) : dialog.showMessageBox(options);
+  const answer = shown.then((r) => r.response === 0, () => false).then((ok) => {
+    permissionAnswers.set(key, ok);
+    permissionPending.delete(key);
+    return ok;
+  });
+  permissionPending.set(key, answer);
+  return answer;
+}
+
+/**
+ * Point a browsing session at the guard: its traffic goes through the proxy,
+ * and the requests the proxy can never see — Chromium sends link-local
+ * LITERALS straight to the network — are cancelled on the request hook.
+ * Called from `will-attach-webview` with the guest's partition, so the session
+ * is armed before the guest exists rather than after its first request.
+ * @param {string | undefined} partition */
+function armEgress(partition) {
+  const ses = session.fromPartition(partition || BROWSER_PARTITION);
+  // The permission policy is not the egress guard's to skip: with the guard
+  // off or unbound the browser still must not hand a page the camera.
+  if (!permissionArmed.has(ses)) {
+    permissionArmed.add(ses);
+    ses.setPermissionRequestHandler((wc, permission, callback, details) => {
+      const ask = permissionAsk(wc, permission, details && "mediaTypes" in details ? details.mediaTypes : undefined);
+      if (ask.verdict !== "ask") return callback(ask.verdict === "allow");
+      void askPermission(wc, ask.what, details && details.requestingUrl).then(callback);
+    });
+    // Synchronous, so it can only repeat an answer already given.
+    ses.setPermissionCheckHandler((wc, permission, origin, details) => {
+      const ask = permissionAsk(wc, permission, details && details.mediaType ? [details.mediaType] : undefined);
+      if (ask.verdict !== "ask") return ask.verdict === "allow";
+      return permissionAnswers.get(permissionKey(ask.what || "", origin)) === true;
+    });
+    // No streams offered is a refusal; getDisplayMedia rejects in the page.
+    ses.setDisplayMediaRequestHandler((_request, callback) => callback({}));
+    ses.setDevicePermissionHandler(() => false);
+  }
+  if (!egress) return;
+  if (egressArmed.has(ses)) return;
+  egressArmed.add(ses);
+  ses.setProxy({ proxyRules: egress.proxyRules, proxyBypassRules: "" })
+    .catch((e) => console.error("[egress] could not set the session proxy:", e));
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const why = literalRefusal(details.url);
+    if (why && egress) egress.refuse(new URL(details.url).hostname, why);
+    callback({ cancel: !!why });
+  });
+}
+const { browserMenuTemplate } = require("./browser-menu.js");
+const power = require("./power.js");
+const { probe: probeServer, holdDesk } = require("./server-probe.js");
+
+/*
+ * What `// @ts-check` at the top of this file buys, and why the JSDoc below it
+ * exists at all.
+ *
+ * This is the file that mints the auth token, decides what a <webview> may be,
+ * and registers every IPC channel the renderer can reach — and it is plain
+ * JavaScript, which for years meant it was the one file here nothing checked a
+ * line of. `make typecheck` and CI both read it now. The annotations are only where the checker cannot work
+ * a type out for itself: a `let x = null` it would otherwise call `any`, a
+ * function whose parameters have no call site to infer from, and the handful of
+ * places where Electron's own types are stricter than this code was.
+ */
+
+/** @typedef {import("electron").WebContents} WebContents */
+/** @typedef {import("electron").BrowserWindow} AppWindow */
+/** @typedef {import("electron").WebContentsView} DevtoolsView */
+
+/** Why there is no server, in a shape the renderer can draw. Four reasons and
+ *  four different fixes — see describeSidecarFailure, which is the only thing
+ *  that builds one.
+ * @typedef {{ reason: string, what: string, where: string, fix: string, detail: string, port: number }} SidecarFailure */
 
 /*
  * Which windowing backend this app is, on Linux. Pinned, on purpose.
@@ -55,7 +207,7 @@ const {
  * why, and still does today:
  *     ui/base/x/x11_software_bitmap_presenter.cc:147
  *       XGetWindowAttributes failed for window 1
- * With AGENTGLASS_GPU=1 (so this is not the white-out workaround below) it is the
+ * Without the CPU-compositing switch (so this is not the white-out workaround below) it is the
  * same, plus three ContextResult::kTransientFailure out of CreateCommandBuffer.
  * The switch is not being ignored — it reaches the children, it is right there in
  * /proc/<gpu-pid>/cmdline — it just cannot present.
@@ -106,18 +258,19 @@ if (process.platform === "linux") {
 }
 
 /*
- * Software-composite the final frame on Linux.
+ * GPU-composite the final frame on Linux, unless AGENTGLASS_GPU=0.
  *
  * On some Linux GPU/compositor stacks Chromium's GPU compositor hands the window
  * stale or empty tiles — the whole UI reads as solid white until a repaint
  * (switching theme) forces them to redraw. Compositing the final frame on the
- * CPU sidesteps it. Linux only, and AGENTGLASS_GPU=1 opts back in.
+ * CPU sidesteps it, and that used to be the default here. It is now the opt-out:
+ * AGENTGLASS_GPU=0 puts the switch back for a stack that shows the white-out.
  *
  * The price, MEASURED, because what used to be written here was wrong. This said
  * "GPU raster and WebGL still run… only the last composite is on the CPU". Half
  * of that is true. Read out of the running app through CDP SystemInfo.getInfo:
  *
- *                        default (this switch)   AGENTGLASS_GPU=1
+ *                        AGENTGLASS_GPU=0        default
  *     gpu_compositing    disabled_software       enabled
  *     rasterization      enabled                 enabled
  *     webgl              enabled_readback        enabled
@@ -130,19 +283,48 @@ if (process.platform === "linux") {
  * (web/src/components/TerminalPanel.tsx) exists precisely to keep a fast-writing
  * shell off the CPU.
  *
- * Kept anyway, for now. Under native Wayland on this machine (AMD Radeon 890M,
- * Mesa 25.2.8, GNOME 46) the white-out did not appear in either mode across a
- * dark→light theme change, view switches, maximise, unmaximise, fullscreen,
- * windowed, minimise and restore — nine frames each way, every one with the
- * right mean colour and a clean log. That is an absence of evidence from one
- * session, not evidence of absence, and the bug it guards against is
- * intermittent and stack-dependent; it was also tuned on XWayland under Electron
- * 33, which is no longer the configuration that ships. Whoever removes it should
- * do it deliberately, run without it for a week, and get the terminal's
- * acceleration back as the reward.
+ * Flipped to opt-out because a CPU-composited 4K window was the biggest single
+ * idle cost measured on the desktop (the renderer's compositor plus the GPU
+ * process reading WebGL back, about a third of a core). Under native Wayland on
+ * this machine (AMD Radeon 890M, Mesa 25.2.8, GNOME 46) the white-out did not
+ * appear in either mode across a dark→light theme change, view switches,
+ * maximise, unmaximise, fullscreen, windowed, minimise and restore — nine frames
+ * each way, every one with the right mean colour and a clean log. That is an
+ * absence of evidence from one session, not evidence of absence, and the bug it
+ * guards against is intermittent and stack-dependent; it was also tuned on
+ * XWayland under Electron 33, which is no longer the configuration that ships.
+ * If a solid-white window turns up, AGENTGLASS_GPU=0 is the first thing to try,
+ * and the report belongs with the GPU/compositor it came from. Not measured
+ * here: the CPU of each mode on a visible window, which needs frame callbacks.
  */
-if (process.platform === "linux" && !process.env.AGENTGLASS_GPU) {
+if (process.platform === "linux" && process.env.AGENTGLASS_GPU === "0") {
   app.commandLine.appendSwitch("disable-gpu-compositing");
+}
+
+/**
+ * Expose Chromium's own debugging port — off by default, on request only.
+ *
+ * Every idle-CPU fix so far was reasoned about from outside this process:
+ * headless Chrome standing in for the renderer, the sidecar's own request
+ * count, everything but the renderer itself. `--remote-debugging-port` is
+ * how that stops being a guess — it is Chromium's CDP port, a different
+ * door from the one the fuses in electron/package.json shut (Node's
+ * `--inspect`, `NODE_OPTIONS`, `ELECTRON_RUN_AS_NODE`; see
+ * server/test/desktop-fuses.test.ts). Appended here as a switch this
+ * process hands itself, never read off an argv an attacker could set, so it
+ * exists exactly when AGENTGLASS_DEBUG_PORT is set and not otherwise.
+ *
+ * Chromium binds it to 127.0.0.1 only, same as the sidecar's own port — but
+ * unlike the sidecar it takes no token. A CDP connection can read every DOM
+ * node, every variable, and drive the page as the user, in the one window
+ * that also holds the read token and every live terminal session. That is
+ * worse than the token it has none of, so it stays off unless somebody who
+ * can already set an environment variable on this machine asks for it by
+ * name — the same bar AGENTGLASS_GPU above sets for the compositor switch.
+ */
+const DEBUG_PORT = Number(process.env.AGENTGLASS_DEBUG_PORT || 0);
+if (DEBUG_PORT > 0) {
+  app.commandLine.appendSwitch("remote-debugging-port", String(DEBUG_PORT));
 }
 
 // One instance, one window.
@@ -161,6 +343,12 @@ if (process.platform === "linux" && !process.env.AGENTGLASS_GPU) {
 // top level is a function body.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
+  // TypeScript checks this file against a module top level, where a bare
+  // `return` is a syntax error (TS1108). Node does not: it wraps a CommonJS
+  // module in a function before running it, which is what the comment above is
+  // about and why this has worked since it was written. The suppression is for
+  // the checker's model, not for the language.
+  // @ts-ignore -- CommonJS module top level IS a function body
   return;
 }
 
@@ -175,6 +363,67 @@ protocol.registerSchemesAsPrivileged([
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
   },
 ]);
+
+/**
+ * "Install this plugin", clicked on a web page.
+ *
+ * The catalogue lives on a site and the app lives here, and the only thing a
+ * browser can hand across that gap is a link. So the app owns
+ * `agentglass://plugin/install?url=…`: a click opens the window and puts the
+ * URL in the install box in Settings ▸ Plugins, WITH THE APPROVAL IT ALWAYS
+ * HAD. Nothing installs, nothing runs, and nothing is enabled — a link from a
+ * page nobody vetted may ask, and only the person answers.
+ *
+ * The same scheme already serves the renderer from `agentglass://app`, which
+ * is why the host is checked: `app` is this application's own origin and is
+ * never a deep link, whatever a page puts after it.
+ */
+const DEEP_LINK_MAX = 2048;
+
+/** @param {readonly string[]} argv @returns {string | null} */
+function deepLinkFrom(argv) {
+  for (const arg of argv || []) {
+    if (typeof arg !== "string" || !arg.startsWith(`${APP_SCHEME}://`) || arg.length > DEEP_LINK_MAX) continue;
+    if (arg.startsWith(`${APP_ORIGIN}/`) || arg === APP_ORIGIN) continue;
+    return arg;
+  }
+  return null;
+}
+
+/** What a deep link is allowed to ask for. One shape today, and the parsing
+ *  is here rather than in the window because a malformed link should die in
+ *  the process that can simply drop it. */
+/** @param {string} link @returns {{ kind: "plugin-install", url: string } | null} */
+function parseDeepLink(link) {
+  let u;
+  try { u = new URL(link); } catch { return null; }
+  if (u.protocol !== `${APP_SCHEME}:` || u.host !== "plugin" || u.pathname !== "/install") return null;
+  const url = (u.searchParams.get("url") || "").trim();
+  // Only a git URL over https, which is the one `installPlugin` would accept
+  // anyway: a link that could name a local path would let a page point the
+  // install box at somebody's home directory.
+  if (!/^https:\/\/[^\s"'<>]{4,512}$/.test(url)) return null;
+  return { kind: "plugin-install", url };
+}
+
+/** Held when a link starts the app cold: the window is not there to be told
+ *  yet, and the renderer asks for it once it has mounted. */
+/** @type {{ kind: "plugin-install", url: string } | null} */
+let pendingDeepLink = null;
+
+/** @param {string | null} link */
+function offerDeepLink(link) {
+  const parsed = link && parseDeepLink(link);
+  if (!parsed) return;
+  pendingDeepLink = parsed;
+  const w = mainWindow;
+  if (w && !w.isDestroyed()) {
+    if (w.isMinimized()) w.restore();
+    w.show();
+    w.focus();
+    try { w.webContents.send("ag:deep-link", parsed); } catch { /* window went away */ }
+  }
+}
 
 // Where the sidecar is asked to listen. Resolved at startup (see pickPort) --
 // the preferred port is only the first candidate, not a promise.
@@ -192,8 +441,45 @@ const DIST = PACKAGED ? path.join(process.resourcesPath, "web") : path.join(REPO
 const SIDECAR_NAME = process.platform === "win32" ? "agentglass-server.exe" : "agentglass-server";
 const SIDECAR_BIN = PACKAGED ? path.join(process.resourcesPath, SIDECAR_NAME) : null;
 
+/**
+ * The PATH the sidecar — and through it every agent it seats — is started with.
+ *
+ * `bin/` ships inside every package as an extraResource (electron/package.json
+ * "build.extraResources": `../bin` → `resources/bin`), so a .dmg carries
+ * `agentglass-agent`, `agentglass-browser` and `agentglass-browser-mcp` at
+ * `agentglass.app/Contents/Resources/bin/`. Nothing puts that directory on
+ * anybody's PATH: the Linux installer symlinks the CLIs into `~/.local/bin`,
+ * a .dmg has no installer, and an agent that types `agentglass-browser` on a
+ * Mac got "command not found" from an app that had the file all along.
+ *
+ * Prepended, because a package's user has no other copy for it to shadow, and
+ * the one that ships with this build is the one that matches this build's
+ * server. Every packaged platform, not only the Mac: a .deb or AppImage user
+ * who never ran the local installer has exactly the same gap, and on a
+ * machine where the installer DID symlink the CLIs the prepended copy is the
+ * same file at another path. A development run is left alone — bin/ is in
+ * the checkout there, not under resources/.
+ *
+ * Pure, and its inputs are parameters, because the suite runs on Linux and
+ * states a Mac instead (desktop-mac-bin-path.test.ts).
+ *
+ * @param {string | undefined} current  the PATH the shell was started with
+ * @param {{ platform: string, packaged: boolean, resourcesPath: string, delimiter?: string }} where
+ * @returns {string | undefined}
+ */
+function withBundledBin(current, where) {
+  if (!where.packaged) return current;
+  const bin = path.join(where.resourcesPath, "bin");
+  const sep = where.delimiter ?? path.delimiter;
+  const parts = (current ?? "").split(sep).filter(Boolean);
+  if (parts.includes(bin)) return current;
+  return [bin, ...parts].join(sep);
+}
+
+/** @type {import("child_process").ChildProcess | null} */
 let sidecar = null;
 // Kept so a second launch has something to raise instead of opening a window.
+/** @type {AppWindow | null} */
 let mainWindow = null;
 
 // --- remote access (open the dashboard on your phone) -----------------------
@@ -235,6 +521,7 @@ function readLastFolder() {
   }
 }
 
+/** @param {string} folder */
 function saveLastFolder(folder) {
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
@@ -289,12 +576,88 @@ function readWindowState() {
       y: APP_PLACES_ITS_WINDOW && Number.isFinite(s.y) ? s.y : undefined,
       max: s.max === true,
       full: s.full === true,
+      bg: windowBackground(s.bg),
+      bgSystem: s.bgSystem && windowBackground(s.bgSystem.dark) && windowBackground(s.bgSystem.light)
+        ? { dark: /** @type {string} */ (windowBackground(s.bgSystem.dark)), light: /** @type {string} */ (windowBackground(s.bgSystem.light)) }
+        : null,
     };
   } catch {
-    return { width: 1440, height: 900, max: false, full: false };
+    return { width: 1440, height: 900, max: false, full: false, bg: null, bgSystem: null };
   }
 }
 
+/**
+ * The theme's background, as the window paints it before the page does.
+ *
+ * `backgroundColor` is the only thing in the window until the renderer's first
+ * frame, and a fixed one — the violet-black this used to hard-code — was a
+ * flash of the wrong colour on every launch of every theme that was not that
+ * one, white themes worst. The renderer reports its background on every paint
+ * of a theme (web/src/lib/themes.ts); it is kept beside the window's size and
+ * handed to the next window. Only a plain #rrggbb is taken.
+ * @param {unknown} c
+ * @returns {string | null}
+ */
+function windowBackground(c) {
+  return typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c) ? c.toLowerCase() : null;
+}
+/** The last background the renderer reported, saved with the window state.
+ *  @type {string | null} */
+let windowBg = null;
+/** Both grounds, when the theme follows the OS: the next window picks by what
+ *  the OS says then, as the page does.
+ *  @type {{ dark: string, light: string } | null} */
+let windowBgSystem = null;
+
+/*
+ * Why the window stopped being maximised — written down, because nobody is
+ * watching when it happens.
+ *
+ * Reported as "if I paste what I have in the clipboard it minimises and stays
+ * that way": a maximised window that comes back at its normal size after a paste.
+ * Nothing in this process asks for that — the only two callers of `unmaximize`
+ * are the button and the context menu — so the answer is either the window
+ * manager, an extension, or a relaunch that restored the wrong state, and none
+ * of those can be told apart after the fact from the outside.
+ *
+ * So the moment is recorded when it happens: what the bounds became, whether
+ * this process asked, and whether a keyboard CHORD had just been pressed.
+ *
+ * Chords only, and this is deliberate: a paste is Ctrl+V, and knowing whether
+ * one arrived a few milliseconds before the window changed is the whole
+ * question. Plain keys are never recorded — that would be a keylogger with a
+ * diagnostic's name on it — and the chord is stored as its modifiers plus one
+ * key name, never as text that reached a field.
+ */
+const WINDOW_LOG_MAX = 60_000;
+/** Bigger than the window log's, because one entry here is a stack trace and
+ *  one there is a line of numbers — see `writeSidecarLog`. */
+const SERVER_LOG_MAX = 200_000;
+/** @type {{at:number,key:string,ctrl:boolean,shift:boolean,alt:boolean}|null} */
+let lastChord = null;
+let askedAt = 0;            // when THIS process last asked for a window change
+let lastAsk = "";           // and how that ask was made — see winToggleMaximize
+
+/**
+ * @param {string} what — the transition being recorded
+ * @param {AppWindow} win
+ */
+function noteWindow(what, win) {
+  try {
+    const b = win.getBounds();
+    const chord = lastChord && Date.now() - lastChord.at < 3000
+      ? `${lastChord.ctrl ? "Ctrl+" : ""}${lastChord.alt ? "Alt+" : ""}${lastChord.shift ? "Shift+" : ""}${lastChord.key} ${Date.now() - lastChord.at}ms ago`
+      : "none";
+    const line = `${new Date().toISOString()} ${what} max=${win.isMaximized()} full=${win.isFullScreen()} `
+      + `bounds=${b.width}x${b.height}+${b.x}+${b.y} focused=${win.isFocused()} `
+      + `asked=${askedAt && Date.now() - askedAt < 3000 ? "yes" : "no"} why=${askedAt && Date.now() - askedAt < 3000 ? (lastAsk || "unsaid") : "-"} chord=${chord}\n`;
+    const file = path.join(app.getPath("userData"), "window.log");
+    if (fs.existsSync(file) && fs.statSync(file).size > WINDOW_LOG_MAX) fs.writeFileSync(file, "");
+    fs.appendFileSync(file, line);
+  } catch { /* a log nobody can write is not worth an exception */ }
+}
+
+/** @param {AppWindow} win */
 function saveWindowState(win) {
   try {
     if (win.isDestroyed()) return;
@@ -305,9 +668,10 @@ function saveWindowState(win) {
     // for ever after — the window would come back maximised-sized and then have
     // nowhere to unmaximise to.
     const b = win.getNormalBounds();
+    const ground = { ...(windowBg ? { bg: windowBg } : {}), ...(windowBgSystem ? { bgSystem: windowBgSystem } : {}) };
     const state = APP_PLACES_ITS_WINDOW
-      ? { ...b, max, full }
-      : { width: b.width, height: b.height, max, full };
+      ? { ...b, max, full, ...ground }
+      : { width: b.width, height: b.height, max, full, ...ground };
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     fs.writeFileSync(WINDOW_CFG, JSON.stringify(state, null, 2) + "\n");
   } catch { /* a window state is not worth failing a close over */ }
@@ -319,12 +683,18 @@ function saveWindowState(win) {
  *
  *  Dead code on Linux by construction rather than by an `if` here: readWindowState
  *  hands back undefined coordinates when the platform does not place its own
- *  windows, and undefined is already the "do not place it" answer below. */
+ *  windows, and undefined is already the "do not place it" answer below.
+ * @param {{ x?: number, y?: number, width: number, height: number }} b
+ * @param {import("electron").Screen} screen */
 function onSomeDisplay(b, screen) {
   if (b.x === undefined || b.y === undefined) return false;
+  // Read into locals rather than used through `b` inside the callback: the
+  // check above narrows the properties here, and that narrowing does not
+  // survive into a closure, which the callback below is.
+  const { x, y } = b;
   return screen.getAllDisplays().some((d) => {
     const a = d.workArea;
-    return b.x < a.x + a.width && b.x + b.width > a.x && b.y < a.y + a.height && b.y + b.height > a.y;
+    return x < a.x + a.width && x + b.width > a.x && y < a.y + a.height && y + b.height > a.y;
   });
 }
 const TOKEN_PATH = path.join(CONFIG_DIR, "token");
@@ -337,6 +707,7 @@ function remoteEnabled() {
   }
 }
 
+/** @param {boolean} on */
 function setRemoteEnabled(on) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(REMOTE_CFG, JSON.stringify({ enabled: !!on }, null, 2) + "\n");
@@ -382,6 +753,88 @@ function currentToken() {
 }
 
 /**
+ * The desk's key: what lets a held call go, and the one secret here that no
+ * agent this app runs can read.
+ *
+ * The token above is a file of this user's and a variable in every environment
+ * the sidecar starts, so the process whose call is held has it too. This is
+ * minted for each sidecar this app spawns (ensureServer), never written
+ * anywhere, and reaches that sidecar down a pipe and the renderer through the
+ * preload — see server/src/desk.ts for what it closes and what it does not.
+ * A server the app adopted was never piped one: there it is the key the app
+ * claimed (holdAdoptedDesk), and null until that server holds it.
+ * @type {string | null}
+ */
+let deskKey = null;
+/** Lets the claim on an adopted server's desk go; null when there is none. */
+let letDeskGo = /** @type {(() => void) | null} */ (null);
+
+/**
+ * Claim the desk of a server this app adopted, and keep claiming it.
+ *
+ * It was started by hand or by an earlier launch, so no pipe handed it a key
+ * and the Origin rule was all that guarded the browser role and a held call's
+ * release there (server/src/desk.ts). The claim is proved and held by
+ * server-probe.js; the windows are told the key once the server holds it, and
+ * told null when it does not. Null means one of three things: the server is on
+ * the Origin rule for a moment between claims; another process holds its desk;
+ * or an earlier launch of this app piped it a key this launch does not have. In
+ * the last two this window can neither host the browser nor release a hold
+ * there — the ceiling desk.ts states. When another process holds it the
+ * window is told (noteDeskTaken) and claims again only on its Retry. A claim made on
+ * behalf of a server this app has since replaced with its own says nothing.
+ * @param {number} port
+ */
+function holdAdoptedDesk(port, settleMs = 0) {
+  letDeskGo?.();
+  deskKey = null;
+  letDeskGo = holdDesk(port, {
+    token: currentToken,
+    key: require("crypto").randomBytes(32).toString("base64url"),
+    onChange: (k) => {
+      if (sidecar || SERVER_PORT !== port) return;
+      if (!k) console.error(`[agentglass] :${port} did not give this app its desk: if another process holds it, or an earlier launch started that server, this window cannot drive the browser or release a held call there until the server is restarted`);
+      if (k) noteDeskTaken(null); // the banner stays until a claim is held
+      deskKey = k;
+      for (const w of BrowserWindow.getAllWindows()) {
+        try { w.webContents.send("ag:server-changed", { deskKey: k }); } catch { /* window went away */ }
+      }
+    },
+    onTaken: () => { if (!sidecar && SERVER_PORT === port) noteDeskTaken(port); },
+    settleMs,
+  });
+}
+
+/** The port of an adopted server whose desk another process holds, or null. */
+let deskTaken = /** @type {number | null} */ (null);
+
+/**
+ * Tell the windows that an adopted server's desk is held by another process,
+ * or (null) that it no longer is.
+ *
+ * The app does not leave for a server of its own: two servers on one database
+ * would leave the second without the lock — no transcript scan — and the hooks
+ * still posting to the first. It stays, refused the browser role and a hold's
+ * release there, and the window says so with a Retry (ag:retryDesk). No token
+ * goes anywhere: the claim was refused, not sent on.
+ * @param {number | null} port
+ */
+function noteDeskTaken(port) {
+  if (port === deskTaken) return;
+  deskTaken = port;
+  if (port !== null) console.error(`[agentglass] :${port} desk is claimed by another process; this window cannot drive the browser or release a held call there until it lets go, or that server is restarted`);
+  for (const w of BrowserWindow.getAllWindows()) {
+    try { w.webContents.send("ag:desk-taken", port === null ? null : { port }); } catch { /* window went away */ }
+  }
+}
+/* POSIX only. Windows hands a child a descriptor past stderr through the C
+   runtime's handle table, which nothing here has measured the compiled sidecar
+   reading — and a sidecar told to expect a key it cannot read refuses its own
+   window's answer. So a Windows sidecar is not told, and keeps the Origin rule
+   a server started by hand has (SECURITY.md). */
+const DESK_PIPE = process.platform !== "win32";
+
+/**
  * Throw away the shared secret and mint another.
  *
  * The toggle alone cannot do this. Turning remote access off shuts the port,
@@ -408,12 +861,25 @@ function rotateToken() {
  * the virtual filesystem holding the bundle, where nothing else exists. The
  * build does ship the dashboard (electron-builder copies web/dist to
  * resources/web) and this is the only thing that knows where.
+ * @param {number} port
  */
 function sidecarEnv(port) {
+  /* Typed as the process environment it is about to become, not as the object
+     literal it starts as: the two remote-access keys below are added
+     conditionally, and an inferred literal type has no room for a key that is
+     only sometimes set. */
+  /** @type {NodeJS.ProcessEnv} */
   const env = {
     ...process.env,
+    // A .dmg's CLIs live inside the bundle and nowhere on PATH; see
+    // withBundledBin. Linux and Windows get their PATH back unchanged.
+    PATH: withBundledBin(process.env.PATH, { platform: process.platform, packaged: PACKAGED, resourcesPath: process.resourcesPath }),
     AGENTGLASS_PORT: String(port),
     AGENTGLASS_DIE_WITH_PARENT: "1",
+    // Opt-in for the server's skill refresh: an installed app only (a checkout
+    // run from a worktree must not push its older copy over the installed one),
+    // and an isolated instance says "0".
+    AGENTGLASS_SKILL_AUTOUPDATE: PACKAGED && process.env.AGENTGLASS_SKILL_AUTOUPDATE !== "0" ? "1" : "0",
     AGENTGLASS_WEB_DIR: DIST,
     /**
      * Always — remote access on or off.
@@ -441,6 +907,12 @@ function sidecarEnv(port) {
      */
     AGENTGLASS_TOKEN: currentToken(),
   };
+  // Not the desk's key: the descriptor it comes down, and this process as the
+  // parent holding the other end, so a server started by hand from a terminal
+  // that inherited this variable reads nothing (server/src/desk.ts). Without a
+  // pipe, one a relaunch carried in is dropped rather than passed on.
+  if (DESK_PIPE) env.AGENTGLASS_DESK_FD = `3:${process.pid}`;
+  else delete env.AGENTGLASS_DESK_FD;
   if (remoteEnabled()) {
     // An explicit env var wins: someone who set the bind by hand meant it.
     env.AGENTGLASS_BIND = process.env.AGENTGLASS_BIND || "0.0.0.0";
@@ -449,6 +921,11 @@ function sidecarEnv(port) {
   return env;
 }
 
+/** Extension to content type. `Record<string, string>` rather than the literal
+ *  type inferred from the entries, because it is looked up with whatever
+ *  extension a file on disk happens to have — an unknown one is the
+ *  octet-stream case below, not a type error.
+ * @type {Record<string, string>} */
 const MIME = {
   ".html": "text/html", ".js": "text/javascript", ".css": "text/css",
   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
@@ -469,17 +946,46 @@ const MIME = {
  * can reach only this app and its own loopback sidecar, never an outside host)
  * and script-src/object-src/base-uri (no injected <script>, plugin, or <base>).
  *
- * Shipped Report-Only deliberately: index.html carries one inline bootstrap
- * <script>, so an enforcing `script-src 'self'` would blank the window until that
- * inline moves to a hash or nonce. Report-Only reports every violation to the
- * renderer console with zero risk to a running app; flipping to enforcing is this
- * header's name plus the boot script's sha256 added to script-src.
+ * It shipped Report-Only while index.html's one inline bootstrap <script> was
+ * unnamed, because an enforcing `script-src 'self'` blanks the window until it
+ * is. It is named now — the sha256 below — so this is enforcing, and a real
+ * build was loaded under exactly these directives in headless Chromium first:
+ * one violation, `manifest-src`, which is why that directive is here.
+ *
+ * THIS LIST IS A COPY. The original is shared/csp.ts, which the sidecar imports
+ * for the HTTP origin that serves the same web/dist to a phone. Two copies
+ * because this file cannot import it: `build.files` in electron/package.json is
+ * an allowlist of four files, so a `require("../shared/csp.js")` resolves to
+ * nothing inside the packaged asar and the app dies on launch. What keeps the
+ * copy honest is server/test/csp.test.ts, which parses this array out of this
+ * file and fails on the first byte of drift. If those four files ever grow a
+ * fifth, delete this array and require the shared one.
  */
 const CSP = [
   "default-src 'none'",
-  "script-src 'self'",
+  /* The splash in web/index.html, hashed. Its bytes and this string are locked
+     together by the test named above — edit the splash without rehashing it and
+     the window comes up blank, which is precisely the failure the test spends
+     its time preventing. */
+  "script-src 'self' 'sha256-LTSYKIPWk5E2YWobubSHeR9emFHS7dbREE6rvHplVZM=' 'sha256-WoyIdsXRXsB6KXPWR0pkumt+r5WqeyVOTWuslDXPNb8='",
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob:",
+  /* The two hosts this app really draws pictures from, named rather than left to
+     the enforcing header below — which would otherwise blank every avatar in the
+     pull request panel and every screenshot on a card.
+     Images only: neither host can run a script under this policy. */
+  /* And the sidecar itself, which is where every proxied picture actually
+     comes from. The desktop renderer is served from `agentglass://app`, so
+     `'self'` is that scheme and NOT the loopback the API lives on — and each
+     avatar is `http://127.0.0.1:<port>/prs/asset?url=…`, the allowlisted proxy
+     that fetches GitHub for us. Naming the two GitHub hosts above was
+     therefore not enough: the request never goes there from the page.
+     Measured, A/B, on the real proxy answering 200 image/jpeg: without this
+     directive the <img> ends with naturalWidth 0 and an error event; with it,
+     48. Reported as "we don't have the avatar images". */
+  "img-src 'self' data: blob: http://127.0.0.1:* http://localhost:* https://*.clickup-attachments.com https://*.clickup.com https://*.githubusercontent.com https://avatars.githubusercontent.com",
+  /* Falls back to default-src, and 'none' there blocks web.manifest — which is
+     what "add to home screen" is made of on the HTTP twin of this policy. */
+  "manifest-src 'self'",
   "font-src 'self' data:",
   "media-src 'self' data: blob:",
   "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*",
@@ -489,6 +995,8 @@ const CSP = [
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
+  /* Nothing frames this app, here or on the HTTP origin. */
+  "frame-ancestors 'none'",
 ].join("; ");
 
 /**
@@ -511,7 +1019,11 @@ function serveApp() {
       return new Response(data, {
         headers: {
           "content-type": MIME[path.extname(file)] || "application/octet-stream",
-          "content-security-policy-report-only": CSP,
+          "content-security-policy": CSP,
+          /* The MIME table above is the only thing saying what a file is, so
+             nothing downstream is allowed to guess otherwise. */
+          "x-content-type-options": "nosniff",
+          "referrer-policy": "no-referrer",
         },
       });
     } catch {
@@ -521,37 +1033,14 @@ function serveApp() {
 }
 
 /**
- * What is answering on a port: our server, someone else's, or nothing.
- *
- * "Answers 200" is NOT proof it is us, and treating it as proof is a bug with
- * teeth: a machine that autostarts any other local dev server on :4000 -- an
- * observability server, an API stub, anything -- handed agentglass a stranger,
- * which the shell then adopted. Every panel fetched from it, got whatever it
- * says, and the app came up empty ("no repos found") with no error anywhere.
- * That is why /health names itself and why this reads the body.
+ * What is answering on a port: our server, someone else's, or nothing. "Ours"
+ * means it proved it holds this app's token; see server-probe.js for why the
+ * body saying so is not enough, and why a development shell still takes it.
+ * @param {number} port @param {number} [timeoutMs]
+ * @returns {Promise<"ours" | "foreign" | "free">}
  */
 function probe(port, timeoutMs = 1000) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/health`, (r) => {
-      if (r.statusCode !== 200) { r.resume(); return resolve("foreign"); }
-      let body = "";
-      r.setEncoding("utf8");
-      // Bounded: a foreign server may stream something enormous at us.
-      r.on("data", (c) => { body += c; if (body.length > 4096) req.destroy(); });
-      r.on("end", () => {
-        try {
-          const j = JSON.parse(body);
-          // `service` is the marker; the shape check keeps a sidecar built
-          // before that field existed adoptable rather than orphaned.
-          const ours = j.service === "agentglass" || (j.ok === true && typeof j.clients === "number");
-          resolve(ours ? "ours" : "foreign");
-        } catch { resolve("foreign"); }
-      });
-      r.on("error", () => resolve("foreign"));
-    });
-    req.on("error", () => resolve("free")); // refused == nothing listening
-    req.setTimeout(timeoutMs, () => { req.destroy(); resolve("foreign") });
-  });
+  return probeServer(port, { token: currentToken(), allowUnproven: !PACKAGED, timeoutMs });
 }
 
 /**
@@ -560,6 +1049,8 @@ function probe(port, timeoutMs = 1000) {
  * Null on anything unexpected — a build predating /remote/status, a token
  * mismatch, a timeout. Callers treat null as "cannot confirm", which is the
  * safe reading: it never claims reachability it has not seen.
+ * @param {number} port @param {string | null} token @param {number} [timeoutMs]
+ * @returns {Promise<{ exposed?: boolean } | null>}
  */
 function probeRemote(port, token, timeoutMs = 700) {
   return new Promise((resolve) => {
@@ -632,8 +1123,41 @@ async function resolvePort() {
  * event entirely. The renderer reads this synchronously through the preload the
  * same way it reads `apiOrigin`, and subscribes for anything that happens
  * after.
+ * @type {SidecarFailure | null}
  */
 let sidecarFailure = null;
+
+/** Whether a server has been CONFIRMED, which is not the same as nothing having
+ *  failed yet. Set only from reportSidecar; see the comment there for why the
+ *  distinction is worth a second variable. */
+let sidecarUp = false;
+
+/**
+ * THE SERVER'S LAST WORDS, ON DISK.
+ *
+ * They were kept in memory only, to paint in the banner at the top of the
+ * window — so a crash explained itself once, in a strip a popover could cover,
+ * and restarting the app threw the explanation away. Reported after exactly
+ * that: a `SIGILL` from the runtime, the banner underneath an open search, and
+ * by the time anybody went looking there was nothing on this machine to read.
+ * `window.log` already sits in the same directory for a far smaller question.
+ *
+ * Appended rather than replaced, and trimmed like `window.log`: a sidecar that
+ * dies every few seconds would otherwise fill a disk, and the SECOND crash is
+ * often the one that names the cause.
+ *
+ * Never throws. A log nobody can write must not become the reason a failing
+ * app also fails to say so.
+ * @param {SidecarFailure} failure
+ */
+function writeSidecarLog(failure) {
+  try {
+    const file = path.join(app.getPath("userData"), "server.log");
+    if (fs.existsSync(file) && fs.statSync(file).size > SERVER_LOG_MAX) fs.writeFileSync(file, "");
+    fs.appendFileSync(file,
+      `${new Date().toISOString()} ${failure.reason}\n${failure.detail || "(no detail)"}\n\n`);
+  } catch { /* the disk is full or read-only; the banner still says it */ }
+}
 
 /**
  * Say out loud that there is no server, and say WHY.
@@ -655,11 +1179,29 @@ let sidecarFailure = null;
  *
  * Also to the console, because a failure this thing describes badly is one
  * somebody will want the raw text of.
+ * `sidecarUp` is the other half, and the half that was missing: `sidecarFailure`
+ * is null in two situations that could not be more different — the sidecar is
+ * up, and nobody has decided yet. The renderer could not tell those apart, so
+ * it asked the network instead: one /health per boot, refused in the cold case
+ * and logged by Chromium as an error whatever the caller does with it, plus a
+ * second from ServerBanner probing on its own. A null report only ever follows
+ * a confirmed server — the adopt branch, where one was already up, or the poll
+ * that saw /health say "ours" — so this is the fact the shell already had and
+ * was never asked for.
+ * @param {SidecarFailure | null} failure
  */
+
 function reportSidecar(failure) {
   sidecarFailure = failure;
+  sidecarUp = !failure;
   if (failure) console.error(`[agentglass] sidecar: ${failure.reason} — ${failure.detail || "(no detail)"}`);
+  if (failure) writeSidecarLog(failure);
   for (const w of BrowserWindow.getAllWindows()) {
+    // No server of ours came up, so whatever holds the port is unproven: take
+    // the token back before the failure releases the window's first requests
+    // (whenServerUp in web/src/lib/api.ts), or they carry it to a squatter
+    // that won the bind. Sent first; one webContents delivers in order.
+    if (failure) { try { w.webContents.send("ag:server-changed", { token: null }); } catch { /* window went away */ } }
     try { w.webContents.send("ag:server-failed", failure); } catch { /* window went away */ }
   }
 }
@@ -673,30 +1215,49 @@ function reportSidecar(failure) {
  * buffered whole: a pipe nobody reads fills at 64KB and then blocks the writer,
  * so a server that logged enough would hang instead of running. Only the tail
  * is kept, which is where a fatal error is.
+ * @param {import("child_process").ChildProcess} child
  */
 function tailStderr(child) {
   const box = { text: "" };
   child.stderr?.setEncoding("utf8");
-  child.stderr?.on("data", (c) => { box.text = (box.text + c).slice(-4096); });
+  child.stderr?.on("data", (/** @type {Buffer | string} */ c) => { box.text = (box.text + c).slice(-4096); });
   child.stderr?.on("error", () => { /* the process went away mid-write */ });
   return box;
 }
 
+/** @param {boolean} adopt @returns {Promise<boolean>} */
 async function ensureServer(adopt) {
   const port = SERVER_PORT;
-  if (adopt) { reportSidecar(null); return true; } // a dev server or another instance is already up
+  if (adopt) { holdAdoptedDesk(port); reportSidecar(null); return true; } // a dev server or another instance is already up
+  letDeskGo?.();
+  letDeskGo = null;
+  noteDeskTaken(null);
   // AGENTGLASS_DIE_WITH_PARENT arms the server's own parent-death watchdog:
   // stopSidecar below cannot fire if this main process is SIGKILLed or crashes,
   // so the sidecar backs it up by exiting on its own once we are gone. Only
   // servers we spawn get the flag; adopted ones (returned above) keep whatever
   // lifecycle they were launched with.
   const env = sidecarEnv(port);
+  /* The cast is the checker's blind spot, not a doubt about the value:
+     SIDECAR_BIN is a path when PACKAGED and null when it is not, and nothing
+     tells TypeScript that the two ternaries are asking the same question. */
   const [cmd, argv] = PACKAGED
-    ? [SIDECAR_BIN, []]
+    ? [/** @type {string} */ (SIDECAR_BIN), []]
     : ["bun", ["run", path.join(REPO, "server", "src", "index.ts")]];
-  const child = spawn(cmd, argv, { stdio: ["ignore", "ignore", "pipe"], env });
+  const child = spawn(cmd, argv, { stdio: DESK_PIPE ? ["ignore", "ignore", "pipe", "pipe"] : ["ignore", "ignore", "pipe"], env });
   sidecar = child;
   const err = tailStderr(child);
+  /* A key per spawn, so one read out of a sidecar that is gone — a core dump —
+     opens nothing the next one holds. Minted before this function's first
+     await: createWindow() has just run, and its preload asks for the key once
+     this task yields. It goes down fd 3 with `end`, not `write`: the sidecar's
+     read at boot waits for the pipe to close. A sidecar that exits unread
+     answers with ECONNRESET, and an `error` with no listener takes this
+     process down. */
+  deskKey = DESK_PIPE ? require("crypto").randomBytes(32).toString("base64url") : null;
+  const desk = /** @type {import("stream").Writable | null} */ (child.stdio[3]);
+  desk?.on("error", () => { /* it went away before reading; `exit` below says why */ });
+  if (deskKey) desk?.end(deskKey + "\n");
 
   /*
    * The `error` event, which is what a missing binary actually is.
@@ -709,6 +1270,7 @@ async function ensureServer(adopt) {
    * A packaged build whose sidecar failed to be copied in did not start with a
    * broken app, it did not start at all.
    */
+  /** @type {NodeJS.ErrnoException | null} */
   let spawnError = null;
   child.on("error", (e) => { spawnError = e; });
   /*
@@ -726,10 +1288,14 @@ async function ensureServer(adopt) {
    * all: a crash at three in the morning left a live window in front of a dead
    * port with a CLOSED pill as the only clue.
    */
+  /** @type {{ code: number | null, signal: NodeJS.Signals | null } | null} */
   let exit = null;
   let started = false;
   child.on("exit", (code, signal) => {
     exit = { code, signal };
+    /* Its lane table died with it, so the windows hosting those lanes are
+       orphans that would count against the cap for nothing. */
+    for (const id of Array.from(laneHosts.keys())) destroyLaneHost(id);
     // A kill we asked for is not a failure. `killSidecar` nulls `sidecar`
     // before this can fire, and `stopped` covers the app going down, so the
     // identity check is what tells "it died" from "we ended it".
@@ -738,13 +1304,29 @@ async function ensureServer(adopt) {
     if (started) reportSidecar(describeSidecarFailure(port, { code, signal }, spawnError, err.text, true));
   });
 
-  for (let i = 0; i < 40; i++) {
+  /*
+   * Tight at first, then the old cadence.
+   *
+   * This loop is now the renderer's ONLY way of learning that a server exists:
+   * the page stopped asking the network and waits for the null report this
+   * sends. So the gap between the sidecar being ready and this noticing became
+   * a gap in front of every panel's first request — measured at 410ms of it,
+   * first data at 1436ms before and 1846ms after, on the same rig and clock.
+   *
+   * The first second is checked every 60ms and the rest keeps the 300ms it had.
+   * These probes are a Node http.get from the main process, so unlike the ones
+   * the page used to make they cost nothing visible when they are refused —
+   * which is exactly why it is cheap to ask more often while the answer is
+   * still changing. The 12s ceiling is unchanged: 16 quick tries plus 36 slow
+   * ones is the same wall-clock budget the 40-at-300ms loop had.
+   */
+  for (let i = 0; i < 52; i++) {
     if ((await probe(port)) === "ours") { started = true; reportSidecar(null); return true; }
     // Do not spend twelve seconds waiting for a process that is already gone.
     // The old loop did, which is why "the binary is missing" and "the server is
     // slow to boot" felt the same from outside.
     if (spawnError || exit) break;
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, i < 16 ? 60 : 300));
   }
   reportSidecar(describeSidecarFailure(port, exit, spawnError, err.text, false));
   return false;
@@ -757,9 +1339,22 @@ async function ensureServer(adopt) {
  * one "server unavailable" string: a missing binary is a broken install, a
  * taken port is another program, a crash on start is a bug or a bad config, and
  * a timeout is none of those and needs the log.
+ * @param {number} port
+ * @param {{ code: number | null, signal: NodeJS.Signals | null } | null} exit
+ * @param {NodeJS.ErrnoException | null} spawnError
+ * @param {string} stderr
+ * @param {boolean} hadStarted
+ * @returns {SidecarFailure}
  */
 function describeSidecarFailure(port, exit, spawnError, stderr, hadStarted) {
-  const detail = (stderr || "").trim().split("\n").filter(Boolean).slice(-3).join(" · ").slice(0, 400);
+  /* The error line first, then the last lines. An uncaught error at module
+     load prints its sentence and THEN its stack and bun's version, so the last
+     three lines alone were two frames and "Bun v1.3.9" — and the banner never
+     said what went wrong. */
+  const lines = (stderr || "").trim().split("\n").map((l) => l.trim()).filter(Boolean);
+  const named = lines.findLast((l) => /^(error:|\w*(Error|Exception)\b)/.test(l));
+  const tail = lines.slice(-3).filter((l) => l !== named);
+  const detail = (named ? [named, ...tail] : tail).join(" · ").slice(0, 400);
   if (spawnError?.code === "ENOENT") {
     return {
       reason: "missing",
@@ -822,6 +1417,10 @@ function describeSidecarFailure(port, exit, spawnError, stderr, hadStarted) {
  * with it, which the smoke test pins.
  */
 async function restartSidecar() {
+  /* The new server has no lanes, so the windows that were hosting the old one's
+     would sit registered with a key it will not accept. */
+  for (const id of Array.from(laneHosts.keys())) destroyLaneHost(id);
+  const hadChild = !!sidecar;
   killSidecar();
 
   // Wait for the socket to actually be gone before looking for a port.
@@ -832,8 +1431,15 @@ async function restartSidecar() {
   // finishes dying, and the app is left with no server at all — no window, no
   // error, just every panel failing. Measured intermittent: the same click
   // worked and then did not.
+  //
+  // "Gone" is nothing listening, not "no longer proves it is ours": revoking
+  // remote access rotates the token before this runs, so the corpse fails the
+  // proof while it still holds the port, and pickPort would then move away.
+  // An adopted server had no child to kill and will not go away, so there is
+  // nothing to wait for once it stops answering as ours.
   for (let i = 0; i < 50; i++) {
-    if ((await probe(SERVER_PORT, 300)) !== "ours") break;
+    const state = await probe(SERVER_PORT, 300);
+    if (state === "free" || (!hadChild && state === "foreign")) break;
     await new Promise((r) => setTimeout(r, 100));
   }
 
@@ -852,17 +1458,24 @@ async function restartSidecar() {
   // live bindings (web/src/lib/api.ts), so handing it the new pair is enough —
   // the next fetch and the next socket connect use them.
   for (const w of BrowserWindow.getAllWindows()) {
-    try { w.webContents.send("ag:server-changed", { origin: apiOrigin, token: currentToken() }); } catch { /* window went away mid-toggle */ }
+    try { w.webContents.send("ag:server-changed", { origin: apiOrigin, token: sidecarUp ? currentToken() : null, deskKey }); } catch { /* window went away mid-toggle */ }
   }
 }
 
 // --- desktop capabilities the UI calls through the preload bridge ------------
 
+/** @param {AppWindow} win */
 function registerIpc(win) {
   // The window controls the app now draws for itself. Trivial, and they have to
   // exist: `frame: false` removed the only other way to do any of them.
   ipcMain.handle("ag:winMinimize", () => { win.minimize(); });
-  ipcMain.handle("ag:winToggleMaximize", () => {
+  ipcMain.handle("ag:winToggleMaximize", (_e, why) => {
+    // Stamped so the log can tell "the user pressed the button" apart from
+    // "something else did this to us" — see noteWindow. `why` carries how the
+    // control was activated: a pointer click, a keyboard activation of a
+    // button that still had focus, or a click nobody made.
+    askedAt = Date.now();
+    lastAsk = typeof why === "string" ? why.slice(0, 120) : "";
     if (win.isMaximized()) win.unmaximize(); else win.maximize();
     return win.isMaximized();
   });
@@ -920,15 +1533,22 @@ function registerIpc(win) {
    *     one surface a compromised renderer can neither fake nor suppress, and it
    *     names the sites.
    */
+  /** @param {string[]} args @returns {Promise<any>} */
   const runCookieReader = (args) => new Promise((resolve, reject) => {
+    // Same cast, same reason, as the sidecar spawn above: SIDECAR_BIN is a path
+    // exactly when PACKAGED, and nothing tells the checker the two ternaries
+    // ask one question.
     const [cmd, argv] = PACKAGED
-      ? [SIDECAR_BIN, ["cookies", ...args]]
+      ? [/** @type {string} */ (SIDECAR_BIN), ["cookies", ...args]]
       : ["bun", ["run", path.join(__dirname, "..", "server", "src", "cookieread.ts"), ...args]];
     const child = spawn(cmd, argv, { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
-    child.stdout.on("data", (d) => { out += d.toString(); });
-    child.stderr.on("data", (d) => { err += d.toString(); });
+    // Optional access on streams that "pipe" above guarantees are there, for
+    // the same reason tailStderr does it: the types describe every stdio shape
+    // spawn can be given, not the one it was given here.
+    child.stdout?.on("data", (/** @type {Buffer | string} */ d) => { out += d.toString(); });
+    child.stderr?.on("data", (/** @type {Buffer | string} */ d) => { err += d.toString(); });
     child.on("error", (e) => reject(e));
     /*
      * `close`, not `exit`.
@@ -959,14 +1579,14 @@ function registerIpc(win) {
 
   ipcMain.handle("ag:cookieSources", async () => {
     try { return await runCookieReader(["list"]); }
-    catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+    catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
   });
 
   ipcMain.handle("ag:importCookies", async (_e, req) => {
     const source = typeof req?.source === "string" ? req.source : "";
     // Two thousand, not two hundred. A real profile had two hundred and
     // one sites and the old cap dropped the last one without a word.
-    const sites = Array.isArray(req?.sites) ? req.sites.filter((s) => typeof s === "string").slice(0, 2000) : [];
+    const sites = Array.isArray(req?.sites) ? req.sites.filter((/** @type {unknown} */ s) => typeof s === "string").slice(0, 2000) : [];
     // Re-checked here rather than trusted from the renderer: this is the side
     // that holds the values.
     if (!source || !sites.length) return { ok: false, error: "choose a browser and at least one site" };
@@ -984,7 +1604,7 @@ function registerIpc(win) {
 
     let read;
     try { read = await runCookieReader(["read", "--source", source, "--sites", sites.join(",")]); }
-    catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+    catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
     if (!read || !read.ok) return { ok: false, error: (read && read.error) || "could not read those cookies" };
 
     const ses = session.fromPartition(BROWSER_PARTITION);
@@ -992,7 +1612,7 @@ function registerIpc(win) {
     const failed = [];
     for (const c of read.cookies) {
       try { await ses.cookies.set(c); set += 1; }
-      catch (err) { failed.push({ name: c.name, url: c.url, error: String(err && err.message ? err.message : err) }); }
+      catch (err) { failed.push({ name: c.name, url: c.url, error: String(err instanceof Error ? err.message : err) }); }
     }
     // Without this, a quit or a crash between here and the next checkpoint
     // loses the session somebody just handed over.
@@ -1017,7 +1637,7 @@ function registerIpc(win) {
   ipcMain.handle("ag:forgetCookies", async (_e, req) => {
     // Two thousand, not two hundred. A real profile had two hundred and
     // one sites and the old cap dropped the last one without a word.
-    const sites = Array.isArray(req?.sites) ? req.sites.filter((s) => typeof s === "string").slice(0, 2000) : [];
+    const sites = Array.isArray(req?.sites) ? req.sites.filter((/** @type {unknown} */ s) => typeof s === "string").slice(0, 2000) : [];
     if (!sites.length) return { ok: false, error: "choose at least one site" };
     // The default is always swept, named or not: a caller that forgets to list
     // it must not end up clearing only the profiles.
@@ -1029,7 +1649,7 @@ function registerIpc(win) {
       const all = await ses.cookies.get({});
       for (const c of all) {
         const host = (c.domain || "").replace(/^\./, "");
-        if (!sites.some((s) => host === s || host.endsWith(`.${s}`))) continue;
+        if (!sites.some((/** @type {unknown} */ s) => host === s || host.endsWith(`.${s}`))) continue;
         const url = `${c.secure ? "https" : "http"}://${host}${c.path || "/"}`;
         try { await ses.cookies.remove(url, c.name); removed += 1; } catch { /* already gone */ }
       }
@@ -1064,27 +1684,1500 @@ function registerIpc(win) {
     const source = typeof req?.source === "string" ? req.source : "";
     if (!source) return { ok: false, error: "no profile chosen" };
     try { return await runCookieReader(["places", "--source", source]); }
-    catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
+    catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
   });
 
-  ipcMain.handle("ag:captureBrowser", async () => {
-    const guest = browserGuest;
-    if (!guest || guest.isDestroyed()) return null;
+  /*
+   * A frame of the browser pane, even when nobody is looking at it.
+   *
+   * Chromium does not render what is not on screen, and the browser view is
+   * hidden whenever somebody is reading a diff or working in the terminal —
+   * which is exactly when an agent is driving it. `capturePage` came back empty
+   * there, the verb reported "the pane is not on screen", and the CLI, which
+   * treats that as fixable, pulled the whole window over to the browser on
+   * every screenshot. That is the bug this exists to end.
+   *
+   * Two ways, in order, because the first one is cheap and correct WHEN IT
+   * WORKS and neither is reliable on its own:
+   *
+   *   1. `capturePage` with `stayHidden: false` — the flag reads like "capture
+   *      it discreetly" and means the opposite of what this needs: true keeps
+   *      the page hidden, and a hidden page has no frame to give. False marks
+   *      the guest visible for the length of the capture. Nothing appears on
+   *      screen: the element embedding it is still hidden in a view nobody is
+   *      looking at.
+   *
+   *   2. The debugger, and `Page.captureScreenshot` with
+   *      `captureBeyondViewport`, which makes Chromium render the page into an
+   *      off-screen surface rather than read the one it is already compositing.
+   *      This is how a background tab is screenshotted; it costs an attach and
+   *      a detach, so it is the fallback rather than the first move.
+   *
+   * MEASURED, both times, against the running app with the terminal in front —
+   * `stayHidden: false` alone was not enough, which is why (2) is here.
+   */
+  /** One of THIS window's browser guests, by webContents id. Null for anything
+   *  else: a capture must never fall back to the active tab, because that is
+   *  how one agent's shot becomes a picture of another agent's page. */
+  /** @param {number} id */
+  const browserGuestById = (id) => {
+    for (const g of browserGuests) if (!g.isDestroyed() && g.id === id) return g;
+    return null;
+  };
+
+  ipcMain.handle("ag:captureBrowser", async (_e, opts) => {
+    /* Answers `{ png, why }` rather than a string, because the interesting case
+       is the failure: several things can stop a capture and the caller could not
+       tell them apart — an agent got "the pane is not on screen" whatever the
+       actual reason was. */
+    /*
+     * THE GUEST THE CALLER NAMED, not whichever tab is in front.
+     *
+     * This took `browserGuest` — the ACTIVE one. With one agent that is the
+     * same thing; with two it is not. Agent A asking for a shot of its own tab
+     * while agent B has a different one in front got back a picture of B's
+     * page, and nothing anywhere said so: right dimensions, plausible
+     * content, wrong page. Cross-contaminated evidence between two agents that
+     * were supposed to be isolated, and the kind that survives review because
+     * it looks fine.
+     *
+     * The panel knows which webview it is driving and passes its id. An id
+     * that is not one of this window's browser guests is refused rather than
+     * silently falling back to the active one — a fallback here is how the bug
+     * comes back.
+     */
+    const wanted = Number(opts && opts.guestId);
+    const guest = Number.isFinite(wanted) && wanted > 0
+      ? browserGuestById(wanted)
+      : browserGuest;
+    if (!guest || guest.isDestroyed()) {
+      return { png: null, why: wanted ? "that tab is not a browser pane in this window" : "no browser pane is mounted" };
+    }
+
+    /*
+     * `shot --selector/--clip/--full-page` (§12/§18) — what the frame should
+     * CONTAIN, resolved once here rather than left for a caller to crop out of
+     * a whole-viewport PNG afterwards. `clip` is already a viewport-relative
+     * rectangle by the time it reaches this handler — the renderer turned a
+     * selector into one — so this only has to fill it in for `fullPage`,
+     * which needs the page's actual content size and not the viewport's.
+     */
+    /* WHICH PAGE THIS PICTURE IS OF, said out loud.
+       A capture that comes back from the wrong guest is indistinguishable from
+       a right one — measured: two `shot --page` calls naming two different
+       tabs produced byte-identical PNGs of a third page nobody asked for. The
+       renderer compares this against the tab it addressed and refuses a
+       mismatch, so a wrong page is an error rather than evidence. */
+    const guestUrl = () => { try { return guest.getURL(); } catch { return ""; } };
+
+    const wantClip = opts && opts.clip && typeof opts.clip === "object" ? opts.clip : null;
+    const wantFullPage = !!(opts && opts.fullPage);
+
+    /*
+     * One clock for the whole verb, not one per attempt.
+     *
+     * There are five ways to a frame below and each of them can hang. Giving
+     * every one its own generous timeout adds up to longer than the renderer
+     * waits for an answer, and then a capture that was going to succeed is
+     * reported as "the shell did not answer in time" — MEASURED, twice. So the
+     * routes share a deadline and each takes what is left.
+     *
+     * Ten seconds, and the number is not free: the relay hangs up on a
+     * screenshot at twenty and the renderer has its own last resort to try
+     * afterwards. Everything below has to fit inside that with the answer still
+     * arriving — MEASURED at six, where the first debugger route hung for three
+     * and the other two never ran at all.
+     */
+    const deadline = Date.now() + 10_000;
+    const left = () => Math.max(0, deadline - Date.now());
+    const LATE = Symbol("late");
+    /** @param {Promise<any>} p @param {number} ms */
+    const inTime = (p, ms) => Promise.race([
+      p,
+      new Promise((r) => setTimeout(() => r(LATE), Math.min(ms, left()))),
+    ]);
+    /** @type {string[]} */
+    const tried = [];
+    /** @param {string} what */
+    const note = (what) => { tried.push(what); return null; };
+
+    /*
+     * The compositor's own copy, twice.
+     *
+     * `stayHidden: false` marks the guest visible for the length of the capture
+     * — the flag reads like "capture it discreetly" and means the opposite of
+     * what this needs. Nothing appears on screen: the element embedding the
+     * guest is still hidden in a view nobody is looking at.
+     *
+     * Twice because `UnknownVizError` is what Chromium answers when the frame
+     * sink it would copy from is not there, and it is sometimes back a moment
+     * later. MEASURED on a page with a voice SDK on it: the first shot failed
+     * and every shot after it failed too, including back on a page that had
+     * worked, which is what a frame sink that does NOT come back looks like
+     * from here — hence everything below this loop.
+     */
+    // `fullPage` needs the page's real content size, which only the debugger
+    // route below can ask for — the compositor copies the surface it already
+    // has, which is the viewport and nothing past it.
+    if (!wantFullPage) {
+      for (let go = 0; go < 2 && left() > 500; go++) {
+        try {
+          const img = await inTime(guest.capturePage(wantClip || undefined, { stayHidden: false, stayAwake: true }), 1200);
+          if (img === LATE) note("the compositor did not answer");
+          else if (img && !img.isEmpty()) return { png: img.toDataURL(), why: "", url: guestUrl(), via: go === 0 ? "the compositor" : "the compositor, second try" };
+          else note("the compositor produced an empty frame");
+        } catch (e) {
+          note(String(e instanceof Error ? e.message : e));
+        }
+        if (go === 0) await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+
+    /*
+     * Then the debugger, which can render a page that the compositor cannot.
+     *
+     * The seat is single and the inspector sits in it, so say that plainly
+     * rather than reporting the compositor's error for it — with DevTools open
+     * on this page there is no second session to be had, and the answer is to
+     * close it.
+     */
+    // Attached and OURS (§4's addInitScript/expose hold a session open on
+    // this guest) is not the inspector — reuse it rather than refusing.
+    const ownSession = guestOwnsDebugger.has(guest);
+    if (guest.debugger.isAttached() && !ownSession) {
+      return {
+        png: null,
+        why: "the inspector is attached to this page, so the screenshot cannot use the debugger — close the inspector and try again",
+      };
+    }
+    let attached = false;
+    let cut = false;
     try {
-      // Raced, because `stayHidden` does not always come back. It is the flag
-      // for "render this even though nobody is looking", and when the compositor
-      // has nothing to render from it simply never resolves — measured: every
-      // other verb answered instantly and `shot` sat until the server's own
-      // twenty-second timeout, which reads to an agent as a broken browser
-      // rather than as a pane that is not showing. Four seconds is far longer
-      // than a capture that is going to happen takes.
-      const img = await Promise.race([
-        guest.capturePage(undefined, { stayHidden: true, stayAwake: true }),
-        new Promise((r) => setTimeout(() => r(null), 4000)),
+      if (!ownSession) { guest.debugger.attach("1.3"); attached = true; }
+      /** @param {string} method @param {object} params @param {number} ms */
+      const send = async (method, params, ms) => {
+        const r = await inTime(guest.debugger.sendCommand(method, params), ms);
+        return r === LATE ? note(`${method} did not answer`) : r;
+      };
+
+      /* `fullPage`'s clip is the page's own content size, not a rectangle the
+         caller already knew — same source and the same 16384 Chromium cap as
+         `ag:captureFullPage`'s manual "shoot the whole page" button, so an
+         agent's `--full-page` and a person's own screenshot never disagree
+         about how tall "the whole page" is. */
+      let effectiveClip = wantClip;
+      /* 1 unless a full-page capture measures the page's zoom below. */
+      let fullPageScale = 1;
+      if (wantFullPage) {
+        const m = await send("Page.getLayoutMetrics", {}, 1500);
+        const size = (m && (m.cssContentSize || m.contentSize)) || null;
+        if (size && size.width && size.height) {
+          const CAP = 16384;
+          /* Never smaller than what is on screen — see the same guard in
+             `ag:captureFullPage`. A page laid out narrower than the window
+             produced a "whole page" shot with the right-hand side missing,
+             smaller than the plain visible one, which is a bug whichever way
+             round you read it. */
+          /* The zoom, measured — see the note in `ag:captureFullPage`. A clip
+             in CSS pixels captured at scale 1 comes back SMALLER than the
+             visible shot on any zoomed page, by exactly the zoom factor. */
+          const vp = (m && (m.cssVisualViewport || m.visualViewport)) || {};
+          fullPageScale = Number(vp.zoom) || 1;
+          const wide = Math.ceil(size.width);
+          const tall = Math.max(Math.ceil(size.height), Math.ceil(vp.clientHeight || 0));
+          /* Nothing below the fold means the whole page IS the visible one —
+             see the long note in `ag:captureFullPage`. Leaving the clip unset
+             takes the ordinary route, which lands right without arithmetic. */
+          if (Math.ceil(size.height) <= Math.ceil(vp.clientHeight || 0) + 2) {
+            fullPageScale = 1;
+            effectiveClip = wantClip;
+          } else {
+            const width = Math.min(wide, CAP);
+            const height = Math.min(tall, CAP);
+            cut = tall > CAP || wide > CAP;
+            effectiveClip = { x: 0, y: 0, width, height };
+          }
+        } else {
+          note("the page reported no content size to capture full-page");
+        }
+      }
+      const clipParams = effectiveClip
+        ? { captureBeyondViewport: true, clip: { x: effectiveClip.x, y: effectiveClip.y, width: effectiveClip.width, height: effectiveClip.height, scale: fullPageScale } }
+        : {};
+      /*
+       * `captureBeyondViewport` renders into an off-screen surface and
+       * `fromSurface: false` asks the renderer for the frame instead of the
+       * surface — the surface being precisely the broken part when the sink is
+       * gone. If both come back empty, the page is being told its size by a
+       * surface it no longer has: an explicit metrics override gives it one,
+       * which is the same trick headless Chrome uses to capture a page nobody
+       * is showing.
+       */
+      /* Spelled out rather than inferred: an array of [label, thunk] pairs
+         widens to `(string | (() => …))[]` on its own, and destructuring that
+         in the loop below gives a `way` the checker will not call. */
+      /** @type {[string, () => Promise<any>][]} */
+      const ways = [
+        /* `fromSurface: false` first, and the order is the diagnosis: the two
+           compositor attempts have already failed by the time this runs, and
+           they failed on the surface. Asking the surface again with
+           `captureBeyondViewport` hung for three seconds and left no time for
+           the two routes that do not use it — measured. So the ones that render
+           from the frame go first, and the surface gets whatever is left. */
+        ["the debugger, from the frame", () => send("Page.captureScreenshot", { format: "png", fromSurface: false, ...clipParams }, 2200)],
+        ["the debugger, with a viewport of its own", async () => {
+          const m = await send("Page.getLayoutMetrics", {}, 1500);
+          const box = (m && (m.cssLayoutViewport || m.layoutViewport)) || null;
+          if (!box) return null;
+          await send("Emulation.setDeviceMetricsOverride", {
+            width: Math.max(1, Math.round(box.clientWidth)),
+            height: Math.max(1, Math.round(box.clientHeight)),
+            deviceScaleFactor: 1,
+            mobile: false,
+          }, 1500);
+          try {
+            return await send("Page.captureScreenshot", { format: "png", fromSurface: false, ...clipParams }, 2200);
+          } finally {
+            // Always, even on the way out of a failure: a page left with an
+            // override lays itself out for a viewport nobody has.
+            try { await guest.debugger.sendCommand("Emulation.clearDeviceMetricsOverride"); } catch { /* detaching clears it anyway */ }
+          }
+        }],
+        ["the debugger, off-screen", () => send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, ...clipParams }, 2200)],
+      ];
+      for (const [via, way] of ways) {
+        if (left() < 400) { note("there was no time left to try the rest"); break; }
+        try {
+          const shot = await way();
+          if (shot && shot.data) return { png: `data:image/png;base64,${shot.data}`, why: "", url: guestUrl(), via, cut: cut || undefined };
+          if (shot) note("the page produced no frame off-screen");
+        } catch (e) {
+          note(String(e instanceof Error ? e.message : e));
+        }
+      }
+    } catch (e) {
+      note(String(e instanceof Error ? e.message : e));
+    } finally {
+      // Only ours. A DevTools window somebody opened on this page owns the
+      // debugger too, and detaching it from under them would close it.
+      if (attached) { try { guest.debugger.detach(); } catch { /* already gone */ } }
+    }
+    return { png: null, why: `every way of capturing this page failed: ${[...new Set(tried)].join("; ")}` };
+  });
+
+  /**
+   * §4: `addInitScript`/`expose`, both funnelled through one relay call —
+   * `browserDrive.ts` only ever asks to register a NAMED script.
+   *
+   * `Page.addScriptToEvaluateOnNewDocument` is what makes this different from
+   * `eval`: Chromium runs it in every new document on this guest, before that
+   * document's own scripts, for as long as the debugger session lives — which
+   * here is as long as the guest does, not one command's round trip. Re-
+   * registering the same `name` REMOVES the old identifier before adding the
+   * new one, so a caller changing its mind ends up with one script under that
+   * name, not two both trying to run.
+   */
+  ipcMain.handle("ag:browserRegisterInitScript", async (_e, req) => {
+    /* THE TAB THE CALLER NAMED. This read `browserGuest` — the front tab — so
+       an init script asked for on a background tab was registered on whatever
+       was in front, and answered ok. Same fault the capture and the DevTools
+       relay each had; an id we do not recognise is refused rather than served
+       from the front tab. */
+    const wanted = Number(req && req.guestId);
+    const guest = Number.isFinite(wanted) && wanted > 0 ? browserGuestById(wanted) : browserGuest;
+    if (!guest || guest.isDestroyed()) {
+      return { ok: false, error: wanted ? "that tab is not a browser pane in this window" : "no browser pane is mounted" };
+    }
+    const name = typeof req?.name === "string" ? req.name : "";
+    const source = typeof req?.source === "string" ? req.source : "";
+    if (!name || !source) return { ok: false, error: "name and source are required" };
+    // A human's own DevTools owns the single debugger seat a page has —
+    // refuse rather than steal it, the same call `ag:captureBrowser` makes.
+    if (guest.debugger.isAttached() && !guestOwnsDebugger.has(guest)) {
+      return { ok: false, error: "the inspector is attached to this page — close it and try again" };
+    }
+    try {
+      if (!guestOwnsDebugger.has(guest)) {
+        guest.debugger.attach("1.3");
+        guestOwnsDebugger.add(guest);
+      }
+      let scripts = guestInitScripts.get(guest);
+      if (!scripts) { scripts = new Map(); guestInitScripts.set(guest, scripts); }
+      const old = scripts.get(name);
+      if (old && old.identifier) {
+        try { await guest.debugger.sendCommand("Page.removeScriptToEvaluateOnNewDocument", { identifier: old.identifier }); }
+        catch { /* the guest may already have dropped it on navigation */ }
+      }
+      /* Chromium only injects these on a session whose Page domain is on.
+         Idempotent, and cheap, so it is asked for every time rather than
+         tracked — a session that was attached for a screenshot has not
+         enabled it. */
+      try { await guest.debugger.sendCommand("Page.enable"); } catch { /* already on */ }
+      /*
+       * `runImmediately`, BECAUSE "ON EVERY NEW DOCUMENT" IS NOT TRUE HERE.
+       *
+       * Measured with the raw protocol on a `<webview>` guest: a script
+       * registered on this session runs when asked for `runImmediately` and is
+       * GONE after one navigation — reload or Page.navigate alike, and
+       * re-registering on `did-start-navigation` does not bring it back
+       * either. The guest does not keep them.
+       *
+       * So the verb does the half that is real: it runs the script in the
+       * document that is there now, and says so. A caller that navigates has
+       * to ask again — which is a sentence it can act on, unlike
+       * {"registered": ...} over a page that never saw it.
+       */
+      const { identifier } = await guest.debugger.sendCommand(
+        "Page.addScriptToEvaluateOnNewDocument", { source, runImmediately: true },
+      );
+      scripts.set(name, { source, identifier });
+      return { ok: true, ranNow: true };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  /*
+   * §5: the DevTools protocol itself, one call wide.
+   *
+   * The spec asks for a debugger, DOM breakpoints, a listener inspector, JS and
+   * CSS coverage, a profiler, heap snapshots, source maps and paint layers —
+   * and every one of those is a CDP domain that Chromium already implements.
+   * Wrapping each in its own IPC handler would be nine handlers that all do the
+   * same thing, and would be missing the tenth on the day somebody needs it.
+   * So the protocol is relayed whole, and the ergonomic verbs on top of it
+   * (`listeners`, `coverage`) are built in the panel where they are cheap to
+   * add rather than here where each one costs a round of shell plumbing.
+   *
+   * The seat, and why this can refuse: a page has ONE debugger session. If a
+   * person has their own inspector open on this guest, it is theirs — this
+   * refuses rather than steals it, exactly as `ag:captureBrowser` and §4's
+   * init-script relay do. Stealing it would close their DevTools out from
+   * under them mid-debug, which is the kind of thing that makes somebody stop
+   * trusting a tool for good.
+   *
+   * The event buffer exists because CDP is a stream and this relay is a
+   * request. `Debugger.paused`, `Runtime.consoleAPICalled`, a DOM breakpoint
+   * firing — all of those arrive when they arrive, and an agent that has to
+   * be holding a connection to see them is back to the polling §1 removed.
+   * They queue here, newest last, and `cdp --events` drains them.
+   */
+  /** @type {Map<Electron.WebContents, Array<{at: number, method: string, params: unknown}>>} */
+  const guestCdpEvents = new Map();
+  const CDP_EVENT_CAP = 500;
+  /**
+   * Screencast frames, kept apart from the events above and for two reasons:
+   * a frame is a picture — thirty of them would push every debugger pause
+   * out of a 500-slot buffer — and a frame has to be ACKED the moment it
+   * lands, or Chromium sends no more. So the listener answers each one with
+   * `Page.screencastFrameAck` itself and keeps the newest thirty here, and
+   * `Page.agxScreencastFrames` hands the ring over and empties it.
+   * @type {Map<Electron.WebContents, { frames: Array<{at: number, sessionId: number, data: string, metadata: unknown}>, dropped: number }>} */
+  const guestScreencast = new Map();
+  const SCREENCAST_CAP = 30;
+
+  /*
+   * WHERE A DOWNLOAD IS MEANT TO LAND, per guest.
+   *
+   * `download` arms `Browser.setDownloadBehavior` with a directory, clicks, and
+   * then waits for `Page.downloadWillBegin` and `Page.downloadProgress` to come
+   * back through the event buffer. Measured through the CLI: the click happens
+   * — the test server logged three requests for the file — and neither event
+   * ever arrives, so the verb waits out its whole timeout and nothing lands.
+   *
+   * The reason is that Electron takes a guest's download itself, on the
+   * session's `will-download`, before the protocol is involved at all. Nothing
+   * in this app listened for it (grep: zero handlers), so the item was left to
+   * the default behaviour and CDP had nothing to report.
+   *
+   * So the path is remembered here when the verb asks for it, the session
+   * handler below saves the file where it was asked to go, and it pushes the
+   * two events the waiting loop is already listening for. Same shape as the
+   * printToPDF branch further down and for the same reason: the answer stops
+   * coming from the protocol without anything downstream needing to learn that.
+   */
+  /** Save paths chosen for downloads still in flight. @type {Set<string>} */
+  const reservedSavePaths = new Set();
+  /** lstat, not exists: a dangling symlink is a name that is taken. @param {string} p */
+  const pathTaken = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+  /** Sessions already wired, so a second download does not stack handlers. */
+  const downloadWired = new WeakSet();
+
+  /** @param {Electron.WebContents} guest */
+  const wireDownloads = (guest) => {
+    const ses = guest.session;
+    if (downloadWired.has(ses)) return;
+    downloadWired.add(ses);
+    ses.on("will-download", (_ev, item, wc) => {
+      // Keyed by the tab the download came from and by nothing else: a fallback
+      // to the tab that wired the session let a download from ANY other tab of
+      // the profile land in an agent's directory.
+      const dir = guestDownloadDir.get(wc);
+      if (!dir) return; // nobody asked for this one; leave Electron's default alone
+      // One download per arming. The verb arms a directory for the click it is
+      // about to make; left armed, the next download of the profile took it.
+      guestDownloadDir.delete(wc);
+      // Chromium renames onto the path only when the download finishes, so a
+      // name is held from here to `done`: two downloads into one directory
+      // must not both find it free.
+      const savePath = uniqueSavePath(dir, item.getFilename(), (p) => reservedSavePaths.has(p) || pathTaken(p));
+      reservedSavePaths.add(savePath);
+      const name = path.basename(savePath);
+      item.setSavePath(savePath);
+      // Spelled out because this file is typechecked and an untyped parameter
+      // here is two more tsc errors on a list that has to stay readable.
+      /** @param {string} method @param {Record<string, unknown>} params */
+      const push = (method, params) => {
+        const buf = guestCdpEvents.get(wc);
+        if (!buf) return;
+        buf.push({ at: Date.now(), method, params });
+        if (buf.length > CDP_EVENT_CAP) buf.splice(0, buf.length - CDP_EVENT_CAP);
+      };
+      // The guid is the protocol's way of pairing the two events. Electron has
+      // no equivalent, so one is minted and used for both — the waiting loop
+      // only ever compares it with itself.
+      const guid = `agx-dl-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+      push("Page.downloadWillBegin", { guid, suggestedFilename: name, url: item.getURL() });
+      item.once("done", (_e2, state) => {
+        reservedSavePaths.delete(savePath);
+        push("Page.downloadProgress", {
+          guid,
+          // `completed` and `canceled` are the two the loop acts on; anything
+          // else it keeps waiting through, which is right — an interrupted
+          // download that resumes still finishes.
+          state: state === "completed" ? "completed" : state === "cancelled" ? "canceled" : String(state),
+        });
+      });
+    });
+  };
+
+  /*
+   * A favicon as `data:`, so the tab strip stops asking the network.
+   *
+   * Same guest-resolution rule as the relay below, and the same refusal: an id
+   * we do not recognise is turned down rather than quietly served from the tab
+   * in front. That bug has appeared three times in this file — the capture, the
+   * DevTools relay, addInitScript — and every time it looked like success.
+   *
+   * The URL is checked against what Chromium reported for THAT guest; see where
+   * guestFavicons is filled. A caller cannot reach the network with an argument
+   * of its own, which is the line prAsset draws and the reason this is not a
+   * proxy.
+   *
+   * Fetched on the guest's OWN session, so it carries that tab's cookies,
+   * partition and proxy: the same request the page made a moment ago, not a
+   * privileged one from the shell.
+   */
+  ipcMain.handle("ag:browserFavicon", async (_e, req) => {
+    const wanted = Number(req && req.guestId);
+    const guest = Number.isFinite(wanted) && wanted > 0 ? browserGuestById(wanted) : null;
+    if (!guest || guest.isDestroyed()) {
+      return { ok: false, error: "that tab is not a browser pane in this window" };
+    }
+    const url = typeof (req && req.url) === "string" ? req.url : "";
+    const known = guestFavicons.get(guest);
+    if (!url || !known || !known.has(url)) {
+      return { ok: false, error: "that is not an icon this tab reported" };
+    }
+    try {
+      const res = await guest.session.fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) return { ok: false, error: `upstream ${res.status}` };
+      const type = res.headers.get("content-type") || "";
+      // Images only: this must not become a way to read text off a host by
+      // dressing it as an icon.
+      if (!/^image\//i.test(type)) return { ok: false, error: "not an image" };
+      const buf = Buffer.from(await res.arrayBuffer());
+      // A favicon is a few kB. Past this it is not one, and every byte is paid
+      // for again as base64 in the renderer.
+      if (buf.length > 256 * 1024) return { ok: false, error: "too large for an icon" };
+      return { ok: true, dataUrl: "data:" + type.split(";")[0] + ";base64," + buf.toString("base64") };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  });
+
+  /*
+   * THE PERSON'S ZOOM, WHICH IS NOT THE AGENT'S.
+   *
+   * Reported with three screenshots at 110%, 140% and 240%: the page kept its
+   * size and the RECTANGLE IT WAS DRAWN IN shrank, leaving a small page in a
+   * large empty area — "it doesn't zoom, it does something odd".
+   *
+   * That is exactly what `Emulation.setDeviceMetricsOverride` does. It narrows
+   * the layout VIEWPORT, and the `<webview>` element keeps the box it always
+   * had, so the page is laid out for a smaller window and drawn at the same
+   * scale. It is the right primitive for an agent asking "show me this page as
+   * a phone would see it"; it is the wrong one for a person leaning in.
+   *
+   * Electron already has the right one, and it scales the page inside the box
+   * it has: `webContents.setZoomFactor`. It is only reachable from this
+   * process, which is why it is a door of its own — the renderer's
+   * `<webview>.setZoomFactor` was measured doing nothing at all.
+   *
+   * The guest is resolved the way `ag:browserCdp` resolves it, including the
+   * refusal on an id we do not recognise: a silent fall back to the front tab
+   * is how the wrong-tab bug keeps coming back.
+   */
+  ipcMain.handle("ag:browserZoom", async (_e, req) => {
+    const wanted = Number(req && req.guestId);
+    const guest = Number.isFinite(wanted) && wanted > 0 ? browserGuestById(wanted) : browserGuest;
+    if (!guest || guest.isDestroyed()) {
+      return { ok: false, error: wanted ? "that tab is not a browser pane in this window" : "no browser pane is mounted" };
+    }
+    try {
+      const asked = req && req.factor;
+      /* No factor is a READ. Setting and reading go through one door so they
+         cannot disagree about what the page is at. */
+      if (typeof asked === "number" && Number.isFinite(asked)) {
+        if (!(asked > 0.1 && asked <= 5)) {
+          return { ok: false, error: "zoom takes a factor between 0.1 and 5 — 1 is a page at its own size" };
+        }
+        guest.setZoomFactor(asked);
+      }
+      const factor = guest.getZoomFactor();
+      return { ok: true, factor, percent: Math.round(factor * 100) };
+    } catch (e) {
+      return { ok: false, error: String((e && /** @type {Error} */ (e).message) || e) };
+    }
+  });
+
+  ipcMain.handle("ag:browserCdp", async (_e, req) => {
+    /*
+     * THE TAB THE CALLER NAMED, not whichever one is in front.
+     *
+     * This said `browserGuest` — the front tab — so every DevTools call went
+     * there whatever `--page` said, and the screenshot route is a DevTools
+     * call. Measured on the running app: `read` answered from the agent's own
+     * page while `shot`, one command later, returned a picture of a different
+     * tab. Right dimensions, plausible content, wrong page, and nothing in the
+     * answer saying so.
+     *
+     * An id we do not recognise is REFUSED rather than quietly served from the
+     * front tab: a silent fallback here is how this bug comes back.
+     */
+    const wanted = Number(req && req.guestId);
+    const guest = Number.isFinite(wanted) && wanted > 0 ? browserGuestById(wanted) : browserGuest;
+    if (!guest || guest.isDestroyed()) {
+      return { ok: false, error: wanted ? "that tab is not a browser pane in this window" : "no browser pane is mounted" };
+    }
+
+    // Draining the buffer needs no session and must work even when attaching
+    // would fail — the events already happened.
+    if (req?.drain === true) {
+      const buf = guestCdpEvents.get(guest) || [];
+      guestCdpEvents.set(guest, []);
+      return { ok: true, events: buf };
+    }
+
+    const method = typeof req?.method === "string" ? req.method : "";
+    if (!method || !method.includes(".")) {
+      return { ok: false, error: 'method must be a CDP method, e.g. "Debugger.enable"' };
+    }
+
+    /*
+     * INTERCEPT'S RULES, kept HERE because this is where the events arrive.
+     *
+     * `intercept` used to call `Fetch.enable` and write its rules into a
+     * variable in the page. Fetch.enable pauses EVERY request until something
+     * answers it, and nothing did: one call and the tab stopped loading
+     * anything, for good, while the verb answered ok. Measured by a peer
+     * session — a matching URL, a non-matching URL and `--clear` all hung, and
+     * the tab only came back after `Fetch.disable` by hand.
+     *
+     * A rule has to live where `Fetch.requestPaused` is received, which is the
+     * debugger session in this process. `Fetch.agxSetRules` is that door: it
+     * takes the whole list at once (so clearing is passing a shorter list),
+     * turns the domain on when there is something to match and off when there
+     * is not.
+     */
+    if (method === "Page.agxScreencastFrames") {
+      const ring = guestScreencast.get(guest) || { frames: [], dropped: 0 };
+      guestScreencast.set(guest, { frames: [], dropped: 0 });
+      return { ok: true, result: { frames: ring.frames, dropped: ring.dropped } };
+    }
+    if (method === "Fetch.agxSetRules") {
+      const rules = Array.isArray(req?.params?.rules) ? req.params.rules : [];
+      if (!rules.length) {
+        guestIntercepts.delete(guest);
+        if (guestOwnsDebugger.has(guest)) {
+          try { await guest.debugger.sendCommand("Fetch.disable"); } catch { /* already gone */ }
+        }
+        return { ok: true, result: { rules: 0 } };
+      }
+      guestIntercepts.set(guest, rules);
+      return { ok: true, result: { rules: rules.length } };
+    }
+
+
+    /*
+     * Page.printToPDF, which a guest's debugger does not have.
+     *
+     * `pdf` called it over the protocol and got back `'Page.printToPDF' wasn't
+     * found` — measured on a clean launch, before anything else had touched the
+     * debugger, and `Page.enable` first changes nothing. The method is simply
+     * not in the surface Chromium exposes to a <webview>'s debugger session.
+     * Electron carries the same capability as a webContents call, so that is
+     * what answers here.
+     *
+     * SERVED FROM THIS HANDLER RATHER THAN A CHANNEL OF ITS OWN, deliberately.
+     * A second channel would have to repeat the twenty lines above that decide
+     * WHICH guest this is and refuse an id they do not recognise — and a
+     * second copy of that rule is exactly how "every DevTools call went to the
+     * front tab" comes back. One resolution, one refusal, both shared.
+     *
+     * The reply keeps CDP's shape (`{ data: <base64> }`) because the contract
+     * downstream is unchanged: the verb passes it through and the CLI decodes
+     * the base64 and writes the file. Nothing above this line learns that the
+     * answer stopped coming from the protocol.
+     */
+    /*
+     * The directory a download is meant to land in, taken from the protocol
+     * call the verb already makes rather than from a channel of its own.
+     *
+     * Passed through to the debugger as well, not swallowed: a guest that DOES
+     * honour it should keep doing so, and this is only the safety net for the
+     * far commoner case where Electron takes the item first.
+     */
+    if (method === "Browser.setDownloadBehavior") {
+      const p = (req && req.params) || {};
+      if (p.behavior === "allow" && typeof p.downloadPath === "string" && p.downloadPath) {
+        guestDownloadDir.set(guest, p.downloadPath);
+        wireDownloads(guest);
+      } else {
+        guestDownloadDir.delete(guest);
+      }
+    }
+
+    if (method === "Page.printToPDF") {
+      try {
+        const p = (req && req.params) || {};
+        const buf = await guest.printToPDF({
+          printBackground: p.printBackground !== false,
+          landscape: p.landscape === true,
+        });
+        return { ok: true, result: { data: buf.toString("base64") } };
+      } catch (e) {
+        // Narrowed rather than `e.message` on a bare catch: this file is
+        // typechecked, and the untyped form is two more tsc errors on top of
+        // the eight already here. Adding to that list is how it stops being
+        // read at all.
+        return { ok: false, error: `the page could not be printed: ${e instanceof Error ? e.message : String(e)}` };
+      }
+    }
+    if (guest.debugger.isAttached() && !guestOwnsDebugger.has(guest)) {
+      return { ok: false, error: "the inspector is attached to this page — close it and try again" };
+    }
+    try {
+      if (!guestOwnsDebugger.has(guest)) {
+        guest.debugger.attach("1.3");
+        guestOwnsDebugger.add(guest);
+        guestCdpEvents.set(guest, []);
+        /* Spelled out: `guest` is now a lookup that can miss, so the checker no
+           longer infers these from a narrowed constant.
+           @param {unknown} _ev @param {string} m @param {unknown} params */
+        guest.debugger.on("message", (/** @type {unknown} */ _ev, /** @type {string} */ m, /** @type {unknown} */ params) => {
+          /* A paused request is a request nobody has answered yet, and every
+             one of them is a page that is not loading. Answered first, and
+             before the buffer, because a rule that matches nothing still has
+             to let the request through. */
+          if (m === "Fetch.requestPaused") answerPaused(guest, params);
+          if (m === "Page.screencastFrame") {
+            const p = /** @type {{ sessionId?: number, data?: string, metadata?: unknown }} */ (params || {});
+            guest.debugger.sendCommand("Page.screencastFrameAck", { sessionId: p.sessionId }).catch(() => { /* the cast just stopped */ });
+            const ring = guestScreencast.get(guest) || { frames: [], dropped: 0 };
+            ring.frames.push({ at: Date.now(), sessionId: Number(p.sessionId), data: String(p.data || ""), metadata: p.metadata });
+            if (ring.frames.length > SCREENCAST_CAP) { ring.dropped += ring.frames.length - SCREENCAST_CAP; ring.frames.splice(0, ring.frames.length - SCREENCAST_CAP); }
+            guestScreencast.set(guest, ring);
+            return;
+          }
+          const buf = guestCdpEvents.get(guest);
+          if (!buf) return;
+          buf.push({ at: Date.now(), method: m, params });
+          // Oldest first out: a page that logs in a loop must not be able to
+          // push a debugger pause out of the buffer before anyone reads it.
+          if (buf.length > CDP_EVENT_CAP) buf.splice(0, buf.length - CDP_EVENT_CAP);
+        });
+        guest.debugger.on("detach", () => {
+          guestOwnsDebugger.delete(guest);
+          guestCdpEvents.delete(guest);
+          guestScreencast.delete(guest);
+        });
+      }
+      /*
+       * BOUNDED HERE, WHERE THE COMMAND IS ISSUED — not raced by the caller.
+       *
+       * `Page.captureScreenshot` does not fail on a guest that is not
+       * compositing: it never answers. The first fix raced it in the renderer
+       * and that made things WORSE, measured by somebody using it: a tab that
+       * had been in the background once could not be captured again ever, not
+       * after being brought to the front, not after a reload. Racing abandons
+       * the promise and leaves the command outstanding in the debugger session,
+       * and the next one queues behind a capture that is never coming.
+       *
+       * So the deadline lives with the command, and a command that misses it
+       * takes the session down with it: detaching is what clears the pending
+       * request, and the next call attaches a clean one. That is the difference
+       * between a slow answer and a poisoned tab.
+       */
+      const late = Symbol("late");
+      const result = await Promise.race([
+        guest.debugger.sendCommand(method, req?.params || {}),
+        new Promise((r) => setTimeout(() => r(late), CDP_DEADLINE_MS)),
       ]);
-      return !img || img.isEmpty() ? null : img.toDataURL();
-    } catch {
-      return null;
+      if (result === late) {
+        try { guest.debugger.detach(); } catch { /* already gone */ }
+        guestOwnsDebugger.delete(guest);
+        return { ok: false, error: `${method} did not answer in ${Math.round(CDP_DEADLINE_MS / 1000)}s — the session was reset` };
+      }
+      return { ok: true, result };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  ipcMain.handle("ag:browserSessionSettings", async (_e, req) => {
+    /* §13: apply session-level settings — proxy, extensions, third-party cookies, DNS.
+       These are process-level and go through the Electron session API, not through CDP.
+       Everything here is optional: if a setting cannot be applied, we report plainly
+       what happened rather than silently failing. */
+    /* S9's `identify` is the one setting here that is per-profile rather than
+       session-wide: every other branch below has always applied to the
+       default partition regardless of which tab asked, and changing that for
+       proxy/cookies/dns is a separate change nobody has asked for. `identify`
+       alone reads `req.partition`, refusing anything outside the browser's
+       own family the same way `will-attach-webview` does. */
+    const partition = typeof req?.partition === "string" && isBrowserPartition(req.partition)
+      ? req.partition : BROWSER_PARTITION;
+    const ses = session.fromPartition(partition);
+    if (!ses) return { ok: false, error: "no browser session is available" };
+    const applied = [];
+    try {
+      if (req?.proxy && typeof req.proxy === "object") {
+        const px = req.proxy;
+        const rules = String(px.rules ?? "");
+        const bypass = String(px.bypass ?? "");
+        /*
+         * A proxy of the operator's replaces the egress guard's, and with an
+         * upstream proxy the name is resolved THERE — the connect-time policy
+         * cannot be held from here while one is set. Said in the reply rather
+         * than left to be discovered. Clearing the rules puts the guard back.
+         */
+        if (!rules.trim() && egress) {
+          await ses.setProxy({ proxyRules: egress.proxyRules, proxyBypassRules: "" });
+          applied.push("proxy:cleared (egress guard restored)");
+        } else {
+          await ses.setProxy({ proxyRules: rules, proxyBypassRules: bypass });
+          applied.push("proxy");
+          if (egress) {
+            applied.push("egress guard: its connect-time check is off while this proxy is set");
+            // The reply above reaches the calling agent; nothing put this in
+            // front of the person until now. `rules` is agent-supplied text:
+            // stripped of control characters (a newline forges a second log
+            // line), credentials redacted (Chromium's proxy-rules grammar
+            // allows `user:pass@host`, even if this app never sets one), and
+            // capped, so a large value cannot flood the app's own log.
+            const safeRules = rules
+              .replace(/[\r\n]+/g, " ")
+              .replace(/\/\/[^/@]*@/g, "//<redacted>@")
+              .slice(0, 200);
+            console.warn(`[egress] guard replaced by a custom proxy: ${safeRules}`);
+          }
+        }
+      }
+      if (req?.cookies && typeof req.cookies === "object") {
+        /*
+         * REFUSED, AND IT USED TO SAY "cookies" INSTEAD.
+         *
+         * These three branches called `ses.setVisitedLink({ options: { options:
+         * { thirdPartyPolicy } } })` — a method `Session` does not have, with a
+         * shape nothing in Electron takes — and then pushed "cookies" onto the
+         * list of things applied. So the verb answered that it had set a cookie
+         * policy while the call threw into the catch below, or did nothing at
+         * all: the exact "answered success, changed nothing" this repository has
+         * spent two sweeps removing. The typecheck named it the moment one was
+         * run over `electron/`.
+         *
+         * There is no per-session third-party cookie policy to call instead:
+         * Chromium decides that from the profile and its own flags, and Electron
+         * exposes neither at runtime. So the honest answer is that this shell
+         * cannot do it, said to the caller rather than swallowed.
+         */
+        const policy = String(req.cookies.thirdParty ?? "");
+        if (policy) {
+          return {
+            ok: false,
+            error: "cookies.thirdParty cannot be set from here — Electron exposes no per-session "
+              + "third-party cookie policy, and the call that pretended to was a method Session does "
+              + "not have. Use a separate container (a profile) for the pages that must not share cookies.",
+          };
+        }
+      }
+      if (req?.extensions && typeof req.extensions === "object") {
+        const ext = req.extensions;
+        const action = String(ext.action ?? "");
+        if (action === "load") {
+          const path = String(ext.path ?? "");
+          if (path) {
+            try {
+              await ses.loadExtension(path);
+              applied.push("extensions:load");
+            } catch (e) {
+              return { ok: false, error: `could not load extension: ${String(e instanceof Error ? e.message : e)}` };
+            }
+          }
+        } else if (action === "remove") {
+          const id = String(ext.id ?? "");
+          if (id) {
+            try {
+              ses.removeExtension(id);
+              applied.push("extensions:remove");
+            } catch (e) {
+              return { ok: false, error: `could not remove extension: ${String(e instanceof Error ? e.message : e)}` };
+            }
+          }
+        } else if (action === "list") {
+          try {
+            const exts = await ses.getAllExtensions();
+            applied.push("extensions:list");
+            return { ok: true, applied, value: { extensions: exts } };
+          } catch (e) {
+            return { ok: false, error: `could not list extensions: ${String(e instanceof Error ? e.message : e)}` };
+          }
+        }
+      }
+      if (req?.egress && typeof req.egress === "object") {
+        /* Why a navigation failed, when the guard is why. A refused CONNECT
+           reaches the page as a bare ERR_TUNNEL_CONNECTION_FAILED, which names
+           nothing an agent can act on; the guard kept the reason, and the
+           driver asks for it here to put it in the sentence. */
+        const host = String(req.egress.host ?? "").toLowerCase();
+        const rows = egress ? egress.refusals().filter((r) => !host || r.host === host) : [];
+        return { ok: true, applied: ["egress:refusals"], value: { armed: !!egress, refusals: rows.slice(-5) } };
+      }
+      if (req?.dns && typeof req.dns === "object") {
+        /* Electron does not expose a method to change DNS at runtime — it must
+           be set at launch with --host-resolver-rules. We report this plainly
+           rather than silently accepting a request we cannot fulfill. */
+        return { ok: false, error: "DNS remapping must be set at launch with --host-resolver-rules, not at runtime" };
+      }
+      if (typeof req?.identify === "boolean") {
+        /* The flag alone. The dispatcher that reads it is armed once, in
+           `did-attach-webview` — see the comment there — the first time a
+           guest attaches on this session, which for a partition already
+           holding a tab has already happened by the time this runs. */
+        identifyEnabled.set(ses, req.identify);
+        applied.push(req.identify ? "identify:on" : "identify:off");
+      }
+      return { ok: true, applied };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  /*
+   * S9: which agent's `--as` a guest's requests should carry, pushed here by
+   * the renderer whenever it addresses one — `web/src/lib/browserBus.ts`,
+   * where an ask already resolves the guest id to talk to it. `send`, not
+   * `invoke`: this is fire-and-forget bookkeeping, not something a caller
+   * waits on, and the same reason `ag:browser-active` is a `send`.
+   *
+   * Sanitised here, once, so `guestOwner` is a map the header dispatcher can
+   * read without checking it again — a page that supplied a value would be
+   * an argument to the RENDERER's IPC bridge, not to the page, but the value
+   * still travels through a renderer this process must not trust.
+   */
+  ipcMain.on("ag:browserGuestOwner", (_e, req) => {
+    const guestId = Number(req && req.guestId);
+    if (!Number.isInteger(guestId) || guestId <= 0) return;
+    const owner = sanitizeAgentName(req && req.owner);
+    if (owner) guestOwner.set(guestId, owner);
+    else guestOwner.delete(guestId);
+  });
+
+  /*
+   * The inspector, inside the app instead of floating over it.
+   *
+   * A `<webview>` guest has no window of its own, so every docking mode Electron
+   * offers collapses to "detached": DevTools came up as a separate OS window,
+   * over the app, with its content not filling its frame on a fractionally
+   * scaled display. The fix is the documented one — give the guest a webContents
+   * to draw its DevTools INTO, and let the panel lay that out like any other
+   * pane.
+   *
+   * Both ids must be guests this window attached. `webContents.fromId` will hand
+   * back anything in the process, the renderer is the one asking, and "point the
+   * DevTools of X at Y" is not a sentence any other webContents should be able
+   * to complete.
+   */
+  /** @param {number} id */
+  const knownGuest = (id) => {
+    for (const g of browserGuests) if (!g.isDestroyed() && g.id === id) return g;
+    return null;
+  };
+
+  /*
+   * The DevTools host: a WebContentsView the shell owns, not a second guest.
+   *
+   * The first version pointed the page's DevTools at another `<webview>`, which
+   * is what `setDevToolsWebContents` is documented to accept — and MEASURED, it
+   * came up with a working toolbar and an EMPTY Elements tree. It is a known
+   * webview-to-webview limitation (electron/electron#15874, open since 2018).
+   *
+   * A `WebContentsView` is the other thing the docs name, it is created here
+   * rather than by the guest view manager, and its Elements tree is populated.
+   * The price is that it is not part of the page's layout: it floats over the
+   * window at a rectangle somebody has to keep correct, which is what
+   * `ag:browserDevtoolsRect` is for. The renderer measures the hole it left and
+   * says where it is; this multiplies by the window's zoom, because the
+   * renderer speaks CSS pixels and a view's bounds are device-independent ones.
+   *
+   * Hidden rather than removed when the browser is not the view on screen — a
+   * floating child view knows nothing about our workspace, and left visible it
+   * would sit over the terminal.
+   */
+  /** @type {Map<number, DevtoolsView>} */
+  const devtoolsViews = new Map();
+  /*
+   * Each inspector's own `apply`, kept rather than dropped on the floor.
+   *
+   * `wireDevtoolsZoom` returns the setter that BOTH scales the view and tells
+   * the panel what it is now, and until there was a second caller nobody needed
+   * the return value: the panel was the only thing asking, and it already knew.
+   * A shell verb is that second caller, and without the echo it leaves the
+   * panel reading 160% over an inspector at 100.
+   * @type {Map<number, (level: number) => void>}
+   */
+  const devtoolsZoom = new Map();
+
+  /** `rect` is described as the complete rectangle it has to be for the branch
+   *  below to use it, and the `!!rect` guard stays for the renderer that sends
+   *  nothing at all — a shape and a presence check are different questions.
+   * @param {DevtoolsView} view
+   * @param {{ x: number, y: number, width: number, height: number, on?: boolean } | null | undefined} rect */
+  const placeDevtools = (view, rect) => {
+    const z = (() => { try { return win.webContents.getZoomFactor() || 1; } catch { return 1; } })();
+    const on = !!rect && rect.width > 8 && rect.height > 8 && rect.on !== false;
+    try {
+      view.setVisible(on);
+      if (on) {
+        view.setBounds({
+          x: Math.round(rect.x * z), y: Math.round(rect.y * z),
+          width: Math.round(rect.width * z), height: Math.round(rect.height * z),
+        });
+      }
+    } catch { /* the view is gone */ }
+  };
+
+  /*
+   * The inspector's own zoom.
+   *
+   * Its own, and that is the entire requirement: not the app's, not the page's.
+   * Every browser does this — Ctrl+plus inside DevTools makes DevTools bigger
+   * and leaves the site alone — and here it comes free, because the host is a
+   * WebContents of its own. What does NOT come free is the gesture: the keys and
+   * the wheel land in that view, so they are caught there, exactly as the
+   * guest's own zoom is caught in the guest.
+   *
+   * Bounds are unaffected. They are device-independent pixels multiplied by the
+   * WINDOW's zoom; what this changes is how big the DevTools draw themselves
+   * inside the rectangle they were given.
+   */
+  /** @param {DevtoolsView} view @param {number} guestId */
+  const wireDevtoolsZoom = (view, guestId) => {
+    const wc = view.webContents;
+    /** @param {number} level */
+    const apply = (level) => {
+      const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
+      try { wc.setZoomLevel(next); } catch { return; }
+      // The panel draws the percentage, and a level it did not ask for is one it
+      // would otherwise report wrongly for the rest of the session.
+      try { win.webContents.send("ag:browser-devtools-zoom", { guest: guestId, level: next }); } catch { /* torn down */ }
+    };
+    wc.on("before-input-event", (event, input) => {
+      if (input.type !== "keyDown") return;
+      const mod = process.platform === "darwin" ? input.meta : input.control;
+      if (!mod) return;
+      if (input.key === "+" || input.key === "=" || input.key === "-" || input.key === "0") {
+        event.preventDefault();
+        apply(input.key === "0" ? 0 : stepZoom(wc.getZoomLevel(), input.key === "-" ? -1 : 1));
+      }
+    });
+    wc.on("zoom-changed", (_e, direction) => {
+      apply(stepZoom(wc.getZoomLevel(), direction === "in" ? 1 : -1));
+    });
+    return apply;
+  };
+
+  /** @param {number} id */
+  const dropDevtools = (id) => {
+    const view = devtoolsViews.get(id);
+    if (!view) return;
+    devtoolsViews.delete(id);
+    devtoolsZoom.delete(id);
+    /* Every close routes through here — the shell verb, the panel's own, and
+       the guest being destroyed — so one line covers all three and none of
+       them can leave the tab's mark lit over an inspector that is gone. */
+    try { win.webContents.send("ag:browser-devtools-open", { guest: id, open: false }); } catch { /* torn down */ }
+    try { win.contentView.removeChildView(view); } catch { /* already detached */ }
+    try { view.webContents.close(); } catch { /* already closed */ }
+  };
+
+  /*
+   * Another browser's sidebar, for importing.
+   *
+   * Through the same one-shot as the cookies and the history, and for the same
+   * reason: it is somebody's browsing, and there is no HTTP route for it, so an
+   * agent driving this browser cannot ask. No confirmation dialog here — unlike
+   * the cookies, nothing leaves this machine and nothing is written to another
+   * profile; the panel shows what it found and the person presses Import.
+   */
+  ipcMain.handle("ag:browserShelfRead", async (_e, source) => {
+    try { return await runCookieReader(["shelf", "--source", String(source ?? "")]); }
+    catch (e) { return { ok: false, error: String(e instanceof Error ? e.message : e) }; }
+  });
+
+  ipcMain.handle("ag:browserDevtools", (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    if (!guest) return { ok: false, error: "that page is gone" };
+    try {
+      let view = devtoolsViews.get(guest.id);
+      if (!view || view.webContents.isDestroyed()) {
+        view = new WebContentsView();
+        devtoolsViews.set(guest.id, view);
+        win.contentView.addChildView(view);
+        guest.setDevToolsWebContents(view.webContents);
+        guest.openDevTools();
+        devtoolsZoom.set(guest.id, wireDevtoolsZoom(view, guest.id));
+        /* The level the panel remembers, applied once the front-end is there to
+           be scaled — before that the call lands on `about:blank` and is lost
+           on the navigation to `devtools://`. */
+        if (typeof req.zoom === "number") {
+          const z = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, req.zoom));
+          /*
+           * On EVERY load, and once more a beat later.
+           *
+           * `once("dom-ready")` was not enough and he noticed: the DevTools
+           * front-end is a page that reloads itself as panels come up, and each
+           * load resets the zoom to 1 — so the level came back only if you were
+           * quick. `on` rather than `once` covers the reloads; the delayed
+           * repeat covers the one where the front-end sets its own zoom after
+           * ours.
+           */
+          /* Held in a const for the closure. `view` is a `let`, and a closure
+             reading a `let` is read as possibly seeing a later value — it
+             cannot here, but only a const says so. */
+          const pane = view;
+          const apply = () => { try { pane.webContents.setZoomLevel(z); } catch { /* gone */ } };
+          view.webContents.on("dom-ready", () => { apply(); setTimeout(apply, 400); });
+        }
+        // A tab that goes takes its inspector with it, or the view outlives the
+        // page it was inspecting and floats over whatever is behind it.
+        guest.once("destroyed", () => dropDevtools(guest.id));
+      }
+      placeDevtools(view, req && req.rect);
+      if (req && typeof req.x === "number" && typeof req.y === "number") {
+        guest.inspectElement(Math.round(req.x), Math.round(req.y));
+      }
+      /*
+       * THE TAB SAYS SO, because nothing else does any more.
+       *
+       * The inspector used to announce itself by covering half the screen —
+       * badly, and it was reported as a bug, so it opens hidden now. Which
+       * leaves an agent able to open an inspector on somebody's tab with no
+       * sign of it anywhere: the panel's own switch is inside a `⋯` menu, and
+       * a signal you have to open a menu to read is not a signal.
+       *
+       * Sent from HERE and not from the caller, so the panel's own open and a
+       * shell verb's open are the same event. Two sources for one mark is two
+       * marks that can disagree.
+       *
+       * After `placeDevtools` on purpose: an open that threw before this line
+       * would otherwise light a mark with no inspector under it.
+       */
+      try { win.webContents.send("ag:browser-devtools-open", { guest: guest.id, open: true }); } catch { /* torn down */ }
+      return { ok: true, docked: true };
+    } catch (e) {
+      dropDevtools(guest.id);
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  // Fire and forget: this arrives on every drag frame and every resize, and an
+  // invoke would make the renderer wait for a round trip to draw the next one.
+  ipcMain.on("ag:browserDevtoolsRect", (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    const view = guest && devtoolsViews.get(guest.id);
+    if (view) placeDevtools(view, req && req.rect);
+  });
+
+  ipcMain.handle("ag:browserDevtoolsZoom", (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    const view = guest && devtoolsViews.get(guest.id);
+    if (!view || view.webContents.isDestroyed()) return { ok: false };
+    const level = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Number(req && req.level) || 0));
+    /* Through the wired setter, not `setZoomLevel` on its own: that one scales
+       the view and tells nobody, which is invisible while the panel is the only
+       caller and a lie the moment a shell verb is. */
+    const apply = devtoolsZoom.get(guest.id);
+    if (apply) apply(level);
+    else { try { view.webContents.setZoomLevel(level); } catch { return { ok: false }; } }
+    return { ok: true, level };
+  });
+
+  /*
+   * A PICTURE OF THE INSPECTOR ITSELF.
+   *
+   * The panel's screenshot verb photographs the page; the inspector is a
+   * WebContentsView the shell owns, so it has to be asked separately. This is
+   * what makes "show me the Network tab" answerable at all — Console and
+   * Network have CDP verbs that return data, and Elements, Sources, Performance
+   * and Application have nothing an agent can read except the pixels.
+   *
+   * Hidden is the normal state, not the exception: `placeDevtools` marks the
+   * view invisible whenever the browser is not the pane on screen, which is
+   * most of the time an agent is driving. Chromium does not render what is not
+   * visible, so the compositor hands back an empty frame — the same wall the
+   * pane capture hit.
+   *
+   * The way out is NOT `setVisible(true)` where it stands: the view floats over
+   * the window, so that paints the inspector across whatever the person is
+   * reading. It is moved off the window first, shown there, photographed, and
+   * put back — the bounds are restored in a `finally`, because a view left
+   * parked outside the window is an inspector that never comes back.
+   */
+  ipcMain.handle("ag:browserDevtoolsShot", async (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    const view = guest && devtoolsViews.get(guest.id);
+    if (!view || view.webContents.isDestroyed()) return { ok: false, error: "the inspector is not open" };
+    const wc = view.webContents;
+    /*
+     * A FRAME OF ONE COLOUR IS NOT A PICTURE OF ANYTHING.
+     *
+     * `isEmpty()` only answers "is this zero by zero", and the failure that
+     * actually happens here answers no to that: a view that has never been
+     * composited hands back a full-size rectangle of the theme's background
+     * and nothing else. MEASURED — 1500x1125, one distinct colour, and the
+     * verb reported success and wrote the file.
+     *
+     * So the check is on the pixels. Corners and centre rather than all of
+     * them: a real inspector differs across those five points every time (the
+     * toolbar, the tree, the styles pane), a blank frame differs nowhere, and
+     * reading five pixels costs nothing next to reading two megabytes.
+     */
+    /** @param {Electron.NativeImage} img */
+    const blank = (img) => {
+      try {
+        const { width, height } = img.getSize();
+        if (!width || !height) return true;
+        const buf = img.toBitmap();
+        /** @param {number} x @param {number} y */
+        const at = (x, y) => {
+          const i = (y * width + x) * 4;
+          return `${buf[i]},${buf[i + 1]},${buf[i + 2]}`;
+        };
+        const seen = new Set([
+          at(1, 1), at(width - 2, 1), at(1, height - 2),
+          at(width - 2, height - 2), at(width >> 1, height >> 1),
+        ]);
+        return seen.size <= 1;
+      } catch { return false; }
+    };
+    const shoot = async () => {
+      const img = await wc.capturePage(undefined, { stayHidden: false, stayAwake: true });
+      return img && !img.isEmpty() && !blank(img) ? img : null;
+    };
+    let before = null;
+    /* Read here rather than taken from the caller: the renderer that asks knows
+       whether the browser is the pane on screen, but by the time this restores
+       the view that may already be stale — and a wrong answer leaves the
+       inspector painted over the terminal, or invisible when it should not be. */
+    let wasVisible = false;
+    try {
+      const first = await shoot();
+      if (first) return { ok: true, png: first.toDataURL(), via: "the compositor" };
+      /*
+       * Shown WHERE IT BELONGS, briefly — not parked off the window.
+       *
+       * Off-window was the first attempt and it does not work: measured, the
+       * capture came back a full-size rectangle of one colour, because
+       * Chromium composites what is inside the window and a view moved outside
+       * it is still a view being drawn nowhere. The same wall, one step along.
+       *
+       * So it is made visible in its own rectangle for as long as the capture
+       * takes. If the browser is not the pane on screen this flickers the
+       * inspector over whatever is — which is the honest price, and the same
+       * one the pane capture pays for the same reason. It lasts about a third
+       * of a second and only when an agent asks for a picture.
+       */
+      before = view.getBounds();
+      wasVisible = typeof view.getVisible === "function" ? view.getVisible() : false;
+      if (!before.width || !before.height) {
+        /* Never placed: the panel sets the real hole when it renders, and
+           until then the view has no size to be drawn into. */
+        view.setBounds({ x: 0, y: 0, width: 1200, height: 900 });
+      }
+      view.setVisible(true);
+      // One frame is not enough — the view has to be composited once where it
+      // now stands before there is anything to copy.
+      await new Promise((r) => setTimeout(r, 300));
+      const second = await shoot();
+      if (second) return { ok: true, png: second.toDataURL(), via: "shown briefly" };
+      return { ok: false, error: "the inspector produced an empty frame" };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    } finally {
+      if (before) {
+        try { view.setBounds(before); } catch { /* the view went away mid-shot */ }
+        /* Back to exactly what it was before the detour. */
+        try { view.setVisible(wasVisible); } catch { /* gone */ }
+      }
+    }
+  });
+
+  /*
+   * WHICH PANEL THE INSPECTOR IS SHOWING.
+   *
+   * There is no CDP for this and there cannot be: the panels belong to the
+   * DevTools front-end, which is a web page, and CDP talks to the page being
+   * inspected rather than to the thing inspecting it. So this runs script in
+   * the front-end's own WebContents.
+   *
+   * Two ways, tried in order, because which one exists depends on the Chromium
+   * the front-end shipped with and this app has moved between them before:
+   *
+   *   1. `DevToolsAPI.showPanel(id)` — the embedder API, hung on the front-end
+   *      window for exactly this kind of host. Oldest and most stable.
+   *   2. The front-end's own view manager, reached through its module graph.
+   *      The path has changed between versions, so it is a fallback and it
+   *      reports what it found rather than pretending.
+   *
+   * Returns which route worked, so a caller that got neither can say so
+   * instead of reporting a panel change that never happened.
+   */
+  ipcMain.handle("ag:browserDevtoolsPanel", async (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    const view = guest && devtoolsViews.get(guest.id);
+    if (!view || view.webContents.isDestroyed()) return { ok: false, error: "the inspector is not open" };
+    const panel = String((req && req.panel) || "").trim();
+    if (!/^[a-z0-9_-]{1,40}$/i.test(panel)) return { ok: false, error: "not a panel name" };
+    /*
+     * THE NAME ON THE TAB IS NOT THE PANEL'S ID.
+     *
+     * Three of them differ, and `showPanel` on an id it does not know returns
+     * without throwing and without switching — so the verb reported
+     * "via DevToolsAPI.showPanel" for `performance`, `memory` and
+     * `application` and photographed whatever was already up. Measured: the
+     * three files came back byte-identical, and identical to the Network shot
+     * before them.
+     */
+    /** @type {Record<string, string>} */
+    const ALIAS = {
+      performance: "timeline",
+      memory: "heap-profiler",
+      application: "resources",
+      network: "network",
+      elements: "elements",
+      console: "console",
+      sources: "sources",
+      security: "security",
+      lighthouse: "lighthouse",
+    };
+    const want = ALIAS[panel.toLowerCase()] || panel;
+    /*
+     * NO WAITING IN HERE, and that is not a style choice.
+     *
+     * This view is hidden — the inspector is opened with no rectangle so it
+     * cannot land on top of whatever is on screen — and Chromium freezes the
+     * timers of a page nobody is showing. A poll of "has the tab changed yet"
+     * therefore never advances: measured, twenty seconds and a timeout on
+     * every panel, while the panel HAD in fact changed. So the tab bar is read
+     * once, straight after the call, and the answer says what it found.
+     */
+    const script = `(function () {
+      var id = ${JSON.stringify(want)};
+      var label = function (e) { return (e.id || e.getAttribute("aria-label") || e.textContent || "").trim().toLowerCase(); };
+      var all = function () { return Array.prototype.map.call(document.querySelectorAll(".tabbed-pane-header-tab"), label); };
+      var current = function () {
+        var el = document.querySelector(".tabbed-pane-header-tab.selected, .tabbed-pane-header-tab[aria-selected='true']");
+        return el ? label(el) : "";
+      };
+      var seen = all();
+      /* A bar we can read that has no such panel: say what it does have,
+         rather than report a switch over whatever was already up. */
+      if (seen.length && !seen.some(function (t) { return t.indexOf(id) >= 0; })) {
+        return { error: "this front-end has no panel called " + id + " — it has " + seen.join(", ") };
+      }
+      if (typeof DevToolsAPI === "undefined" || !DevToolsAPI || typeof DevToolsAPI.showPanel !== "function") {
+        return { error: "this front-end has no DevToolsAPI.showPanel" };
+      }
+      try { DevToolsAPI.showPanel(id); } catch (e) { return { error: String(e && e.message || e) }; }
+      /* Read back at once. The selection itself is synchronous; what is slow is
+         the panel's own module, which is not what is being asserted here. An
+         empty reading on a bar this does not recognise is left empty rather
+         than invented — showPanel is the embedder API and it took the call. */
+      return { via: "DevToolsAPI.showPanel", now: current() };
+    })()`;
+    try {
+      const r = await view.webContents.executeJavaScript(script, true);
+      if (r && r.via) return { ok: true, panel: want, via: r.via };
+      return { ok: false, error: (r && r.error) || "the front-end did not answer" };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  ipcMain.handle("ag:browserDevtoolsClose", (_e, req) => {
+    const guest = knownGuest(Number(req && req.guest));
+    if (guest) {
+      try { guest.closeDevTools(); } catch { /* already closed */ }
+      dropDevtools(guest.id);
+    }
+    return { ok: true };
+  });
+
+  /*
+   * The whole page, scroll and all.
+   *
+   * `capturePage` cannot do this and never will: it photographs what the
+   * compositor has, and what is below the fold was never painted. The debugger
+   * can — `captureBeyondViewport` renders the document into an off-screen
+   * surface at whatever size `Page.getLayoutMetrics` says it is — which is the
+   * same door the hidden-pane capture goes through, for the same reason.
+   *
+   * Copied here rather than handed back as a data URL to be copied in the
+   * renderer: a full page is several megabytes of base64, and the clipboard
+   * this app needs is the desktop's anyway (a renderer write is refused while
+   * the guest holds the focus, which it does).
+   */
+  /*
+   * A screenshot, saved.
+   *
+   * Into the downloads folder without asking, which is what a browser does with
+   * this button — a save dialog for something you took by dragging a rectangle
+   * is a second decision nobody wanted to make. The name is ours and the
+   * extension is fixed: this only ever writes a PNG, and the only thing the
+   * renderer chooses is the middle of the filename.
+   */
+  ipcMain.handle("ag:saveImage", async (_e, dataUrl, name) => {
+    try {
+      const head = "data:image/png;base64,";
+      if (typeof dataUrl !== "string" || !dataUrl.startsWith(head)) return { ok: false, error: "that is not a PNG" };
+      const img = nativeImage.createFromDataURL(dataUrl);
+      if (img.isEmpty()) return { ok: false, error: "that image is empty" };
+      // Only what a filename may be: this string came from the renderer, and a
+      // path separator in it is the difference between a download and a write
+      // anywhere on the disk.
+      const slug = String(name || "").replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+/, "").slice(0, 60) || "screenshot";
+      const base = slug.toLowerCase().endsWith(".png") ? slug.slice(0, -4) : slug;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const file = path.join(app.getPath("downloads"), `${base}-${stamp}.png`);
+      fs.writeFileSync(file, img.toPNG());
+      return { ok: true, path: file };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    }
+  });
+
+  ipcMain.handle("ag:captureFullPage", async (_e, how) => {
+    const guest = browserGuest;
+    if (!guest || guest.isDestroyed()) return { ok: false, error: "there is no page to capture" };
+    let attached = false;
+    try {
+      if (!guest.debugger.isAttached()) { guest.debugger.attach("1.3"); attached = true; }
+      const m = await guest.debugger.sendCommand("Page.getLayoutMetrics");
+      const size = m.cssContentSize || m.contentSize || { width: 0, height: 0 };
+      /*
+       * NEVER SMALLER THAN WHAT IS ON SCREEN.
+       *
+       * `cssContentSize` is the size of the CONTENT, and on a page whose layout
+       * is narrower than the window — a centred app, a fixed-width dashboard —
+       * that is less than the viewport. Capturing it produced a "whole page"
+       * shot with the right-hand side cut off, while "Visible" got everything:
+       * the whole page was SMALLER than the visible one, which reads as a bug
+       * whichever way round you look at it.
+       *
+       * Reported with two screenshots side by side, and they are the clearest
+       * possible statement of it. Whole page means "everything visible, plus
+       * whatever is below the fold" — so each dimension is the larger of the
+       * two.
+       */
+      const vp = (m.cssVisualViewport || m.visualViewport || {});
+      /*
+       * THE ZOOM, which is what was actually missing.
+       *
+       * MEASURED on the page this was reported against: a full-page capture
+       * came back 2580x1606 while the plain visible one was 3375x1625 — the
+       * WHOLE page narrower than the visible one by 795 pixels, which is
+       * exactly the crop that was reported. The ratio between them is 1.308,
+       * and `getLayoutMetrics` reported `zoom: 1.3145` on that page.
+       *
+       * `cssContentSize` is in CSS pixels and does NOT account for the
+       * browser's zoom; `clip.scale` is the multiplier that does. Asked with
+       * scale 1 the capture is 2580 wide; asked with scale 1.3145 it is 3391 —
+       * the size of the visible shot. That is the whole bug, and two earlier
+       * guesses (content width, then re-layout) were both wrong about it.
+       */
+      const zoom = Number(vp.zoom) || 1;
+      const wide = Math.ceil(size.width);
+      const tall = Math.max(Math.ceil(size.height), Math.ceil(vp.clientHeight || 0));
+      /*
+       * IF NOTHING IS BELOW THE FOLD, THE WHOLE PAGE IS WHAT YOU CAN SEE.
+       *
+       * This is the case that kept coming back wrong, and the answer turned
+       * out to be that there was nothing to do. On a page that fits, the
+       * content-size route re-renders through a clip and a scale and lands
+       * shifted and cropped, while the ordinary visible capture is already
+       * exactly right — same picture, no arithmetic. Three attempts went into
+       * making the arithmetic produce what the simple route produces for free.
+       *
+       * A page that DOES scroll still needs the clip, so the branch stays.
+       */
+      const fits = Math.ceil(size.height) <= Math.ceil(vp.clientHeight || 0) + 2;
+      if (fits) {
+        const img0 = await guest.capturePage().catch(() => null);
+        if (img0 && !img0.isEmpty()) {
+          const sz = img0.getSize();
+          if (how === "save") {
+            const stamp0 = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            const file0 = path.join(app.getPath("downloads"), `agentglass-page-${sz.width}x${sz.height}-${stamp0}.png`);
+            fs.writeFileSync(file0, img0.toPNG());
+            return { ok: true, width: sz.width, height: sz.height, cut: false, path: file0 };
+          }
+          clipboard.writeImage(img0);
+          return { ok: true, width: sz.width, height: sz.height, cut: false };
+        }
+      }
+      // Chromium refuses a capture past this; a page taller than it comes back
+      // cut rather than not at all, and saying so is better than a silent crop.
+      const CAP = 16384;
+      const width = Math.min(wide, CAP);
+      const height = Math.min(tall, CAP);
+      if (!width || !height) return { ok: false, error: "that page reports no size" };
+      const shot = await guest.debugger.sendCommand("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        /* scale is the zoom, not 1 — see the note above. With 1 the capture
+           comes back smaller than the visible one on any zoomed page. */
+        clip: { x: 0, y: 0, width, height, scale: zoom },
+      });
+      if (!shot || !shot.data) return { ok: false, error: "the page produced no frame" };
+      const img = nativeImage.createFromBuffer(Buffer.from(shot.data, "base64"));
+      if (img.isEmpty()) return { ok: false, error: "the page produced an empty frame" };
+      const cut = tall > CAP;
+      // Copy or keep — the same two things the selection offers, because a
+      // whole page is the one shot you are most likely to want as a file.
+      if (how === "save") {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const file = path.join(app.getPath("downloads"), `agentglass-page-${width}x${height}-${stamp}.png`);
+        fs.writeFileSync(file, img.toPNG());
+        return { ok: true, width, height, cut, path: file };
+      }
+      clipboard.writeImage(img);
+      return { ok: true, width, height, cut };
+    } catch (e) {
+      return { ok: false, error: String(e instanceof Error ? e.message : e) };
+    } finally {
+      if (attached) { try { guest.debugger.detach(); } catch { /* already gone */ } }
     }
   });
 
@@ -1135,7 +3228,7 @@ function registerIpc(win) {
       ] },
       { label: "Window", submenu: [
         { role: "minimize" },
-        { label: win.isMaximized() ? "Restore" : "Maximise", click: () => (win.isMaximized() ? win.unmaximize() : win.maximize()) },
+        { label: win.isMaximized() ? "Restore" : "Maximise", click: () => { askedAt = Date.now(); return win.isMaximized() ? win.unmaximize() : win.maximize(); } },
         { type: "separator" },
         { role: "close" },
       ] },
@@ -1151,12 +3244,19 @@ function registerIpc(win) {
   // else the window manager owns does not go through us — so the renderer is
   // TOLD rather than left to infer, or the glyph says "maximise" on a maximised
   // window and the clock hides itself at the wrong moment.
-  for (const ev of ["maximize", "unmaximize", "enter-full-screen", "leave-full-screen", "restore"]) {
-    win.on(ev, () => {
-      try { win.webContents.send("ag:winState", { max: win.isMaximized(), full: win.isFullScreen() }); }
-      catch { /* torn down */ }
-    });
-  }
+  /* One subscription per line rather than a loop over the names. `on` is typed
+     one event at a time — each name has its own listener signature — so a loop
+     hands it a union that matches none of them, and the only way to keep the
+     loop is to lie about the name with a cast. */
+  const tellWinState = () => {
+    try { win.webContents.send("ag:winState", { max: win.isMaximized(), full: win.isFullScreen() }); }
+    catch { /* torn down */ }
+  };
+  win.on("maximize", tellWinState);
+  win.on("unmaximize", tellWinState);
+  win.on("enter-full-screen", tellWinState);
+  win.on("leave-full-screen", tellWinState);
+  win.on("restore", tellWinState);
 
   ipcMain.handle("ag:setFullscreen", (_e, on) => { win.setFullScreen(!!on); return win.isFullScreen(); });
   ipcMain.handle("ag:isFullscreen", () => win.isFullScreen());
@@ -1164,6 +3264,9 @@ function registerIpc(win) {
 
   ipcMain.handle("ag:autostartEnabled", () => autostartEnabled());
   ipcMain.handle("ag:setAutostart", (_e, on) => setAutostart(!!on));
+
+  ipcMain.handle("ag:powerStatus", () => power.status());
+  ipcMain.handle("ag:setPowerMode", (_e, m) => power.setMode(String(m)));
 
   /*
    * Show a file where it lives, in the desktop's own file manager.
@@ -1240,6 +3343,7 @@ function autostartEnabled() {
   return app.getLoginItemSettings().openAtLogin;
 }
 
+/** @param {boolean} on */
 function setAutostart(on) {
   if (process.platform === "linux") {
     if (on) {
@@ -1262,25 +3366,215 @@ function setAutostart(on) {
  *  the size ladder Chrome walks with Ctrl+plus. ±7 is about 25%–500%. */
 /** The guest currently showing a page, for the one thing the panel cannot do
  *  for itself — see ag:captureBrowser. Null whenever there is no browser pane
- *  mounted, which is most of the time. */
+ *  mounted, which is most of the time.
+ * @type {WebContents | null} */
 let browserGuest = null;
 /** Every attached guest. `browserGuest` is whichever of them the renderer says
  *  is on screen; this is what lets a destroyed tab fall back to another. */
 const browserGuests = new Set();
+/** Per guest, the favicon URLs Chromium has reported for it. The allowlist
+ *  `ag:browserFavicon` checks against; see where it is filled for why. */
+const guestFavicons = new WeakMap();
+/** Enough for a tab that changes its icon a few times; not enough for a page
+ *  that rewrites it in a loop to grow this without end. */
+const FAVICON_URL_CAP = 16;
 
-const ZOOM_STEP = 0.5;
+/** S9: which agent's name to send in `X-Agentglass-Agent`, by webContents id.
+ *  A plain `Map`, not a `WeakMap`, because the key the header dispatcher has
+ *  at request time (`details.webContentsId`) is a number, not the guest
+ *  itself — cleared on `destroyed` below, same as `guestFavicons`. Already
+ *  sanitised on the way in, so the dispatcher can use it without checking
+ *  again. @type {Map<number, string>} */
+const guestOwner = new Map();
+
+/** Windows opened as popups from a guest — a sign-in, in practice. The
+ *  Cross-Origin-Opener-Policy header is dropped for these and only these; see
+ *  where it is done for the measurement that justifies it. */
+const popupIds = new Set();
+/** Sessions whose header filter is already installed. One per partition, and
+ *  installing it twice would run it twice for every response. */
+const coopFreed = new WeakSet();
+
+/**
+ * §4's `addInitScript`/`expose`: which CDP script identifier belongs to which
+ * NAME, per guest.
+ *
+ * `Page.addScriptToEvaluateOnNewDocument` is the one door that runs before a
+ * page's own scripts — `executeJavaScript` only ever reaches a page already
+ * running — and it needs a debugger session held open for the guest's whole
+ * life, not attached and detached per call the way `ag:captureBrowser` does
+ * it. A `WeakMap` rather than explicit teardown on tab close: the guest is
+ * the key, so the entry is unreachable the moment nothing else in this
+ * process holds the guest either, which is exactly when its scripts stop
+ * mattering — there is no page left to run them on.
+ * Holds the SOURCE beside the identifier: a guest drops its registered
+ * scripts on every navigation, so they have to be added again, and the
+ * identifier alone cannot do that.
+ * @type {WeakMap<WebContents, Map<string, { source: string, identifier: string }>>} */
+const guestInitScripts = new WeakMap();
+/** Guests whose debugger session is OURS — held open for
+ *  `Page.addScriptToEvaluateOnNewDocument`, not a screenshot's transient
+ *  attach/detach. `ag:captureBrowser`'s "the inspector is attached" refusal
+ *  means something different when the attacher is this map instead of a
+ *  human's DevTools, so it checks here before believing that. */
+const guestOwnsDebugger = new WeakSet();
+
+/** What `intercept` is holding for each guest, newest set wins. Empty means the
+ *  Fetch domain is off — see `Fetch.agxSetRules`.
+ *  @type {WeakMap<WebContents, Array<Record<string, unknown>>>} */
+const guestIntercepts = new WeakMap();
+
+/**
+ * Answer one paused request.
+ *
+ * EVERY path ends in a call, including the one where nothing matches: a
+ * request that is paused and never answered is a page that stops loading, and
+ * that is exactly what the first version of this feature did to a tab.
+ *
+ * @param {WebContents} guest
+ * @param {unknown} params
+ */
+function answerPaused(guest, params) {
+  const p = /** @type {{ requestId?: string; request?: { url?: string } }} */ (params || {});
+  const id = typeof p.requestId === "string" ? p.requestId : "";
+  if (!id) return;
+  const url = String(p.request?.url || "");
+  const send = (/** @type {string} */ method, /** @type {Record<string, unknown>} */ args) => {
+    /* A request can be gone by the time we answer — the page navigated, the
+       tab closed. That is not a failure worth reporting anywhere. */
+    guest.debugger.sendCommand(method, { requestId: id, ...args }).catch(() => {});
+  };
+  const rules = guestIntercepts.get(guest) || [];
+  const hit = rules.find((r) => typeof r.pattern === "string" && r.pattern && url.includes(String(r.pattern)));
+  if (!hit) { send("Fetch.continueRequest", {}); return; }
+  if (hit.abort === true) {
+    const reason = typeof hit.reason === "string" && hit.reason ? hit.reason : "Failed";
+    send("Fetch.failRequest", { errorReason: reason });
+    return;
+  }
+  const status = Number(hit.status);
+  send("Fetch.fulfillRequest", {
+    responseCode: Number.isInteger(status) && status >= 100 && status <= 599 ? status : 200,
+    body: Buffer.from(typeof hit.body === "string" ? hit.body : "").toString("base64"),
+  });
+}
+
+/* How long one DevTools command may take before the session is reset out from
+   under it. Generous — a real capture of a big page is under a second and a
+   debugger evaluate can be slower — and short enough that a caller is not left
+   holding a tab that will never answer. */
+const CDP_DEADLINE_MS = 8_000;
+
 const ZOOM_MIN = -7;
 const ZOOM_MAX = 7;
 
-function guardWebviews(win) {
+/*
+ * ZOOM MOVES IN TENS.
+ *
+ * Chromium's ladder is geometric — every step multiplies by 1.2^0.5 — so it
+ * walks 100, 110, 120, 132, 145, 158, 173. Each step is the same PROPORTION
+ * and no two are the same number, which is what makes it read as arbitrary
+ * from outside: "sometimes it goes up by five, sometimes by three. That has to
+ * be something consistent."
+ *
+ * Ten percentage points, up or down, always. A level that arrived from
+ * somewhere else — an old stored value, a pinch, a site that set its own —
+ * lands ON the grid with the first press instead of carrying its offset
+ * forever: 107% goes to 110 pressing in and 100 pressing out.
+ *
+ * Mirrored in web/src/lib/browserPrefs.ts, which cannot be imported from this
+ * process. Both are three lines of arithmetic; a shared module across the
+ * process boundary would be more machinery than the rule is.
+ */
+const ZOOM_PCT_MIN = 30;
+const ZOOM_PCT_MAX = 350;
+const ZOOM_PCT_STEP = 10;
+
+/** @param {number} level @param {number} dir +1 in, -1 out */
+const stepZoom = (level, dir) => {
+  const now = Math.pow(1.2, level) * 100;
+  const grid = Math.round(now / ZOOM_PCT_STEP) * ZOOM_PCT_STEP;
+  const off = Math.abs(grid - now) > 0.6;
+  const next = off
+    ? (dir > 0 ? Math.ceil(now / ZOOM_PCT_STEP) : Math.floor(now / ZOOM_PCT_STEP)) * ZOOM_PCT_STEP
+    : grid + dir * ZOOM_PCT_STEP;
+  const held = Math.max(ZOOM_PCT_MIN, Math.min(ZOOM_PCT_MAX, next));
+  return Math.log(held / 100) / Math.log(1.2);
+};
+
+/**
+ * Back and forward on a guest, across two Electron generations.
+ *
+ * `webContents.goBack()` moved to `webContents.navigationHistory` and the old
+ * names are on their way out; the `<webview>` element in the renderer still has
+ * both. Asked in that order rather than assumed, because a shortcut that throws
+ * takes the keystroke with it and reads as a browser that ignores Alt+Left.
+ */
+/** @param {WebContents} guest @param {number} dir */
+function guestNav(guest, dir) {
+  const back = dir < 0;
+  try {
+    const h = guest.navigationHistory;
+    if (h && typeof h.goBack === "function") {
+      // Statements rather than a ternary used as one: a ternary evaluated for
+      // its side effects reads as a value somebody forgot to use, which is what
+      // the linter says about it too.
+      if (back ? h.canGoBack() : h.canGoForward()) { if (back) h.goBack(); else h.goForward(); }
+      return;
+    }
+    if (back ? guest.canGoBack() : guest.canGoForward()) { if (back) guest.goBack(); else guest.goForward(); }
+  } catch { /* nothing to go back to */ }
+}
+
+/** @param {WebContents} guest @param {number} dir */
+function canNav(guest, dir) {
+  const back = dir < 0;
+  try {
+    const h = guest.navigationHistory;
+    if (h && typeof h.canGoBack === "function") return back ? h.canGoBack() : h.canGoForward();
+    return back ? guest.canGoBack() : guest.canGoForward();
+  } catch { return false; }
+}
+
+/** @param {AppWindow} win @param {{ lane?: boolean, laneId?: string }} [opts] */
+function guardWebviews(win, opts = {}) {
   // The decision itself lives in guest-guard.js so a test can call it — see the
   // header there. This is only the wiring: the guard says yes or no, and no
   // means the guest never exists.
   win.webContents.on("will-attach-webview", (e, webPreferences, params) => {
+    // `applyGuestGuard` alone accepts ANY family member on ANY window — it has
+    // no notion of which lane, or that a non-lane window should never carry
+    // an ephemeral one at all. Pin it here, where `laneHosts` is:
+    //   - the app's own window (and any webview that is not a lane's) never
+    //     gets an ephemeral partition, full stop — that string names a live
+    //     fork's in-memory session, and nothing outside that fork's own host
+    //     window has business sharing it;
+    //   - a lane's host gets exactly the ONE partition its own table entry
+    //     says it should — never "any family member", which is what let a
+    //     renderer bug attach a private lane's guest on the app's own jar and
+    //     have `destroyLaneHost` wipe the wrong name on close.
+    if (!opts.lane) {
+      // S6 refused the app's own window ANY ephemeral partition, full stop —
+      // nothing here could tell one fork's jar from another's. `newtab
+      // --from-template` (below, `tabEphemerals`) is the one exception: the
+      // window's own mint, for its own new tab, and nothing else — see
+      // `mayAttachOnMainWindow`'s comment in guest-guard.js.
+      if (!mayAttachOnMainWindow(webPreferences.partition, tabEphemerals)) { e.preventDefault(); return; }
+    } else {
+      const laneId = opts.laneId;
+      const entry = laneId ? laneHosts.get(laneId) : undefined;
+      const expected = !entry || !laneId ? null
+        : entry.ephemeral ? ephemeralPartition(laneId)
+        : entry.slug ? `persist:agentglass-browser-${entry.slug}`
+        : BROWSER_PARTITION;
+      if (webPreferences.partition !== expected) { e.preventDefault(); return; }
+    }
     if (!applyGuestGuard(webPreferences, params)) e.preventDefault();
+    else armEgress(webPreferences.partition);
   });
 
   win.webContents.on("did-attach-webview", (_e, guest) => {
+    if (opts.lane) laneGuests.add(guest);
     // A guest is its own Chromium process and its key events never reach the
     // renderer, so with a page focused every app shortcut silently stops
     // working — the workspace cannot be switched or closed and the pane is a
@@ -1295,21 +3589,108 @@ function guardWebviews(win) {
       // handled here and swallowed, exactly as a browser does.
       if (mod && (input.key === "+" || input.key === "=" || input.key === "-" || input.key === "0")) {
         event.preventDefault();
-        applyZoom(input.key === "0" ? 0 : guest.getZoomLevel() + (input.key === "-" ? -ZOOM_STEP : ZOOM_STEP));
+        applyZoom(input.key === "0" ? 0 : stepZoom(guest.getZoomLevel(), input.key === "-" ? -1 : 1));
         return;
       }
-      const jumpsOut = (mod && /^[1-9]$/.test(input.key))
-        || (mod && input.key.toLowerCase() === "w")
-        || input.key === "Escape";
+      /*
+       * The chords a browser owns, which a bare guest has none of.
+       *
+       * The note above this handler used to say Ctrl+L, Ctrl+F "and the rest
+       * still mean what they mean in a browser" inside the page. They do not:
+       * a guest is a page, not a browser — there is no chrome in there to
+       * reload it, open a tab or focus an address bar, so every one of these
+       * did nothing at all while a page had the focus, which is most of the
+       * time somebody is using this view.
+       *
+       * Two kinds, and they are handled differently on purpose. Reloading and
+       * going back are the GUEST's own business: done here, swallowed, and the
+       * focus stays on the page — routing them through the renderer would cost
+       * a round trip and take the caret off whatever you were doing. A new tab,
+       * the address bar and the find strip are the APP's chrome: they go to the
+       * renderer by name, and the window is focused first, because all three
+       * end with a caret in a box that must be able to receive it.
+       */
+      const key = input.key.length === 1 ? input.key.toLowerCase() : input.key;
+      if ((mod && key === "r") || key === "F5") {
+        event.preventDefault();
+        // Shift is the usual way to ask for it; Ctrl+F5 is the other one, and a
+        // browser that only knows one of them is a browser somebody's hands get
+        // wrong twice a day.
+        if (input.shift || (key === "F5" && mod)) guest.reloadIgnoringCache();
+        else guest.reload();
+        return;
+      }
+      if (input.alt && (key === "ArrowLeft" || key === "ArrowRight")) {
+        event.preventDefault();
+        guestNav(guest, key === "ArrowLeft" ? -1 : 1);
+        return;
+      }
+      // Ctrl+Shift+T: the last tab back, and the one before that. Its own line
+      // because every other chord here is shift-less, and this one IS the shift.
+      // Ctrl+Shift+S: the screenshot tool, which is a thing the panel draws over
+      // the page rather than anything the page itself can do.
+      if (mod && input.shift && key === "s") {
+        event.preventDefault();
+        win.webContents.send("ag:browser-key", "S");
+        return;
+      }
+      if (mod && input.shift && key === "t") {
+        event.preventDefault();
+        win.webContents.send("ag:browser-key", "T");
+        return;
+      }
+      // `s` and `w` as well. The bar is this app's chrome and Ctrl+S saves
+      // nothing here — there is no document — so the chord is free; and closing
+      // a tab is a thing the panel does, not the page.
+      if (mod && !input.shift && (key === "t" || key === "l" || key === "f" || key === "s" || key === "w")) {
+        event.preventDefault();
+        // Hiding the bar and closing a tab leave the focus where it was: they
+        // are the ones that do not end with a caret in a box of ours.
+        if (key !== "s" && key !== "w") win.webContents.focus();
+        win.webContents.send("ag:browser-key", key);
+        return;
+      }
+      // `w` used to be here, forwarded as a synthetic key press and landing on
+      // whatever happened to have the focus — which is why closing a tab from a
+      // page worked or did not depending on where you had last clicked. It goes
+      // through the named channel above now, like the rest.
+      /* Ctrl+Alt+A is the app's floating bench, and a guest has to let it out.
+         A page's keys never reach the renderer, so with a page focused the
+         chord did nothing at all — which is the same trap the workspace chords
+         were in, and the reason this list exists. Sent back the same way, so
+         the renderer decides what it means. */
+      const benchChord = mod && input.alt && (input.key || "").toLowerCase() === "a";
+      const jumpsOut = (mod && /^[1-9]$/.test(input.key)) || input.key === "Escape" || benchChord;
       if (!jumpsOut) return;
+      /*
+       * A KEY NO HAND DELIVERED DOES NOT MOVE ANYBODY.
+       *
+       * `press Escape` is one of the commonest verbs an agent runs, and it
+       * arrives here as a real Chromium input event — deliberately, because a
+       * KeyboardEvent built in JavaScript is untrusted and pages ignore it. So
+       * a synthetic Escape took this branch: it was swallowed by
+       * `preventDefault` (the verb never reached the page, which is its whole
+       * job), an Escape was injected into the app's own renderer, closing
+       * whatever panel the person had open, and then `win.webContents.focus()`
+       * raised the window over whatever they were doing.
+       *
+       * A real keystroke can only arrive at a guest that already has focus, so
+       * this costs a person nothing. `sendInputEvent` reaches an unfocused
+       * guest, and that is exactly the case that must not take the screen —
+       * the browser panel is mounted from launch whether or not anybody has
+       * gone to it, so there is always one there to receive it.
+       */
+      try { if (!guest.isFocused()) return; } catch { /* gone: nobody to move */ }
       event.preventDefault();
       win.webContents.sendInputEvent({
         type: "keyDown",
         keyCode: input.key,
-        modifiers: [
+        /* `filter(Boolean)` drops the `false`s at run time; the checker does
+           not read it as a narrowing, hence the cast on the result. */
+        modifiers: /** @type {("control" | "meta" | "shift" | "alt")[]} */ ([
           input.control && "control", input.meta && "meta",
           input.shift && "shift", input.alt && "alt",
-        ].filter(Boolean),
+        ].filter(Boolean)),
       });
       win.webContents.focus();
     });
@@ -1331,9 +3712,23 @@ function guardWebviews(win) {
      * that a page stops being usable in a way that is hard to undo when the
      * controls themselves are too small to hit.
      */
+    /** @param {number} level */
     const applyZoom = (level) => {
       const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
-      guest.setZoomLevel(next);
+      /*
+       * The panel applies it, not this process.
+       *
+       * `guest.setZoomLevel(next)` used to be the line above this one, and it
+       * is measured — twice, in web/src/lib/browserDrive.ts — to do nothing to
+       * a guest: the level goes in, comes back out, and the page keeps the
+       * scale of the window embedding it. So this gesture moved a number and
+       * left the page alone.
+       *
+       * The zoom that works is a device-metrics override on that guest's own
+       * DevTools session, and the panel is where the guest is resolved. Send
+       * the level and let it; a second resolver in this process is how the
+       * capture ended up photographing the wrong tab.
+       */
       win.webContents.send("ag:browser-zoom", next);
       return next;
     };
@@ -1350,14 +3745,49 @@ function guardWebviews(win) {
      * version always did and is right until the first tab switch.
      */
     browserGuests.add(guest);
-    browserGuest = guest;
+    // A lane's guest is addressed by id only. It never becomes the fallback
+    // "front tab": that one must be a page somebody can see.
+    if (!opts.lane) browserGuest = guest;
     guest.once("destroyed", () => {
       browserGuests.delete(guest);
+      guestFavicons.delete(guest);
+      guestOwner.delete(guest.id);
       if (browserGuest === guest) browserGuest = [...browserGuests].pop() ?? null;
     });
 
+    /*
+     * THE FAVICON URLS CHROMIUM ITSELF DECLARED, and nothing else.
+     *
+     * A tab strip painting `<img src="https://some-site/favicon.ico">` is six
+     * CSP violations a launch, because `img-src` allows self, data:, blob:,
+     * loopback and two named hosts — so a favicon from anywhere else is blocked
+     * ALWAYS, not just at boot. The icons never appeared; the strip has been
+     * drawing the globe fallback and the console has been paying for it.
+     *
+     * The bytes are fetched in the shell instead and handed back as `data:`,
+     * which the policy already allows. Widening `img-src` was the other option
+     * and is worse: it would admit every image on the internet to this window
+     * to save a fetch that happens once per tab.
+     *
+     * THE SET IS THE WHOLE SECURITY ARGUMENT. `ag:browserFavicon` will fetch a
+     * URL only if it is in here — put there by Chromium reporting the icon of a
+     * page the guest had already loaded, never by a caller. That is what keeps
+     * this from being the general fetcher `prAsset` refuses to become: there is
+     * no argument an agent can pass that reaches the network.
+     */
+    guest.on("page-favicon-updated", (_e, favicons) => {
+      const set = guestFavicons.get(guest) ?? new Set();
+      for (const u of favicons || []) {
+        if (typeof u === "string" && /^https?:\/\//i.test(u)) set.add(u);
+      }
+      // Bounded: a page that rewrites its icon in a loop must not grow this
+      // without end. Oldest out — the current icon is always the newest.
+      while (set.size > FAVICON_URL_CAP) set.delete(set.values().next().value);
+      guestFavicons.set(guest, set);
+    });
+
     guest.on("zoom-changed", (_e, direction) => {
-      applyZoom(guest.getZoomLevel() + (direction === "in" ? ZOOM_STEP : -ZOOM_STEP));
+      applyZoom(stepZoom(guest.getZoomLevel(), direction === "in" ? 1 : -1));
     });
 
     /*
@@ -1369,22 +3799,418 @@ function guardWebviews(win) {
      * tab it came from. Still `deny`, so Electron never makes a real window of
      * its own; and still through safeGuestUrl, so only http(s) is passed on.
      */
-    guest.setWindowOpenHandler(({ url }) => {
+    /*
+     * A page asking for a window: sometimes a tab, sometimes a real one.
+     *
+     * Everything used to become a tab, and for a link that is right — a
+     * middle-click or a `target="_blank"` belongs beside the page it came from.
+     * For a SIGN-IN it is fatal. Google's, Microsoft's and every SSO flow open
+     * a popup and then talk back to it: `window.opener`, `postMessage`, and a
+     * handle they hold on to. Denying the open hands the page a null, and what
+     * you get is exactly what he saw — six of "[GSI_LOGGER] Failed to open
+     * popup window on url… Maybe blocked by the browser?" and two stray tabs
+     * called "Login" that could never finish anything.
+     *
+     * Chromium already tells the two apart: a `window.open` with width and
+     * height in its features is `new-popup`, and a link is `foreground-tab`. So
+     * a popup gets a real window — same session, so it is signed in as this
+     * profile — and everything else still becomes a tab.
+     */
+    guest.setWindowOpenHandler(({ url, disposition, features }) => {
       const safe = safeGuestUrl(url);
-      if (safe) win.webContents.send("ag:browser-open-tab", safe);
-      return { action: "deny" };
+      if (!safe) return { action: "deny" };
+      /* A `target="_blank"` download link asks for a window, and the file is
+         then requested by the new tab, which nothing armed: the verb timed out
+         with an empty directory. While THIS tab is armed the link is fetched
+         here, by the tab that holds the arming, and no tab opens. A lane takes
+         this branch too: it is where agents run the verb. */
+      if (guestDownloadDir.has(guest)) {
+        guest.downloadURL(safe);
+        return { action: "deny" };
+      }
+      /* A lane has no window a person could see, and a popup would map a real,
+         visible one: denied outright, not left to the webview lacking
+         `allowpopups`. A sign-in that needs a popup fails in a lane. */
+      if (opts.lane) return { action: "deny" };
+      /*
+       * READ THIS BEFORE TRUSTING THE PARAGRAPH ABOVE.
+       *
+       * Turning `// @ts-check` on found that `"new-popup"` is not a value this
+       * app can ever be given: Electron 43 types `disposition` as
+       * `"default" | "foreground-tab" | "background-tab" | "new-window" |
+       * "other"`, and its own documentation lists the same five. Chromium's
+       * NEW_POPUP is not passed through under that name. So the first half of
+       * this test has never once been true, and every popup that has worked
+       * here worked through the "belt and braces" half below.
+       *
+       * Left exactly as it was rather than quietly changed to `"new-window"`:
+       * this decides whether a sign-in gets a real window or becomes a tab, and
+       * which of the five dispositions is the right one is a question to answer
+       * against a real OAuth flow, not against a type. The comparison is
+       * written through `String()` so the checker stops calling it an
+       * impossible one while it stands.
+       */
+      const wantsWindow = String(disposition) === "new-popup"
+        // Belt and braces: some flows do not set a disposition Chromium reads
+        // as a popup, and ask for a size instead. In practice this is the whole
+        // test — see above.
+        || /\b(width|height)=/.test(String(features || ""));
+      if (!wantsWindow) {
+        win.webContents.send("ag:browser-open-tab", safe);
+        return { action: "deny" };
+      }
+      return {
+        action: "allow",
+        /*
+         * SIZE AND NOTHING ELSE.
+         *
+         * The first version passed webPreferences as well — the same hardening
+         * the guest already has, written out again to be explicit. Measured:
+         * the popup opened, Google showed the account chooser, and picking one
+         * ended in "Cross-Origin-Opener-Policy policy would block the
+         * window.postMessage call". Preferences that differ from the opener's
+         * put the child in another process, and a child in another process has
+         * no opener to answer — which is the entire mechanism a sign-in uses to
+         * hand the result back.
+         *
+         * Inheriting is both safer and correct: the guest was hardened by the
+         * guard when it attached (no preload, sandboxed, isolated, its own
+         * partition) and the child gets all of it, including the session — which
+         * is what makes the login land in the profile it was started from.
+         *
+         * No `parent` either. A parented window is another difference from what
+         * these flows are tested against, and being always-above ours is not
+         * worth one more thing that behaves unlike every other browser.
+         */
+        /* TRUE. A sign-in window that dies because the page underneath it
+           navigated is exactly the symptom he described — the verification-code
+           page appearing for a moment and vanishing — and the page underneath a
+           sign-in navigates as a matter of course, because that is what a
+           sign-in does to it. */
+        outlivesOpener: true,
+        overrideBrowserWindowOptions: {
+          width: 520,
+          height: 680,
+          autoHideMenuBar: true,
+          backgroundColor: "#ffffff",
+        },
+      };
+    });
+
+    /*
+     * What happened to the sign-in window, written down.
+     *
+     * A popup that opens, navigates twice and closes leaves nothing behind: the
+     * console is the child's, the child is gone, and all anybody can report is
+     * "it flashed". Three lines in a file turn that into a sequence — which
+     * navigation, and what closed it.
+     *
+     * Append-only, truncated at a hundred kilobytes, and it only ever writes
+     * while a popup exists. Nothing here is on a hot path.
+     */
+    /*
+     * Let a sign-in window talk back to the page that opened it.
+     *
+     * MEASURED, from the log this same handler writes:
+     *
+     *   open  accounts.google.com/o/oauth2/v2/auth…
+     *   nav   accounts.google.com/v3/signin/accountchooser…
+     *   nav   accounts.google.com/signin/oauth/legacy/consent…
+     *   nav   accounts.google.com/gsi/transform
+     *   console  Cross-Origin-Opener-Policy policy would block the
+     *            window.postMessage call.          (twice)
+     *   destroyed
+     *
+     * `gsi/transform` is the last step of Google's flow: the page whose only
+     * job is to postMessage the credential to its opener and close. Chromium
+     * refused, because a Cross-Origin-Opener-Policy header on the way through
+     * had severed the pair — and it severs here and not in Chrome because the
+     * opener is a `<webview>` guest, which lives in a browsing context group of
+     * its own. That is structural; no flag on our side changes it.
+     *
+     * So the header is dropped, and ONLY for windows this app opened as popups
+     * from a guest. Not for tabs, not for anything else in the session: a page
+     * you navigate to keeps every protection it asked for. What is given up is
+     * an isolation guarantee for a window whose entire purpose is to talk to
+     * its opener — and what is bought is that signing in works at all.
+     */
+    const session = guest.session;
+    if (!coopFreed.has(session)) {
+      coopFreed.add(session);
+      session.webRequest.onHeadersReceived((details, callback) => {
+        const id = details.webContentsId;
+        if (id == null || !popupIds.has(id)) { callback({}); return; }
+        const headers = details.responseHeaders || {};
+        let touched = false;
+        for (const name of Object.keys(headers)) {
+          const key = name.toLowerCase();
+          if (key === "cross-origin-opener-policy" || key === "cross-origin-opener-policy-report-only") {
+            delete headers[name];
+            touched = true;
+          }
+        }
+        callback(touched ? { responseHeaders: headers } : {});
+      });
+    }
+
+    /*
+     * S9: `X-Agentglass-Agent`, self-asserted and sent only to a dev origin —
+     * see identify-header.js for what counts as one, and browser-phase3-plan
+     * -2026-09-25.md §S9 for why (D8). Off until `ag:browserSessionSettings`
+     * turns it on for THIS session; nothing here reaches the switch.
+     *
+     * ONE dispatcher per session, same rule the COOP filter just above is
+     * arming for the same reason: Electron keeps only the last
+     * `onBeforeSendHeaders` a session was given, so a second header feature
+     * does not get a second listener — it gets a branch inside this one.
+     */
+    if (!identifyHeaderArmed.has(session)) {
+      identifyHeaderArmed.add(session);
+      session.webRequest.onBeforeSendHeaders((details, callback) => {
+        const owner = identifyEnabled.get(session) && shouldIdentify(details.url) && details.webContentsId != null
+          ? guestOwner.get(details.webContentsId)
+          : undefined;
+        callback(owner
+          ? { requestHeaders: { ...details.requestHeaders, [IDENTIFY_HEADER]: owner } }
+          : {});
+      });
+    }
+
+    guest.on("did-create-window", (child, details) => {
+      // Which windows the rule above applies to: the ones this handler made.
+      const id = child.webContents.id;
+      popupIds.add(id);
+      child.webContents.once("destroyed", () => popupIds.delete(id));
+
+      /** @param {string} what @param {unknown} detail */
+      const note = (what, detail) => {
+        try {
+          const line = `${new Date().toISOString()} ${what} ${String(detail || "").slice(0, 300)}\n`;
+          const file = path.join(app.getPath("userData"), "browser-popups.log");
+          if (fs.existsSync(file) && fs.statSync(file).size > 100_000) fs.writeFileSync(file, "");
+          fs.appendFileSync(file, line);
+        } catch { /* a log nobody can write is not worth an exception */ }
+      };
+      note("open", details.url);
+      const wc = child.webContents;
+      wc.on("did-navigate", (_e, url) => note("nav", url));
+      wc.on("did-navigate-in-page", (_e, url) => note("nav-in-page", url));
+      wc.on("did-fail-load", (_e, code, desc, url) => note("fail", `${code} ${desc} ${url}`));
+      wc.on("console-message", (_e, _lvl, message) => note("console", message));
+      wc.on("destroyed", () => note("destroyed", ""));
+      child.on("closed", () => note("closed", ""));
+    });
+
+    /*
+     * The right button did nothing at all.
+     *
+     * A `<webview>` has no context menu of its own — Chromium's belongs to the
+     * browser around the page, and here that browser is us. So this is built
+     * from what Chromium reports about the spot that was clicked: a link, an
+     * image, a selection, an editable box, and the page itself under all of it.
+     *
+     * Only what this app can actually do. No "save link as" while there is
+     * nowhere for a download to land, no bookmark item while there are no
+     * bookmarks — a menu whose entries do nothing is worse than a short one.
+     * The two that leave the app are named as leaving it, because opening a
+     * page signed in HERE in another browser signed in as somebody else is a
+     * surprise worth spelling out.
+     */
+    guest.on("context-menu", (_e, params) => {
+      const items = browserMenuTemplate(params, {
+        safeUrl: safeGuestUrl,
+        pageUrl: guest.getURL() || "",
+        canBack: canNav(guest, -1),
+        canForward: canNav(guest, 1),
+        on: {
+          openTab: (/** @type {string} */ url) => win.webContents.send("ag:browser-open-tab", url),
+          copyText: (/** @type {string} */ text) => clipboard.writeText(String(text || "")),
+          openExternal: (/** @type {string} */ url) => { void shell.openExternal(url); },
+          copyImage: () => { try { guest.copyImageAt(params.x, params.y); } catch { /* gone */ } },
+          // The engine is a setting and the setting lives in the renderer, so
+          // the TEXT is sent rather than a url built from a second copy of the
+          // choice here, which would drift out of step with Settings.
+          search: (/** @type {string} */ text) => win.webContents.send("ag:browser-search", text),
+          back: () => guestNav(guest, -1),
+          forward: () => guestNav(guest, 1),
+          reload: () => guest.reload(),
+          /* Asked of the PANEL rather than done here: the inspector is a pane
+             in the window now, and the panel is what mounts it. It comes back
+             through ag:browserDevtools with these coordinates. */
+          inspect: () => win.webContents.send("ag:browser-inspect", { x: params.x, y: params.y }),
+        },
+      });
+      // At the pointer, which is where a context menu belongs — unlike the app
+      // menu, which is anchored under the button that opens it.
+      /* browserMenuTemplate lives in browser-menu.js, which is plain JS with no
+         `// @ts-check`: its `type: "separator"` entries infer as `type: string`,
+         which is not the union Electron's template takes. The cast is at the
+         boundary rather than in that file so the menu stays testable there. */
+      Menu.buildFromTemplate(/** @type {import("electron").MenuItemConstructorOptions[]} */ (items)).popup({ window: win });
     });
   });
+}
+
+/*
+ * A LANE HOST: a window nobody sees, where an agent's browser tab lives.
+ *
+ * It loads the same app with `#lane=<id>`, which mounts only a webview and the
+ * browser ask handler, so the driver in browserDrive.ts runs there unchanged.
+ * Measured on Linux/Wayland (Electron 43), a webview guest in the host:
+ *
+ *   show:false             rAF 1/s, Page.captureScreenshot 9/10 time out,
+ *                          capturePage 10/10 time out, screencast 0 frames
+ *   show:false + offscreen rAF 30/s, captureScreenshot p50 100 ms,
+ *                          capturePage p50 33 ms, screencast 59 frames in 2 s
+ *
+ * A hidden window gets no frames because the compositor never asks it for one,
+ * and `backgroundThrottling` does not change that. An offscreen window paints
+ * on its own clock, so the guest inside it does too. `stayHidden` on
+ * capturePage made no difference. Moving a real window off screen was not an
+ * option: a Wayland client cannot place itself, and a window on a workspace
+ * nobody looks at gets no frames either.
+ *
+ * Driven through the CLI in a lane (20 reps, main window on a workspace nobody
+ * looks at): observe p50 83 ms, click 250, fill 83, shot 188, screencast 59
+ * frames in 2 s, none failed on the lane's side.
+ *
+ * Ceilings: offscreen paints in software (no GPU for the guest); one webview
+ * per host; and a page the guest navigates to reports visibilityState "hidden"
+ * (the first document is "visible", the new process after a cross-site load
+ * is not, and neither setBackgroundThrottling(false), startPainting, focus
+ * emulation nor a lifecycle override changed it), so a page that pauses when
+ * hidden will pause here though it keeps painting.
+ *
+ * The server decides how many lanes there may be and which are idle
+ * (server/src/lanes.ts); this is only the window, made and destroyed when the
+ * app's own renderer asks (`ag:laneOpen`, `ag:laneClose`). The count and the
+ * memory are capped here too, because this is where they are spent.
+ */
+const LANE_FRAME_RATE = 30;
+const LANE_MAX = 4;
+/** Working set of every lane's processes together, in MB. A lane is a renderer
+ *  plus a guest; software paint makes an animated page dear. */
+const LANE_RSS_MB = Number(process.env.AGENTGLASS_LANE_RSS_MB) || 2048;
+/** id -> its window, its guest, and its container. Ids are what the server minted.
+ *  @type {Map<string, { host: Electron.BrowserWindow, guest: Electron.WebContents | null, slug: string, private: boolean, ephemeral: boolean }>} */
+const laneHosts = new Map();
+
+/** Clear an in-memory ephemeral partition's storage and cache — a lane's fork
+ *  (`destroyLaneHost`, below) and a tab's (`ag:tabEphemeralClose`, further
+ *  down) share this rather than each clearing it their own way: same shape,
+ *  same reason. Nothing was ever on disk — the partition carries no
+ *  `persist:` prefix — but the cookies/storage the fork wrote, and anything
+ *  it fetched, are still live in this process's memory under that name until
+ *  this runs.
+ *  @param {string} partition */
+function wipeEphemeralPartition(partition) {
+  const ses = session.fromPartition(partition);
+  void ses.clearStorageData().then(() => ses.clearCache()).catch(() => { /* already gone with the window */ });
+}
+
+/**
+ * Ephemeral TAB partitions the app's OWN window may attach a guest on right
+ * now — `newtab --from-template`'s visible-tab twin of a lane's ephemeral
+ * fork. Minted one at a time by `ag:tabEphemeralOpen`, held until
+ * `ag:tabEphemeralClose` wipes it and drops the entry.
+ *
+ * A lane's ephemeral partition is never in here, and that is the point of two
+ * tables rather than one shared set: the app's own window still cannot
+ * attach on a LANE's fork by guessing its id, only on one it minted for
+ * itself. See `mayAttachOnMainWindow` in guest-guard.js, which reads this.
+ * @type {Set<string>} */
+const tabEphemerals = new Set();
+/** Generous next to `LANE_MAX` (4): a tab costs no hidden window, just a jar. */
+const TAB_EPHEMERAL_MAX = 8;
+
+/** Combined working set of the lanes' processes, in MB. */
+/* CEILING: this is checked when a lane opens, not while it runs. A lane on a
+   heavy animated page can grow past the cap after it opened, and nothing stops
+   it short of `lane close`, the idle TTL, or the app. */
+function laneRssMb() {
+  const pids = new Set();
+  for (const l of laneHosts.values()) {
+    for (const wc of [l.host.isDestroyed() ? null : l.host.webContents, l.guest && !l.guest.isDestroyed() ? l.guest : null]) {
+      const pid = wc?.getOSProcessId?.();
+      if (pid) pids.add(pid);
+    }
+  }
+  let kb = 0;
+  for (const m of app.getAppMetrics()) if (pids.has(m.pid)) kb += m.memory?.workingSetSize ?? 0;
+  return kb / 1024;
+}
+
+/**
+ * @param {string} id
+ * @param {string} slug the container the lane browses in: a profile id, "" for
+ *   the person's own, or the lane's own id for a private one. Meaningless
+ *   (and always "") when `ephemeral` is true.
+ * @param {boolean} [ephemeral] S6: a `lane new --from-template` fork. Its
+ *   partition carries no `persist:` prefix at all — Electron keeps such a
+ *   session in memory only, so unlike a private lane there is nothing on disk
+ *   to wipe when it closes, only a crash that leaves nothing behind either.
+ */
+function createLaneHost(id, slug, ephemeral) {
+  const host = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 800,
+    title: `agentglass lane ${id}`,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      webviewTag: true,
+      offscreen: true,
+      backgroundThrottling: false,
+    },
+  });
+  host.webContents.setFrameRate(LANE_FRAME_RATE);
+  guardWebviews(host, { lane: true, laneId: id });
+  const entry = /** @type {NonNullable<ReturnType<typeof laneHosts.get>>} */
+    ({ host, guest: null, slug, private: !ephemeral && slug === id, ephemeral: !!ephemeral });
+  host.webContents.on("did-attach-webview", (_e, guest) => { entry.guest = guest; });
+  laneHosts.set(id, entry);
+  host.once("closed", () => { laneHosts.delete(id); });
+  host.loadURL(`${APP_ORIGIN}/#lane=${encodeURIComponent(id)}${ephemeral ? "&t=eph" : slug ? `&p=${slug}` : ""}`);
+  return host;
+}
+
+/** @param {Electron.WebContents} wc */
+const isLaneHost = (wc) => [...laneHosts.values()].some((l) => !l.host.isDestroyed() && l.host.webContents === wc);
+
+/** Destroy a lane's window, and its cookie jar when the lane was the only one who had it.
+ *  @param {string} id */
+function destroyLaneHost(id) {
+  const l = laneHosts.get(id);
+  if (!l) return false;
+  laneHosts.delete(id);
+  if (!l.host.isDestroyed()) l.host.destroy();
+  if (l.ephemeral) {
+    // See `wipeEphemeralPartition`: nothing on disk to begin with, but the
+    // template's cookies/storage/cache are still live in this process's
+    // memory under that name until this runs.
+    wipeEphemeralPartition(ephemeralPartition(id));
+  } else if (l.private) {
+    /* A private lane's jar is its own and nobody can come back to it: wiped, not
+       left on disk under a name that says nothing. */
+    const ses = session.fromPartition(`persist:agentglass-browser-${l.slug}`);
+    void ses.clearStorageData().then(() => ses.clearCache()).catch(() => { /* the profile dir goes on its own */ });
+  }
+  return true;
 }
 
 function createWindow() {
   const st = readWindowState();
   const place = onSomeDisplay(st, screen) ? { x: st.x, y: st.y } : {};
+  windowBg = st.bg;
+  windowBgSystem = st.bgSystem;
+  const ground = st.bgSystem ? (nativeTheme.shouldUseDarkColors ? st.bgSystem.dark : st.bgSystem.light) : st.bg;
   const win = new BrowserWindow({
     width: st.width,
     height: st.height,
     ...place,
-    backgroundColor: "#0f0a1a",
+    // Until a theme has been painted once: the ground a first run opens on,
+    // Graphite's or Porcelain's by the OS, as the page's own first run does.
+    backgroundColor: ground || (nativeTheme.shouldUseDarkColors ? "#1e1e1e" : "#ffffff"),
     title: "agentglass",
     autoHideMenuBar: true,
     /*
@@ -1447,21 +4273,92 @@ function createWindow() {
   win.loadURL(`${APP_ORIGIN}/`);
   mainWindow = win;
 
+  /* A reload starts the renderer's tab list over from `saveSession` — which
+     never carries `partition` — so every ephemeral tab this window still had
+     is orphaned the instant the page reloads: `tabEphemerals` still names
+     them, but nothing in the new renderer can ever ask to close one. Wiped
+     here rather than left for the process to exit; harmless on the FIRST
+     load too, since the Set starts empty. */
+  win.webContents.on("did-finish-load", () => {
+    for (const p of tabEphemerals) wipeEphemeralPartition(p);
+    tabEphemerals.clear();
+  });
+
   // Saved on every settle rather than only on close: a crash, a kill or a
   // reboot are exactly the times you would most like the window to come back
   // where it was. Debounced, because a drag or a resize fires continuously.
-  let saveTimer = null;
+  /* `undefined` rather than `null` as the empty value, so the type is the one
+     setTimeout hands back and clearTimeout takes. Both are a no-op on nothing;
+     only the checker can tell them apart. */
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let saveTimer;
   const remember = () => {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => saveWindowState(win), 400);
   };
-  for (const ev of ["resize", "move", "maximize", "unmaximize", "enter-full-screen", "leave-full-screen"]) {
-    win.on(ev, remember);
-  }
+  /* Listed rather than looped, for the reason spelled out beside the winState
+     subscriptions above — and because a `for (const ev of [...])` gives tsc a
+     `string` where each `on()` overload wants its own literal. */
+  win.on("resize", remember);
+  win.on("move", remember);
+  win.on("maximize", remember);
+  win.on("unmaximize", remember);
+  win.on("enter-full-screen", remember);
+  win.on("leave-full-screen", remember);
+  /* The one transition worth a line of its own. `resize` fires continuously
+     during a drag and would drown the file; leaving maximised happens once. */
+  win.on("unmaximize", () => noteWindow("unmaximize", win));
+  win.on("leave-full-screen", () => noteWindow("leave-full-screen", win));
+  /*
+   * And what the relaunch made of the saved state.
+   *
+   * Every install of this app kills the running one and reopens it, so a window
+   * that "changed on its own" may simply be a new window that came back
+   * differently. `maximize()` above runs before the window is shown, and a
+   * window manager is free to ignore it that early — measured here rather than
+   * assumed, and re-asserted once if it did not take.
+   */
+  win.once("ready-to-show", () => {
+    noteWindow(`opened wanted-max=${st.max === true}`, win);
+    if (st.max && !win.isMaximized() && !win.isFullScreen()) {
+      askedAt = Date.now();
+      win.maximize();
+      noteWindow("re-maximised after open", win);
+    }
+  });
   // And once more on the way out, unthrottled: the debounce would otherwise be
   // cancelled by the process ending.
   win.on("close", () => { clearTimeout(saveTimer); saveWindowState(win); });
-  win.on("closed", () => { if (mainWindow === win) mainWindow = null; });
+  /*
+   * THE MOUSE'S BACK BUTTON NEVER REACHES THE PAGE.
+   *
+   * Chromium routes the thumb buttons to the embedder as an APP COMMAND, not
+   * as a DOM event: a renderer listening for `auxclick` waits for something
+   * that is never dispatched, which is exactly what the first attempt at this
+   * did. The window is the only place the press can be read.
+   *
+   * Forwarded as an intention rather than acted on here — what "back" means is
+   * a question about the view on screen, and the shell has no idea which one
+   * that is. A renderer with nothing to go back to ignores it, which is what
+   * the press did before.
+   */
+  win.on("app-command", (e, cmd) => {
+    if (cmd !== "browser-backward" && cmd !== "browser-forward") return;
+    /* Prevented, or Chromium follows it with a history navigation of its own
+       on a window whose history is the app itself. */
+    e.preventDefault();
+    try { win.webContents.send("ag:app-back", { back: cmd === "browser-backward" }); } catch { /* gone */ }
+  });
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+    /* A lane host is a window too: left alive, closing the app's window would
+       not end the app, which would keep running with nothing on screen. */
+    for (const id of Array.from(laneHosts.keys())) destroyLaneHost(id);
+    // Every ephemeral tab this window held goes with it — the same reason a
+    // reload wipes them above, and the window is not coming back with them.
+    for (const p of tabEphemerals) wipeEphemeralPartition(p);
+    tabEphemerals.clear();
+  });
 }
 
 /**
@@ -1473,11 +4370,22 @@ function createWindow() {
  * one look at the lock and exit in silence. `show` is what crosses workspaces;
  * `restore` alone leaves a minimised window minimised.
  */
-app.on("second-instance", () => {
+app.on("second-instance", (_event, argv) => {
+  // A link clicked in a browser arrives as the argv of a second launch, which
+  // this process then refuses — so the link has to be taken off it here or it
+  // dies with that process.
+  const link = deepLinkFrom(argv);
+  if (link) offerDeepLink(link);
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+});
+
+// macOS hands it over as an event instead of an argument.
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  offerDeepLink(url);
 });
 
 /**
@@ -1504,10 +4412,14 @@ app.on("second-instance", () => {
  * clears. Rebinding those to browser actions would break the pane people spend
  * the most time in, so reload is Ctrl+Shift+R and the rest are function keys.
  */
+/** @param {AppWindow} win */
 function keepUsefulShortcuts(win) {
   win.webContents.on("before-input-event", (e, input) => {
     if (input.type !== "keyDown") return;
     const ctrl = input.control || input.meta;
+    /* Chords only — never a plain key. See noteWindow for why this is here at
+       all and why it stops at the modifiers plus a key name. */
+    if (ctrl || input.alt) lastChord = { at: Date.now(), key: String(input.key).slice(0, 12), ctrl, shift: input.shift, alt: input.alt };
     const hit = () => e.preventDefault();
 
     if (input.key === "F12" || (ctrl && input.shift && input.key.toLowerCase() === "i")) {
@@ -1541,7 +4453,9 @@ function keepUsefulShortcuts(win) {
   });
 }
 
+/** @param {AppWindow} win */
 function openLinksOutside(win) {
+  /** @param {string} url */
   const external = (url) => {
     try {
       const u = new URL(url);
@@ -1578,6 +4492,46 @@ app.whenReady().then(async () => {
   // Removing the menu outright is the only thing that stops that; the handful
   // of accelerators it carried are rebound in keepUsefulShortcuts().
   Menu.setApplicationMenu(null);
+  /*
+   * Claim `agentglass://` with the desktop, so a link on a web page reaches
+   * this app rather than a browser's "no application can open this".
+   *
+   * Only for a packaged install: from a checkout the executable is Electron
+   * itself with this directory as an argument, and registering that would
+   * point the whole scheme at whatever ran last. A developer who wants it
+   * installs the app.
+   */
+  if (app.isPackaged) {
+    try { app.setAsDefaultProtocolClient(APP_SCHEME); } catch { /* a desktop that has no registry for this */ }
+  }
+  // A link that started the app cold: taken before any window exists and
+  // handed over when the renderer asks for it.
+  /*
+   * The egress guard, before any window can attach a guest. Off by the
+   * environment only, and said out loud either way: a browser that reaches
+   * the network directly is the state this app was in for its first year,
+   * not a failure — but it should never be a surprise.
+   */
+  if (String(process.env[EGRESS_ENV] || "on").toLowerCase() === "off") {
+    console.log(`[egress] ${EGRESS_ENV}=off: the browser resolves names itself, and a name is free to answer a private address`);
+  } else {
+    try {
+      const started = await startEgressProxy({ log: (/** @type {string} */ line) => console.log(line) });
+      egress = started;
+      console.log(`[egress] guard listening on ${started.proxyRules}`);
+    } catch (e) {
+      console.error("[egress] the guard could not start; the browser reaches the network directly:", e);
+    }
+  }
+  const coldLink = deepLinkFrom(process.argv.slice(1));
+  if (coldLink) pendingDeepLink = parseDeepLink(coldLink);
+  // The renderer asks once it has mounted, because a message sent to a window
+  // that is still loading is a message nobody hears.
+  ipcMain.handle("ag:takeDeepLink", () => {
+    const held = pendingDeepLink;
+    pendingDeepLink = null;
+    return held;
+  });
   serveApp();
   // Synchronous on purpose: the preload publishes `apiOrigin` as a plain value
   // because web/src/lib/api.ts reads it while its module body runs, before any
@@ -1588,12 +4542,97 @@ app.whenReady().then(async () => {
   // body runs. Turning remote access on makes the token mandatory for *every*
   // caller, the local renderer included — without this the app would lock
   // itself out of its own sidecar the moment the toggle was flipped.
-  ipcMain.on("ag:apiToken", (e) => { e.returnValue = currentToken(); });
+  // Withheld once the sidecar has failed: a window loaded after that would
+  // otherwise send it to whatever holds the port (see reportSidecar).
+  ipcMain.on("ag:apiToken", (e) => { e.returnValue = sidecarFailure ? null : currentToken(); });
+  // The desk's key, to a window's own page and to nothing a window hosts: the
+  // agent browser's guests are webviews, and a page an agent opened must not
+  // be the one thing on this machine that can let its hold go.
+  /* Lanes are made and destroyed by the app's own renderer, at the server's
+     request (server/src/browserdrive.ts, the lane manager). Only that window
+     may: a lane host or a guest asking for another window is not a thing. */
+  ipcMain.handle("ag:laneOpen", (e, id, slug, ephemeral) => {
+    if (!mainWindow || e.sender !== mainWindow.webContents) return { ok: false, error: "only the app window opens lanes" };
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return { ok: false, error: "bad lane id" };
+    if (typeof slug !== "string" || !/^[a-z0-9]{0,16}$/.test(slug)) return { ok: false, error: "bad container" };
+    if (ephemeral !== undefined && typeof ephemeral !== "boolean") return { ok: false, error: "bad ephemeral flag" };
+    if (laneHosts.has(id)) return { ok: false, error: "that lane exists" };
+    if (laneHosts.size >= LANE_MAX) return { ok: false, error: `${LANE_MAX} lanes are already open` };
+    const used = laneRssMb();
+    if (used > LANE_RSS_MB) return { ok: false, error: `the lanes hold ${Math.round(used)} MB (the cap is ${LANE_RSS_MB}); close one` };
+    createLaneHost(id, slug, ephemeral === true);
+    return { ok: true };
+  });
+  /* The server's own list of lanes, on every manager heartbeat: a host it no
+     longer knows (its table row went while no manager could be asked to drop
+     it) is destroyed here, so it cannot sit against the cap for ever. */
+  ipcMain.handle("ag:laneKeep", (e, ids) => {
+    if (!mainWindow || e.sender !== mainWindow.webContents || !Array.isArray(ids)) return 0;
+    let gone = 0;
+    for (const id of Array.from(laneHosts.keys())) if (!ids.includes(id) && destroyLaneHost(id)) gone++;
+    return gone;
+  });
+  ipcMain.handle("ag:laneClose", (e, id) => {
+    if (!mainWindow || e.sender !== mainWindow.webContents) return { ok: false, error: "only the app window closes lanes" };
+    return { ok: typeof id === "string" && destroyLaneHost(id) };
+  });
+  /* `newtab --from-template`: the visible-tab twin of a lane's ephemeral fork.
+     Minted BEFORE the renderer creates the `<webview>`, because `partition`
+     has to be right the first time a guest attaches — `guardWebviews` checks
+     `tabEphemerals` at that exact moment (above) and there is no second
+     chance to widen it after. */
+  ipcMain.handle("ag:tabEphemeralOpen", (e) => {
+    if (!mainWindow || e.sender !== mainWindow.webContents) return { ok: false, error: "only the app window opens tabs" };
+    if (tabEphemerals.size >= TAB_EPHEMERAL_MAX) {
+      return { ok: false, error: `${TAB_EPHEMERAL_MAX} ephemeral tabs are already open — close one first` };
+    }
+    const partition = ephemeralPartition(require("crypto").randomUUID().slice(0, 8));
+    tabEphemerals.add(partition);
+    return { ok: true, partition };
+  });
+  ipcMain.handle("ag:tabEphemeralClose", (e, partition) => {
+    if (!mainWindow || e.sender !== mainWindow.webContents) return { ok: false, error: "only the app window closes tabs" };
+    if (typeof partition !== "string" || !tabEphemerals.has(partition)) return { ok: false };
+    tabEphemerals.delete(partition);
+    wipeEphemeralPartition(partition);
+    return { ok: true };
+  });
+  /* An offscreen window's contents are typed "offscreen", not "window", so a
+     lane host would be handed nothing and could never register: it is our own
+     page in a window we made, which is why it is let in, and only it. */
+  ipcMain.on("ag:deskKey", (e) => { e.returnValue = (e.sender.getType() === "window" || isLaneHost(e.sender)) ? deskKey : null; });
   // Whether there is a server at all, for a window that opened AFTER the give-up
   // — a reload, or a second window. The push in `reportSidecar` only reaches
   // windows that already exist, and a page that reloads five minutes into a
   // dead sidecar would otherwise come up with no idea anything is wrong.
   ipcMain.on("ag:sidecarFailure", (e) => { e.returnValue = sidecarFailure; });
+  // The desk notice, for a window that opened after it was pushed, and the
+  // Retry that claims again. Only on an adopted server: a sidecar of ours has
+  // its key from the pipe.
+  ipcMain.on("ag:deskTaken", (e) => { e.returnValue = deskTaken === null ? null : { port: deskTaken }; });
+  ipcMain.on("ag:retryDesk", () => { if (!sidecar && deskTaken !== null) holdAdoptedDesk(SERVER_PORT, 3000); });
+  /* Asked at CALL time, not captured at load like the line above: the renderer
+     needs this exactly when it does not yet know, and a page that came up
+     before the sidecar would freeze a false forever and go back to asking the
+     network — the /health this exists to remove. */
+  ipcMain.on("ag:sidecarUp", (e) => { e.returnValue = sidecarUp === true; });
+  // The theme's background, on every paint of a theme — see windowBackground.
+  // Painted on the window now, so a resize edge matches, and saved for the next.
+  ipcMain.on("ag:setWindowBackground", (e, color, both) => {
+    // A lane host runs the same theme code and would save ITS bounds as the app window's.
+    if (isLaneHost(e.sender)) return;
+    const bg = windowBackground(color);
+    const dark = both && typeof both === "object" ? windowBackground(both.dark) : null;
+    const light = both && typeof both === "object" ? windowBackground(both.light) : null;
+    const sys = dark && light ? { dark, light } : null;
+    if (!bg || (bg === windowBg && JSON.stringify(sys) === JSON.stringify(windowBgSystem))) return;
+    windowBg = bg;
+    windowBgSystem = sys;
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win || win.isDestroyed()) return;
+    try { win.setBackgroundColor(bg); } catch { /* a window on its way out */ }
+    saveWindowState(win);
+  });
   // The browser element-picker's copy/screenshot, done on the main-process
   // clipboard so it works while the <webview> guest holds focus — the preload
   // explains why navigator.clipboard cannot. Each returns whether it stuck, so
@@ -1630,6 +4669,10 @@ app.whenReady().then(async () => {
   // the window comes up first and the server arrives underneath it.
   createWindow();
   void ensureServer(adopt);
+  /* Never fatal. A window that keeps the machine awake is a convenience; a
+     window that does not open is not one. */
+  try { power.init({ configDir: CONFIG_DIR, apiOrigin: () => apiOrigin, token: () => (sidecarUp ? currentToken() : "") }); }
+  catch (e) { console.error("[power] not started:", e instanceof Error ? e.message : e); }
 });
 
 /**
@@ -1649,6 +4692,8 @@ let stopped = false;
 function stopSidecar() {
   if (stopped) return;
   stopped = true;
+  letDeskGo?.();
+  try { power.shutdown(); } catch { /* nothing held */ }
   killSidecar();
 }
 

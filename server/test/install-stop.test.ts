@@ -17,26 +17,11 @@
 // text would have passed against the broken version too.
 import { describe, expect, test, afterEach } from "bun:test";
 import { readFileSync } from "node:fs";
-import { mkdtempSync, mkdirSync, copyFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { APPCTL, AWAIT_MAIN, fakeInstall } from "./fakeInstall.ts";
 
-const APPCTL = join(import.meta.dir, "..", "..", "electron", "appctl.sh");
-
-/** Wait, inside the shell, for the reopened instance to exist — same reason as
- *  `visible` below, on the other side of the process boundary. */
-const AWAIT_MAIN = 'for _ in $(seq 200); do [ -n "$(main_pids)" ] && break; sleep 0.025; done';
 const spawned: number[] = [];
-
-/** A fake install: our own copy of a shell, named the way the real one is. The
- *  copy matters — /proc/<pid>/exe has to point inside the install directory. */
-function fakeInstall() {
-  const app = mkdtempSync(join(tmpdir(), "agx-install-"));
-  mkdirSync(join(app, "resources"));
-  copyFileSync("/bin/sh", join(app, "agentglass"));
-  copyFileSync("/bin/sh", join(app, "resources", "agentglass-server"));
-  return app;
-}
 
 /**
  * Run a process out of the fake install.
@@ -411,20 +396,20 @@ describe("what survives a reinstall", () => {
   const POLLUTED = {
     AGENTGLASS_TOKEN: "sidecar-token", AGENTGLASS_PORT: "4000", AGENTGLASS_BIND: "0.0.0.0",
     AGENTGLASS_TRUST_LAN: "1", AGENTGLASS_WEB_DIR: "/opt/web", AGENTGLASS_DIE_WITH_PARENT: "1",
-    AGENTGLASS_PTY_SIZE_FILE: "/tmp/pty",
+    AGENTGLASS_PTY_SIZE_FILE: "/tmp/pty", AGENTGLASS_DESK_FD: "3:4242",
   };
-  test("the two lists that hold the seven cannot drift apart", async () => {
+  test("the two lists of derived variables cannot drift apart", async () => {
     // One in bash and one in TypeScript, because they shut different doors —
     // `make desktop-update` from a terminal never goes through the server, and
     // the update button never goes through a clean shell. Different files, same
-    // seven, so the way that fails is somebody adding an eighth to one of them.
+    // list, so the way that fails is somebody adding a variable to one of them.
     const { DERIVED_ENV } = await import("../src/selfupdate.ts");
     const inShell = /APPCTL_DERIVED=\(([^)]*)\)/.exec(CAPTURE)?.[1]?.split(/\s+/).filter(Boolean) ?? [];
     expect([...inShell].sort()).toEqual([...DERIVED_ENV].sort());
     expect(inShell).toContain("AGENTGLASS_TOKEN");
   });
 
-  test("the derived seven do not reach the reopened app, even from the shell", async () => {
+  test("the derived variables do not reach the reopened app, even from the shell", async () => {
     // The bug in one assertion. The replay list never held these; the
     // environment the installer was RUN IN did, and that is what the app
     // inherited. Exported here exactly as server/src/selfupdate.ts used to

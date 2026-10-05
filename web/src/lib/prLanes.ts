@@ -260,10 +260,22 @@ export function fileInLane(p: PrSummary, stake: Stake): Filed {
   }
 
   if (changesAsked) {
+    /*
+     * A re-request moves the ball back, and the sentence has to say so.
+     *
+     * Applying the review and pressing "Re-request review" left this reading
+     * exactly as it had before either happened — "the ball is with you" over
+     * a pull request where it plainly was not, the second the author had
+     * already done both things. `askedAgain` comes from the same
+     * `reviewRequests` GitHub's own ↻ reads.
+     */
+    const again = p.humanReview?.askedAgain;
     return { lane: stake.mine ? "flight" : "others",
       reason: stake.mine
-        ? "Changes were asked for. The ball is with you."
-        : "Changes were asked for. The ball is with the author, not you." };
+        ? (again ? "Changes were asked for, and you've asked them to look again — the ball is with them now."
+          : "Changes were asked for. The ball is with you.")
+        : (again ? "Changes were asked for, and the author has asked for another look."
+          : "Changes were asked for. The ball is with the author, not you.") };
   }
 
   if (stake.mine) {
@@ -291,11 +303,16 @@ export function board(prs: PrSummary[], stakeOf: (p: PrSummary) => Stake): Map<L
  * How many a lane may draw.
  *
  * A lane is allowed to be forty on a bad week, and forty cards in a column is a
- * scroll inside a scroll — worse than the flat list the board replaced. Six
- * keeps every lane on one screen at the sizes this app runs at; the rest are
- * counted, not hidden, and the table is one click away.
+ * scroll inside a scroll — worse than the flat list the board replaced. The
+ * rest are counted, not hidden, and the table is one click away.
+ *
+ * Six was that argument taken too far. On a real board the green lane held
+ * thirteen, so the button appeared with SEVEN left over — and pressing a button to see seven more cards
+ * on a screen with room for them is a click that buys nothing. Twenty is where
+ * a column stops fitting and starts being a list; below that the fold costs
+ * more than it saves.
  */
-export const LANE_CAP = 6;
+export const LANE_CAP = 20;
 
 /* ------------------------------------------------------------------ acting */
 
@@ -322,9 +339,15 @@ export function suggestedAction(p: PrSummary, filed: Filed): Suggested {
    * whose only missing step is a button would be the board answering a question
    * nobody asked.
    */
-  if (filed.lane === "review" && p.reviewDecision === "APPROVED"
+  /* `humanReview`, not `reviewDecision`: GitHub counts the auto-review bot, so
+     this offered "merge" on a pull request no person had read. And never on a
+     stale approval — the reviewer approved a different commit. */
+  if (filed.lane === "review" && p.humanReview?.kind === "approved" && !p.humanReview.stale
     && p.checks.failure === 0 && p.checks.pending === 0 && p.checks.total > 0
     && p.mergeable !== "CONFLICTING") return "merge";
+  /* A conflict is the one thing that has to move first: no amount of reviewing
+     or re-running gets past it, and the button that says so is the useful one. */
+  if (p.mergeable === "CONFLICTING") return "open";
   // Yours and red: the useful press is the one that finds out whether it is
   // flake, and it is the only one of these that does not need a human read.
   if (filed.lane === "blocked" && p.checks.failure > 0) return "rerun";

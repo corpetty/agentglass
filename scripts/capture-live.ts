@@ -69,6 +69,13 @@ async function main() {
       XDG_CONFIG_HOME: join(home, "config"),
       XDG_DATA_HOME: join(home, "data"),
       XDG_CACHE_HOME: join(home, "cache"),
+      /* And the STATE dir, which is where the engine's generated tmux.conf
+         lives. Isolating the config alone is what let a throwaway run rewrite
+         the conf the operator's own engine is running on — measured twice on a
+         real machine, and the reason confPath() now names itself after the
+         config dir. Belt and braces: this run should not even share the file
+         name. */
+      AGENTGLASS_STATE_DIR: join(home, "state"),
       // Its own tmux socket directory, beside the config/data/cache above and
       // for the same reason: this child is a SERVER, and a server with no
       // TMUX_TMPDIR sweeps and lists /tmp/tmux-<uid> — the sessions the user is
@@ -123,7 +130,7 @@ async function main() {
       source: `try{localStorage.setItem('agentglass-theme','graphite');localStorage.setItem('agentglass-theme-mode','dark');localStorage.setItem('agentglass.projectChosen','1');}catch(e){}`,
     });
     await cdp.send("Page.reload");
-    await until(cdp, `document.querySelector('#root')?.children.length`, "the graphite terminal", 25_000);
+    await until(cdp, `document.querySelector('#root')?.children.length && !document.documentElement.classList.contains('ag-covering')`, "the graphite terminal", 25_000);
     await Bun.sleep(2500);
     // 16:9, matching the other workspace panels in capture.ts — the terminal
     // fills its height, so the dashboard's taller viewport would only add floor.

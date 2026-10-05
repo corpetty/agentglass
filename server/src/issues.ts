@@ -18,13 +18,14 @@
 // checkouts and no idea which is which.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { failed } from "./refused.ts";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
 import { gh, ghGraphql } from "./prs.ts";
 import { git, safeAbs } from "./git.ts";
 import { addWorktree, removeWorktree } from "./gitwork.ts";
-import { inScope } from "./config.ts";
+import { inScopeReal } from "./config.ts";
 
 export interface IssueRow {
   number: number;
@@ -38,8 +39,18 @@ export interface IssueRow {
   url: string;
 }
 
+/** One comment under an issue. */
+export interface IssueComment {
+  author: string;
+  body: string;
+  createdAt: string;
+  url: string;
+}
+
 export interface IssueDetail extends IssueRow {
   body: string;
+  /** Oldest first, the newest 50 of a longer thread. */
+  thread: IssueComment[];
   createdAt: string;
   milestone: string | null;
   /** The work started from this issue, if any is still on disk. */
@@ -194,7 +205,7 @@ async function repoOf(root: string): Promise<string | null> {
 export async function listIssues(rootIn: unknown, opts: { state?: string; assignee?: string; search?: string; limit?: number } = {}): Promise<IssuesReport> {
   const root = safeAbs(rootIn);
   if (!root) return { ok: false, issues: [], error: "no directory given" };
-  if (!inScope(root)) return { ok: false, issues: [], error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, issues: [], error: "outside the open project" };
 
   const args = ["issue", "list", "--json", LIST_FIELDS, "--limit", String(Math.min(200, opts.limit ?? 60))];
   // `--state all` rather than two calls: the panel's Open/Closed toggle is a
@@ -211,15 +222,32 @@ export async function listIssues(rootIn: unknown, opts: { state?: string; assign
     const rows = (JSON.parse(r.stdout) as any[]).map((x) => normalise(x, repo, work));
     return { ok: true, issues: rows };
   } catch (e) {
-    return { ok: false, issues: [], error: String(e) };
+    return { ok: false, issues: [], error: failed("issues/list", e, "the issues could not be read") };
   }
+}
+
+/**
+ * The comments `gh issue view --json comments` returns, in the shape the phone
+ * draws. The newest 50, oldest first: a long thread is read from where it
+ * ended, and the rest is one link away on GitHub. A body is cut at 4000
+ * characters so fifty long comments cannot make one answer enormous. A deleted account has no
+ * author, which GitHub itself shows as "ghost".
+ */
+export function threadOf(raw: unknown): IssueComment[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(-50).map((c: any) => ({
+    author: String(c?.author?.login ?? "ghost"),
+    body: String(c?.body ?? "").slice(0, 4000),
+    createdAt: String(c?.createdAt ?? ""),
+    url: String(c?.url ?? ""),
+  }));
 }
 
 export async function issueDetail(rootIn: unknown, numberIn: unknown): Promise<{ ok: boolean; issue?: IssueDetail; error?: string }> {
   const root = safeAbs(rootIn);
   const number = Number(numberIn);
   if (!root || !Number.isInteger(number) || number <= 0) return { ok: false, error: "invalid request" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project" };
 
   const r = await gh(["issue", "view", String(number), "--json", `${LIST_FIELDS},body,createdAt,milestone`], root);
   if (r.code !== 0) return { ok: false, error: r.stderr.trim() || "gh failed" };
@@ -232,13 +260,14 @@ export async function issueDetail(rootIn: unknown, numberIn: unknown): Promise<{
       issue: {
         ...normalise(raw, repo, []),
         body: String(raw.body ?? ""),
+        thread: threadOf(raw.comments),
         createdAt: String(raw.createdAt ?? ""),
         milestone: raw.milestone?.title ?? null,
         work,
       },
     };
   } catch (e) {
-    return { ok: false, error: String(e) };
+    return { ok: false, error: failed("issues/detail", e, "that issue could not be read") };
   }
 }
 
@@ -311,7 +340,7 @@ export async function issuePullRequests(
   const root = safeAbs(rootIn);
   const number = Number(numberIn);
   if (!root || !Number.isInteger(number) || number <= 0) return { ok: false, prs: [], error: "invalid request" };
-  if (!inScope(root)) return { ok: false, prs: [], error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, prs: [], error: "outside the open project" };
 
   const repo = await repoOf(root);
   const [owner, name] = (repo ?? "").split("/");
@@ -423,7 +452,7 @@ export async function startIssue(rootIn: unknown, numberIn: unknown, modeIn: unk
   const number = Number(numberIn);
   const mode = (["worktree", "shell", "claude", "plan", "branch"] as const).find((m) => m === modeIn) ?? "claude";
   if (!root || !Number.isInteger(number) || number <= 0) return { ok: false, error: "invalid request" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project" };
 
   const d = await issueDetail(root, number);
   if (!d.ok || !d.issue) return { ok: false, error: d.error ?? "could not read that issue" };
@@ -505,7 +534,7 @@ export async function claimIssue(rootIn: unknown, numberIn: unknown, comment?: u
   const root = safeAbs(rootIn);
   const number = Number(numberIn);
   if (!root || !Number.isInteger(number)) return { ok: false, error: "invalid request" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project" };
   const a = await gh(["issue", "edit", String(number), "--add-assignee", "@me"], root);
   if (a.code !== 0) return { ok: false, error: a.stderr.trim() || "could not assign it" };
   const text = typeof comment === "string" ? comment.trim() : "";
@@ -521,7 +550,7 @@ export async function commentIssue(rootIn: unknown, numberIn: unknown, body: unk
   const number = Number(numberIn);
   const text = typeof body === "string" ? body.trim() : "";
   if (!root || !Number.isInteger(number) || !text) return { ok: false, error: "invalid request" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project" };
   const r = await gh(["issue", "comment", String(number), "--body", text], root);
   return r.code === 0 ? { ok: true, detail: "Comment posted" } : { ok: false, error: r.stderr.trim() || "could not comment" };
 }
@@ -530,7 +559,7 @@ export async function setIssueState(rootIn: unknown, numberIn: unknown, close: b
   const root = safeAbs(rootIn);
   const number = Number(numberIn);
   if (!root || !Number.isInteger(number)) return { ok: false, error: "invalid request" };
-  if (!inScope(root)) return { ok: false, error: "outside the open project" };
+  if (!inScopeReal(root)) return { ok: false, error: "outside the open project" };
   const r = await gh(["issue", close ? "close" : "reopen", String(number)], root);
   return r.code === 0
     ? { ok: true, detail: close ? "Closed" : "Reopened" }

@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
 import type { ViewId } from "../../../../shared/types.ts";
-import { GitIcon, DiffIcon, DockerIcon, TerminalIcon, ChatIcon, PrIcon, BrowserIcon, FilesIcon, DashIcon, IssuesIcon } from "./icons.tsx";
+import { GitIcon, DiffIcon, DockerIcon, TerminalIcon, ChatIcon, PrIcon, BrowserIcon, FilesIcon, DashIcon, IssuesIcon, LanternIcon, SeatIcon, PluginsIcon } from "./icons.tsx";
 import { HAS_BROWSER } from "../../lib/desktop.ts";
 import { IS_DEMO } from "../../lib/demo.ts";
 
@@ -28,7 +28,10 @@ export type ViewDef = {
    * Which drawer a view is actually IN is the user's, and lives in the rail
    * layout below; this is only where it starts.
    */
-  group?: "utility";
+  /** Which drawer this ships in. "utility" is the bottom one; "hidden" is the
+   *  rail's back pocket — the view still exists and is still reachable from the
+   *  restore menu, it just does not take a seat by default. */
+  group?: "utility" | "hidden";
 };
 
 /** Order is the rail's order, and ⌘1..⌘N index into it.
@@ -66,6 +69,34 @@ export const VIEWS: ViewDef[] = [
   // so leading with it here would only have renumbered the people who never
   // touched it.
   { id: "files", label: "Files", key: "e", icon: FilesIcon, hint: "Browse and search a checkout — and open a file to edit" },
+  // Appended for the same reason Files was — a number already in somebody's
+  // fingers is not worth taking away — and it ships in the bottom drawer for
+  // the reason set out on `group` above: this is a thing you go and LOOK at.
+  // It is a scorecard. It cannot stage, commit, launch or answer anything, and
+  // a seat among the views you WORK in would be a promise the view does not
+  // keep.
+  /*
+   * Appended, same reason as the two above it. Bottom drawer because it is a
+   * thing you go and LOOK at — and the one view whose icon comes to you: it
+   * lights with a count when an agent is stopped on you, from wherever you
+   * are. It was a tab inside Clone called "Crew", which is where nobody found
+   * it and a name that meant nothing: "it makes no sense to me… something outside
+   * the clone, since it is not only about the clone".
+   */
+  { id: "lantern", label: "Lantern", key: "l", icon: LanternIcon, hint: "Who needs you, what every agent is working on, and the way there — it never acts on its own", group: "utility" },
+  /*
+   * Appended last, for the same reason as the three above it, and next to the
+   * Lantern on purpose: the Lantern is the field and never acts; this is the
+   * post that reads it, and it is the one view that CAN be given hands. Two
+   * views rather than one card because "what is happening" and "who is minding
+   * it" are different questions, and a screen answering both answers neither
+   * first.
+   */
+  { id: "seat", label: "Orchestrator", key: "s", icon: SeatIcon, hint: "Who is minding this project: the seat, its last word, and the rules it was seated with", group: "utility" },
+  // Appended, same reason as every entry above it: a number already in
+  // somebody's fingers is not renumbered. Bottom drawer, because it is where
+  // plugins draw rather than a place you work in by default.
+  { id: "plugins", label: "Plugins", key: "x", icon: PluginsIcon, hint: "Panels your plugins draw — drawn by this app, never run in it", group: "utility" },
 ];
 
 export const VIEW_IDS = VIEWS.map((v) => v.id);
@@ -104,9 +135,9 @@ const LEGACY_ORDER_KEY = "agentglass.workspace.order";
 /** What the rail looks like before anyone touches it. Also the server snapshot
  *  for useSyncExternalStore, where localStorage does not exist. */
 export const SHIPPED_RAIL: RailLayout = {
-  work: VIEWS.filter((v) => v.group !== "utility"),
+  work: VIEWS.filter((v) => !v.group),
   utility: VIEWS.filter((v) => v.group === "utility"),
-  hidden: [],
+  hidden: VIEWS.filter((v) => v.group === "hidden"),
 };
 
 /**
@@ -169,9 +200,9 @@ function buildRail(): RailLayout {
     const flat = pick(legacy);
     for (const v of VIEWS) if (!taken.has(v.id)) { taken.add(v.id); flat.push(v); }
     return {
-      work: flat.filter((v) => v.group !== "utility"),
+      work: flat.filter((v) => !v.group),
       utility: flat.filter((v) => v.group === "utility"),
-      hidden: [],
+      hidden: flat.filter((v) => v.group === "hidden"),
     };
   }
 
@@ -180,11 +211,17 @@ function buildRail(): RailLayout {
   const hidden = pick(stored.hidden);
   // A view that shipped after this layout was saved lands in its own drawer, at
   // the end — visible, because a view nobody has had the chance to reject
-  // should not arrive already hidden.
+  // should not arrive already hidden. Unless it SHIPS hidden, which is a
+  // different statement: that one is not new to this person, it is one this
+  // version stopped giving a seat to.
+  //
+  // And a view already placed by a saved layout stays where that person put it.
+  // Shipping something hidden must not reach into a rail somebody arranged;
+  // they can drag it out, or reset.
   for (const v of VIEWS) {
     if (taken.has(v.id)) continue;
     taken.add(v.id);
-    (v.group === "utility" ? utility : work).push(v);
+    (v.group === "utility" ? utility : v.group === "hidden" ? hidden : work).push(v);
   }
   return { work, utility, hidden };
 }

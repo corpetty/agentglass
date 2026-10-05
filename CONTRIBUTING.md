@@ -3,6 +3,12 @@
 Thanks for your interest! This project aims to stay small, fast, and
 dependency-light.
 
+## Plugins
+
+A plugin is its own repository, not a pull request here: write `plugin.json`, push it anywhere `git clone` reaches, and it installs from its URL. [docs/PLUGINS.md](docs/PLUGINS.md) has the manifest, the vocabulary a plugin draws with, and the routes it talks over; `bin/agentglass-plugin validate <folder>` applies the same rules the app applies at install and needs nothing running.
+
+To have one listed in the catalogue this project publishes, open the [List a plugin](https://github.com/SirAllap/agentglass/issues/new?template=plugin_submission.yml) issue. A check clones what you named, validates the manifest and reads the source for a short list of patterns — it never runs your code — and writes what it found on the issue. Listing is not auditing, and the page says so: whoever installs it still approves the scope and the places it draws.
+
 ## Dev setup
 
 ```bash
@@ -33,8 +39,8 @@ python3 hooks/seed_demo.py   # populate with demo data
   and the packaged installer goes stale.
 - **`electron/`** — the Electron desktop shell. It runs the `web/` UI in
   Chromium and brings the Bun server up with it. Note the final frame is
-  **composited on the CPU on Linux** by default (`AGENTGLASS_GPU=1` opts back
-  in), because some GPU/compositor stacks paint the window white. `make desktop`
+  **composited on the GPU on Linux** by default (`AGENTGLASS_GPU=0` falls back
+  to the CPU), because some GPU/compositor stacks paint the window white. `make desktop`
   builds the UI and launches it; `make desktop-dist` packages installers with
   electron-builder (the sidecar is the Bun server compiled standalone, staged in
   via `extraResources`). Linux (AppImage/`.deb`), macOS (`.dmg`), Windows.

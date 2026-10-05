@@ -24,6 +24,11 @@ export interface TmuxPaneRow {
   command: string;
   /** The pane's working directory. */
   path: string;
+  /** The command has exited and tmux kept the pane (`remain-on-exit`): a
+   *  corpse with a status line, not a place anybody can type. */
+  dead?: boolean;
+  /** The pane's own process — the shell, or the command it was born with. */
+  pid?: number;
 }
 
 /** A window with its panes, for a tab strip and split UI. */
@@ -33,18 +38,24 @@ export interface TmuxWindowDetail extends TmuxWindow {
 
 const WINDOW_RE = /^@\d+$/;
 const PANE_RE = /^%\d+$/;
+/** `#{window_layout}`: a checksum, then sizes, offsets, pane ids and braces —
+ *  nothing a shell would read, and nothing else is accepted for `-t` either. */
+export const LAYOUT_RE = /^[0-9a-f]{4},[0-9x,{}\[\]]+$/;
 
 /** One window row for a session, or null when the session is gone. */
 export async function listWindows(name: string): Promise<TmuxWindow[]> {
   if (!validSessionName(name)) return [];
   const r = await tmux([
     "list-windows", "-t", `=${name}`,
-    "-F", "#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_flags}",
+    "-F", "#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_flags}\t#{window_layout}",
   ]);
   if (!r.ok) return [];
   return r.stdout.split("\n").filter(Boolean).map((line) => {
-    const [id, index, name_, active, flags] = line.split("\t");
-    return { id, index: Number(index), name: name_ ?? "", active: active === "1", flags: flags ?? "", ask: undefined, phone: undefined, agent: undefined };
+    const [id, index, name_, active, flags, layout] = line.split("\t");
+    /* How the window is split, in tmux's own words — the one string that
+       brings a window back split the way it was, not merely into as many
+       panes. See tmuxrestore.ts (restoreLayout). */
+    return { id, index: Number(index), name: name_ ?? "", active: active === "1", flags: flags ?? "", ask: undefined, phone: undefined, agent: undefined, ...(layout && LAYOUT_RE.test(layout) ? { layout } : {}) };
   }).filter((w) => WINDOW_RE.test(w.id));
 }
 
@@ -53,12 +64,16 @@ export async function windowPanes(name: string, windowId: string): Promise<TmuxP
   if (!validSessionName(name) || !WINDOW_RE.test(windowId)) return null;
   const r = await tmux([
     "list-panes", "-t", `=${name}:${windowId}`,
-    "-F", "#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}",
+    "-F", "#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}\t#{pane_pid}",
   ]);
   if (!r.ok) return null;
   return r.stdout.split("\n").filter(Boolean).map((line) => {
-    const [id, index, active, command, path] = line.split("\t");
-    return { id, index: Number(index), active: active === "1", command: command ?? "", path: path ?? "" };
+    const [id, index, active, command, path, dead, pid] = line.split("\t");
+    const n = Number(pid);
+    return {
+      id, index: Number(index), active: active === "1", command: command ?? "", path: path ?? "",
+      ...(dead === "1" ? { dead: true } : {}), ...(Number.isInteger(n) && n > 1 ? { pid: n } : {}),
+    };
   }).filter((p) => PANE_RE.test(p.id));
 }
 
@@ -76,8 +91,10 @@ export async function windowTree(name: string): Promise<TmuxWindowDetail[]> {
 
 /** The command a pane starts with. Same `sh`-wrapped, exit-surviving shape the
  *  chat engine uses (newSessionArgv), so a tool that exits leaves the pane
- *  alive with a line saying so instead of vanishing mid-layout. */
-function paneCommand(argv: string[]): string {
+ *  alive with a line saying so instead of vanishing mid-layout. A named agent
+ *  started with `--keep` runs in it too (agentops.ts), and is read as ended
+ *  once the `sleep` has taken over (`KEPT_EXITED`). */
+export function paneCommand(argv: string[]): string {
   if (!argv.length) return "";
   const quoted = argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
   return `${quoted}; printf '\\n[agentglass] the CLI exited (%s). This pane is kept for inspection.\\n' "$?"; exec sleep 86400`;

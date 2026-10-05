@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { MIN_BOX } from "../lib/iconSize.ts";
 // The column beside the diff, scoped to the file under the cursor.
 //
 // Everything here was already in the pull request and in another tab. What it
@@ -19,8 +20,10 @@ import { useMemo } from "react";
 import type { PrDetail } from "../../../shared/types.ts";
 import { railScan, checksAbout, threadsAbout, queuedOn, heldOn, railAge,  railPreview, type RailDraft, type RailHeld, type RailMention } from "../lib/fileRail.ts";
 import { openExternal } from "../lib/externalUrl.ts";
-import { mergeBlockedWhy, checksLine, checksStanding, standingLine, mergeVerdict } from "../../../shared/mergeReason.ts";
+import { mergeBlockedWhy, checksLine, checksStanding, standingLine, mergeVerdict, githubWillMerge } from "../../../shared/mergeReason.ts";
+import { mergeBlockers, mergeRefusal } from "../../../shared/mergeBlockers.ts";
 import { ICON } from "../lib/iconSize.ts";
+import { CircleIcon, CommentIcon, CrossIcon, DoneIcon, IconLabel } from "../lib/glyphIcons.tsx";
 
 /** How your own last verdict reads back, and in what colour. Its own map so the
  *  three states are spelled once — the buttons above already spell them as
@@ -65,8 +68,12 @@ const QUOTE_CODE = {
  * four of them stacked, and a 26px square would make the provenance line taller
  * than the quote it belongs to. 20 clears the 14px glyph with room and keeps the
  * entry's shape.
+ *
+ * The number itself moved to `iconSize.ts` as `MIN_BOX`, where the rest of this
+ * question already lived — it was declared here, alone, and the file that owns
+ * the floor had never heard of it.
  */
-const JUMP_BOX = 20;
+const JUMP_BOX = MIN_BOX;
 
 /** Past this the list stops being readable at 300px and the Conversation tab is
  *  the better place to be. */
@@ -169,8 +176,9 @@ export function FileRail({
    * The review note being written, and a way to write it.
    *
    * The rail used to carry the three verdicts and the Submit and no field, so
-   * everything except an approval bounced you to another tab — "si quiero hacer
-   * la review desde aquí no tengo input para meter texto, entonces es inútil".
+   * everything except an approval bounced you to another tab. A rail you can
+   * finish a review from except when you have something to say is a rail you
+   * leave every time.
    *
    * It is the SAME draft the Review tab holds, not a second one: two boxes with
    * two bodies is a way to lose the one you typed in the other.
@@ -202,7 +210,13 @@ export function FileRail({
   const queued = useMemo(() => queuedOn(drafts, path), [drafts, path]);
   const heldHere = useMemo(() => heldOn(held, path), [held, path]);
   const standing = checksStanding(d.checks, awaitingChecks);
-  const allClear = d.mergeState === "CLEAN" && standing === "green";
+  /* The ranked reasons Overview lists, so the short version names the same
+     first one — a locked base included — instead of the first two failing
+     checks it happened to meet. And green is not green under a refusal. */
+  const blockers = useMemo(() => mergeBlockers({ ...d, openThreads: d.threads.filter((t) => !t.isResolved).length, awaitingChecks }),
+    [d, awaitingChecks]);
+  const refusal = mergeRefusal(blockers, d.mergeState);
+  const allClear = githubWillMerge(d.mergeState) && standing === "green" && !refusal;
   /*
    * Whether GitHub will take it, which is a different question from whether the
    * checks are green — and asking only the second one is how this box said
@@ -222,10 +236,12 @@ export function FileRail({
    * behind its base is still worth a press with a warning. Behind is a reason,
    * so it must not read as "nothing is blocking it".
    */
-  const willTake = d.mergeState === "CLEAN";
+  const willTake = githubWillMerge(d.mergeState);
   /* Not `verdict` — that name is already the review's, three lines up in the
      props, and this is the merge's. */
-  const { line: mergeLine } = mergeVerdict(d.mergeState, d.checks, awaitingChecks);
+  const { line: verdictLine, blocked } = mergeVerdict(d.mergeState, d.checks, awaitingChecks);
+  const first = blockers.find((b) => b.weight === "blocks" && b.kind !== "behind");
+  const mergeLine = refusal?.title ?? (blocked && first ? first.title : verdictLine);
   const under = standingLine(standing) ?? (allClear ? checksLine(d.checks) : null);
   /* What GitHub cut off. Every "nothing" below is a claim about the page that
      came back, not about the pull request: `truncated.comments` is the number
@@ -239,9 +255,9 @@ export function FileRail({
   /* Only the verdicts the caller actually wired, in the Review tab's own
      spelling and order so the two surfaces are one control in two places. */
   const verdicts = [
-    { id: "approve" as const, label: "✓ Approve", tint: "var(--success)", on: onApprove },
-    { id: "request_changes" as const, label: "✕ Request changes", tint: "var(--error)", on: onRequestChanges },
-    { id: "comment" as const, label: "💬 Comment", tint: "var(--text)", on: onComment },
+    { id: "approve" as const, label: <IconLabel icon={<DoneIcon size={ICON.xs} />}>Approve</IconLabel>, tint: "var(--success)", on: onApprove },
+    { id: "request_changes" as const, label: <IconLabel icon={<CrossIcon size={ICON.xs} />}>Request changes</IconLabel>, tint: "var(--error)", on: onRequestChanges },
+    { id: "comment" as const, label: <IconLabel icon={<CommentIcon size={ICON.xs} />}>Comment</IconLabel>, tint: "var(--text)", on: onComment },
   ].filter((v) => !!v.on);
   const armed = verdicts.length > 0 || !!onSubmit;
   /* Your own last review on this pull request, newest first. GitHub keeps every
@@ -434,7 +450,7 @@ export function FileRail({
                      second place to read the same output. */
                   <button key={check.name} onClick={onGoChecks} title="Open the log"
                     className="flex w-full items-baseline gap-1.5 text-left text-[11px] mb-1 last:mb-0">
-                    <span style={{ color: "var(--error)" }}>✕</span>
+                    <span className="flex" style={{ color: "var(--error)" }}><CrossIcon size={ICON.xs} /></span>
                     <span className="min-w-0 truncate" style={{ color: "var(--text2)" }}>{check.name}</span>
                     {/* Said only when it is true. A check carries a name and no
                         log, so most of the time we cannot know which file broke
@@ -617,7 +633,7 @@ export function FileRail({
           that there are more of them and where. */}
       <Sec title="Merge">
         <div className="text-[11px]" style={{ color: allClear ? "var(--success)" : "var(--warning)" }}>
-          {allClear ? `✓ ${mergeLine}` : `◯ ${mergeLine}`}
+          <IconLabel icon={allClear ? <DoneIcon size={ICON.xs} /> : <CircleIcon size={ICON.xs} />}>{mergeLine}</IconLabel>
         </div>
         {/* What the checks add up to, the mockup's "44 of 45 in". `standingLine`
             speaks when nothing has reported; the count only when the line above
@@ -625,7 +641,8 @@ export function FileRail({
             `mergeBlockedWhy`, and "1 check still running" twice in two lines is
             how a box starts reading like a form letter. */}
         {under && <p className="m-0 mt-1 text-[10px]" style={{ color: "var(--text4)" }}>{under}</p>}
-        <button onClick={onMerge} disabled={!canMerge || busyWhat === "Merge"}
+        <button onClick={onMerge} disabled={!canMerge || !!refusal || busyWhat === "Merge"}
+          title={refusal ? `${refusal.title} — ${refusal.detail}` : undefined}
           className="agx-btn w-full mt-2 rounded-md py-1 text-[10.5px] inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
           style={{ background: allClear ? "var(--primary)" : "transparent", color: allClear ? "var(--bg)" : "var(--text2)", border: edge(20) }}>
           {/* "anyway" is a word about overriding something. With nothing to

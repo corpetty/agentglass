@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SettingRow } from "./SettingRow.tsx";
 import { api } from "../lib/api.ts";
+import { usePoll } from "../lib/usePoll.ts";
 import { qrMatrix, qrSvgPath } from "../lib/qr.ts";
 import { fmtAgo } from "../lib/format.ts";
 import type { DeviceScope, PairedDevice, PairRequest, PairState } from "../../../shared/types.ts";
+import { CopyIcon, DoneIcon, IconLabel, PhoneIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 /**
  * Adding a phone, from the machine's side.
@@ -81,12 +84,12 @@ export function PairPanel({ baseUrl, variant = "hero", onPaired }: {
 
   useEffect(() => {
     poll();
-    const t = setInterval(poll, 2000);
     // A second timer only for the countdown, so the digits tick every second
     // without asking the server sixty times a minute.
     const c = setInterval(() => setNow(Date.now()), 1000);
-    return () => { clearInterval(t); clearInterval(c); };
+    return () => clearInterval(c);
   }, [poll]);
+  usePoll(true, poll, 2000);
 
   // Closing the pane closes the invitation. A QR left live because a window was
   // shut is exactly the code somebody scans off a screenshot later.
@@ -139,7 +142,7 @@ export function PairPanel({ baseUrl, variant = "hero", onPaired }: {
       className="t-mono text-[10.5px] text-left px-2 py-1.5 rounded-lg break-all w-full hover:opacity-80 flex items-center gap-2"
       style={{ color: "var(--text)", background: "color-mix(in srgb, var(--bg) 70%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 50%, transparent)" }}>
       <span className="flex-1 min-w-0">{cmd}</span>
-      <span className="shrink-0 text-[10px]" style={{ color: copiedCmd === cmd ? "var(--success)" : "var(--text3)" }}>{copiedCmd === cmd ? "✓ copied" : "⧉ copy"}</span>
+      <span className="shrink-0 text-[10px]" style={{ color: copiedCmd === cmd ? "var(--success)" : "var(--text3)" }}>{copiedCmd === cmd ? <IconLabel icon={<DoneIcon size={ICON.xs} />}>copied</IconLabel> : <IconLabel icon={<CopyIcon size={ICON.xs} />}>copy</IconLabel>}</span>
     </button>
   );
 
@@ -226,7 +229,7 @@ export function PairPanel({ baseUrl, variant = "hero", onPaired }: {
              for — opening Settings should not burn a two-minute invitation — so
              what fills the pane is the ask, not a ticking code. */
           <div className="flex flex-col items-center text-center gap-2 py-6">
-            <span className="text-[26px] leading-none" aria-hidden>📱</span>
+            <span className="flex" aria-hidden><PhoneIcon size={ICON.xl} /></span>
             <span className="text-[15px]" style={{ color: "var(--text)" }}>
               {busy ? "Starting…" : "Put this on your phone"}
             </span>
@@ -373,7 +376,7 @@ function Request({ req, busy, onDecide }: {
 /** The three levels, in the words that say what changes rather than what the
  *  field is called. See server/src/devices.ts for why there are only three. */
 const SCOPES: { key: DeviceScope; title: string; what: string }[] = [
-  { key: "answer", title: "Answer things", what: "Everything below, plus approving gates and replying to a session that is already running. What a phone is for." },
+  { key: "answer", title: "Answer things", what: "Everything below, plus approving gates and replying to a chat that is open now. A tool call in a chat it sent the turn to needs another device or the desk. What a phone is for." },
   { key: "read", title: "Look only", what: "Sessions, costs, changes, pull requests. It cannot approve anything or send anything." },
   { key: "full", title: "Everything this machine can do", what: "A terminal, git write access, docker control, merging pull requests. Give this to a laptop you trust, not to a phone." },
 ];

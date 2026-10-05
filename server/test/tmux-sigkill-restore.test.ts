@@ -35,6 +35,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { TEST_TERM } from "./tmuxTerm.ts";
+import { freePort } from "./freePort.ts";
 
 /*
  * Short, for the 108-byte unix socket path limit — a pid is five or six of
@@ -119,6 +120,9 @@ const serverEnv = () => ({
   LANG: process.env.LANG ?? "C.UTF-8",
   TMUX_TMPDIR: TMPDIR,
   XDG_CONFIG_HOME: dir,
+  // State (audit log, ledgers, engine conf) jailed too: without this a booted
+  // server writes into the developer's real ~/.local/state/agentglass.
+  AGENTGLASS_STATE_DIR: `${dir}/state`,
   AGENTGLASS_ROOT: dir,
   AGENTGLASS_DB: join(dir, "f.db"),
   AGENTGLASS_SCAN_DISABLED: "1",
@@ -164,7 +168,7 @@ beforeAll(async () => {
 
   dir = join(TMPDIR, "agx-server");
   mkdirSync(dir, { recursive: true });
-  port = 4930 + Math.floor(Math.random() * 20);
+  port = await freePort();
   server = await startServer();
 }, 60_000);
 

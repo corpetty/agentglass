@@ -88,6 +88,9 @@ describe("deny by default", () => {
     "/git/status",
     // What a phone is for: answering something that is already asked.
     "/gate/decide", "/chat/send", "/chat/pane/key",
+    // Saying something has been read, which moves a badge on the other devices
+    // and nothing else.
+    "/marks",
     // `/push/subscribe`, `/push/unsubscribe` and `/push/test` were here, for a
     // device managing its own notifications. Web Push is gone and the phone
     // hears alerts on the socket it already holds, which is a read — so the
@@ -213,6 +216,7 @@ describe("the pairing routes themselves", () => {
       "/otlp/v1/traces": "append-only OTel sink, same reason",
       "/v1/logs": "append-only OTel sink, same reason",
       "/otlp/v1/logs": "append-only OTel sink, same reason",
+      "/agents/status": "a hooked session saying what it works on, asked for by the Lantern reminder — it has no secret to carry, and this replaces one row and raises nothing",
     };
     const FROM_ANYWHERE: Record<string, string> = {
       "/health": "answers a fixed shape, so a shell — or a phone that is not paired yet — can find which server owns the port",

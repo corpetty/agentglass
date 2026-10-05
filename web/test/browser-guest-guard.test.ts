@@ -36,14 +36,16 @@ const guard: {
   BROWSER_PARTITION: string;
   BROWSER_PARTITION_RE: RegExp;
   isBrowserPartition: (p: unknown) => boolean;
+  isEphemeralPartition: (p: unknown) => boolean;
   safeGuestUrl: (src: unknown) => string | null;
   applyGuestGuard: (
     webPreferences: Record<string, unknown>,
     params: Record<string, unknown>,
   ) => boolean;
+  mayAttachOnMainWindow: (partition: unknown, tabEphemerals: ReadonlySet<string>) => boolean;
 } = load("../../electron/guest-guard.js");
 
-const { BROWSER_PARTITION, isBrowserPartition, safeGuestUrl, applyGuestGuard } = guard;
+const { BROWSER_PARTITION, isBrowserPartition, isEphemeralPartition, safeGuestUrl, applyGuestGuard, mayAttachOnMainWindow } = guard;
 
 /** What Electron hands the handler: the preferences it is about to build the
  *  guest from, and the tag's attributes. Both are the renderer's to write, which
@@ -125,6 +127,54 @@ describe("which partition a guest may attach on", () => {
   });
 });
 
+describe("the ephemeral (S6 fork-per-task) family", () => {
+  // `lane new --from-template` seeds a lane in a jar that never touches disk:
+  // no `persist:` prefix at all, so a crash leaves nothing behind — the
+  // partition string is the whole guarantee, and this is what checks it.
+  test("agentglass-browser-eph-<lane id> is a guest partition", () => {
+    expect(isEphemeralPartition("agentglass-browser-eph-l1a2b3c4")).toBe(true);
+    expect(attach({}, { partition: "agentglass-browser-eph-l1a2b3c4" }).allowed).toBe(true);
+  });
+
+  test("but not with a persist: prefix — that would make it the exact leak it exists to avoid", () => {
+    expect(isEphemeralPartition("persist:agentglass-browser-eph-l1a2b3c4")).toBe(false);
+    expect(attach({}, { partition: "persist:agentglass-browser-eph-l1a2b3c4" }).allowed).toBe(false);
+  });
+
+  test("nor anything that only looks like it", () => {
+    for (const partition of [
+      "agentglass-browser-eph-",              // no id at all
+      "agentglass-browser-eph-WORK",          // uppercase is outside the alphabet
+      "agentglass-browser-eph-../../app",     // a path is the reason for the alphabet
+      "agentglass-browser-ephemeral-x",
+      "agentglass-browser",                   // the bare, non-persisted string — still refused
+    ]) expect(attach({}, { partition }).allowed, partition).toBe(false);
+  });
+});
+
+describe("the app's own window minting an ephemeral TAB (newtab --from-template)", () => {
+  // S6 shipped lanes only, and refused the app's own window ANY ephemeral
+  // partition, full stop — nothing there could yet tell one fork's jar from
+  // another's. This is the one new door: the window's OWN mint, and only that.
+  test("an ordinary partition needs no allow-list at all", () => {
+    expect(mayAttachOnMainWindow(BROWSER_PARTITION, new Set())).toBe(true);
+    expect(mayAttachOnMainWindow(`${BROWSER_PARTITION}-work`, new Set())).toBe(true);
+  });
+
+  test("an ephemeral partition the window minted for itself is allowed", () => {
+    const mine = "agentglass-browser-eph-t1a2b3c4";
+    expect(mayAttachOnMainWindow(mine, new Set([mine]))).toBe(true);
+  });
+
+  test("an ephemeral partition NOT in the window's own table is still refused — "
+    + "a lane's, another tab's, or a guess", () => {
+    const mine = "agentglass-browser-eph-t1a2b3c4";
+    const someoneElses = "agentglass-browser-eph-l9z8y7x6";
+    expect(mayAttachOnMainWindow(someoneElses, new Set([mine]))).toBe(false);
+    expect(mayAttachOnMainWindow(someoneElses, new Set())).toBe(false);
+  });
+});
+
 describe("what an attaching guest is allowed to be", () => {
   test("a hostile src never attaches", () => {
     expect(attach({ src: "file:///etc/passwd" }).allowed).toBe(false);
@@ -164,7 +214,21 @@ describe("what an attaching guest is allowed to be", () => {
       webSecurity: true,
       allowRunningInsecureContent: false,
       enableBlinkFeatures: "",
+      backgroundThrottling: false,
     });
+  });
+
+  test("background throttling is off, so a hidden tab keeps taking its pushes", () => {
+    // Every tab but the frontmost one is `visibility: hidden` in BrowserPanel —
+    // that is how a tab exists without painting. Left throttled, the SAME
+    // hidden state that lets a tab sit in the background also stalls its
+    // timers, and that is where a page's WebSocket delivery usually lives:
+    // a real softphone tab received `incoming-call-reserved` over the wire and
+    // never handed it to page JS until brought to the front. A renderer the
+    // request explicitly asked to throttle is left alone (`false` is
+    // overwritten, `true` is a request this guard refuses same as any other).
+    expect(attach({}, {}).prefs.backgroundThrottling).toBe(false);
+    expect(attach({}, { backgroundThrottling: true }).prefs.backgroundThrottling).toBe(false);
   });
 
   test("the profile it chose is kept", () => {

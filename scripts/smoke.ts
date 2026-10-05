@@ -184,8 +184,9 @@ class Cdp {
     });
   }
 
-  on(fn: (e: CdpEvent) => void) {
+  on(fn: (e: CdpEvent) => void): () => void {
     this.#listeners.push(fn);
+    return () => { this.#listeners = this.#listeners.filter((l) => l !== fn); };
   }
 
   close() {
@@ -311,9 +312,40 @@ async function main() {
         evaluate(`document.querySelector('${railSel} [aria-selected="true"]')?.getAttribute("data-view") ?? null`);
 
       // The workspace is the window now — no modal to open with ⌘\ or close with
-      // Escape, and the rail is always drawn. Check that it draws a set of view
-      // tabs; the exact count is the user's rail to arrange.
-      const railTabs = await evaluate(`document.querySelectorAll('${railSel} [role="tab"]').length`);
+      // Escape. Check that the rail draws a set of view tabs; the exact count is
+      // the user's rail to arrange.
+      //
+      // Except on a first run, and a fresh browser against a fresh server IS a
+      // first run: /projects says nothing is scoped, nobody has answered the
+      // project picker, so the picker opens and the views wait behind it
+      // (awaitingPick in App.tsx) — on purpose. Whether this run sees that
+      // depends on a race: the views come in anyway after PICK_WAIT_MS (3 s) if
+      // /projects has not answered by then. Measured with the CI step's own
+      // server in a private network namespace, it answers well inside 3 s and
+      // the rail count was 0, on main as on this branch; the runner is green
+      // only when its server happens to be slower than that. A run that reaches
+      // a developer's own server on :4000 never sees it at all — that server wants
+      // a token the bundle does not have, and a 401 releases the views.
+      //
+      // So answer the picker the way a person does, by closing it, and hold the
+      // app to what closing promises: the views come in. A picker that closes
+      // onto no rail is a first run stuck on an empty window, and still fails.
+      const pickerSel = '[role="dialog"][aria-label="Choose a project"]';
+      const waitFor = (expr: string, ms: number) => evaluate(`new Promise((r) => {
+        const t0 = Date.now();
+        (function poll() { const v = ${expr}; if (v || Date.now() - t0 > ${ms}) r(v); else setTimeout(poll, 100); })();
+      })`);
+      const countTabs = `document.querySelectorAll('${railSel} [role="tab"]').length`;
+      // "Mounted" is the root's first paint, not the rail's: on a slow runner the
+      // rail lands a beat later, so wait for it (10 s) — or for the picker.
+      await waitFor(`${countTabs} >= 6 || !!document.querySelector('${pickerSel}')`, 10000);
+      if (await evaluate(`!!document.querySelector('${pickerSel}')`)) {
+        await evaluate(`document.querySelector('${pickerSel} button[aria-label="Close"]')?.click()`);
+        if (!(await waitFor(`!document.querySelector('${pickerSel}')`, 5000)))
+          failures.push("[workspace] the first-run project picker did not close");
+        else console.log("• smoke: first run, closed the project picker to let the views in");
+      }
+      const railTabs = await waitFor(`${countTabs} >= 6 && ${countTabs}`, 10000) || await evaluate(countTabs);
       if (railTabs < 6) failures.push(`[workspace] expected a rail of view tabs, found ${railTabs}`);
 
       // ⌘1 and ⌘2 reach two DIFFERENT views: the numbers switch, and to
@@ -434,6 +466,76 @@ async function main() {
           if (!failures.length) console.log(`✓ smoke: ${after} chats and the composer draft survive a reload`);
         }
       }
+
+      /*
+       * An idle window must stop drawing.
+       *
+       * Any visible running animation keeps Chromium drawing at every vsync, and
+       * the desktop composites in software, so an ambient loop left on screen is
+       * a full-window composite sixty times a second for as long as it shows —
+       * measured, three working-tab pulses and one waiting ring held a whole
+       * browser at 53% against 22%. The status loops are stepped (~4 frames/s)
+       * and pause while the window is unfocused; see index.css. This counts the
+       * frames Chromium actually draws, three ways: the shell alone, the shell
+       * with those status marks written the way the components write them, and
+       * the same marks with the window marked idle.
+       */
+      const framesPerSecond = async (ms: number) => {
+        let draws = 0;
+        let done!: () => void;
+        const complete = new Promise<void>((r) => (done = r));
+        const off = cdp!.on((e) => {
+          if (e.sessionId !== sessionId) return;
+          if (e.method === "Tracing.dataCollected") draws += e.params.value.filter((t: any) => t.name === "DrawFrame").length;
+          if (e.method === "Tracing.tracingComplete") done();
+        });
+        await cdp!.send("Tracing.start", { categories: "disabled-by-default-devtools.timeline.frame", transferMode: "ReportEvents" }, sessionId);
+        await Bun.sleep(ms);
+        await cdp!.send("Tracing.end", {}, sessionId);
+        await complete;
+        off();
+        return draws / (ms / 1000);
+      };
+      await evaluate(`document.activeElement?.blur?.(); true`);
+      await Bun.sleep(300);
+      const shell = await framesPerSecond(1500);
+      await evaluate(`(async () => {
+        // Mirrors sharedPhase in web/src/lib/sharedPhase.ts: a negative delay of
+        // where document.timeline's shared clock already is in the cycle, so
+        // every instance steps in phase however far apart it mounted. Each mark
+        // is inserted 250 ms after the last, the way tabs turn busy at different
+        // moments: out of phase, stepped loops draw the SUM of their rates.
+        const phase = (ms) => {
+          const t = document.timeline?.currentTime;
+          if (t == null) return "0ms";
+          return "-" + (Number(t) % ms) + "ms";
+        };
+        const host = document.createElement("div");
+        host.id = "smoke-status-marks";
+        host.style.cssText = "position:fixed;left:8px;bottom:8px;display:flex;gap:8px";
+        document.body.appendChild(host);
+        document.documentElement.dataset.idle = "0";
+        const marks = [
+          ...Array(3).fill('<svg width="9" height="9" viewBox="0 0 12 12" style="animation: agx-phone-pulse 1.8s ease-in-out infinite; animation-delay: PHASE"><circle cx="6" cy="6" r="3.5" fill="currentColor"/></svg>'),
+          '<span style="animation: agx-attention 1.8s ease-in-out infinite; animation-delay: PHASE">waiting</span>',
+        ];
+        for (const m of marks) {
+          host.insertAdjacentHTML("beforeend", m.replace("PHASE", phase(1800)));
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return true;
+      })()`);
+      await Bun.sleep(300);
+      const marked = await framesPerSecond(2000);
+      await evaluate(`document.documentElement.dataset.idle = "1"; true`);
+      await Bun.sleep(300);
+      const idle = await framesPerSecond(1500);
+      await evaluate(`document.getElementById("smoke-status-marks")?.remove(); true`);
+      const fps = `shell ${shell.toFixed(1)}/s, status marks ${marked.toFixed(1)}/s, unfocused ${idle.toFixed(1)}/s`;
+      if (shell > 2) failures.push(`[idle-redraw] the shell alone keeps drawing: ${fps}`);
+      if (marked > 12) failures.push(`[idle-redraw] the status marks draw too often — stepped, and on one shared clock? ${fps}`);
+      if (idle > 2) failures.push(`[idle-redraw] the status marks keep drawing while the window is unfocused: ${fps}`);
+      if (!failures.length) console.log(`✓ smoke: an idle window stops drawing (${fps})`);
     }
 
     console.log(`smoke: served ${DIST} at ${url}`);

@@ -82,7 +82,9 @@ describe("windows as tabs", () => {
   test("an agent under a pane is carried, because it is why you open it", () => {
     const tabs = paneTabs([pane({ agentCwds: ["/home/x/code/orbit"] })]);
     expect(tabs[0]!.agent).toBe(true);
-    expect(tabs[0]!.where).toBe("orbit");
+    // The whole directory: Source control and Files send it as the root, and
+    // a bare leaf names no checkout ("no such directory", "No commits here").
+    expect(tabs[0]!.where).toBe("/home/x/code/orbit");
   });
 
   test("nothing in, nothing out", () => {
@@ -154,12 +156,35 @@ describe("the sessions this app made itself", () => {
 });
 
 describe("a tmux floating window", () => {
+  const base = { sessionId: "$1", windowId: "@1", windowIndex: "1", windowName: "w",
+    path: "/x", agentCwds: [] as string[], agentSession: null };
+
   test("is not somewhere to go", () => {
-    const base = { sessionId: "$1", windowId: "@1", windowIndex: "1", windowName: "w",
-      path: "/x", agentCwds: [], agentSession: null };
     const tabs = paneTabs([
       { ...base, session: "work", paneId: "%1" },
       { ...base, session: "scratch", sessionId: "$2", paneId: "%2", popup: true },
+    ]);
+    expect(sessionsOf(tabs)).toEqual(["work"]);
+  });
+
+  /*
+   * The scratch is open on the computer right now, and the phone is the only
+   * way to read it. The mark on a popup session is remembered by the panes
+   * route for as long as the server runs, so "is it a popup" cannot answer
+   * this; "is a client on it" can, and it is exact — the popup IS the client.
+   */
+  test("is somewhere to go while it is open on the desk", () => {
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", attached: true },
+      { ...base, session: "scratch", sessionId: "$2", paneId: "%2", popup: true, attached: true },
+    ]);
+    expect(sessionsOf(tabs)).toEqual(["scratch", "work"]);
+  });
+
+  test("drops out again once it is dismissed", () => {
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", attached: true },
+      { ...base, session: "scratch", sessionId: "$2", paneId: "%2", popup: true, attached: false },
     ]);
     expect(sessionsOf(tabs)).toEqual(["work"]);
   });
@@ -173,6 +198,24 @@ describe("sessions nobody is looking at", () => {
     const tabs = paneTabs([
       { ...base, session: "work", paneId: "%1", attached: true },
       { ...base, session: "leftover", sessionId: "$2", paneId: "%2", attached: false },
+    ]);
+    expect(sessionsOf(tabs)).toEqual(["work"]);
+  });
+
+  test("unless nothing else is left and the app's own server holds it", () => {
+    // A shell opened from the phone has no client and no agent; after a
+    // relaunch it is the only thing on the machine and must still be a tab.
+    const tabs = paneTabs([
+      { ...base, session: "orbit", paneId: "%1", attached: false, own: true },
+      { ...base, session: "stray", sessionId: "$2", paneId: "%2", attached: false, own: false },
+    ]);
+    expect(sessionsOf(tabs)).toEqual(["orbit"]);
+  });
+
+  test("but never beside real windows", () => {
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", attached: true, own: true },
+      { ...base, session: "orbit", sessionId: "$2", paneId: "%2", attached: false, own: true },
     ]);
     expect(sessionsOf(tabs)).toEqual(["work"]);
   });
@@ -191,5 +234,86 @@ describe("sessions nobody is looking at", () => {
     // `attached` absent means an older build answered. Hiding on a missing
     // field would empty the screen against every server but the newest.
     expect(paneTabs([{ ...base, session: "work", paneId: "%1" }])).toHaveLength(1);
+  });
+});
+
+/*
+ * A session on somebody else's tmux server is not in this list.
+ *
+ * `listPanes` walks the socket directory and answers for every server that has
+ * a client, so a tmux the test suite left running — or another agent's —
+ * arrives beside the one you work in. On a desk that is a row to scroll past;
+ * on a phone the strip IS the screen.
+ *
+ * Reproduced on a rig with two isolated servers, each with a client, through
+ * the real `/terminal/panes`:
+ *
+ *     canAttach: true   panes: 2
+ *       agx-probe-9f2  win 0 sh      pane %0  attached true   <- a test's
+ *       work           win 0 editor  pane %0  attached true   <- the real one
+ *
+ * and the strip that came out of it:
+ *
+ *     before ->  0 sh (agx-probe-9f2)  |  0 editor (work)
+ *     after  ->  0 editor (work)
+ *
+ * NOTHING ELSE ON THAT WIRE TOLD THEM APART, which is why the fix is a new
+ * field rather than a cleverer read of the old ones. `attached` was true for
+ * both. The pane ids were BOTH `%0` — ids are per server, so they cannot
+ * separate servers and cannot even identify a pane across them. And the name
+ * is not a rule: three servers on this machine each held a session called
+ * `agentglass-understudy`, so a prefix test would have been a guess wearing a
+ * rule's clothes.
+ *
+ * The server has the socket and says only whether it is its own, so the path
+ * still stays on its side of the wire.
+ */
+describe("servers that are not ours", () => {
+  const base = pane({ attached: true });
+
+  test("a session on another tmux server is dropped", () => {
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", own: true },
+      { ...base, session: "agx-probe-9f2", sessionId: "$2", paneId: "%2", own: false },
+    ]);
+    expect(tabs.map((t) => t.session)).toEqual(["work"]);
+  });
+
+  test("even when an agent is running in it", () => {
+    // The exception `attached` makes does NOT extend here. An agent in a test's
+    // tmux is a test's agent, and opening its pane on a phone is a coin flip
+    // between two servers that both answer to that id.
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", own: true },
+      { ...base, session: "agx-probe-9f2", sessionId: "$2", paneId: "%2", own: false,
+        agentCwds: ["/tmp/agx-probe"] },
+    ]);
+    expect(tabs.map((t) => t.session)).toEqual(["work"]);
+  });
+
+  test("but a server too old to say keeps everything", () => {
+    // Absent is a third answer, the same as it is for `attached`. It is also
+    // what a server answers when this app has never attached anything and has
+    // no server of its own to compare against — and emptying the strip there
+    // would be a phone that shows nothing on a fresh profile.
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1" },
+      { ...base, session: "other", sessionId: "$2", paneId: "%2" },
+    ]);
+    expect(tabs.map((t) => t.session)).toEqual(["other", "work"]);
+  });
+
+  test("and `own` never revives a session the other rules dropped", () => {
+    // Ours, and still detached with nothing running in it. One filter saying
+    // yes is not the others saying yes.
+    const tabs = paneTabs([
+      { ...base, session: "work", paneId: "%1", own: true },
+      { ...base, session: "leftover", sessionId: "$2", paneId: "%2", own: true, attached: false },
+      // Dismissed, which is what makes a popup droppable — `base` here is
+      // attached, and an OPEN one is a tab now.
+      { ...base, session: "popup", sessionId: "$3", paneId: "%3", own: true, popup: true, attached: false },
+      { ...base, session: "agx-phone-%9-abc", sessionId: "$4", paneId: "%4", own: true },
+    ]);
+    expect(tabs.map((t) => t.session)).toEqual(["work"]);
   });
 });

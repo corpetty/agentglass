@@ -11,13 +11,21 @@
 # ever edited, so there is no work to lose and no HEAD anyone cares about.
 set -uo pipefail
 
-LOG="${AGENTGLASS_UPDATE_LOG:-/tmp/agentglass-update.log}"
+LOG="${AGENTGLASS_UPDATE_LOG:-$HOME/.cache/agentglass/update.log}"
 STAMP="${AGENTGLASS_UPDATE_STAMP:-$HOME/.cache/agentglass/last-update.json}"
 SRC="${AGENTGLASS_UPDATE_SRC:-$HOME/.cache/agentglass/source}"
 TAG="${AGENTGLASS_UPDATE_TAG:-}"
 ORIGIN="${AGENTGLASS_UPDATE_ORIGIN:-}"
+# Overridable so a test can point this at a throwaway key instead of the real
+# pinned one; unset in every real install, where the default (beside this
+# script) is the only path that matters.
+ALLOWED_SIGNERS_OVERRIDE="${AGENTGLASS_UPDATE_ALLOWED_SIGNERS:-}"
 
-mkdir -p "$(dirname "$STAMP")" "$(dirname "$SRC")" 2>/dev/null || true
+mkdir -p "$(dirname "$STAMP")" "$(dirname "$SRC")" "$(dirname "$LOG")" 2>/dev/null || true
+# The log carries paths and git output, so it is created private and lives under
+# the user's own cache — a fixed name in a shared directory is a name anyone can
+# plant a link at. Only the log is made 0600: a umask here would reach the build.
+( umask 077; : >>"$LOG" ) 2>/dev/null; chmod 600 "$LOG" 2>/dev/null || true
 exec >>"$LOG" 2>&1
 
 say() { printf '\n==> %s\n' "$*"; }
@@ -42,6 +50,15 @@ esac
 
 export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS_REQUIRE=never
 
+# This runs with the app's environment, and the app has whatever the shell that
+# last opened it exported. A real update built into another session's
+# scratchpad that way: AGENTGLASS_DIST_DIR sends electron-builder's output
+# anywhere it names, and a TMPDIR that is some other process's temp dir can be
+# gone by the time the build wants it. Without them the build lands in the
+# update clone under ~/.cache/agentglass and temp files go where they go for
+# everything else, and the app the install reopens carries neither.
+unset AGENTGLASS_DIST_DIR TMPDIR CLAUDE_CODE_TMPDIR
+
 if [ -d "$SRC/.git" ]; then
   say "updating the update clone at $SRC"
   git -C "$SRC" remote set-url origin "$ORIGIN" || fail "cannot set origin"
@@ -52,17 +69,66 @@ else
   git clone --quiet "$ORIGIN" "$SRC" || fail "cannot clone $ORIGIN"
 fi
 
+say "checking the tag $TAG"
+# What this builds is whatever the tag names once it is fetched, so the tag is
+# pinned to a commit here and the checkout is held to it. An annotated tag is
+# what release.yml cuts. A lightweight tag is refused too, which rules out the
+# seven releases before v0.16.0 — updating goes forward to the newest tag, so
+# it is not a path anyone takes.
+[ "$(git -C "$SRC" for-each-ref --format='%(objecttype)' "refs/tags/$TAG")" = tag ] \
+  || fail "$TAG is not an annotated release tag"
+WANT="$(git -C "$SRC" rev-parse "refs/tags/$TAG^{commit}")" || fail "cannot resolve $TAG"
+# The tag OBJECT's own "tag <name>" header must name $TAG, not merely the ref
+# path used to fetch it: without this, a compromised origin can publish an
+# older, legitimately-signed tag object under a brand-new ref name (refs/tags/
+# v9.99.0, say) and every install "updates" backward to it — the signature
+# verifies fine, because it is real, just for a different release than the
+# one this ref claims to be.
+GOT_NAME="$(git -C "$SRC" cat-file tag "refs/tags/$TAG" | sed -n 's/^tag //p;/^$/q')"
+[ "$GOT_NAME" = "$TAG" ] \
+  || fail "the signed tag object names \"$GOT_NAME\", not $TAG — refusing a renamed or replayed tag"
+# The signature has to verify against ONE pinned key, shipped next to this
+# script rather than trusted from whatever gpg/ssh already knows on this
+# machine — `git verify-tag` alone answers "does a signature verify against
+# some key the local trust store already has", which is a question an
+# attacker who can get their own key trusted (or a machine with a stray key
+# already configured) answers just as well as the real signer. Read from
+# beside THIS script (its own install, or the dev checkout), never from
+# inside $SRC: that clone is exactly the thing under test, and a compromised
+# origin could otherwise ship its own allowed-signers file alongside a forged
+# signature and pass its own check.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALLOWED_SIGNERS="${ALLOWED_SIGNERS_OVERRIDE:-$SCRIPT_DIR/release-allowed-signers}"
+[ -f "$ALLOWED_SIGNERS" ] || fail "no pinned release-signing key at $ALLOWED_SIGNERS — cannot verify $TAG"
+# Every non-SSH verifier disabled outright, not merely `gpg.format=ssh`: that
+# setting alone governs how git SIGNS, not how `verify-tag` picks a verifier
+# for an EXISTING signature, which it still does by sniffing the armor block
+# itself. Measured: a tag object carrying a real PGP signature, PLUS the
+# literal text "-----BEGIN SSH SIGNATURE-----" sitting harmlessly in its free-
+# text message, passed a grep-then-verify sequence that checked "is this
+# tag signed at all" by grepping the WHOLE object for that marker (true, by
+# accident) and then let `git verify-tag` shell out to gpg for the real PGP
+# block — which happily verified against a key from the local keyring that
+# was never anywhere near ALLOWED_SIGNERS. Disabling gpg/x509 as verifier
+# programs makes an SSH-format signature the only kind `verify-tag` can ever
+# succeed on, so there is no format left for an attacker to switch to.
+git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$ALLOWED_SIGNERS" \
+    -c gpg.program=false -c gpg.openpgp.program=false -c gpg.x509.program=false \
+    -C "$SRC" verify-tag "refs/tags/$TAG" >/dev/null 2>&1 \
+  || fail "refusing $TAG: no valid SSH signature from the pinned release key"
+
 say "checking out $TAG"
 # Discards anything in this clone without a thought, which is safe precisely
 # because it is ours: a half-applied previous run must not survive into this one.
 git -C "$SRC" reset --hard --quiet HEAD
 git -C "$SRC" clean -qfd
 git -C "$SRC" checkout --quiet --detach "refs/tags/$TAG" || fail "no such tag: $TAG"
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$WANT" ] || fail "the checkout is not the commit $TAG names"
 say "now at $(git -C "$SRC" rev-parse --short HEAD) ($TAG)"
 
 say "installing dependencies"
-( cd "$SRC/web" && bun install --silent ) || fail "web dependencies failed"
-( cd "$SRC/electron" && bun install --silent ) || fail "electron dependencies failed"
+( cd "$SRC/web" && bun install --frozen-lockfile --silent ) || fail "web dependencies failed"
+( cd "$SRC/electron" && bun install --frozen-lockfile --silent ) || fail "electron dependencies failed"
 
 say "building and installing (this stops the running app)"
 # The old wording here promised "the installed app is untouched", which was only

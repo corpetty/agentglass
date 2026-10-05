@@ -32,17 +32,18 @@ describe("loop watchdog", () => {
     // while the loop was blocked", so a tick that was already late — from
     // whatever the rest of the suite is doing — would make the block look like
     // it started before the label, and the label would rightly lose.
-    await Bun.sleep(120);
+    await Bun.sleep(300);
     const before = lw.stalls().stalls.at(-1)?.id ?? 0;
     lw.entered("GET /git/repos");
-    block(320);
-    await Bun.sleep(250);
+    block(520);
+    await Bun.sleep(300);
 
     const seen = lw.stalls(before).stalls;
     expect(seen.length).toBeGreaterThan(0);
     const worst = seen.reduce((a, b) => (b.ms > a.ms ? b : a));
     // Reported as drift past the heartbeat, not wall time — a 320ms block on a
-    // 100ms tick is ~220ms of loop unavailable to anyone else.
+    // 250ms tick is ~270ms of loop unavailable to anyone else. Long enough that
+    // the tick cannot fall in the gap: shorter blocks are only sampled.
     expect(worst.ms).toBeGreaterThanOrEqual(150);
     expect(worst.ms).toBeLessThan(1_000);
     expect(worst.what).toBe("GET /git/repos");
@@ -58,8 +59,8 @@ describe("loop watchdog", () => {
     lw.entered("GET /something-old");
     await Bun.sleep(300); // it has finished; the block below is not its doing
     const before = lw.stalls().stalls.at(-1)?.id ?? 0;
-    block(300);
-    await Bun.sleep(250);
+    block(520);
+    await Bun.sleep(300);
 
     const seen = lw.stalls(before).stalls;
     expect(seen.length).toBeGreaterThan(0);
@@ -74,7 +75,7 @@ describe("loop watchdog", () => {
   });
 
   it("is bounded — the thing that watches for growth must not grow", async () => {
-    for (let i = 0; i < 8; i++) { lw.entered(`burst ${i}`); block(240); await Bun.sleep(120); }
+    for (let i = 0; i < 8; i++) { lw.entered(`burst ${i}`); block(520); await Bun.sleep(300); }
     const s = lw.stalls();
     expect(s.stalls.length).toBeLessThanOrEqual(5);       // the ring trimmed
     expect(s.stalls.at(-1)!.id).toBeGreaterThan(5);        // …and kept the newest
@@ -125,6 +126,71 @@ describe("attribution across an await", () => {
   // that blocks is a *continuation* that resumes after its handler returned.
   // "The last thing to start" then names whichever poll arrived while we were
   // waiting — it named `/__ping__`, a route that does not exist, for 674ms.
+  it("does not blame a request that arrived after the block", async () => {
+    // A request that lands while the loop is held waits in the socket buffer,
+    // and its handler runs as soon as the loop comes back — before the
+    // heartbeat that measures the block. It entered last, inside the window,
+    // and it did nothing. Measured on an isolated server stopped from outside
+    // five times with no code at fault: all five stalls were filed under
+    // `GET /health` or `POST /ingest`, whichever the load happened to send.
+    await Bun.sleep(300);
+    const before = lw.stalls().stalls.at(-1)?.id ?? 0;
+    lw.entered("GET /the-real-culprit");
+    block(520);
+    lw.entered("OPTIONS /the-victim"); // queued during the block, handled right after
+    await Bun.sleep(300);
+
+    const seen = lw.stalls(before).stalls;
+    const worst = seen.reduce((a, b) => (b.ms > a.ms ? b : a));
+    expect(worst.ms).toBeGreaterThanOrEqual(150);
+    expect(worst.what).toBe("GET /the-real-culprit");
+  });
+
+  it("does not blame a request that finished in less time than the stall", async () => {
+    // Under steady load a request always lands between the last heartbeat and
+    // a freeze, and it is inside the window. Stopped from outside at 20
+    // requests a second, every stall still went to `/ingest` or `/health`.
+    // One that answered in a millisecond cannot have held the loop for half
+    // a second.
+    await Bun.sleep(300);
+    const before = lw.stalls().stalls.at(-1)?.id ?? 0;
+    lw.finished(lw.entered("GET /quick"));
+    block(520);
+    await Bun.sleep(300);
+    const worst = lw.stalls(before).stalls.reduce((a, b) => (b.ms > a.ms ? b : a));
+    expect(worst.what).toContain("background");
+
+    // …while one that was still running across the block answers for it.
+    await Bun.sleep(300);
+    const again = lw.stalls().stalls.at(-1)?.id ?? 0;
+    const mark = lw.entered("GET /slow");
+    block(520);
+    lw.finished(mark);
+    await Bun.sleep(300);
+    expect(lw.stalls(again).stalls.reduce((a, b) => (b.ms > a.ms ? b : a)).what).toBe("GET /slow");
+  });
+
+  it("says whether the thread was computing or waiting", async () => {
+    // Burning CPU is this process's own code. Holding the thread without
+    // burning it is a synchronous read, a child process, or the machine
+    // itself (swap, a stopped process) — different fixes, so it says which.
+    await Bun.sleep(300);
+    let before = lw.stalls().stalls.at(-1)?.id ?? 0;
+    block(520);
+    await Bun.sleep(300);
+    let worst = lw.stalls(before).stalls.reduce((a, b) => (b.ms > a.ms ? b : a));
+    expect(worst.waiting).toBe(false);
+
+    await Bun.sleep(300);
+    before = lw.stalls().stalls.at(-1)?.id ?? 0;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 520); // held, not busy
+    await Bun.sleep(300);
+    worst = lw.stalls(before).stalls.reduce((a, b) => (b.ms > a.ms ? b : a));
+    expect(worst.ms).toBeGreaterThanOrEqual(150);
+    expect(worst.waiting).toBe(true);
+    expect(worst.cpuMs).toBeLessThan(worst.ms / 2);
+  });
+
   it("blames the request that owns the continuation, not the poll that arrived meanwhile", async () => {
     await Bun.sleep(120);
     const before = lw.stalls().stalls.at(-1)?.id ?? 0;
@@ -135,13 +201,13 @@ describe("attribution across an await", () => {
       const owner = lw.currentLabel(); // captured while still inside the handler
       await Bun.sleep(60);            // …a subprocess, in real life
       lw.resumedAs(owner);            // its output is about to be parsed
-      block(300);
+      block(520);
     })();
     // Meanwhile a cheap poll arrives and finishes long before the block.
     await Bun.sleep(20);
     lw.entered("GET /__ping__");
     await slow;
-    await Bun.sleep(250);
+    await Bun.sleep(300);
 
     const seen = lw.stalls(before).stalls;
     const worst = seen.reduce((a, b) => (b.ms > a.ms ? b : a));

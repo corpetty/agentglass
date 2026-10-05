@@ -1,5 +1,7 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { ICON } from "../lib/iconSize.ts";
+import { GearIcon } from "./workspace/icons.tsx";
 import type { SessionDetail, TimelineEntry } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
 import { PresetDiff } from "./diff/PresetDiff.tsx";
@@ -13,6 +15,13 @@ import { sessionIsLive } from "../lib/derive.ts";
 import { sessionWorktree, sessionCwd } from "../lib/worktree.ts";
 import { useStuckBottom } from "../lib/useStuckBottom.ts";
 import { CloseButton } from "./CloseButton.tsx";
+import { BranchIcon, CopyIcon, IconLabel } from "../lib/glyphIcons.tsx";
+import { agentsOf, subscribeAgents } from "../lib/fleetAgents.ts";
+import { branchesOf, subscribeBranches } from "../lib/repoBranches.ts";
+import {
+  SHARED_TREE_LABEL, SHARED_TREE_TOOLTIP,
+  branchForCwd, isSharedCwd, liveSharedCwds, workingTreeOf,
+} from "../lib/sharedTree.ts";
 
 const TOOL_RAMP = ["#a78bfa", "#f472b6", "#34d399", "#60a5fa", "#fbbf24", "#22d3ee", "#a3e635", "#fb923c"];
 const shortType = (t: string) => t.replace(/^workflow-subagent$/, "workflow").replace(/^general-purpose$/, "general");
@@ -83,6 +92,16 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
       setD((prev) => (prev && s && prev.last_seen === s.last_seen && prev.events === s.events ? prev : s));
     }).catch(() => { /* keep showing what we have */ });
   }, d && !sessionIsLive(d) ? 20_000 : 3000);
+
+  // Branch + shared-tree chips — same signals as the Fleet card, so the deep
+  // dive matches the wall.
+  const [, bumpAgents] = useState(0);
+  const [, bumpBranches] = useState(0);
+  useEffect(() => subscribeAgents(() => bumpAgents((n) => n + 1)), []);
+  useEffect(() => subscribeBranches(() => bumpBranches((n) => n + 1)), []);
+  const cwdKey = d ? workingTreeOf(d) : null;
+  const shared = isSharedCwd(cwdKey, liveSharedCwds(agentsOf()));
+  const branch = branchForCwd(cwdKey, branchesOf());
 
   const open = !!sessionId;
   // The name if it has one, the uuid otherwise. `id` stays available for the
@@ -161,7 +180,19 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                     {d && sessionWorktree(d) && (
                       <span className="chip" title={`Linked worktree — ran in ${d.cwd_path}`}
                         style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 15%, transparent)" }}>
-                        ⑂ {sessionWorktree(d)}
+                        <BranchIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />{sessionWorktree(d)}
+                      </span>
+                    )}
+                    {d && branch && (
+                      <span className="chip" title={`Checked out on ${branch}`}
+                        style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--border) 35%, transparent)" }}>
+                        {branch}
+                      </span>
+                    )}
+                    {d && shared && (
+                      <span className="chip" title={SHARED_TREE_TOOLTIP}
+                        style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 14%, transparent)" }}>
+                        {SHARED_TREE_LABEL}
                       </span>
                     )}
                     {d && <span className="text-[10px] t-dim2">{durLabel} · last {fmtAgo(d.last_seen)} ago</span>}
@@ -190,7 +221,7 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                     )}
                     {d && onFilter && (
                       <button onClick={() => { onFilter(d.source_app); onClose(); }} className="chip cursor-pointer" style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 16%, transparent)", borderColor: "color-mix(in srgb, var(--primary) 45%, transparent)" }}>
-                        ⧉ Watch in live feed
+                        <IconLabel icon={<CopyIcon size={ICON.xs} />}>Watch in live feed</IconLabel>
                       </button>
                     )}
                     <CloseButton onClick={onClose} />
@@ -317,14 +348,14 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                             </button>
                           )}
                           <button onClick={() => setShowTools((s) => !s)}
-                            className="text-[9.5px] px-1.5 py-0.5 rounded-full"
+                            className="text-[9.5px] px-1.5 py-0.5 rounded-full inline-flex items-center gap-1"
                             title={showTools ? "Hide tool runs" : "Show tool runs"}
                             style={{
                               color: showTools ? "var(--primary-hover)" : "var(--text3)",
                               background: `color-mix(in srgb, var(--primary) ${showTools ? 15 : 6}%, transparent)`,
                               border: `1px solid color-mix(in srgb, var(--primary) ${showTools ? 40 : 18}%, transparent)`,
                             }}>
-                            ⚙ Tools {toolCount > 0 && <span className="tabular-nums">{toolCount}</span>}
+                            <GearIcon size={ICON.xs} />Tools {toolCount > 0 && <span className="tabular-nums">{toolCount}</span>}
                           </button>
                         </div>
                         {/* Watched for height changes — the eyebrow row above is

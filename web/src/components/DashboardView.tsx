@@ -28,8 +28,11 @@ import { Latency } from "./Latency.tsx";
 import { Sessions } from "./Sessions.tsx";
 import { MissionTimeline } from "./MissionTimeline.tsx";
 import { UsageBox } from "./UsageBox.tsx";
+import { FleetVerdictStrip, useFleetVerdict } from "./FleetVerdictStrip.tsx";
 import { Select } from "./Select.tsx";
 import type { AgentCard, Alert } from "../lib/derive.ts";
+import { CrossIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 /** "unknown" is a real bucket (a session whose model never resolved), and it
  *  reads as a value rather than as a gap when it is spelled out. */
@@ -50,7 +53,7 @@ export type DashFilter = { app: string; type: string; provider: string; account:
 export function DashboardView({
   active, events, visibleEvents, agents, alerts, stats, sessionProvider, providers,
   windowMs, onWindow, filter, onFilter, onClearFilter, retentionDays,
-  startedAt, epm, onSelectEvent, onSelectSession,
+  startedAt, epm, onSelectEvent, onSelectSession, onOpenLantern,
 }: {
   active: boolean;
   events: WatchEvent[];
@@ -70,6 +73,7 @@ export function DashboardView({
   epm: number;
   onSelectEvent: (e: WatchEvent | null) => void;
   onSelectSession: (s: { id: string; app: string }) => void;
+  onOpenLantern: () => void;
 }) {
   /**
    * The facet lists, fetched HERE and only while this view is open.
@@ -85,6 +89,9 @@ export function DashboardView({
     const id = setInterval(load, 20_000);
     return () => clearInterval(id);
   }, [active]);
+
+  /* Read once, for the strip and the KPI tiles alike: one screen, one count. */
+  const fleet = useFleetVerdict();
 
   const hasFilter = filter.app || filter.type || filter.provider || filter.account;
   const selStyle = {
@@ -135,18 +142,23 @@ export function DashboardView({
         )}
         {hasFilter && (
           <button onClick={onClearFilter} className="text-[10.5px] px-2 py-1 rounded-lg shrink-0 whitespace-nowrap"
-            style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>Clear ✕</button>
+            style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}><span className="inline-flex items-center gap-1">Clear<CrossIcon size={ICON.xs} /></span></button>
         )}
       </div>
 
+      {/* The answer before the charts: what is running, what is stuck, what
+          needs you. Outside the scroller, so it is the first thing on the
+          screen however far down the panels have been read. */}
+      <FleetVerdictStrip verdict={fleet} onOpenLantern={onOpenLantern} />
+
       <div className="flex-1 min-h-0 p-3 flex flex-col gap-3 overflow-auto tall:overflow-hidden agx-scroll">
         <div className="shrink-0">
-          <Kpis stats={stats} agents={agents} startedAt={startedAt} epm={epm} />
+          <Kpis stats={stats} agents={agents} fleet={fleet} startedAt={startedAt} epm={epm} />
         </div>
 
         <div className="shrink-0 min-h-0 tall:flex-1 grid grid-cols-1 xl:grid-cols-12 gap-3">
           <div className="xl:col-span-3 min-w-0 min-h-0 h-[420px] xl:h-[520px] tall:h-auto">
-            <Fleet agents={agents} activeApp={filter.app} onSelect={(a) => onSelectSession({ id: a.session_id, app: a.source_app })} />
+            <Fleet agents={agents} activeApp={filter.app} active={active} onSelect={(a) => onSelectSession({ id: a.session_id, app: a.source_app })} />
           </div>
           <div className="xl:col-span-6 min-w-0 min-h-0 grid grid-rows-[auto_400px] sm:grid-rows-[minmax(0,150px)_minmax(0,1fr)] gap-3 h-auto sm:h-[520px] tall:h-auto">
             <div className="grid grid-cols-1 sm:grid-cols-2 auto-rows-[150px] sm:auto-rows-auto gap-3 min-w-0 min-h-0">
@@ -159,7 +171,7 @@ export function DashboardView({
           </div>
           <div className="xl:col-span-3 min-w-0 min-h-0 grid grid-rows-[3fr_2fr] gap-3 h-[420px] xl:h-[520px] tall:h-auto">
             <Radar agents={agents} onSelect={(a) => onFilter({ ...filter, app: a.source_app })} />
-            <Alerts alerts={alerts} agents={agents} onSelectApp={(app) => onFilter({ ...filter, app })} />
+            <Alerts alerts={alerts} agents={agents} active={active} onSelectApp={(app) => onFilter({ ...filter, app })} />
           </div>
         </div>
 
@@ -181,7 +193,7 @@ export function DashboardView({
               Usage cell above is allowed to ask for more. */}
           <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><CostByModel stats={stats} /></div>
           <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Latency stats={stats} /></div>
-          <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Sessions provider={filter.provider} /></div>
+          <div className="xl:col-span-3 min-w-0 min-h-0 h-[196px] xl:h-[196px]"><Sessions provider={filter.provider} active={active} /></div>
           <div className="xl:col-span-9 min-w-0 min-h-0 h-[140px] xl:h-[140px]"><MissionTimeline stats={stats} /></div>
         </div>
       </div>

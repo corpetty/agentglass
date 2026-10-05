@@ -16,6 +16,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { accountById, defaultAccount, listAccounts, type Account } from "./accounts.ts";
 import { accessToken } from "./oauth.ts";
+import { failed } from "./refused.ts";
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 
@@ -449,7 +450,12 @@ async function usageForAccount(acct: Account, now: number = Date.now()): Promise
     slot.failures++;
     const status = e instanceof UsageHttpError ? e.status : null;
     const reason = status === 401 ? "unauthorized" : status === 429 ? "rate_limited" : "error";
-    slot.cache = degrade(slot, now, acct.id, String(e), reason, status);
+    /* An HTTP status is a fact this code built, and the one worth showing: a
+       429 means "wait", a 401 means "sign in again". It is written from the
+       number, not read off the exception, so no exception text travels. Any
+       other failure goes to the log and the caller gets a sentence. */
+    const said = status !== null ? `HTTP ${status}` : failed("usage", e, "usage could not be read");
+    slot.cache = degrade(slot, now, acct.id, said, reason, status);
   }
   slot.cacheAt = now;
   return slot.cache;

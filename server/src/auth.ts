@@ -15,11 +15,12 @@
 // sender on this machine: local hooks and OTel exporters have no way to carry
 // a secret, and everything they can reach without one now has to come from
 // loopback.
-import { timingSafeEqual, randomBytes } from "node:crypto";
+import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { deviceFor, scopeAllows, type Device, type Scope } from "./devices.ts";
+import { DESK_HEADER, deskKey } from "./desk.ts";
 
 const TOKEN_PATH = join(
   process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
@@ -100,6 +101,22 @@ const LOCAL_SINKS = new Set([
   "/otlp/v1/traces",
   "/v1/logs",
   "/otlp/v1/logs",
+  /*
+   * A hooked session saying what it is working on, from the same machine.
+   *
+   * The Lantern reminder rides /ingest's answer and asks the session to `curl`
+   * this — with no credential, because the session has none to give: the
+   * token is not in its environment, and baking one into a line that lands
+   * in a transcript would be worse than the 401 it would save. Measured on a
+   * server started with a token: the reminder's own curl answered 401, so
+   * the one thing the board asked for could not be done on the machine that
+   * asked for it.
+   *
+   * Less than /ingest, not more: it replaces one status row keyed by the
+   * name given, raises no notification, and the route still refuses a
+   * browser Origin (trustedCaller). Off-box it authenticates like anything.
+   */
+  "/agents/status",
 ]);
 
 /**
@@ -140,6 +157,20 @@ export interface Auth {
   path: string;
 }
 
+/**
+ * …and the one thing to know before reading any credential rule below: on a
+ * loopback-only install with no `AGENTGLASS_TOKEN`, this returns `null` and
+ * index.ts skips the whole block that calls `callerFor` and `allowed`. Nothing
+ * downstream ever learns WHO is asking, so every rule graded by scope — the
+ * `answer` grant, `answersFromADevice`, the deny-by-default table — is not
+ * loosened on such a box, it is simply never consulted.
+ *
+ * Which installs those are: `bun run dev` and any hand-started server. NOT the
+ * packaged desktop app, which mints a secret on first launch and hands it to
+ * its own sidecar (electron/main.js), so it is authenticated on loopback like
+ * everything else. If you are running the server yourself and want any of this
+ * enforced, set `AGENTGLASS_TOKEN`.
+ */
 export function resolveToken(loopbackOnly: boolean): Auth {
   const fromEnv = process.env.AGENTGLASS_TOKEN?.trim();
   if (fromEnv) return { token: fromEnv, source: "env", path: TOKEN_PATH };
@@ -149,6 +180,23 @@ export function resolveToken(loopbackOnly: boolean): Auth {
   const t = randomBytes(24).toString("base64url");
   persist(t);
   return { token: t, source: "generated", path: TOKEN_PATH };
+}
+
+/**
+ * Non-null on the one install this whole file is decoration for: loopback,
+ * no `AGENTGLASS_TOKEN`. `resolveToken` returns a null token there, and
+ * index.ts skips the entire `callerFor`/`allowed` block — see
+ * `understudyRequiresToken` above for the same fact from a different door.
+ * Printed at startup so the gap is loud rather than found later; it changes
+ * no behaviour, only whether anyone was told.
+ */
+export function tokenlessWarning(a: Auth): string | null {
+  if (a.source !== "none") return null;
+  return (
+    "⚠  no AGENTGLASS_TOKEN configured — any process on this machine, on any account, " +
+    "can drive the shell, git/docker writes and the fleet feed. Set AGENTGLASS_TOKEN " +
+    "to require a credential."
+  );
 }
 
 function readPersisted(): string | null {
@@ -169,6 +217,17 @@ function persist(t: string): void {
   }
 }
 
+/**
+ * The answer to `/health?challenge=<nonce>`: proof this server holds the
+ * token, without sending it. The desktop shell adopts a server already on its
+ * port only when this checks out (electron/server-probe.js, which must compute
+ * the same bytes). The port is in the message so a squatter cannot relay a
+ * challenge to a genuine server on another port and pass its answer off.
+ */
+export function healthProof(token: string, port: number, nonce: string): string {
+  return createHmac("sha256", token).update(`agentglass-health:${port}:${nonce}`).digest("hex");
+}
+
 function eq(a: string, b: string): boolean {
   const ba = Buffer.from(a);
   const bb = Buffer.from(b);
@@ -185,7 +244,10 @@ export function tokenOk(req: Request, url: URL, token: string): boolean {
 }
 
 /** The credential this request carries, however it carried it. */
-function presented(req: Request, url: URL): string {
+/** Exported for `plugin-socket.ts`'s own gate, which has to tell "no
+ *  credential at all" (401) from "a real credential of the wrong kind" (403)
+ *  before it ever calls `callerFor` — see the comment there. */
+export function presented(req: Request, url: URL): string {
   const auth = req.headers.get("authorization") || "";
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   return bearer || url.searchParams.get("token") || "";
@@ -204,14 +266,221 @@ function presented(req: Request, url: URL): string {
  * the common case never walks the device list at all.
  */
 export interface Caller {
-  kind: "machine" | "device";
+  /**
+   * Three kinds, and the third is not a flavour of the second.
+   *
+   * A plugin's token used to come back as `device`, on the reasoning that a
+   * scoped grant a human approved means the same thing whichever way it was
+   * minted. For `allowed` that is true. For `answersFromADevice` it is false,
+   * and the gap was measured: a manifest may declare `scope: "answer"` or
+   * `"full"`, and with `kind: "device"` that plugin passed
+   * `answersFromADevice` and could POST `/gate/decide` — the one act this file
+   * says only "a credential an agent on this machine cannot mint" may perform.
+   * A plugin IS a process on this machine, started by this server, holding a
+   * token this server handed it. It is exactly the thing the gate is asking
+   * about, so it gets its own kind and the gate turns it away by name.
+   */
+  kind: "machine" | "device" | "plugin";
   scope: Scope;
   device?: Device;
+  /**
+   * A narrowing that no scope can undo.
+   *
+   * The understudy watches the work and keeps score; it never acts. The obvious
+   * way to say that would be a fourth `Scope` sitting under `read`, and it is
+   * the wrong one. RANK in devices.ts is a *total order* and every check asks
+   * "is this at least X", so a new value has to be placed somewhere on that
+   * line — and anything placed above `read` inherits ANSWER_POST, which
+   * contains `/chat/send`: the single route the understudy must never hold,
+   * because holding it means speaking as him into a running agent. Placing it
+   * below `read` fails the other way round: it could not GET anything, and
+   * looking is the entire job.
+   *
+   * So the understudy is not a scope at all. It is a principal, and `allowed`
+   * answers for it with its own total function, before scope is consulted at
+   * all. Whatever scope the credential happens to carry is then irrelevant,
+   * which is the property worth having: no future widening of `full`, and no
+   * slip while minting, can hand this caller a write nobody wrote down here.
+   *
+   * Nothing mints such a caller yet — v1 has no understudy credential — so this
+   * is the fence going up before the thing that needs fencing arrives, which is
+   * the only order in which a fence is ever built correctly.
+   */
+  principal?: "understudy" | "seat";
+  /** When `principal` is `seat`: which project's chair, and what that chair
+   *  was granted. Carried on the caller rather than looked up per request so
+   *  the grant is the one made at seating — changing the setting afterwards
+   *  takes effect at the next seating, which is also what the prompt says. */
+  seat?: { root: string; powers: "speak" | "nudge" | "assign" };
+  /** The plugin's name when `kind` is `plugin`. `allowed` grades it by scope
+   *  like any other caller — the manifest declared a scope and a human approved
+   *  it — but it is never a person's hand on a gate; see `kind`. */
+  plugin?: string;
+}
+
+/*
+ * Credentials carrying the understudy's principal, and why they had to exist.
+ *
+ * `understudyAllows` has fenced this principal since it was written, and until
+ * now NOTHING COULD PRESENT IT: `callerFor` returned a machine or a device and
+ * nothing else, so the fence guarded a caller with no way to arrive. Correct,
+ * and unreachable.
+ *
+ * That stopped being harmless the moment the work loop began launching agents.
+ * They inherit the process environment, which carries the MACHINE token — so an
+ * agent asking this server anything asked as the machine, `full` scope, every
+ * write route open. The thing being fenced was holding the key to the fence.
+ *
+ * One minted credential fixes both halves. The agent can read every view this
+ * app has — which is the ask, "give it the views too" — and can write nothing,
+ * because `understudyAllows` refuses every POST outside a short enumerated set.
+ *
+ * IN MEMORY AND PER RUN. Never written to disk, revoked when the run ends, gone
+ * entirely on restart. A credential that outlives the work it was minted for is
+ * a credential somebody finds later.
+ */
+const understudyTokens = new Set<string>();
+
+/*
+ * Credentials carrying the SEAT's principal.
+ *
+ * Same shape and the same reasoning as the understudy's, with one difference
+ * that is the whole point of the feature: the seat is allowed to act, and how
+ * much is a setting. A seat granted `speak` holds a token that cannot prompt
+ * an agent, whatever its prompt says it may do — because a sentence in a
+ * prompt is a wish, and this is the wall. `refusedArg` learned the same lesson
+ * about permission flags arriving as parameters.
+ *
+ * In memory, minted at seating, revoked when the chair is emptied and gone on
+ * restart. A seat that comes back after a restart is seated again and gets a
+ * new one.
+ */
+const seatTokens = new Map<string, { root: string; powers: "speak" | "nudge" | "assign" }>();
+
+export function mintSeatToken(root: string, powers: "speak" | "nudge" | "assign"): string {
+  const t = `st_${randomBytes(24).toString("base64url")}`;
+  seatTokens.set(t, { root, powers });
+  return t;
+}
+
+export function revokeSeatTokens(root: string): void {
+  for (const [t, v] of seatTokens) if (v.root === root) seatTokens.delete(t);
+}
+
+/** How many are live, so a test can prove they do not accumulate. */
+export function seatTokenCount(): number { return seatTokens.size; }
+
+/**
+ * What a seat may ask for, by the powers its chair was given.
+ *
+ * Deny by default, like every other fence in this file: a POST that is not
+ * named here is refused whatever the powers, so a route added next month is
+ * out of the seat's reach until somebody decides otherwise. Reads are the
+ * understudy's reads — every view, minus the ones that are a shell wearing a
+ * GET.
+ */
+const SEAT_POST_NUDGE = new Set([
+  "/agents/named/prompt", "/agents/named/read", "/agents/named/wait",
+  /* One message to N agents is N prompts, so it sits with `prompt` and not a
+     step above it: it reaches only agents that are already running, and it
+     opens nobody. A seat that may unstick one may unstick five. */
+  "/agents/named/broadcast",
+  "/seat/say", "/seat/recall",
+]);
+/* `enlist` sits with start and stop rather than with prompt, and the reason is
+   the reach it grants: enlisting decides WHICH panes on this machine the seat's
+   other verbs can touch, including ones in projects that are none of its
+   business. Deciding who exists is the assigning half of the job. */
+const SEAT_POST_ASSIGN = new Set(["/agents/named/start", "/agents/named/stop", "/agents/named/keys", "/agents/named/enlist"]);
+
+export function seatAllows(powers: "speak" | "nudge" | "assign", method: string, pathname: string): boolean {
+  if (method === "GET" || method === "HEAD") return !FULL_GET.has(pathname);
+  if (method !== "POST") return false;
+  /* Saying its line and asking the bank are not acts: allowed at every level.
+     Seating another orchestrator is NOT on this list at any level — a seat
+     that could open seats is a seat that can spend without a ceiling. */
+  /* Its own tray is the same kind of thing: `report` writes what an agent
+     said, `inbox` hands the seat what is waiting. Draining marks those rows
+     read, which is a change — but it is a change to the seat's own post, and a
+     chair that may not read its mail is not a chair. */
+  if (pathname === "/seat/say" || pathname === "/seat/recall"
+    || pathname === "/seat/report" || pathname === "/seat/inbox"
+    /* Asking the person for a decision is the opposite of acting without one:
+       a seat with no powers at all must still be able to say "this needs you",
+       or the only way it has to escalate is to do the thing itself. */
+    || pathname === "/seat/need" || pathname === "/seat/need/finish" || pathname === "/seat/need/drop") return true;
+  if (READ_POST.has(pathname)) return true;
+  if (powers === "speak") return false;
+  if (SEAT_POST_NUDGE.has(pathname)) return true;
+  return powers === "assign" && SEAT_POST_ASSIGN.has(pathname);
+}
+
+export function mintUnderstudyToken(): string {
+  const t = `us_${randomBytes(24).toString("base64url")}`;
+  understudyTokens.add(t);
+  return t;
+}
+
+export function revokeUnderstudyToken(t: string): void {
+  understudyTokens.delete(t);
+}
+
+/** How many are live, so a test can prove they do not accumulate. */
+export function understudyTokenCount(): number {
+  return understudyTokens.size;
+}
+
+/**
+ * Credentials minted for an enabled plugin, one per running instance.
+ *
+ * IN MEMORY ONLY, same reasoning as `understudyTokens`: this is not the
+ * plugin's identity (that is its name, recorded in plugins.json), it is a
+ * live grant that must not survive past the process it was minted for. A
+ * restart means every plugin gets a fresh token when it is respawned, not
+ * that yesterday's token still opens the door.
+ */
+const pluginTokens = new Map<string, { scope: Scope; name: string }>();
+
+export function mintPluginToken(scope: Scope, name: string): string {
+  const t = `pg_${randomBytes(24).toString("base64url")}`;
+  pluginTokens.set(t, { scope, name });
+  return t;
+}
+
+/** Which plugin holds this token, if any. The `/plugin/self` routes ask this
+ *  directly, because on a loopback box with no machine token configured the
+ *  global gate never builds a caller at all. */
+export function pluginOfRequest(req: Request, url: URL): string | null {
+  const t = presented(req, url);
+  return t ? pluginTokens.get(t)?.name ?? null : null;
+}
+
+export function revokePluginToken(t: string): void {
+  pluginTokens.delete(t);
+}
+
+/** So a test can prove a disabled plugin's token stops working, not merely
+ *  that the process was asked to exit. */
+export function pluginTokenCount(): number {
+  return pluginTokens.size;
 }
 
 export function callerFor(req: Request, url: URL, token: string): Caller | null {
   const provided = presented(req, url);
   if (!provided) return null;
+  /*
+   * Checked BEFORE the machine token, and it cannot collide: these carry a
+   * prefix the machine token never has. Checking after would be equally correct
+   * today and would quietly become wrong the first time somebody changed how
+   * either one is made.
+   */
+  if (understudyTokens.has(provided)) {
+    return { kind: "machine", scope: "full", principal: "understudy" };
+  }
+  const seat = seatTokens.get(provided);
+  if (seat) return { kind: "machine", scope: "full", principal: "seat", seat };
+  const plugin = pluginTokens.get(provided);
+  if (plugin) return { kind: "plugin", scope: plugin.scope, plugin: plugin.name };
   if (eq(provided, token)) return { kind: "machine", scope: "full" };
   const device = deviceFor(provided);
   return device ? { kind: "device", scope: device.scope, device } : null;
@@ -249,6 +518,19 @@ const FULL_GET = new Set([
   // pull. Drive verbs (/browser/open, /browser/read) already need full as POSTs;
   // this brings the history read in line with them.
   "/browser/places/all",
+  // What a person typed into a plugin's settings, and what plugins draw. A
+  // key or a private repository list is not for another plugin's read token
+  // or a paired read-only phone; the plugin itself reads its own over
+  // /plugin/self.
+  "/plugins/settings",
+  "/plugins/panels",
+  // The desktop's notifications, mirrored. Their bodies carry sign-in codes,
+  // direct messages and mail previews, and the only switch that turns the
+  // mirror off lives in the desk's own UI, so a read-scope credential opening
+  // the socket was reading them whatever that switch said. The phone does not
+  // use either route; the desk holds the machine token.
+  "/notifications",
+  "/notifications/capability",
 ]);
 
 /**
@@ -270,6 +552,10 @@ const ANSWER_POST = new Set([
   "/gate/decide",
   "/chat/send",
   "/chat/pane/key",
+  // "I have read this". Moves a badge on the other devices and nothing else:
+  // no agent, no repository and nothing on GitHub hears about it. A read-scope
+  // credential still only GETs it.
+  "/marks",
 ]);
 
 export function scopeNeeded(method: string, pathname: string): Scope {
@@ -280,7 +566,175 @@ export function scopeNeeded(method: string, pathname: string): Scope {
   return "full";
 }
 
+/**
+ * Every write the understudy has, which in v1 is its own two switches.
+ *
+ * A *positive* allowlist, and deliberately tiny. The question this set answers
+ * is not "which routes should the understudy be kept away from" — that question
+ * has no end, and a list of forbidden things fails open on every route added
+ * after it was written. The question is "what does something that only watches
+ * actually need to POST", and the honest answer is: nothing it does not own.
+ * It records what he did and what it would have predicted; it opens no session,
+ * sends no key, runs no git, touches no card.
+ *
+ * Both routes below exist to make it do *less*. `/understudy/mode` moves one
+ * class between shadow and off, `/understudy/halt` stops the whole thing. So
+ * the worst an understudy credential in the wrong hands can do with either is
+ * turn the scoreboard off, which is a property worth keeping when the next
+ * route is proposed.
+ *
+ * `/chat/send` and `/terminal/tmux/windows` are the two names that are
+ * deliberately *not* here, and understudy-allowlist.test.ts asserts both by
+ * name rather than by rule. The first is speaking as him into a running agent;
+ * the second reshapes his desk out from under him. Something that can do either
+ * has stopped being a watcher, so on the day somebody adds "just let it reply",
+ * the failing test is the conversation that should happen first.
+ */
+export const UNDERSTUDY_POST = new Set([
+  "/understudy/mode",
+  "/understudy/halt",
+]);
+
+/**
+ * What the understudy may ask for, decided without ever consulting a scope.
+ *
+ * Total on purpose: any method that is neither a read nor a named POST is
+ * false, so a route invented next month is out of reach before anybody thinks
+ * about it — the same deny-by-default `scopeNeeded` uses. The difference, and
+ * the reason this is a separate function rather than a rank, is that this one
+ * cannot be widened by granting anything, because it never asks what was
+ * granted.
+ *
+ * Reads are allowed wholesale minus FULL_GET, which is the identical carve-out
+ * the device rules make and for the identical reason: `/terminal/pty` is a
+ * WebSocket upgrade wearing a GET, and an interactive shell handed to the one
+ * caller whose entire promise is that it does not act would make the promise a
+ * lie. `/git/status` arrives through READ_POST — a read that had to be a POST
+ * because its argument is a filesystem path — and the understudy needs it to
+ * see which branch a piece of work started on.
+ */
+export function understudyAllows(method: string, pathname: string): boolean {
+  if (method === "GET" || method === "HEAD") return !FULL_GET.has(pathname);
+  if (method === "POST") return READ_POST.has(pathname) || UNDERSTUDY_POST.has(pathname);
+  return false;
+}
+
+/** What index.ts answers with when the understudy is switched on and there is
+ *  no token to enforce it with. Shared so the route and the test agree on the
+ *  wording, and so the person reading the 409 is told the fix. */
+export const UNDERSTUDY_NO_TOKEN_ERROR =
+  "the clone cannot be enabled on a server with no auth token: its limits are enforced per-caller, " +
+  "and an unauthenticated server never identifies a caller — set AGENTGLASS_TOKEN and restart";
+
+/**
+ * Whether this install still owes a token, and therefore whether everything
+ * above is load-bearing or decoration.
+ *
+ * This is the single most dangerous property of the design, so it is written
+ * down here rather than left to be found. `resolveToken` returns a null token
+ * on the zero-config loopback path — `bun run dev` and any hand-started server
+ * — and index.ts guards the whole `callerFor` / `allowed` block behind having
+ * one. No token means nothing downstream ever learns *who* is asking, which
+ * means `understudyAllows` never runs, which means the understudy is not
+ * narrowed on such a box: it is simply absent, and every request arrives as an
+ * unidentified local caller with the run of the server, `/chat/send` included.
+ * The allowlist would sit in this file looking exactly as correct as it does
+ * now and hold nothing at all.
+ *
+ * A fence cannot fix that from inside itself, so the refusal happens one level
+ * up, at the moment somebody turns the understudy on: index.ts calls this
+ * first and answers 409 with UNDERSTUDY_NO_TOKEN_ERROR — a conflict with the
+ * state of the install, not a malformed request and not a missing credential.
+ * Setting `AGENTGLASS_TOKEN`, or running the packaged desktop app which mints
+ * one for its own sidecar, is the whole of the fix.
+ *
+ * `true` means *there is no token, refuse*. The direction is spelled out
+ * because the misreading this invites is "does the understudy require a token —
+ * yes, obviously", and the install where that misreading changes the answer is
+ * precisely the unauthenticated one.
+ */
+export function understudyRequiresToken(token: string | null | undefined): boolean {
+  return !token;
+}
+
 /** True when this caller may make this request. */
 export function allowed(caller: Caller, method: string, pathname: string): boolean {
+  // First, and returning outright — see `principal` on Caller. The understudy's
+  // fence is a different function, not a lower rank, and the two must never be
+  // consulted together: an `||` on this line would give back everything the
+  // separate function exists to take away.
+  if (caller.principal === "understudy") return understudyAllows(method, pathname);
+  /* Same rule, same reason: a separate function, never an `||` with the scope
+     check — the seat's token says `full` so its reads work, and an `||` here
+     would hand back every write this exists to withhold. */
+  if (caller.principal === "seat") return seatAllows(caller.seat?.powers ?? "speak", method, pathname);
+  // A plugin's own channel: its panels, its settings, its event queue, its
+  // notes. Open at any scope because drawing is not a power over anything
+  // else — what it may draw was declared in its manifest and approved, and
+  // the handlers check each request against that. Only a plugin token gets
+  // here; anybody else asking for `/plugin/self` has no self to be.
+  if (caller.kind === "plugin" && (pathname === "/plugin/self" || pathname.startsWith("/plugin/self/"))) return true;
   return scopeAllows(caller.scope, scopeNeeded(method, pathname));
+}
+
+/**
+ * A caller holding a credential an agent on this machine cannot mint.
+ *
+ * `scopeNeeded` answers "is this caller allowed to answer a gate", and for the
+ * machine token the answer is yes — `full` contains `answer`, and it has to,
+ * because the desk is the machine. That is the right answer to that question
+ * and the wrong one to a different question that `/gate/decide` has to ask:
+ * *is the thing pressing the button the same thing being held?*
+ *
+ * The held party is an agent running as this user. It reads
+ * `~/.config/agentglass/token` — 0600 is not a wall against a process that is
+ * already you — or finds `AGENTGLASS_TOKEN` in its own environment, because a
+ * hook it launched needs it there. So the machine token proves the request came
+ * from this machine and proves nothing at all about who on it.
+ *
+ * A device credential is a different fact. It was minted at the desk while
+ * somebody looked at the request (pairing.ts), it is stored here only as a
+ * hash, it never touches the environment an agent inherits, and it can be taken
+ * back on its own. `answer` is the grant that exists for exactly this act — see
+ * ANSWER_POST above — so `full` clears it too, on the same widest-first rule
+ * every other check uses.
+ *
+ * A plugin's credential is the machine's problem wearing a scope. It is minted
+ * by this server (mintPluginToken), handed to a child process of this server,
+ * and sits in that process's environment — the same place an agent's hook finds
+ * the machine token. Whatever scope its manifest declared, it fails the question
+ * this function asks, so it is refused here whatever `allowed` said.
+ *
+ * Note what this cannot tell you when no token is configured at all: `caller`
+ * is then always null (see resolveToken), so this returns false and the origin
+ * half of the check in index.ts is the whole of it.
+ */
+export function answersFromADevice(caller: Caller | null | undefined): boolean {
+  // The understudy is excluded here as well as in `allowed`, and the repetition
+  // is the point. `allowed` already refuses it `/gate/decide`, so this line
+  // changes no outcome today — it exists because this function is a *second*
+  // door onto the same act (mayReleaseAHold in index.ts asks it directly), and
+  // a caller that must never press the button should be turned away at both.
+  // The day someone gives the understudy an `answer`-scoped credential for some
+  // unrelated convenience, this is what stops it releasing its own holds.
+  if (caller?.principal === "understudy") return false;
+  // A plugin is spelled out too, although `kind === "device"` below already
+  // excludes it, for the same reason the understudy is: this is the door, and
+  // the caller that was walking through it until the kind existed (see
+  // `Caller.kind`) should be refused by name here, not by the shape of an
+  // equality that somebody may one day loosen to "any credential that is not
+  // the machine's".
+  if (caller?.kind === "plugin") return false;
+  return caller?.kind === "device" && scopeAllows(caller.scope, "answer");
+}
+
+/**
+ * The request carries the key the desktop app handed this server (desk.ts):
+ * the credential for letting a hold go that no process on this machine but the
+ * app's own renderer holds. False wherever there is no key.
+ */
+export function deskKeyOk(req: Request): boolean {
+  const key = deskKey();
+  const given = req.headers.get(DESK_HEADER) || "";
+  return !!key && !!given && eq(given, key);
 }

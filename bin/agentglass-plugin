@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""Install, switch on and check agentglass plugins, without the window.
+
+    agentglass-plugin validate ~/code/my-plugin     # offline; 0 clean, 1 not
+    agentglass-plugin hash ~/code/my-plugin         # offline; the content hash a catalogue pins
+    agentglass-plugin add https://github.com/you/my-plugin --approve
+    agentglass-plugin list --json
+    agentglass-plugin enable my-plugin --approve
+    agentglass-plugin disable my-plugin
+    agentglass-plugin update my-plugin
+    agentglass-plugin remove my-plugin              # keeps its settings for a reinstall
+    agentglass-plugin remove my-plugin --drop-settings
+    agentglass-plugin settings my-plugin            # what it holds
+    agentglass-plugin settings my-plugin style=security
+
+Every answer is one JSON object on stdout — {"ok": true, ...} or
+{"ok": false, "error": "..."} — and the exit code follows it, so a shell can
+branch on either. `list` without --json prints a line per plugin instead,
+because that is the one people read rather than parse.
+
+On a machine with agentglass installed this is on PATH as `agentglass-plugin`;
+everywhere else it is one file with no dependencies beyond python3, which is
+why the CI recipe below fetches it rather than installing anything.
+
+`validate` IS THE ONE THAT WORKS WITH NO AGENTGLASS RUNNING. It reads a folder
+and checks its `plugin.json` against the rules the app applies at install, so a
+plugin's own CI can refuse a manifest before anybody tries to install it:
+
+    - name: check the manifest
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/SirAllap/agentglass/main/bin/agentglass-plugin -o /tmp/agentglass-plugin
+        python3 /tmp/agentglass-plugin validate .
+
+It cannot check what a plugin DOES — see `enable`, which is where a person
+approves that. The rules it mirrors live in server/src/plugins.ts and
+shared/pluginUi.ts, and server/test/plugin-cli-validate.test.ts runs both over
+the same cases so the two cannot drift apart quietly.
+
+`hash` IS THE OTHER OFFLINE ONE. It prints the sha256 the app computes over a
+plugin folder at install — the same walk, the same exclusions — which is what
+a catalogue entry pins next to its commit. The app refuses an install whose
+tree hashes to anything else, so the listing describes bytes and not a branch.
+
+Everything else talks to the app over its HTTP API, with the same token the
+other CLIs here use.
+
+Environment:
+    AGENTGLASS_SERVER   base url (default http://localhost:4000)
+    AGENTGLASS_TOKEN    the server's token; read from ~/.config/agentglass/token
+                        when unset, which is where the app keeps it
+"""
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from urllib.parse import urlsplit
+
+
+def _server_or_die(url):
+    """Where the Bearer token goes. https anywhere, http only to this machine:
+    over plain http to a remote host the token travels in the clear."""
+    u = urlsplit(url)
+    host = (u.hostname or "").lower()
+    if u.scheme == "https" and host:
+        return url
+    if u.scheme == "http" and host:
+        loop = host == "localhost"
+        if not loop:
+            try:
+                loop = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loop = False
+        if loop:
+            return url
+        print(f"agentglass: refusing plain http to {host}: the token would travel in the clear. "
+              f"Use https://, or http:// only to localhost/127.0.0.1/::1 (AGENTGLASS_SERVER={url})", file=sys.stderr)
+        sys.exit(2)
+    print(f"agentglass: AGENTGLASS_SERVER must be https://<host> or http://<loopback>, got {url!r}", file=sys.stderr)
+    sys.exit(2)
+
+
+SERVER = _server_or_die(os.environ.get("AGENTGLASS_SERVER", "http://localhost:4000").rstrip("/"))
+
+
+def token():
+    t = os.environ.get("AGENTGLASS_TOKEN", "").strip()
+    if t:
+        return t
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "agentglass", "token"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def call(path, body=None, method="POST", timeout=180):
+    req = urllib.request.Request(
+        f"{SERVER}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Content-Type": "application/json", "Origin": SERVER},
+    )
+    t = token()
+    if t:
+        req.add_header("Authorization", f"Bearer {t}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read() or b"{}")
+        except json.JSONDecodeError:
+            return {"ok": False, "error": f"server said {e.code}"}
+    except urllib.error.URLError as e:
+        return {"ok": False, "error": f"no agentglass at {SERVER} ({e.reason})"}
+
+
+def emit(res):
+    print(json.dumps(res))
+    return 0 if res.get("ok") else 1
+
+
+# ----------------------------------------------------------------- validate
+#
+# The app's rules, in Python, because a plugin's CI has no agentglass to ask.
+# Kept in step with the originals by a test that runs both over the same cases.
+
+MAX_TEXT = 500
+# Every one of these is used with `fullmatch`: in Python `$` also matches
+# before a newline at the very end, so `match` let "name\n" through a rule the
+# app holds exactly, and a listing compares ids exactly as they are written.
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+ICON_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,99}\.(svg|png|webp)$")
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+VERSION_RE = re.compile(r"^\d{1,4}(\.\d{1,4}){0,2}$")
+ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+PANEL_ICONS = ("puzzle", "review", "check", "chart", "list", "bell", "bug", "book", "bolt", "eye")
+FIELD_TYPES = ("string", "text", "number", "boolean", "select", "list", "multi")
+SHORT = 400
+
+
+def _text(v, limit):
+    return isinstance(v, str) and bool(v.strip()) and len(v) <= limit
+
+
+def check_fields(fields):
+    if not isinstance(fields, list):
+        return "fields must be a list"
+    if len(fields) > 60:
+        return "at most 60 fields"
+    seen = set()
+    for f in fields:
+        if not isinstance(f, dict):
+            return "a field must be an object"
+        key = f.get("key")
+        if not isinstance(key, str) or len(key) > 60 or not key.strip():
+            return "field.key must be 1-60 characters"
+        if not KEY_RE.fullmatch(key):
+            return f'field key "{key}" must start with a letter and hold only letters, digits, . _ -'
+        if f.get("type") not in FIELD_TYPES:
+            return f'field "{key}" has an unknown type'
+        if not _text(f.get("label"), 120):
+            return f'field "{key}" label must be 1-120 characters'
+        for name, limit in (("description", SHORT), ("placeholder", 120), ("group", 60)):
+            v = f.get(name)
+            if v is not None and (not isinstance(v, str) or len(v) > limit):
+                return f'field "{key}" {name} must be at most {limit} characters'
+        if key in seen:
+            return f'field key "{key}" appears twice'
+        seen.add(key)
+    return None
+
+
+def check_contributes(c):
+    if c is None:
+        return None
+    if not isinstance(c, dict):
+        return "contributes must be an object"
+    if "settings" in c:
+        why = check_fields(c["settings"])
+        if why:
+            return f"contributes.settings: {why}"
+    if "panels" in c:
+        panels = c["panels"]
+        if not isinstance(panels, list) or len(panels) > 8:
+            return "contributes.panels must be a list of at most 8"
+        seen = set()
+        for p in panels:
+            if not isinstance(p, dict):
+                return "a panel must be an object"
+            pid = p.get("id")
+            if not isinstance(pid, str) or not ID_RE.fullmatch(pid):
+                return "panel id must be 1-40 of a-z, 0-9, - and start with a letter"
+            if pid in seen:
+                return f'panel id "{pid}" appears twice'
+            seen.add(pid)
+            if not _text(p.get("title"), 40):
+                return "panel title must be 1-40 characters"
+            if p.get("icon") is not None and p["icon"] not in PANEL_ICONS:
+                # The app drops an icon it does not know rather than refusing,
+                # so this is a warning's worth of wrong — but a manifest that
+                # names one it does not have is a typo worth catching here.
+                return f'panel icon must be one of {", ".join(PANEL_ICONS)}'
+    if "prNotes" in c and not isinstance(c["prNotes"], bool):
+        return "contributes.prNotes must be true or false"
+    if "prActions" in c:
+        actions = c["prActions"]
+        if not isinstance(actions, list) or len(actions) > 5:
+            return "contributes.prActions must be a list of at most 5"
+        seen = set()
+        for a in actions:
+            if not isinstance(a, dict):
+                return "a pull request action must be an object"
+            aid = a.get("id")
+            if not isinstance(aid, str) or not ID_RE.fullmatch(aid):
+                return "action id must be 1-40 of a-z, 0-9, - and start with a letter"
+            if aid in seen:
+                return f'action id "{aid}" appears twice'
+            seen.add(aid)
+            label = a.get("label")
+            if not isinstance(label, str) or not label.strip() or len(label) > 28:
+                return "action label must be 1-28 characters"
+    return None
+
+
+# The sandbox block, from shared/pluginSandbox.ts. Same rules, same words.
+NEVER_MOUNTABLE = ("~/.config/agentglass", "~/.ssh", "~/.gnupg", "/run/user", "~/.local/share/keyrings")
+PROGRAM_RE = re.compile(r"^[A-Za-z0-9._+-]{1,60}$")
+SANDBOX_KEYS = ("network", "read", "write", "programs")
+SECRET_SEGMENTS = (".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".netrc", ".npmrc", ".pypirc",
+                   ".pgpass", ".git-credentials", ".password-store", ".gnome-keyring", "keyrings")
+SECRET_CONFIG = ("gh", "gcloud", "rclone", "hub", "glab-cli")
+SECRET_NAME = re.compile(r"(token|secret|credential|passwd|password|auth\.json|\.pem$|\.key$|^id_(rsa|ed25519|ecdsa|dsa)|keyring|keychain)", re.I)
+
+
+def _segments(p):
+    return [s for i, s in enumerate(p.split("/")) if s != "" or i == 0]
+
+
+def _sandbox_path(raw, key):
+    at = f"sandbox.{key}"
+    if not isinstance(raw, str) or not raw.strip():
+        return None, f"{at} entries must be non-empty text"
+    if len(raw) > 200 or CONTROL.search(raw):
+        return None, f"{at} paths must be at most 200 characters with no control characters"
+    if not (raw.startswith("~/") or raw.startswith("/")):
+        return None, f'{at} paths must start with ~/ or /, and "{raw}" does not'
+    segs = _segments(raw.rstrip("/") or "/")
+    if any(s in ("..", ".") for s in segs):
+        return None, f'{at} path "{raw}" may not contain . or .. segments'
+    if raw in ("/", "~/") or len(segs) < 2:
+        return None, f"{at} may not be the whole disk or the whole home folder"
+    for never in NEVER_MOUNTABLE:
+        n = _segments(never)
+        if segs[:len(n)] == n or n[:len(segs)] == segs:
+            return None, f'{at} path "{raw}" is or leads to {never}, which no plugin can be given'
+    return "/".join(segs), None
+
+
+def check_sandbox(b):
+    """Returns (normalized block, None) or (None, the reason)."""
+    if not isinstance(b, dict):
+        return None, "sandbox must be an object"
+    for k in b:
+        if k not in SANDBOX_KEYS:
+            return None, f'sandbox has no "{k}": it takes network, read, write and programs'
+    if "network" in b and b["network"] not in ("agentglass", "internet"):
+        return None, "sandbox.network must be agentglass or internet"
+    lists = {}
+    for key in ("read", "write"):
+        raw = b.get(key)
+        if raw is None and key not in b:
+            lists[key] = []
+            continue
+        if not isinstance(raw, list):
+            return None, f"sandbox.{key} must be a list of paths"
+        if len(raw) > 16:
+            return None, f"sandbox.{key} may list at most 16 paths"
+        out = set()
+        for item in raw:
+            path, why = _sandbox_path(item, key)
+            if why:
+                return None, why
+            out.add(path)
+        lists[key] = sorted(out)
+    programs = []
+    if "programs" in b:
+        raw = b["programs"]
+        if not isinstance(raw, list) or len(raw) > 16:
+            return None, "sandbox.programs must be a list of at most 16 command names"
+        for p in raw:
+            if not isinstance(p, str) or not PROGRAM_RE.fullmatch(p) or p in (".", ".."):
+                return None, "sandbox.programs entries must be bare command names, with no slash"
+        programs = sorted(set(raw))
+    return {"network": "internet" if b.get("network") == "internet" else "agentglass",
+            "read": lists["read"], "write": lists["write"], "programs": programs}, None
+
+
+def secret_grant(path):
+    """Why a path looks like it holds a login, or None. A hint, not a fence."""
+    segs = _segments(path)
+    if ".config" in segs:
+        i = segs.index(".config")
+        if i + 1 < len(segs) and segs[i + 1] in SECRET_CONFIG:
+            return f"keeps a login for {segs[i + 1]}"
+    for s in segs:
+        if s in SECRET_SEGMENTS:
+            return f"{s} holds credentials"
+        if SECRET_NAME.search(s):
+            return "the name says it holds a secret"
+    return None
+
+
+def check_manifest(m):
+    """The manifest rules, in the order the app applies them. Returns the
+    first reason it is not installable, or None."""
+    if not isinstance(m, dict):
+        return "manifest must be a JSON object"
+    name = m.get("name")
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in (".", "..") or name.startswith("."):
+        return ("name must be 1-60 characters: letters, numbers, dots, dashes or underscores, "
+                "and may not start with a dot")
+    if not _text(m.get("publisher"), 200):
+        return "publisher must be 1-200 characters"
+    if not _text(m.get("description"), MAX_TEXT):
+        return f"description must be 1-{MAX_TEXT} characters"
+    entry = m.get("entrypoint")
+    if not isinstance(entry, str) or not entry.strip() or len(entry) > MAX_TEXT or CONTROL.search(entry):
+        return "entrypoint must be a non-empty command with no control characters"
+    if m.get("scope") not in ("read", "answer", "full"):
+        return "scope must be one of read, answer, full"
+    why = check_contributes(m.get("contributes"))
+    if why:
+        return why
+    icon = m.get("icon")
+    if icon is not None and (not isinstance(icon, str) or not ICON_RE.fullmatch(icon) or ".." in icon.split("/")):
+        return "icon must be a relative path to an .svg, .png or .webp file in the plugin folder"
+    color = m.get("color")
+    if color is not None and (not isinstance(color, str) or not COLOR_RE.fullmatch(color)):
+        return "color must be a hex colour like #7c5cf5"
+    min_app = m.get("minApp")
+    if min_app is not None and (not isinstance(min_app, str) or not VERSION_RE.fullmatch(min_app)):
+        return "minApp must be a version like 0.18.0"
+    if "sandbox" in m:
+        _, why = check_sandbox(m["sandbox"])
+        if why:
+            return why
+    return None
+
+
+def cmd_validate(args):
+    folder = os.path.abspath(os.path.expanduser(args.folder))
+    path = os.path.join(folder, "plugin.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        return emit({"ok": False, "error": f"no plugin.json in {folder} ({e.strerror or e})"})
+    try:
+        manifest = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return emit({"ok": False, "error": f"plugin.json is not valid JSON: {e}"})
+    why = check_manifest(manifest)
+    if why:
+        return emit({"ok": False, "error": why})
+    # Things the app finds out at install, which a repository can get wrong
+    # long before then: an icon named and not shipped is the common one.
+    warnings = []
+    icon = manifest.get("icon")
+    if icon and not os.path.isfile(os.path.join(folder, icon)):
+        warnings.append(f"icon {icon} is named in the manifest and not in the folder")
+    for expected in ("README.md", "LICENSE"):
+        if not any(os.path.isfile(os.path.join(folder, expected + ext)) for ext in ("", ".md", ".txt")):
+            warnings.append(f"no {expected} — a catalogue will ask for one")
+    sandbox = None
+    if "sandbox" in manifest:
+        sandbox, _ = check_sandbox(manifest["sandbox"])
+        for key in ("read", "write"):
+            for path in sandbox[key]:
+                why = secret_grant(path)
+                if why:
+                    warnings.append(f"sandbox.{key} {path} looks like a login ({why}): a reviewer will see it in red")
+    draws = sorted(k for k in (manifest.get("contributes") or {}))
+    return emit({"ok": True, "name": manifest["name"], "publisher": manifest["publisher"],
+                 "scope": manifest["scope"], "draws": draws,
+                 **({"minApp": manifest["minApp"]} if manifest.get("minApp") else {}),
+                 **({"sandbox": sandbox} if sandbox else {}),
+                 "warnings": warnings})
+
+
+# --------------------------------------------------------------------- hash
+#
+# `walkPluginDir` and `contentHash` from server/src/plugin-sources.ts, in
+# Python. The walk decides what "the plugin" is — `.git` is not part of it, a
+# link that leaves the folder refuses the whole thing, a link that stays is an
+# entry of its own rather than followed — and the hash is one framed line per
+# entry: path, NUL, `f`, `x` or `l`, the sha256 of the bytes or of the link's
+# text, newline, in UTF-8 byte order. `x` is a file that may be run, read from
+# git's index when the folder is a checkout, as the app reads it. Every one of those details is a way for the
+# two to disagree, and the test runs both over one tree.
+
+MAX_FILES = 2000
+MAX_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+
+
+def walk_plugin_dir(folder):
+    """The relative paths the app would hash, or (None, why)."""
+    root = os.path.realpath(folder)
+    files, total = [], 0
+
+    def walk(abs_dir):
+        nonlocal total
+        try:
+            entries = list(os.scandir(abs_dir))
+        except OSError as e:
+            return e.strerror or str(e)
+        for ent in entries:
+            # The app refuses these two names, and must: see walkPluginDir.
+            try:
+                ent.name.encode("utf-8")
+            except UnicodeEncodeError:
+                return f"{os.path.relpath(abs_dir, root)} holds a name that is not UTF-8"
+            if "\\" in ent.name:
+                return f"{ent.name!r} has a backslash in its name"
+            if ent.name == ".git":
+                continue
+            child = os.path.join(abs_dir, ent.name)
+            # With `/` on every platform, as the app spells it: the hash is
+            # the same wherever it is taken.
+            rel = os.path.relpath(child, root).replace(os.sep, "/")
+            try:
+                real = os.path.realpath(child, strict=True)
+            except OSError:
+                return f"could not resolve {rel}"
+            if real != root and not real.startswith(root + os.sep):
+                return f"{rel} resolves outside the plugin directory"
+            # The entry's own type, never the target's: a link is hashed by
+            # what it says, and judged by it too — relative, and never above
+            # the folder even on its way back in, because the folder is
+            # installed somewhere other than where it was walked.
+            if ent.is_symlink():
+                target = os.readlink(child)
+                if os.path.isabs(target):
+                    return f"{rel} is a link to an absolute path; a plugin's links are relative"
+                read = os.path.normpath(os.path.join(os.path.dirname(rel), target))
+                if read == os.pardir or read.startswith(os.pardir + os.sep):
+                    return f"{rel} is a link that climbs outside the plugin directory"
+                files.append(rel)
+                if len(files) > MAX_FILES:
+                    return f"more than {MAX_FILES} files"
+                continue
+            if ent.is_dir(follow_symlinks=False):
+                why = walk(child)
+                if why:
+                    return why
+                continue
+            if not ent.is_file(follow_symlinks=False):
+                continue
+            files.append(rel)
+            if len(files) > MAX_FILES:
+                return f"more than {MAX_FILES} files"
+            size = os.stat(real).st_size
+            if size > MAX_ARTIFACT_BYTES:
+                return f"{rel} is larger than {MAX_ARTIFACT_BYTES // (1024 * 1024)}MB"
+            total += size
+            if total > MAX_TOTAL_BYTES:
+                return f"plugin is larger than {MAX_TOTAL_BYTES // (1024 * 1024)}MB in total"
+        return None
+
+    why = walk(root)
+    return (None, why) if why else (files, None)
+
+
+def index_executables(root):
+    """The files git's index records as 100755, when `root` is itself a
+    checkout; see `indexExecutables` in the app. Windows keeps no bit on disk
+    and Git for Windows keeps it in the index, so this is how a pinned install
+    there hashes what the catalogue hashed on Linux."""
+    import subprocess
+    found = set()
+    if not os.path.lexists(os.path.join(root, ".git")):
+        return found
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "-c", "core.fsmonitor=false", "--git-dir", os.path.join(root, ".git"), "--work-tree", root,
+             "ls-files", "--stage", "-z"],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return found
+    if r.returncode != 0:
+        return found
+    for entry in r.stdout.split(b"\0"):
+        meta, tab, path = entry.partition(b"\t")
+        if tab and meta.startswith(b"100755 "):
+            found.add(path.decode("utf-8", "surrogateescape"))
+    return found
+
+
+def content_hash(folder, files):
+    import hashlib
+    import stat
+    root = os.path.realpath(folder)
+    indexed = index_executables(root)
+    h = hashlib.sha256()
+    # By UTF-8 bytes, which is what the app sorts by. `surrogateescape` hands
+    # back the bytes of a name that is not UTF-8 instead of stopping here; the
+    # app cannot read such a name the same way, so it fails the comparison
+    # rather than this command.
+    for rel in sorted(files, key=lambda r: r.encode("utf-8", "surrogateescape")):
+        path = os.path.join(root, rel)
+        if os.path.islink(path):
+            kind, payload = b"l", os.fsencode(os.readlink(path))
+            if os.name == "nt":
+                payload = payload.replace(b"\\", b"/")
+        else:
+            with open(path, "rb") as f:
+                payload = f.read()
+            # The disk too, except on Windows, which has no bit to read (and
+            # where Python makes one up from the extension).
+            runs = rel in indexed or (os.name != "nt" and os.lstat(path).st_mode & stat.S_IXUSR)
+            kind = b"x" if runs else b"f"
+        h.update(rel.encode("utf-8", "surrogateescape"))
+        h.update(b"\0" + kind + hashlib.sha256(payload).hexdigest().encode("ascii") + b"\n")
+    return h.hexdigest()
+
+
+def cmd_hash(args):
+    folder = os.path.abspath(os.path.expanduser(args.folder))
+    if not os.path.isdir(folder):
+        return emit({"ok": False, "error": f"{folder} is not a folder"})
+    files, why = walk_plugin_dir(folder)
+    if why:
+        return emit({"ok": False, "error": why})
+    return emit({"ok": True, "sha256": content_hash(folder, files), "files": len(files)})
+
+
+# -------------------------------------------------------------- the app's API
+
+def declaration(plugin):
+    """What switching it on approves, in the words the card uses."""
+    c = plugin.get("contributes") or {}
+    draws = []
+    if c.get("panels"):
+        draws += [f'a panel, "{p.get("title")}", in the Plugins view' for p in c["panels"]]
+    if c.get("settings"):
+        draws.append(f'a settings page with {len(c["settings"])} fields')
+    if c.get("prNotes"):
+        draws.append("notes inside pull requests, never sent to GitHub")
+    for a in c.get("prActions") or []:
+        draws.append(f'a button, "{a.get("label")}", in every pull request')
+    return {"scope": plugin.get("scope"), "runs": plugin.get("entrypoint"), "draws": draws}
+
+
+def enable_with_approval(name, approve):
+    """`approved` is the caller saying somebody read the declaration.
+
+    The window can say it because its card shows the scope and every place
+    the plugin draws. A terminal cannot, so this prints them and says it only
+    for `--approve` — otherwise the server refuses and says where to look."""
+    if not approve:
+        return emit(call("/plugins/enable", {"name": name, "approved": False}))
+    r = call("/plugins", method="GET")
+    p = next((x for x in (r.get("plugins") or []) if x.get("name") == name), None)
+    if p:
+        print(json.dumps({"approving": declaration(p)}), file=sys.stderr)
+    return emit(call("/plugins/enable", {"name": name, "approved": True}))
+
+
+def cmd_add(args):
+    r = call("/plugins/install", {"source": args.source})
+    if not r.get("ok") or not args.approve:
+        return emit(r)
+    return enable_with_approval((r.get("plugin") or {}).get("name"), True)
+
+
+def cmd_list(args):
+    r = call("/plugins", method="GET")
+    if args.json or not r.get("plugins"):
+        return emit(r)
+    for p in r["plugins"]:
+        state = "running" if p.get("running") else ("enabled" if p.get("enabled") else "off")
+        draws = ", ".join(sorted(p.get("contributes") or {})) or "nothing"
+        print(f"{p['name']:<24} {state:<8} {p.get('scope', '?'):<7} draws {draws}")
+    return 0
+
+
+def cmd_simple(path, args):
+    return emit(call(path, {"name": args.name}))
+
+
+def cmd_settings(args):
+    if not args.set:
+        return emit(call(f"/plugins/settings?name={urllib.parse.quote(args.name)}", method="GET"))
+    values = {}
+    for pair in args.set:
+        if "=" not in pair:
+            return emit({"ok": False, "error": f"expected key=value, got {pair!r}"})
+        k, v = pair.split("=", 1)
+        values[k] = v
+    return emit(call("/plugins/settings", {"name": args.name, "values": values}))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="agentglass-plugin", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    v = sub.add_parser("validate", help="check a plugin folder's manifest; needs no running agentglass")
+    v.add_argument("folder")
+    v.set_defaults(fn=cmd_validate)
+
+    h = sub.add_parser("hash", help="the content hash the app computes at install; needs no running agentglass")
+    h.add_argument("folder")
+    h.set_defaults(fn=cmd_hash)
+
+    a = sub.add_parser("add", help="install from a git URL or a local folder")
+    a.add_argument("source")
+    a.add_argument("--approve", action="store_true",
+                   help="print what it declares and switch it on; without this it is installed and left off")
+    a.set_defaults(fn=cmd_add)
+
+    ls = sub.add_parser("list", help="what is installed, and what each one draws")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(fn=cmd_list)
+
+    en = sub.add_parser("enable", help="switch one on; needs --approve when what it declares is new or changed")
+    en.add_argument("name")
+    en.add_argument("--approve", action="store_true", help="you have read what it declares")
+    en.set_defaults(fn=lambda args: enable_with_approval(args.name, args.approve))
+
+    rm = sub.add_parser("remove", help="uninstall it and drop what it wrote; its settings are kept for a reinstall")
+    rm.add_argument("name")
+    rm.add_argument("--drop-settings", action="store_true", help="also remove what was chosen on its settings page")
+    rm.set_defaults(fn=lambda args: emit(call("/plugins/remove", {"name": args.name, "dropSettings": args.drop_settings})))
+
+    for name, path, help_text in (
+        ("disable", "/plugins/disable", "switch one off; its notes stay readable"),
+        ("update", "/plugins/update", "re-clone a git-backed install at its recorded ref"),
+    ):
+        s = sub.add_parser(name, help=help_text)
+        s.add_argument("name")
+        s.set_defaults(fn=lambda args, path=path: cmd_simple(path, args))
+
+    st = sub.add_parser("settings", help="read or write a plugin's settings")
+    st.add_argument("name")
+    st.add_argument("set", nargs="*", metavar="key=value")
+    st.set_defaults(fn=cmd_settings)
+
+    args = p.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()

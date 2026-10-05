@@ -19,69 +19,98 @@
 //
 // 4. Nothing waits on the network. `gh` costs a second or more per call and the
 //    server has one thread; every read is a cached answer with its age shown.
+import { PluginPrActions } from "./plugins/PluginPrActions.tsx";
+import { useLocalNotes, groupByRun, RunCard, NoteCard, LocalMark, LocalGlyph, LocalStrip, sortNotes, type LocalNotes, type LocalNote } from "./plugins/LocalReview.tsx";
 import { createContext, Fragment, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { handoffTo } from "../lib/handoffTo.ts";
+import { isBackButton } from "../lib/mouseBack.ts";
+import { onAppBack } from "../lib/desktop.ts";
 import { requestTermIssue } from "../lib/termIssue.ts";
-import { diffSplit, diffWrap } from "../lib/diffPrefs.ts";
+import { diffSplit, diffWrap, diffNoWhitespace, setDiffNoWhitespace } from "../lib/diffPrefs.ts";
 import { Portal } from "./Portal.tsx";
 import { subscribePrJump, prJump, clearPrJump } from "../lib/prJump.ts";
+import { findMention, selectorFor } from "../lib/prMention.ts";
+import { fileSection } from "../lib/patchLines.ts";
+import { groupPatch } from "../lib/changeGroups.ts";
+import { flashElement } from "../lib/flash.ts";
 import { shaFromHref } from "../lib/commitLink.ts";
+import { isShortRef, openInApp, wantsExternal } from "../lib/linkRouter.ts";
 import { viewHeaderClass, viewHeaderStyle } from "./workspace/ViewHeader.tsx";
 import { ScopeChip } from "./workspace/Chrome.tsx";
+import { CheckoutPicker } from "./CheckoutPicker.tsx";
 import type {
   PrSummary, PrDetail, PrRepoId, PrThread, PrComment, PrReview, PrReviewer, PrCheck, GitRepoRef, FileChange,
   PrReaction, PrAuthorAssociation, PrEvent, PrCommit, PrFile, PrCheckJob, PrLocalHead,
   ReviewRecipe, ReviewRecipeGroup, ReviewRecipeContext,
 } from "../../../shared/types.ts";
-import { api } from "../lib/api.ts";
+import { api, type BranchSpend, type RepoSpend } from "../lib/api.ts";
 import {
   allowedMethods, pickMergeMethod, MERGE_LABEL, MERGE_OPTION, type MergeMethod,
 } from "../../../shared/mergeMethod.ts";
-import { updateBranchMove } from "../lib/updateBranch.ts";
+import { updateBranchMove, prConflicted, gitSaysClean as cleanMerge } from "../lib/updateBranch.ts";
 import { depSpec } from "../../../shared/deps.ts";
 import { useDialogs } from "./ConfirmDialog.tsx";
 import { useMergeDialog } from "./MergeDialog.tsx";
 import { mergeCardRef, mergeNote, statusColor } from "../lib/cardMove.ts";
 import { cardPlan, cardPlanNote } from "../lib/cardPlan.ts";
-import { cardOf, askingCard, onCard, forgetCard } from "../lib/prCardStore.ts";
+import { cardOf, askingCard, onCard, forgetCard, forgetCards, cardVersion, withCard } from "../lib/prCardStore.ts";
+import { PeoplePick } from "./PeoplePick.tsx";
 import { SCROLLBAR_CSS, LINEBTN_CSS, CODE_FONT_STYLE, UnifiedDiff, SplitDiff, LineMenuCtx, type LinePick, type LineSel } from "./diff/DiffLines.tsx";
 import { Toggle } from "./diff/DiffControls.tsx";
 import { HiliteCtx, useDiffHighlight } from "../lib/diffHighlight.ts";
 import { Select } from "./Select.tsx";
-import { parseBody, parseUnifiedDiff, newLineNumbers, diffKind, parseShieldBadge, type MdBlock, type MdListItem, type ParsedFile } from "../lib/prBody.ts";
-import { afterViewed, stepFileIndex, verticalScrollerOf } from "../lib/prNav.ts";
+import { parseBody, parseUnifiedDiff, newLineNumbers, diffKind, parseShieldBadge, toggleChecklistItem, type MdBlock, type MdListItem, type ParsedFile } from "../lib/prBody.ts";
+import { afterViewed, fileAtFloor, stepFileIndex, verticalScrollerOf } from "../lib/prNav.ts";
 import { buildFileTree, treeOrder, type TreeNode } from "../lib/prFileTree.ts";
 import { POLL_MS, SETTLE_MS, settleAfter } from "../lib/prSettle.ts";
 import { keepLoadedChecks } from "../lib/prMerge.ts";
 import { askingBehind, behindAnswer, forgetBehind, forgetOneBehind, onBehind, refreshBehind } from "../lib/prBehindStore.ts";
-import { forgetRollups } from "../lib/prRollupStore.ts";
+import { forgetRollups, refreshRollup } from "../lib/prRollupStore.ts";
+import { overlayDetail, refreshPlan } from "../lib/prRefresh.ts";
 import {
-  anchorId, bootstrapSince, clearSeen, foldedIdx, newKeys, newSince, readSeen, reviewSpeaks,
-  threadLastAt, threadMovedOn, writeSeen, type NewAtom,
+  anchorId, bootstrapSince, clearSeen, foldedIdx, markAllSeen, newKeys, newSince, onSeenChange, readSeen,
+  reviewSpeaks, threadLastAt, threadMovedOn, writeSeen, type NewAtom,
 } from "../lib/prNew.ts";
+import { unreadOf, type Unread } from "../lib/prUnread.ts";
+import { quoteReply } from "../lib/prQuote.ts";
+import { sinceRange, sinceTitle } from "../lib/prSinceReview.ts";
+import { withoutWhitespace } from "../lib/diffNoWhitespace.ts";
+import { loginOf, ownersOf } from "../lib/codeowners.ts";
+import { UnreadBadge } from "./UnreadBadge.tsx";
 import { excerpt, findInDiffs, groupByFile, type Match } from "../lib/diffFind.ts";
 import { PrFilterBar } from "./PrFilterBar.tsx";
+import { FilterBuilder } from "./tasks/FilterBuilder.tsx";
+import { EMPTY as EMPTY_RULES, readFilterSet, type FilterSet } from "./tasks/filters.ts";
 import { Avatar } from "./Avatar.tsx";
 import { StatusPill } from "./StatusPill.tsx";
 import { PeekFile, type Peek } from "./PeekFile.tsx";
-import { MERGE_WHY, mergeBlockedWhy, checksLine, checksStanding, standingLine, checksShort, mergeVerdict } from "../../../shared/mergeReason.ts";
-import { parseQuery, applyFilters, peopleMatched, buildFacets, activeCount, type RepoFacets } from "../lib/prFilter.ts";
-import { getHighlighter, shikiTheme, ensureLanguage } from "../lib/highlight.ts";
+import { MERGE_WHY, mergeBlockedWhy, checksLine, checksStanding, standingLine, checksShort, mergeVerdict, githubWillMerge } from "../../../shared/mergeReason.ts";
+import { mergeBlockers, mergeRefusal, autoMergeRefusal, staleApproval, type MergeBlocker } from "../../../shared/mergeBlockers.ts";
+import { parseQuery, applyFilters, applyRulesKeepUnread, peopleMatched, buildFacets, activeCount, readPrField, builderFields, queryToRules, type RepoFacets } from "../lib/prFilter.ts";
+import { CodeBlock as MdCodeBlock } from "../lib/mdCode.tsx";
 import { externalUrl, openExternal } from "../lib/externalUrl.ts";
 import { cardRef, chipAction } from "../lib/cardRef.ts";
+import { trackerName } from "../../../shared/taskref.ts";
+import { reviewerRoster, blockingReviewers, reviewVerdict, verdictLine, type ReviewerRow, type ReviewerState } from "../lib/prReviewers.ts";
 import { expandRecipe } from "../../../shared/recipeText.ts";
 import { suggestRecipeId } from "../../../shared/reviewSuggest.ts";
 import { openSettings } from "../lib/openSettings.ts";
 import { requestWorktreeJump } from "../lib/worktreeJump.ts";
-import { conflictBriefing, CONFLICT_ASK } from "../lib/conflictBrief.ts";
+import { wtCell, wtCellTitle, folderOf } from "../lib/prWorktreeCell.ts";
+import { conflictBriefing, conflictHandoff } from "../lib/conflictBrief.ts";
 import { openCard } from "../lib/openCard.ts";
 import { openIssue } from "../lib/openIssue.ts";
 import { useClickupSetup } from "../lib/clickupSetup.ts";
-import type { ListStatus as CuStatus, ListMember as CuMember } from "../../../shared/providers.ts";
-import { CloseButton } from "./CloseButton.tsx";
+import type { ListStatus as CuStatus, ListMember as CuMember, ProviderTask } from "../../../shared/providers.ts";
+import { CloseButton, CloseIcon } from "./CloseButton.tsx";
 import { ICON } from "../lib/iconSize.ts";
+import { AgentIcon, ArrowIcon, AttachIcon, BlockedIcon, BoltIcon, BranchIcon, CaretIcon, CheckboxIcon, CircleIcon, ClockIcon, CommentIcon, CopyIcon, CrossIcon, DoneIcon, DraftIcon, EditIcon, EyeIcon, FileIcon, FlagIcon, IconLabel, LinkIcon, MergeIcon, MoreIcon, PlusIcon, RefreshIcon, SearchIcon, SparkleIcon, StarIcon, TagIcon, UndoIcon, UserIcon } from "../lib/glyphIcons.tsx";
+import { PrIcon } from "./workspace/icons.tsx";
+import { CardChip } from "../lib/priority.tsx";
+import { ColumnsIcon, InboxIcon, QuoteIcon } from "./settingsNavIcons.tsx";
 import { pins, isPinned, togglePin, subscribePins, type Pin } from "../lib/prPins.ts";
 import { TriageBoard } from "./TriageBoard.tsx";
+import { Inbox } from "./prs/Inbox.tsx";
 import { FileRail } from "./FileRail.tsx";
 
 /**
@@ -157,7 +186,7 @@ const SEEN_KEY = "agentglass.pr.seen";
 /** Which voices the conversation is showing. `new` is not a voice — it is
  *  "only what arrived since I last looked", which cuts across all of them and
  *  is the one filter that answers "where is the reply I came back for". */
-type ConvWho = "all" | "human" | "bot" | "new";
+type ConvWho = "all" | "human" | "bot" | "new" | "local";
 const DRAFT_KEY = "agentglass.pr.drafts";
 /** The unsent review itself — the verdict you picked and the note you typed,
  *  which used to live only in the Review tab's own state. Switching to Files to
@@ -170,6 +199,12 @@ const REVIEW_KEY = "agentglass.pr.review";
  *  in the merge button's own state before, so it went back to squash every time
  *  the Overview tab was unmounted — which the Files tab does. */
 const METHOD_KEY = "agentglass.pr.method";
+/** The builder's rules, per repository — a filter names one tracker's
+ *  statuses and people, so one repository's rows are not the next one's
+ *  answer. Unpersisted, the builder forgot everything it was told on every
+ *  restart: the row you built to watch one squad's cards was gone the next
+ *  time the app opened, and had to be built again from nothing. */
+const FILTERS_KEY = "agentglass.pr.filters";
 
 /** A review written but not yet submitted. */
 export interface ReviewDraft {
@@ -265,15 +300,6 @@ function Chip({ text, tint, title }: { text: string; tint: string; title?: strin
  * "the thing that points up" — that is what people recognise it by — so that is
  * what is drawn.
  */
-function ClickUpMark({ size = ICON.xs }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M4 13.5 12 6l8 7.5" />
-      <path d="M4 20 12 15l8 5" />
-    </svg>
-  );
-}
 
 /**
  * The card this pull request came from.
@@ -293,35 +319,165 @@ function ClickUpMark({ size = ICON.xs }: { size?: number }) {
  * With no ClickUp to land in but an address to hand, it opens ClickUp itself
  * instead of a Tasks view that would only ask you to connect one.
  */
-function CardChip({ pr }: { pr: { headRefName?: string; title?: string; body?: string } }) {
+/**
+ * The card, as a pill. ONE of these, drawn in two places.
+ *
+ * The masthead had it and the sidebar had a purple word — the same link, the same
+ * destination, two different things to look at. Reported that way: "the go-to-card
+ * button has to be exactly the same as the one at the top, with the icon and all".
+ * So the pill is a component and both callers render it; a second spelling cannot
+ * drift back in.
+ */
+/* The chip lives in lib/priority.tsx now: the board, this masthead and the
+   sidebar were drawing three different things for one card — a logo, a flag,
+   and a bare label. One component, one place to change it. */
+function CardPill({ label, onClick, title, external, className, priority, status }: {
+  label: string;
+  onClick: () => void;
+  title: string;
+  /** Leaving the app — the arrow every chip in here uses for that promise. */
+  external?: boolean;
+  className?: string;
+  priority?: ProviderTask["priority"];
+  status?: string;
+}) {
+  return (
+    <span className={`align-middle inline-flex items-center gap-1 ${className ?? ""}`}>
+      <CardChip id={label} priority={priority ?? null} status={status} title={title} onOpen={onClick} />
+      {external && <span aria-hidden style={{ fontSize: 10, opacity: 0.7, color: "var(--primary)" }}>↗</span>}
+    </span>
+  );
+}
+
+function PrCardChip({ pr, card }: {
+  pr: { headRefName?: string; title?: string; body?: string };
+  /** The card itself when the saved boards already hold it — for the flag's
+   *  colour and the status beside the id. Absent is "we have not seen it". */
+  card?: PrSummary["card"];
+}) {
   const setup = useClickupSetup();
   const ref = useMemo(() => cardRef(pr), [pr.headRefName, pr.title, pr.body]);
   const go = chipAction(ref, setup);
   if (!ref || !go) return null;
 
   const inApp = go.in === "tasks";
-  const tint = "var(--primary)";
   return (
-    <button
+    <CardPill
+      className="mr-1.5"
+      label={ref.label}
+      priority={card?.priority ?? null}
+      status={card?.status}
+      external={!inApp}
       onClick={() => { if (go.in === "tasks") openCard(ref.query, ref.label); else openExternal(go.url); }}
+      /* The tracker is named only when its own address said which one it is.
+         Guessing here is how a Jira ticket gets offered as a ClickUp card. */
       title={inApp
         ? `Open ${ref.label} in Tasks — the ClickUp card this pull request came from`
-        : `Open ${ref.label} in ClickUp`}
-      className="agx-btn align-middle inline-flex items-center gap-1 mr-1.5 px-1.5 py-0.5 rounded-md text-[11px] tabular-nums"
-      style={{ color: tint, border: `1px solid color-mix(in srgb, ${tint} 45%, transparent)`,
-        background: `color-mix(in srgb, ${tint} 12%, transparent)` }}>
-      <ClickUpMark />
-      {ref.label}
-      {!inApp && <span aria-hidden style={{ fontSize: 10, opacity: 0.7 }}>↗</span>}
-    </button>
+        : `Open ${ref.label}${trackerName(ref.tracker) ? ` in ${trackerName(ref.tracker)}` : ""}`} />
   );
 }
 
-function ReviewChip({ d }: { d: PrSummary["reviewDecision"] }) {
-  if (d === "APPROVED") return <Chip text="approved" tint="var(--success)" />;
-  if (d === "CHANGES_REQUESTED") return <Chip text="changes" tint="var(--error)" />;
-  if (d === "REVIEW_REQUIRED") return <Chip text="waiting" tint="var(--warning)" />;
-  return null;
+/* `humanReview`, not `reviewDecision` — the fourth surface with the same bug.
+   GitHub counts the auto-review bot, so this chip called a pull request
+   approved that no person had read. See `humanReview` on PrSummary. */
+/**
+ * The Overview's verdict band, from the SAME field the board's card uses.
+ *
+ * The two disagreed on one screen — the card said "Waiting on bjorn",
+ * this box said "Reviewed, no verdict by the author" — because they asked
+ * different questions of different data. `humanReview` is the answer: computed
+ * on the server, where the author's login and the outstanding requests are both
+ * known, neither of which the browser's roster can see.
+ *
+ * The roster stays as the fallback for a detail fetched before the field
+ * existed, so an old cached pull request still says something rather than
+ * nothing.
+ */
+function p2Verdict(hv: PrSummary["humanReview"], rows: ReviewerRow[], decision?: string | null, gate?: PrDetail["gate"]): {
+  tint: string; glyph: React.ReactNode; head: string; who?: string; note?: string; url?: string;
+} | null {
+  const named = (list: string[]) =>
+    list.slice(0, 2).join(" and ") + (list.length > 2 ? ` +${list.length - 2}` : "");
+
+  const v = hv && typeof hv === "object" && hv.kind
+    ? hv
+    : (() => {
+      const r = reviewVerdict(rows);
+      return r.kind === "none" ? null : { kind: r.kind, who: r.who, mine: false } as NonNullable<PrSummary["humanReview"]>;
+    })();
+  if (!v) return null;
+  const who = named(Array.isArray(v.who) ? v.who : []);
+
+  if (v.kind === "approved") {
+    if (v.stale) {
+      /*
+       * ASKED AGAIN, ON TOP OF STALE — the same `askedAgain` the
+       * changes-requested branch below already reads. The approval genuinely
+       * does not cover the code any more, but once the author has
+       * re-requested that reviewer's look, "it does not cover what is here
+       * now" reads as a move still left for the author, when the ball has
+       * already gone back to the reviewer.
+       */
+      /* Whether it still COUNTS is GitHub's answer — see staleApproval. Where
+         GitHub still counts it, amber would say "gone" about an approval the
+         merge box on github.com lists as valid. */
+      const s = staleApproval(decision, v.mine ? "You approved" : who ? `Approved by ${who}` : "Approved", gate);
+      return { tint: s.counts ? "var(--success)" : "var(--warning)", glyph: <RefreshIcon size={ICON.xs} />, url: v.url,
+        // The reviewer is inside the sentence: "… — still counts by ada" was
+        // the one order the trailing " by" could not read in.
+        head: s.head, who: undefined,
+        note: v.askedAgain
+          ? (v.mine ? "You were asked to look again — it is with you now." : `You asked ${who} to look again — it is with them now.`)
+          : s.note };
+    }
+    return { tint: "var(--success)", glyph: <DoneIcon size={ICON.xs} />, url: v.url,
+      head: v.mine ? "You approved" : "Approved", who: v.mine ? undefined : who,
+      note: "Whatever is listed below, the review is done" };
+  }
+  if (v.kind === "changes") {
+    /* A band, not a line among the obstacles. It is the same kind of fact as an
+       approval — a person decided — and it was drawn as neither. */
+    return { tint: "var(--error)", glyph: <CrossIcon size={ICON.xs} />, url: v.url,
+      head: v.mine ? "You asked for changes" : "Changes requested",
+      who: v.mine ? undefined : who,
+      /*
+       * The review still blocks the merge, exactly as GitHub shows it — a
+       * re-request does not withdraw it. What was missing is the OTHER half
+       * of GitHub's page: the small ↻ that says a follow-up round has
+       * already been asked for, so the reader is not left thinking their
+       * threads are still the ones to answer when they already answered
+       * them and asked again.
+       */
+      note: v.askedAgain
+        ? (v.mine ? "You were asked to look again." : "Applied, and asked to look again — their move now.")
+        : "Their threads are the ones to answer." };
+  }
+  if (v.kind === "awaiting") {
+    return { tint: "var(--warning)", glyph: <CircleIcon size={ICON.xs} />,
+      head: v.mine ? "Waiting on you" : "Waiting on review", who: v.mine ? undefined : who,
+      note: "Asked for, and not answered yet." };
+  }
+  return { tint: "var(--text3)", glyph: <CommentIcon size={ICON.xs} />, url: v.url,
+    head: "Reviewed, no verdict", who,
+    note: "Somebody wrote, without approving or asking for changes." };
+}
+
+function ReviewChip({ v }: { v: PrSummary["humanReview"] }) {
+  if (!v) return null;
+  /* Capitalised, like GitHub's own — "approved" all lower case beside
+     "APPROVED" on the same screen was the inconsistency reported. */
+  if (v.kind === "approved") {
+    return v.stale
+      ? <Chip text="Approved · moved" tint="var(--warning)" />
+      : <Chip text="Approved" tint="var(--success)" />;
+  }
+  if (v.kind === "changes") {
+    return v.askedAgain
+      ? <Chip text="Changes requested · asked again" tint="var(--error)" />
+      : <Chip text="Changes requested" tint="var(--error)" />;
+  }
+  if (v.kind === "awaiting") return <Chip text="Awaiting review" tint="var(--warning)" />;
+  return <Chip text="Commented" tint="var(--text3)" />;
 }
 
 function Bar({ parts }: { parts: { pct: number; tint: string }[] }) {
@@ -334,7 +490,7 @@ function Bar({ parts }: { parts: { pct: number; tint: string }[] }) {
 }
 
 
-function Btn({ children, onClick, disabled, danger, primary, ok, warn, title, small, pending }: {
+export function Btn({ children, onClick, disabled, danger, primary, ok, warn, title, small, pending }: {
   children: React.ReactNode; onClick?: () => void; disabled?: boolean;
   danger?: boolean; primary?: boolean; ok?: boolean; warn?: boolean; title?: string; small?: boolean;
   /**
@@ -343,8 +499,8 @@ function Btn({ children, onClick, disabled, danger, primary, ok, warn, title, sm
    * Every action in this panel is a round trip through `gh`, which is a second
    * or two on a good day, and the only feedback was the button going grey — the
    * same grey it wears when it is disabled for a reason that has nothing to do
-   * with you. Reported as the worst thing about the app: "tenemos que dar
-   * feedback en las peticiones async, SIEMPRE".
+   * with you. Reported as the worst thing about the app: "we have to give
+   * feedback on async requests, ALWAYS".
    *
    * The spinner goes IN the button, before the label, and the label stays: a
    * control that swaps its words for "Working…" moves everything beside it, and
@@ -387,7 +543,7 @@ function Btn({ children, onClick, disabled, danger, primary, ok, warn, title, sm
        * + an explicit height means a row of these is the same row whatever is
        * written on them, and the padding only decides the width.
        */
-      className={`agx-btn rounded inline-flex items-center justify-center whitespace-nowrap leading-none disabled:opacity-40 ${small ? "text-[10px] px-2 h-[24px]" : "text-[10.5px] px-2.5 h-[28px]"}`}
+      className={`agx-btn rounded inline-flex items-center justify-center gap-1 whitespace-nowrap leading-none disabled:opacity-40 ${small ? "text-[10px] px-2 h-[24px]" : "text-[10.5px] px-2.5 h-[28px]"}`}
       style={{
         // A plain button's label was --text2, a tier meant for labels beside
         // things — so "Comment" sat at the contrast of a caption next to the
@@ -501,6 +657,12 @@ export const MD_CSS = `
    away from the background, whichever direction the theme runs, so this is a
    step on a dark theme and a step on a light one without a second rule. */
 .agx-md code{font-family:var(--diff-font,ui-monospace,monospace);font-size:.88em;background:color-mix(in srgb,var(--text) 13%,transparent);border:1px solid color-mix(in srgb,var(--text) 12%,transparent);padding:.1em .4em;border-radius:5px;color:var(--text)}
+/* A mention. Somebody's handle in the middle of prose is a link and reads as one;
+   YOUR handle is the thing you scan a page of review for, so it gets the weight
+   GitHub gives it — a filled amber chip rather than one more coloured word. */
+.agx-mention{color:var(--primary-hover);text-decoration:none;font-weight:500}
+.agx-mention:hover{text-decoration:underline}
+.agx-mention-you{color:var(--warning);background:color-mix(in srgb,var(--warning) 18%,transparent);border:1px solid color-mix(in srgb,var(--warning) 40%,transparent);border-radius:5px;padding:.05em .3em}
 .agx-md pre{background:var(--bg);border:1px solid color-mix(in srgb,var(--text) 16%,transparent);border-radius:6px;padding:.7em .9em;overflow-x:auto;margin:0 0 .9em}
 .agx-md pre code{background:none;border:0;padding:0;font-size:.92em;line-height:1.55;color:var(--text)}
 .agx-md blockquote{margin:0 0 .9em;padding:.15em 0 .15em .9em;border-left:3px solid color-mix(in srgb,var(--primary) 45%,transparent);color:var(--text2)}
@@ -521,6 +683,12 @@ export const MD_CSS = `
 .agx-md .agx-task li{display:flex;gap:.55em;align-items:flex-start}
 .agx-md .agx-box{flex:none;width:13px;height:13px;margin-top:.28em;border-radius:3px;border:1px solid color-mix(in srgb,var(--text) 24%,transparent);display:inline-flex;align-items:center;justify-content:center;font-size:9px;line-height:1}
 .agx-md .agx-box[data-on="1"]{background:var(--primary);border-color:var(--primary);color:var(--bg)}
+/* Interactive checkboxes are a button carrying agx-box and agx-btn, so the
+   base button chrome — its own background, padding, border and font — has
+   to give way to the same 13px square a read-only box already draws. */
+button.agx-box{background:none;padding:0;font:inherit;cursor:pointer}
+button.agx-box:hover{border-color:color-mix(in srgb,var(--text) 44%,transparent)}
+button.agx-box[data-on="1"]:hover{border-color:var(--primary)}
 /* A grid of boxes is how a spreadsheet looks, not how a table reads. Rules
    between rows only, a banded head, and one rounded edge around the whole
    thing — the shape GitHub settled on, and the one a coverage report needs to
@@ -619,7 +787,12 @@ function ShieldPill({ label, value, color }: { label: string; value: string; col
  * item carries the depth it was written at, and a depth that goes up opens a
  * child, one that goes down closes it.
  */
-function MdList({ items, ordered }: { items: MdListItem[]; ordered: boolean }) {
+/** What a `<Md onToggleTask>` hands every checkbox it draws: a shared,
+ *  render-pass-only counter (see `Md`) and the callback that turns "box N,
+ *  flip it" into a save. */
+type TaskWiring = { next: { current: number }; onToggle: (index: number) => void };
+
+function MdList({ items, ordered, wiring }: { items: MdListItem[]; ordered: boolean; wiring?: TaskWiring }) {
   const isTask = items.some((i) => i.checked !== undefined);
   const List = ordered ? "ol" : "ul";
   const nodes: React.ReactNode[] = [];
@@ -629,11 +802,26 @@ function MdList({ items, ordered }: { items: MdListItem[]; ordered: boolean }) {
     const kids: MdListItem[] = [];
     let j = i + 1;
     while (j < items.length && items[j]!.depth > it.depth) { kids.push(items[j]!); j++; }
+    /* The index this ONE box gets, claimed at render time — before its kids
+       render, so a nested checkbox is numbered after its parent and before
+       its parent's siblings, same as it reads in the raw text. */
+    const taskIndex = it.checked !== undefined && wiring ? wiring.next.current++ : -1;
     nodes.push(
       <li key={i}>
-        {it.checked !== undefined && <span className="agx-box" data-on={it.checked ? "1" : "0"}>{it.checked ? "✓" : ""}</span>}
+        {it.checked !== undefined && (
+          wiring && taskIndex >= 0 ? (
+            <button type="button" className="agx-box agx-btn" data-on={it.checked ? "1" : "0"}
+              role="checkbox" aria-checked={it.checked}
+              title={it.checked ? "Uncheck" : "Check"}
+              onClick={() => wiring.onToggle(taskIndex)}>
+              {it.checked ? <DoneIcon size={ICON.xs} /> : null}
+            </button>
+          ) : (
+            <span className="agx-box" data-on={it.checked ? "1" : "0"}>{it.checked ? <DoneIcon size={ICON.xs} /> : null}</span>
+          )
+        )}
         <span dangerouslySetInnerHTML={{ __html: it.html }} />
-        {kids.length > 0 && <MdList items={kids} ordered={!!kids[0]!.ordered} />}
+        {kids.length > 0 && <MdList items={kids} ordered={!!kids[0]!.ordered} wiring={wiring} />}
       </li>,
     );
     i = j - 1;
@@ -641,14 +829,14 @@ function MdList({ items, ordered }: { items: MdListItem[]; ordered: boolean }) {
   return <List className={isTask ? "agx-task" : undefined}>{nodes}</List>;
 }
 
-function Block({ b }: { b: MdBlock }) {
+function Block({ b, wiring }: { b: MdBlock; wiring?: TaskWiring }) {
   if (b.kind === "heading") {
     const H = (["h1", "h2", "h3", "h4", "h5", "h6"][b.level - 1] ?? "h6") as "h1";
     return <H dangerouslySetInnerHTML={{ __html: b.html }} />;
   }
   if (b.kind === "para") return <p dangerouslySetInnerHTML={{ __html: b.html }} />;
   if (b.kind === "rule") return <hr />;
-  if (b.kind === "code") return <CodeBlock text={b.text} lang={b.lang} />;
+  if (b.kind === "code") return <MdCodeBlock code={b.text} tag={b.lang} />;
   if (b.kind === "quote") return <blockquote dangerouslySetInnerHTML={{ __html: b.html }} />;
   if (b.kind === "image") {
     // A shields.io badge is text pretending to be a picture. Drawn rather than
@@ -680,7 +868,7 @@ function Block({ b }: { b: MdBlock }) {
     return (
       <details className="agx-details">
         <summary>{b.summary}</summary>
-        <div>{b.blocks.map((inner, i) => <Block key={i} b={inner} />)}</div>
+        <div>{b.blocks.map((inner, i) => <Block key={i} b={inner} wiring={wiring} />)}</div>
       </details>
     );
   }
@@ -696,39 +884,30 @@ function Block({ b }: { b: MdBlock }) {
     );
   }
   if (b.kind === "suggestion") return <Suggestion text={b.text} />;
-  return <MdList items={b.items} ordered={b.ordered} />;
+  return <MdList items={b.items} ordered={b.ordered} wiring={wiring} />;
 }
 
-/**
- * A fenced code block, tokenised by the same shiki highlighter the diff
- * surfaces already use. The parser has carried `lang` since it was written;
- * the renderer dropped it and printed plain text, so a code reference from a
- * person or a bot arrived as prose. Falls back to plain text while the
- * highlighter loads and whenever the language is unknown — a block that
- * renders unstyled is fine, one that renders late or blank is not.
+/*
+ * A fenced code block is `mdCode.tsx`'s CodeBlock, the same one every other
+ * markdown surface in this app uses. There used to be a second implementation
+ * here, and it had two faults that only showed up on a real review:
+ *
+ *   the theme was never registered. It passed `shikiTheme()` straight to
+ *   `codeToHtml` without `ensureTheme`, so tokenising threw unless some OTHER
+ *   surface had happened to load that theme in this session — open the diff first
+ *   and a pull request's code blocks were coloured, go straight to the pull
+ *   request and they were flat grey. Reported as "sometimes the code blocks
+ *   lose their colour… I restart the app and look", and the restart was not the fix:
+ *   what changed was which surface was opened first.
+ *
+ *   a fence with no language was never coloured at all. `if (!id) return`, where
+ *   the shared one guesses from the code (see guessLang) — and a review pasted
+ *   from an editor very often has a bare ``` on it.
+ *
+ * It also ignored the theme and bold preferences the diff picker sets, and built
+ * its output with `dangerouslySetInnerHTML`. One implementation, and none of that
+ * can drift apart again.
  */
-function CodeBlock({ text, lang }: { text: string; lang?: string }) {
-  const [html, setHtml] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    const id = (lang || "").toLowerCase();
-    if (!id) return;
-    (async () => {
-      try {
-        const hl = await getHighlighter();
-        // ensureLanguage, not loadLanguage: the grammar is warmed so the first
-        // line of the first file of this language is tokenized properly.
-        await ensureLanguage(hl, id).catch(() => {});
-        if (!hl.getLoadedLanguages().includes(id)) return;
-        const out = hl.codeToHtml(text, { lang: id as never, theme: shikiTheme() });
-        if (live) setHtml(out);
-      } catch { /* unstyled is a fine outcome */ }
-    })();
-    return () => { live = false; };
-  }, [text, lang]);
-  if (html) return <div className="agx-hl" dangerouslySetInnerHTML={{ __html: html }} />;
-  return <pre><code>{text}</code></pre>;
-}
 
 /** Who `@` completes to and which issues `#` does, for the composer. A context
  *  for the same reason as RepoCtx: the composer is rendered from several places
@@ -748,6 +927,16 @@ const EMOJI_NAMES: Record<string, string> = {
  *  somewhere real. A context because `Md` is rendered from a dozen places and
  *  threading a prop through all of them to reach the same value is noise. */
 export const RepoCtx = createContext<string | undefined>(undefined);
+
+/**
+ * Whose GitHub login this window is signed in as.
+ *
+ * Only used to mark `@you` in somebody else's prose, which is the difference
+ * between a review you have to read all of and a review with one line in it
+ * addressed to you. Undefined until the capability call lands, and undefined is
+ * simply "no highlight" — never a wrong one.
+ */
+export const ViewerCtx = createContext<string | undefined>(undefined);
 
 /** How a suggestion block gets applied. Supplied by whichever thread the
  *  comment belongs to, because only it knows the file and the lines; a markdown
@@ -776,24 +965,66 @@ export const SuggestCtx = createContext<{ apply: (text: string) => void; busy: b
 const CommitJumpCtx = createContext<((sha: string) => boolean) | null>(null);
 
 
-export function Md({ body, className }: { body: string; className?: string }) {
+/** Markdown for plugins' local notes, drawn by the same renderer as a GitHub
+ *  remark so the two read alike side by side. */
+const localMd = (text: string) => <Md body={text} />;
+
+export function Md({ body, className, onToggleTask }: {
+  body: string; className?: string;
+  /**
+   * "GitHub already does this without having to hand-edit the body, by
+   * ticking it as a real checkbox": a real, clickable checkbox, same as
+   * GitHub's own — never on by default, since a review comment or a bot's
+   * digest is not this reader's body to rewrite. Given the WHOLE new body
+   * (see `toggleChecklistItem`) rather than an index, so the caller — who
+   * owns the write, and knows whether it is even allowed here — has nothing
+   * to compute, only to save.
+   */
+  onToggleTask?: (newBody: string) => void;
+}) {
   const repo = useContext(RepoCtx);
   const jump = useContext(CommitJumpCtx);
-  const blocks = useMemo(() => parseBody(body, repo), [body, repo]);
+  /* Who is reading, so `@your-handle` can be marked as addressed to you — the one
+     thing in a wall of review you scan for. A context for the same reason as
+     RepoCtx: this renderer is called from a dozen places. */
+  const viewer = useContext(ViewerCtx);
+  const blocks = useMemo(() => parseBody(body, repo, viewer), [body, repo, viewer]);
+  /*
+   * ONE COUNTER FOR THE WHOLE BODY, not one per list — and a hook, so it has
+   * to sit above the early return below it, same as every other hook here.
+   *
+   * `toggleChecklistItem`'s index is a position in the RAW TEXT — document
+   * order, every checkbox counted once, nesting and separate lists included.
+   * A fresh counter per `<MdList>` would number each list from zero and flip
+   * the wrong line the moment a body has more than one. Reset on every
+   * render and mutated during it, never read after — the render order below
+   * is depth-first and synchronous, which is what makes handing out
+   * `next.current++` in JSX order equal to handing out document order.
+   */
+  const nextTask = useRef(0);
+  nextTask.current = 0;
   if (!body?.trim()) return null;
   /* Delegated from the wrapper rather than handed to each anchor: the markdown
      renderer is shared with chat, the document viewer and the release notes,
      and it should not learn what a pull request is to serve this. */
-  const onClick = jump ? (e: React.MouseEvent) => {
+  const onClick = (e: React.MouseEvent) => {
     // Never steal a modified click — that is somebody asking for a new window.
-    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    if (e.defaultPrevented || wantsExternal(e, true)) return;
     const a = (e.target as HTMLElement | null)?.closest?.("a");
     const href = a?.getAttribute("href");
     if (!href) return;
-    const sha = shaFromHref(href, repo);
-    if (sha && jump(sha)) e.preventDefault();
-  } : undefined;
-  return <div className={`agx-md ${className ?? ""}`} onClick={onClick}>{blocks.map((b, i) => <Block key={i} b={b} />)}</div>;
+    const sha = jump && shaFromHref(href, repo);
+    if (sha && jump(sha)) { e.preventDefault(); return; }
+    /* Another pull request, or a card, opens here rather than on GitHub. A
+       link that READS `#123` (prBody.ts autolinks them to `/issues/`, as
+       GitHub does, for issues and pull requests alike) is tried as a pull
+       request, and goes back to the browser if it is not one. */
+    if (openInApp(href, e, { shortRef: isShortRef(a!.textContent) })) e.preventDefault();
+  };
+  const wiring: TaskWiring | undefined = onToggleTask
+    ? { next: nextTask, onToggle: (i) => onToggleTask(toggleChecklistItem(body, i)) }
+    : undefined;
+  return <div className={`agx-md ${className ?? ""}`} onClick={onClick}>{blocks.map((b, i) => <Block key={i} b={b} wiring={wiring} />)}</div>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1302,26 @@ function ReviewerFace({ r, size }: { r: PrReviewer; size: number }) {
   );
 }
 
+/** One reviewer's own verdict, beside their face. A row of faces says who was
+ *  asked; it does not say what any of them decided, and that is the half people
+ *  came for. */
+function ReviewerMark({ state, again }: { state: ReviewerState; again?: boolean }) {
+  const spec = state === "approved" ? { g: <DoneIcon size={ICON.sm} />, c: "var(--success)" }
+    : state === "changes" ? { g: <CrossIcon size={ICON.sm} />, c: "var(--error)" }
+    : state === "commented" ? { g: <CommentIcon size={ICON.sm} />, c: "var(--text3)" }
+    : state === "dismissed" ? { g: <BlockedIcon size={ICON.sm} />, c: "var(--text4)" }
+    : { g: <CircleIcon size={ICON.sm} />, c: "var(--warning)" };
+  return (
+    <span className="inline-flex items-center gap-0.5">
+      {/* Asked again after answering — GitHub's ↻, same as the sidebar's own
+          reviewer list draws it, and the same reason a lone tick or cross is
+          not the whole story once a follow-up round has been asked for. */}
+      {again && <span aria-hidden className="flex" style={{ color: "var(--text4)" }} title="Asked to look again"><RefreshIcon size={ICON.sm} /></span>}
+      <span aria-hidden className="flex" style={{ color: spec.c }}>{spec.g}</span>
+    </span>
+  );
+}
+
 function ReviewerStack({ p }: { p: PrSummary }) {
   const list = p.reviewers ?? [];
   if (list.length === 0) {
@@ -1184,7 +1435,7 @@ function PinnedCapsule({ pinned, pinState, selected, current, onOpen }: {
           border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)",
         }}>
         {pinned.length === 0
-          ? <span className="text-[10px] shrink-0" style={{ color: "var(--text4)" }}>☆ nothing pinned</span>
+          ? <span className="text-[10px] shrink-0 inline-flex items-center gap-1" style={{ color: "var(--text4)" }}><StarIcon size={ICON.xs} />nothing pinned</span>
           : (
             <span className="text-[10px] uppercase tracking-wider shrink-0" style={{ color: "var(--text4)" }}>Pinned</span>
           )}
@@ -1227,8 +1478,8 @@ function PinnedCapsule({ pinned, pinState, selected, current, onOpen }: {
               title={`Unpin #${p.number}`}
               aria-label={`Unpin #${p.number}`}
               className={`leading-none grid place-items-center ${p.number === selected ? "" : "opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
-              style={{ color: "var(--text3)", fontSize: 14, width: 18, height: 18 }}>
-              ×
+              style={{ color: "var(--text3)", width: 18, height: 18 }}>
+              <CloseIcon size={ICON.xs} />
             </button>
           </span>
         ))}
@@ -1242,11 +1493,11 @@ function PinnedCapsule({ pinned, pinState, selected, current, onOpen }: {
             title={currentPinned
               ? `#${current.number} is on the bar — click to take it off`
               : `Keep #${current.number} on this bar, one click away from anywhere in this panel`}
-            className="text-[10px] px-2 py-px rounded-full shrink-0"
+            className="text-[10px] px-2 py-px rounded-full shrink-0 inline-flex items-center gap-1"
             style={currentPinned
               ? { color: "var(--primary-hover)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)" }
               : { color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 32%, transparent)", background: "color-mix(in srgb, var(--warning) 8%, transparent)" }}>
-            {currentPinned ? "★ Pinned" : `☆ Pin #${current.number}`}
+            <StarIcon size={ICON.xs} filled={currentPinned} />{currentPinned ? "Pinned" : `Pin #${current.number}`}
           </button>
         )}
       </div>
@@ -1254,8 +1505,136 @@ function PinnedCapsule({ pinned, pinState, selected, current, onOpen }: {
   );
 }
 
-function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q }: {
+/**
+ * What this pull request cost on this machine — and the sentence that says what
+ * that number is allowed to mean.
+ *
+ * Every hosted tool in this space reports spend by developer, repository and
+ * branch, inferring the mapping from a usage feed that arrives with no checkout
+ * attached. Here the events, the worktrees and the pull requests are in one
+ * local database, so the same figure is a query (server/src/spend.ts). Which
+ * makes it tempting to print `$12.47` and stop — and that would be the one
+ * number on this board that quietly overstates what is known.
+ *
+ * So the tilde is load-bearing. A turn that recorded its own branch is money
+ * this branch definitely spent; a turn that recorded none is attributed by the
+ * directory it ran in, which is right until the day that worktree was on
+ * something else. The moment any of the total comes from the second kind, the
+ * chip says `~` and the tooltip says which part and why. Same rule as
+ * prWorktreeCell: a state we are only guessing at must never be drawn as one we
+ * know.
+ *
+ * Nothing at all when the branch has no local spend. Not `$0.00` — a branch
+ * written on another machine, or before this cockpit was watching, has an
+ * unknown cost, and zero is a different claim.
+ */
+export type SpendChip = {
+  text: string;
+  title: string;
+  /** The caveat in six words, for the one place that has room to print it
+   *  instead of hiding it in a tooltip. */
+  note: string;
+};
+
+const usd = (n: number): string => (n >= 100 ? `$${Math.round(n)}` : `$${n.toFixed(2)}`);
+
+export function spendChipFor(b: BranchSpend | undefined | null, repo: RepoSpend | null): SpendChip | null {
+  if (!repo?.ok || !b || b.usd <= 0) return null;
+  const guessed = b.inferredUsd > 0;
+  const lines = [
+    guessed
+      ? `About ${usd(b.usd)} of local agent spend on ${b.branch}.`
+      : `${usd(b.usd)} of local agent spend on ${b.branch}.`,
+    `${b.sessions} session${b.sessions === 1 ? "" : "s"} worked on it.`,
+  ];
+  if (guessed) {
+    const where = b.dirs.map(folderOf).join(", ");
+    lines.push(
+      `${usd(b.namedUsd)} of that came from turns that recorded this branch as they ran.`,
+      `${usd(b.inferredUsd)} came from turns that recorded no branch at all and is attributed by where it ran${where ? ` (${where})` : ""} — so an agent working in that folder before this branch existed is counted here too.`,
+    );
+  }
+  if (repo.beforeSeamUsd > 0 && repo.seamDay) {
+    lines.push(`Before ${repo.seamDay} this project also spent ${usd(repo.beforeSeamUsd)} that is now kept per day and can no longer be split by branch.`);
+  }
+  lines.push("Local events only — whatever an agent ran on another machine is not in this.");
+  return {
+    text: `${guessed ? "~" : ""}${usd(b.usd)}`,
+    title: lines.join("\n\n"),
+    note: guessed
+      ? `${usd(b.namedUsd)} on this branch, ${usd(b.inferredUsd)} attributed by folder`
+      : "from turns that recorded this branch",
+  };
+}
+
+
+/**
+ * One view on the pull-request row.
+ *
+ * A SEGMENTED CONTROL, not a row of words, which is this app's own answer to
+ * the same row in the git panel: "these were 10.5px labels with a superscript
+ * count and a leading digit, all in three greys — nine of them in a line, and
+ * picking one meant reading all nine".
+ *
+ * Two things change from what this row used to draw, and both are that answer:
+ *
+ *   the selected one   is a TINT, not an inversion. Filled `--primary` with
+ *                      `--bg` text is the loudest thing this app can paint, and
+ *                      it sat on a row you read at a glance twenty times an
+ *                      hour. A 18% wash under `--text` says "here" without
+ *                      shouting, and leaves the accent free for the one action
+ *                      that should lead.
+ *   the rest           carry NO border. Seven outlines competing is why nothing
+ *                      stood out: a border on every option is a border on none.
+ *                      Now the shape of the selected one is the only shape.
+ *
+ * The count is a real badge rather than a trailing number at 75% opacity —
+ * readable at arm's length, which is the distance these are read from.
+ */
+function Pill({ on, label, icon, dot, count, countTint, title, onClick }: {
+  on: boolean;
+  label: string;
+  icon?: React.ReactNode;
+  /** The lane colour, for scopes that have one. Drawn only when unselected —
+   *  selected, the tint IS the state, and two colours would compete. */
+  dot?: string;
+  count?: number;
+  /** A count that means something other than "how many are in here". The
+   *  inbox's is unread, so it keeps warning colour even when you are elsewhere. */
+  countTint?: string;
+  title: string;
+  onClick: () => void;
+}) {
+  return (
+    <button onClick={onClick} title={title} role="tab" aria-selected={on}
+      className="agx-btn text-[10px] leading-none px-2 py-1 rounded-lg flex items-center gap-1.5 shrink-0 transition-all"
+      style={{
+        color: on ? "var(--text)" : "var(--text3)",
+        background: on ? "color-mix(in srgb, var(--primary) 18%, transparent)" : "transparent",
+        border: `1px solid ${on ? "color-mix(in srgb, var(--primary) 42%, transparent)" : "transparent"}`,
+        fontWeight: on ? 600 : 400,
+      }}>
+      {icon}
+      {dot && !on && <span className="rounded-full shrink-0" style={{ width: 5, height: 5, background: dot }} />}
+      {label}
+      {count != null && count > 0 && (
+        <span className="tabular-nums text-[9px] px-1.5 py-px rounded-full"
+          style={{
+            color: countTint ?? (on ? "var(--primary-hover)" : "var(--text3)"),
+            background: on
+              ? "color-mix(in srgb, var(--primary) 22%, transparent)"
+              : `color-mix(in srgb, ${countTint ?? "var(--text)"} ${countTint ? "18%" : "10%"}, transparent)`,
+          }}>{count}</span>
+      )}
+    </button>
+  );
+}
+
+function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q, unread, spend }: {
   p: PrSummary; active: boolean; onSelect: () => void; onReview: () => void;
+  /** Remarks since you last looked, or null. The same badge the board's cards
+   *  wear — see prUnread.ts. */
+  unread?: Unread | null;
   /** What is in the filter box, so a row that is here because of a PERSON can
    *  say which one. Without it a search for "javi" returns rows whose author
    *  column says somebody else, and the list looks like it ignored you. */
@@ -1263,6 +1642,9 @@ function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q }: {
   /** On the bar at the top. Undefined where there is no repository to pin it
    *  against, and the control then does not appear at all. */
   pinned?: boolean; onTogglePin?: () => void;
+  /** What this branch has cost locally, already worded — see spendChipFor.
+   *  Null both when nothing was spent and when the answer has not landed. */
+  spend?: SpendChip | null;
 }) {
   const st = rowState(p);
   const shownLabels = p.labels.slice(0, 2);
@@ -1301,7 +1683,7 @@ function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q }: {
               color: pinned ? "var(--primary-hover)" : "var(--text3)",
               fontSize: 15, width: 22, height: 22,
             }}>
-            {pinned ? "★" : "☆"}
+            <StarIcon size={ICON.sm} filled={pinned} />
           </button>
         )}
         <span title={st.title} style={{ color: st.tint }}>⇅</span>#{p.number}
@@ -1310,6 +1692,11 @@ function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q }: {
       <div className="min-w-0">
         <div className="flex items-center gap-1.5 min-w-0">
           <span className="truncate text-[12px]" style={{ color: "var(--text)" }}>{p.title}</span>
+          {/* Before the "here" chip and before the labels: this is the only
+              thing on the row that can be true of a pull request nobody has
+              touched all week, and the row's second line is where facts about
+              the pull request live. */}
+          {unread && <UnreadBadge u={unread} />}
           {p.isCurrentBranch && <Chip text="here" tint="var(--primary)" title="This checkout is on that branch" />}
         </div>
         <div className="flex items-center gap-1.5 mt-0.5 min-w-0 text-[10px]" style={{ color: "var(--text3)" }}>
@@ -1347,7 +1734,16 @@ function PrRow({ p, active, onSelect, onReview, pinned, onTogglePin, q }: {
               ? { color: "var(--text3)" }
               : { color: "var(--warning)" }}>{p.baseRefName}</span>
           </span>
-          {p.isDraft ? <Chip text="draft" tint="var(--text3)" /> : <ReviewChip d={p.reviewDecision} />}
+          {/* Beside the branch it is about, and set in the row's own dim tone
+              rather than a colour: this is a fact about the pull request, not a
+              verdict on it, and a board where the expensive ones glow red would
+              be answering a question nobody asked while reviewing. Tabular
+              figures so a column of them lines up on the decimal point. */}
+          {spend && (
+            <span className="shrink-0 tabular-nums" title={spend.title}
+              style={{ color: "var(--text3)" }}>{spend.text}</span>
+          )}
+          {p.isDraft ? <Chip text="draft" tint="var(--text3)" /> : <ReviewChip v={p.humanReview} />}
           {shownLabels.map((l) => <Chip key={l.name} text={l.name} tint={l.color ? `#${l.color}` : "var(--primary)"} />)}
           {p.labels.length > shownLabels.length && (
             <span className="tabular-nums shrink-0" title={p.labels.map((l) => l.name).join(", ")}>+{p.labels.length - shownLabels.length}</span>
@@ -1395,6 +1791,12 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
 
   const [repos, setRepos] = useState<GitRepoRef[]>([]);
   const [root, setRoot] = useState("");
+  /** A project is a remote; its worktrees are the same one. */
+  const projects = useMemo(() => repos.filter((r) => !r.worktreeOf), [repos]);
+  const projectRoot = useMemo(
+    () => repos.find((r) => r.root === root)?.worktreeOf ?? root,
+    [repos, root],
+  );
   const [repo, setRepo] = useState<PrRepoId | null>(null);
   /** The panel opens on what is waiting on you, not on what you wrote — that
    *  is the question a review dashboard exists to answer. If nothing is waiting
@@ -1495,7 +1897,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * used to fire on a 400ms debounce, which is fine if you type in bursts and
    * wrong if you do not: typing slowly meant a GitHub search per word, each one
    * blanking the list mid-sentence and racing the next. A debounce is a guess
-   * about how fast somebody types, and this one guessed wrong about David.
+   * about how fast somebody types, and this one guessed wrong about the maintainer.
    *
    * Clearing the box is the exception, and deliberately so: an empty query is
    * not a search, it is the end of one, and making somebody press Enter to get
@@ -1585,6 +1987,48 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
   const openPr = useCallback((n: number) => { setRowCursor(n); setSelected(n); setTab("overview"); setEditingBody(false); }, []);
   const backToList = useCallback(() => { setSelected(null); setDetailErr(""); setEditingBody(false); }, []);
 
+  /*
+   * AND THE MOUSE'S BACK BUTTON DOES IT TOO.
+   *
+   * The thumb button means "back to where I was" everywhere else on the
+   * machine, and here it meant nothing: the app is one page, so there is no
+   * history entry for Chromium to pop and the press fell on the floor. Getting
+   * out of a pull request was a trip to a breadcrumb at the far corner of the
+   * window.
+   *
+   * TWO DOORS, because the press comes in by one of them depending on who is
+   * hosting the page. In the desktop shell Chromium routes the thumb buttons to
+   * the EMBEDDER as an app command and never dispatches a DOM event at all —
+   * the first version of this listened for `auxclick` and waited for something
+   * that is never sent. In a plain browser tab the opposite is true, and there
+   * `auxclick` is what arrives.
+   *
+   * Bound only while a pull request is open, so nothing else on the screen has
+   * to wonder whether the gesture was meant for it, and not while the caret is
+   * in a field: a half-written comment lost to a thumb is worse than a gesture
+   * that did nothing.
+   */
+  useEffect(() => {
+    if (selected == null) return;
+    const typing = () => /input|textarea/i.test(document.activeElement?.tagName ?? "")
+      || (document.activeElement as HTMLElement | null)?.isContentEditable === true;
+    const back = () => { if (!typing()) backToList(); };
+    const stop = (e: MouseEvent) => { if (isBackButton(e)) e.preventDefault(); };
+    const go = (e: MouseEvent) => {
+      if (!isBackButton(e)) return;
+      e.preventDefault();
+      back();
+    };
+    window.addEventListener("mousedown", stop);
+    window.addEventListener("auxclick", go);
+    const off = onAppBack(({ back: isBack }) => { if (isBack) back(); });
+    return () => {
+      window.removeEventListener("mousedown", stop);
+      window.removeEventListener("auxclick", go);
+      off();
+    };
+  }, [selected, backToList]);
+
   /* Only this repository's: the panel shows one at a time, so a chip opening
      something the list cannot show would be a dead end. */
   /* The third argument is the server snapshot, and without it this component
@@ -1609,8 +2053,24 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
   const pinState = useMemo(() => {
     const by = new Map<number, PrSummary>();
     for (const p of prs) by.set(p.number, p);
+    /*
+     * And the one you have OPEN answers for itself.
+     *
+     * The list is polled; a detail is fetched when you open it and again when
+     * you refresh it, so it is by definition the newer reading of that one pull
+     * request. Without this the chip kept whatever the last poll had said: a red
+     * dot and "2 failing" over a page whose own header read 58 passed, 12
+     * skipped, nothing failing. Two numbers about one thing, on screen at once.
+     *
+     * Only the rollup is taken. The rest of the row — its title, its author, the
+     * scope it came from — is the list's and has not changed.
+     */
+    if (detail?.number != null) {
+      const had = by.get(detail.number);
+      if (had) by.set(detail.number, { ...had, checks: detail.checks, checksLoaded: true });
+    }
     return by;
-  }, [prs]);
+  }, [prs, detail]);
 
   /**
    * "Open this pull request", asked from somewhere that cannot reach this panel.
@@ -1622,39 +2082,91 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * while this was still mounting is not dropped on the way in.
    *
    * The repo is checked rather than assumed. A number alone is not an identity:
-   * `#16175` names a different pull request in every repository, and opening the
+   * `#1175` names a different pull request in every repository, and opening the
    * one with that number in whichever repo happens to be selected would be a
    * confident wrong answer. Mismatched, the request waits for the repo it named
    * — switching to it serves the request rather than losing it.
    */
   const jump = useSyncExternalStore(subscribePrJump, prJump, () => null);
+  /*
+   * A pull request from somewhere else, shown on top of this project.
+   *
+   * A link to `acme/orbit#42` arrives while `acme/billing` is the open
+   * project: from a plugin's list of reviews, from a notification, from a
+   * branch chip in a second checkout. The panel reads pull requests through a
+   * local checkout — that is where the remote, and so the repository's
+   * identity, comes from — and it used to answer a link it could not serve by
+   * searching for the number in the wrong repository, which finds either
+   * nothing or somebody else's pull request with the same number.
+   *
+   * So the panel borrows the other checkout for as long as you are reading
+   * it. Not the project: switching projects changes every other panel in the
+   * window, and a link to one pull request is not a decision to move house.
+   * `back` is what to return to, and the strip under the header is the way
+   * back — a panel quietly showing a repository nobody selected is the kind of
+   * wrong that takes a minute to notice.
+   */
+  const [away, setAway] = useState<{ root: string; repo: string; back: { root: string; repo: string } } | null>(null);
+  const awayRef = useRef(away);
+  awayRef.current = away;
+  /** The jump whose locate call is out, so a re-render does not start it
+   *  again while the first one is still walking the machine's checkouts. */
+  const locating = useRef("");
+  /** A `#123` from a body being tried as a pull request: if GitHub says it is
+   *  not one (an issue, most likely), the click goes to the browser after all
+   *  and the panel goes back to what it was showing. */
+  const tryAsPr = useRef<{ number: number; url: string; prev: number | null } | null>(null);
   useEffect(() => {
     if (!jump || !repo) return;
-    if (jump.repo !== repo.nameWithOwner) {
-      /*
-       * A request this panel cannot serve, and it must not be left lying there.
-       *
-       * The panel binds to one repository and picks it once, from `repos[0]`.
-       * In a workspace with two, pressing the branch chip in Source control on
-       * the SECOND one sent a jump addressed to a repository this panel is not
-       * showing: the guard returned, the request stayed in the module slot, and
-       * nothing opened — no row, no message, no search. Worse, it stayed
-       * pending and would open that pull request later, whenever a panel
-       * happened to be bound to the right repository.
-       *
-       * So it is cleared and answered with the thing that always works: a
-       * search for the number. Less than opening it, and visibly something.
-       */
-      clearPrJump();
-      setQuery(String(jump.number));
-      setSelected(null);
-      flash(false, `#${jump.number} is in ${jump.repo}, and this panel is showing ${repo.nameWithOwner} — searching instead`);
+    // Case-blind, as GitHub is: `Acme/Orbit` in a link is the checkout's `acme/orbit`.
+    if (jump.repo.toLowerCase() !== repo.nameWithOwner.toLowerCase()) {
+      const key = `${jump.repo}#${jump.number}/${jump.n}`;
+      if (locating.current === key) return;
+      locating.current = key;
+      void api.prLocate(jump.repo).then((r) => {
+        if (r.ok && r.root) {
+          /* The jump is deliberately left pending: this only points the panel
+             at the other checkout, and the effect runs again — with `repo`
+             now the one the link named — to open the pull request itself. */
+          setAway({ root: r.root, repo: jump.repo, back: away?.back ?? { root, repo: repo.nameWithOwner } });
+          setSelected(null);
+          setRoot(r.root);
+          return;
+        }
+        /*
+         * Nowhere to read it from, and the request must not be left lying
+         * there: it stayed pending and would open that pull request later,
+         * whenever a panel happened to be bound to the right repository.
+         * Answered with the thing that always works — a search for the
+         * number. Less than opening it, and visibly something.
+         */
+        clearPrJump();
+        // A link somebody clicked has somewhere better to go than a search.
+        if (jump.fallback) { openExternal(jump.fallback); return; }
+        setQuery(String(jump.number));
+        setSelected(null);
+        flash(false, `#${jump.number} is in ${jump.repo}, and there is no checkout of it on this machine — searching ${repo.nameWithOwner} instead`);
+      }).catch(() => { clearPrJump(); });
       return;
     }
     clearPrJump();
+    locating.current = "";
+    /* "Show me what the plugin wrote", carried by the link that opened this.
+       A row reading "2 high, 3 medium" that lands on the Overview has not
+       answered the press. Served once the pull request has loaded, like the
+       mention below it. */
+    if (jump.focus === "local") wantLocal.current = { number: jump.number, n: jump.n };
+    /* "Take me to where I was named."
+       The inbox knows THAT you were mentioned and nothing about where, so a
+       mention notification used to land at the top of a conversation with forty
+       entries in it. Remembered here and served below, once the pull request
+       this is about has actually loaded. */
+    if (jump.mention) wantMention.current = { number: jump.number, n: jump.n };
+    tryAsPr.current = jump.fallback ? { number: jump.number, url: jump.fallback, prev: selected } : null;
     openPr(jump.number);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jump, repo, openPr]);
+
   const [busy, setBusy] = useState(false);
   /** The label passed to `act` for the request in flight — see Btn `pending`. */
   const [busyWhat, setBusyWhat] = useState("");
@@ -1777,6 +2289,53 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
   // Fetched once per repo, cached server-side for five minutes: the composer
   // wants an instant dropdown, not a live directory.
   const [mentions, setMentions] = useState<Mentionables | null>(null);
+  /* Which login this window is signed in as, asked once. The server answers from
+     its own cache (see ghCapability), so this costs nothing per pull request — and
+     until it lands, `@somebody` is drawn as a link with no "this is you" on it,
+     which is the honest state rather than a guess. */
+  const [viewer, setViewer] = useState<string | undefined>(undefined);
+
+  /** A mention asked for and not yet served, by pull request. */
+  const wantMention = useRef<{ number: number; n: number } | null>(null);
+  /** Same, for a link that asked for the local lane — see the jump above. */
+  const wantLocal = useRef<{ number: number; n: number } | null>(null);
+  useEffect(() => {
+    const want = wantLocal.current;
+    if (!want || !detail || detail.number !== want.number) return;
+    wantLocal.current = null;
+    setConvWho("local");
+    setTab("conversation");
+  }, [detail]);
+  useEffect(() => {
+    const want = wantMention.current;
+    if (!want || !detail || detail.number !== want.number) return;
+    /* The login is what a mention is written with, so without it there is
+       nothing to look for — and it arrives a moment after the panel does. */
+    if (!viewer) return;
+    wantMention.current = null;
+    const hit = findMention(detail, viewer);
+    if (!hit) { flash(false, `Nobody named @${viewer} in #${detail.number} — opened it anyway`); return; }
+    // A line comment lives in Files; everything else in the conversation. The
+    // "humans only" filter is cleared: a mention by a bot is still a mention.
+    if (hit.where === "thread") setTab("files");
+    else if (hit.where === "node") { setConvWho("all"); setTab("conversation"); }
+    else setTab("overview");
+    /* Two frames: one for the tab to render, one for its content to lay out.
+       A single one scrolls to an element whose height is still zero. */
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const sel = selectorFor(hit);
+      const el = (sel ? document.querySelector<HTMLElement>(sel) : document.querySelector<HTMLElement>("[data-pr-body]"));
+      if (!el) return;
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      flashElement(el);
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail, viewer]);
+  useEffect(() => {
+    let live = true;
+    api.prCapability().then((c) => { if (live && c?.login) setViewer(c.login); }).catch(() => { /* no highlight, then */ });
+    return () => { live = false; };
+  }, []);
   /** The repository's own labels, authors, milestones and branches. Derived
    *  from the loaded page before, which made the Author menu a list of whoever
    *  happened to be on page one. */
@@ -1819,6 +2378,26 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    *  fetch must go past the server's cache. See the effect that compares them. */
   const diffHead = useRef("");
   const diffFresh = useRef(false);
+  /*
+   * "Ask again for what is in front of me", as a number.
+   *
+   * Refresh used to force the detail and the board lists and then EMPTY the
+   * diff to make its effect run again — so the file you were reading went blank
+   * for as long as GitHub took, which is the flicker he asked not to have. And
+   * the pieces that live outside the detail (the review GitHub is holding for
+   * you) were fetched once when the pull request opened and never again: a line
+   * comment deleted in the browser stayed on this screen until you left the
+   * pull request and came back.
+   *
+   * One counter fixes both. Everything that is per-pull-request re-asks when it
+   * changes, and nothing is cleared first: what is on screen stays until the
+   * new answer lands and replaces it.
+   */
+  const [detailTick, setDetailTick] = useState(0);
+  /** Which (pull request, tick) the diff on screen was fetched for. Replaces
+   *  "is `diff` empty?" as the has-it-been-fetched test, which is what forced
+   *  the blanking. */
+  const diffFetchedFor = useRef("");
   const commitReq = useRef(0);
 
   const flash = useCallback((ok: boolean, msg: string) => {
@@ -1831,6 +2410,18 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     api.gitRepos().then(({ repos }) => {
       setRepos(repos);
       setRoot((cur) => cur || repos[0]?.root || "");
+      /* The project changed under a borrowed repository: the way back points
+         at a checkout this window is no longer showing, so the loan ends
+         rather than leaving a strip offering a repository nobody can see.
+         Read through a ref rather than a state updater — an updater that
+         calls setState is a side effect inside a pure function, and React
+         runs those twice. */
+      const a = awayRef.current;
+      if (a && !repos.some((r) => r.root === a.back.root)) {
+        setAway(null);
+        setSelected(null);
+        setRoot(repos[0]?.root ?? "");
+      }
     }).catch(() => {});
   }, [active]);
 
@@ -1953,8 +2544,8 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
      * call — so the scope changes once from "\u0000open\u0000…" to the real
      * one, and this effect took that for a switch and cleared the selection.
      * Open a pull request inside that second and it threw you back to the
-     * board, which is exactly how it was reported: "entro en una PR rápido y me
-     * manda al board de nuevo".
+     * board, which is exactly how it was reported: "I open a PR quickly and it
+     * sends me back to the board".
      */
     const prev = lastScope.current;
     const first = prev === "" || prev.startsWith("\u0000");
@@ -2084,6 +2675,9 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     setDetailErr("");
     api.prDetail(root, n, force).then((r) => {
       if (req !== detailReq.current) return; // a later selection already won
+      // Disarmed by any load, so a later, ordinary open of that number is ordinary.
+      const trying = tryAsPr.current?.number === n ? tryAsPr.current : null;
+      tryAsPr.current = null;
       if (r.ok && r.detail) {
         rememberDetail(root, n, r.detail); setDetail(r.detail); setDetailStale(false);
         /*
@@ -2100,6 +2694,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
       }
       // A refresh that fails leaves what is on screen alone: the pull request
       // you are reading is better than an error where it used to be.
+      else if (trying) { openExternal(trying.url); setSelected(trying.prev); }
       else if (!force) setDetailErr(r.error || "");
       else { setDetail(null); setDetailErr(r.error || "Could not load this pull request"); }
     }).catch((e) => { if (req === detailReq.current) setDetailErr(String(e)); })
@@ -2144,6 +2739,16 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     return () => clearTimeout(t);
   }, [root, detail?.number, detail?.mergeable]);
   loadDetailRef.current = loadDetail;
+
+  /* The detail is the newer reading of its own row. The lists are not fetched
+     again when only that pull request is refreshed, so the board is brought
+     up to date from it instead (see `overlayDetail`). */
+  useEffect(() => {
+    if (!detail || away) return;
+    setPrs((cur) => overlayDetail(cur, detail));
+    setBoardMine((cur) => overlayDetail(cur, detail));
+    setBoardReview((cur) => overlayDetail(cur, detail));
+  }, [detail, away]);
 
   useEffect(() => {
     if (!active || !root) return;
@@ -2205,7 +2810,10 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
      */
     const held = heldDetail(root, selected);
     setDetail(held); setDetailStale(!!held); setDetailErr("");
+    /* The one place emptying is right: this is a DIFFERENT pull request, and
+       showing the last one's diff under this one's title would be a lie. */
     setDiff(""); setDiffErr(""); setSelFile(null); setSelCommit(null); setCommitText("");
+    diffFetchedFor.current = "";
     loadDetail(selected);
   }, [root, selected, loadDetail]);
 
@@ -2222,16 +2830,24 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * does not re-ask on every render for something that will not come.
    */
   useEffect(() => {
-    if ((tab !== "files" && tab !== "review") || !detail || diff || diffErr || !root) return;
+    if ((tab !== "files" && tab !== "review") || !detail || !root) return;
+    /* The has-it-been-fetched test. `detail` is a new object on every poll, so
+       without this the effect would re-ask GitHub several times a minute; with
+       it, exactly once per pull request until something asks again. */
+    const key = `${detail.number}:${detailTick}`;
+    if (diffFetchedFor.current === key) return;
+    diffFetchedFor.current = key;
     const req = ++diffReq.current; // a later selection's diff must win over a slow earlier one
     const want = diffFresh.current; diffFresh.current = false;
     const head = headOfDetail(detail);
     api.prDiff(root, detail.number, want).then((r) => {
       if (req !== diffReq.current) return;
+      /* The old text stays on screen until this line. A failed re-fetch leaves
+         what you were reading alone — the same rule loadDetail follows. */
       if (r.ok) { diffHead.current = head; setDiff(r.text || ""); setDiffErr(r.text ? "" : "GitHub returned an empty diff for this pull request."); }
-      else setDiffErr(r.error || "The diff could not be fetched.");
-    }).catch((e) => { if (req === diffReq.current) setDiffErr(String(e)); });
-  }, [tab, detail, diff, diffErr, root]);
+      else if (!diff) setDiffErr(r.error || "The diff could not be fetched.");
+    }).catch((e) => { if (req === diffReq.current && !diff) setDiffErr(String(e)); });
+  }, [tab, detail, diff, root, detailTick]);
 
   /*
    * A push replaces the diff. Nothing used to notice.
@@ -2256,7 +2872,11 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     const head = headOfDetail(detail);
     if (!head || !diffHead.current || head === diffHead.current) return;
     diffFresh.current = true;
-    setDiff(""); setDiffErr("");
+    /* Ask again rather than empty it: the diff you are reading is the old one,
+       but it is a diff, and a blank pane for the length of a fetch is worse
+       than a paragraph that changes under you when the answer lands. */
+    setDiffErr("");
+    setDetailTick((n) => n + 1);
   }, [detail]);
 
   // Filter the current scope's rows by the search box: PR number (with or
@@ -2291,7 +2911,78 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * unused. Memoised, so a four-hundred-row scope does not re-scan per
    * keystroke — the reason the sort-only version existed in the first place.
    */
-  const visiblePrs = useMemo(() => applyFilters(pool, filters), [pool, filters]);
+  /*
+   * The table's own "only the ones somebody has spoken on" — the board's toggle, in
+   * the other surface.
+   *
+   * Client-side, and it has to be: GitHub cannot answer "since I last looked", because
+   * that mark is a timestamp in this browser (see prNew.ts). So this narrows the rows
+   * in hand rather than asking for a different set, and the chip says so.
+   */
+  /*
+   * Every mark, not just this pull request's — the list draws a badge per row.
+   *
+   * The marks are localStorage, so nothing here re-renders when one moves.
+   * Reading them once per render would be enough for the first paint and wrong
+   * for every one after it: you open a pull request, read it, come back, and the
+   * row still says two are waiting. See onSeenChange.
+   */
+  const [seenTick, bumpSeenTick] = useState(0);
+  useEffect(() => onSeenChange(() => bumpSeenTick((n) => n + 1)), []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const seenMarks = useMemo(() => readSeen(), [seenTick]);
+
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  /*
+   * THE RULES, ON TOP OF THE PILLS.
+   *
+   * Both, and in this order, because they answer different halves of the same
+   * question. The pills say "which of these" and are one click; the rules say
+   * "anything but these" and "the ones with nothing there", which no checkbox
+   * list can say at all.
+   *
+   * Kept as their own state rather than folded into the query string: that
+   * string has never been able to write a negation, and inventing a syntax for
+   * one would mean every saved view, every URL and the search box learning it
+   * too. The tabs along the top still open the way they always did — see
+   * `queryToRules`, which fills the builder from one instead of clearing it.
+   */
+  /* Persisted per repository, the same way `methods` is: a map loaded once
+     from storage, keyed by `repo.key`, and reconciled through `readFilterSet`
+     so a value another build wrote in a shape this one does not recognise is
+     dropped rather than carried in or thrown over. */
+  const [filterMap, setFilterMap] = useState<Record<string, unknown>>(() => loadMap<unknown>(FILTERS_KEY));
+  const [rules, setRulesRaw] = useState<FilterSet>(() => (repo ? readFilterSet(filterMap[repo.key]) : EMPTY_RULES));
+  // The repository switched under the builder: load its own rules rather than
+  // keep showing the ones built for the last one.
+  useEffect(() => {
+    setRulesRaw(repo ? readFilterSet(filterMap[repo.key]) : EMPTY_RULES);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repo?.key]);
+  const setRules = (next: FilterSet) => {
+    setRulesRaw(next);
+    if (!repo) return;
+    setFilterMap((cur) => {
+      const nextMap = { ...cur, [repo.key]: next };
+      saveMap(FILTERS_KEY, nextMap);
+      return nextMap;
+    });
+  };
+  // Same predicate the "N unread" chip counts by — see applyRulesKeepUnread.
+  const isRuleExempt = (p: PrSummary) => !!unreadOf(p, repo?.key, seenMarks);
+  const basePrs = useMemo(
+    () => applyRulesKeepUnread(applyFilters(pool, filters), rules, readPrField, isRuleExempt),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pool, filters, rules, repo?.key, seenMarks],
+  );
+  const unreadPrs = useMemo(
+    () => basePrs.filter((p) => unreadOf(p, repo?.key, seenMarks)),
+    [basePrs, repo?.key, seenMarks],
+  );
+  /* Turned off by itself when it would select nothing: a filter with no answers is a
+     table that looks empty for a reason nobody can see. */
+  useEffect(() => { if (unreadOnly && !unreadPrs.length) setUnreadOnly(false); }, [unreadOnly, unreadPrs.length]);
+  const visiblePrs = unreadOnly ? unreadPrs : basePrs;
   const facets = useMemo(() => buildFacets(prs, filters, facetOpts), [prs, filters, facetOpts]);
 
   /** What each view last counted.
@@ -2334,7 +3025,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * The board draws `boardMine`/`boardReview` — its own two fetches — and never
    * looks at `prs`, so with the board on, a search ran, counted, and changed
    * nothing: "Searching… 1 of 75", then "388 matches", over the same cards as
-   * before. Reported as "encima para y no me enseña nada", and it is exactly
+   * before. Reported as "on top of that it stops and shows me nothing", and it is exactly
    * right: the search DID finish, and nothing on screen was about it.
    *
    * So a query falls through to the table, which is the surface that can answer
@@ -2342,7 +3033,19 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * standing arrangement rather than a mode you have to restore.
    */
   const searching = query.trim().length > 0;
-  const boardShown = boardOn && !searching;
+  /*
+   * The inbox is a third surface, not a filter.
+   *
+   * The board and the table both answer "what is the state of these pull
+   * requests"; GitHub's notifications answer "what happened while I was away",
+   * which is a different question and the only one that can be about a mention
+   * in a comment or an issue that is not a pull request at all. So it replaces
+   * the list rather than filtering it, and it wins over both — including over a
+   * search, which belongs to the table.
+   */
+  const [inboxOn, setInboxOn] = useState(false);
+  const [inboxUnread, setInboxUnread] = useState(0);
+  const boardShown = boardOn && !searching && !inboxOn;
   const setBoard = useCallback((on: boolean) => {
     setBoardOn(on);
     try { localStorage.setItem("agentglass.pr.board", on ? "1" : "0"); } catch { /* private mode */ }
@@ -2374,6 +3077,56 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
 
   const [boardMine, setBoardMine] = useState<PrSummary[]>([]);
   const [boardReview, setBoardReview] = useState<PrSummary[]>([]);
+  /* The board draws these two fetches of its own and never looks at `prs`, so
+     the rule builder narrowed the table behind it and left every lane as it
+     was. The raw arrays stay for the loading and settling checks, which ask
+     whether the FETCH is complete — not a question a filter should answer. */
+  /* And the card is read the way the cards on screen read it. `p.card` is only
+     filled from boards cached within the day, so on a stale cache it is absent
+     everywhere and the chip comes from `prCardStore` — a filter looking at
+     `p.card` alone then matches nothing at all. No extra request: the board
+     asks for exactly these rows already. */
+  const cardTick = useSyncExternalStore(onCard, cardVersion, () => 0);
+  const boardMineCards = useMemo(
+    () => boardMine.map((p) => withCard(p, hasTaskProvider)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boardMine, hasTaskProvider, cardTick],
+  );
+  const boardReviewCards = useMemo(
+    () => boardReview.map((p) => withCard(p, hasTaskProvider)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boardReview, hasTaskProvider, cardTick],
+  );
+  const boardMineShown = useMemo(
+    () => applyRulesKeepUnread(boardMineCards, rules, readPrField, isRuleExempt),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boardMineCards, rules, repo?.key, seenMarks],
+  );
+  const boardReviewShown = useMemo(
+    () => applyRulesKeepUnread(boardReviewCards, rules, readPrField, isRuleExempt),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boardReviewCards, rules, repo?.key, seenMarks],
+  );
+
+  /*
+   * The fields the builder offers, taken from the rows the surface is drawing.
+   *
+   * `prs` is the table's pool, and with the board up it is not what is on
+   * screen — nor does it carry the cards the board looked up one at a time. So
+   * `Card assignee`, which nothing seeds from the server, had no options at all
+   * and the field was hidden: a filter that cannot offer what is in front of
+   * you. Deduplicated by number because a pull request that is both yours and
+   * asked of you is in both lists, and a value counted twice sorts wrong.
+   */
+  const ruleRows = useMemo(() => {
+    if (!boardShown) return prs;
+    const by = new Map<number, PrSummary>();
+    for (const p of [...boardMineCards, ...boardReviewCards]) if (!by.has(p.number)) by.set(p.number, p);
+    return [...by.values()];
+  }, [boardShown, prs, boardMineCards, boardReviewCards]);
+  /* Only the fields that anything on this board actually has — which is what
+     keeps the tracker's two out of the way of everybody who has no tracker. */
+  const ruleFields = useMemo(() => builderFields(ruleRows, filters, facetOpts), [ruleRows, filters, facetOpts]);
   /*
    * Neither list has answered yet.
    *
@@ -2454,6 +3207,33 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     return () => { live = false; };
   }, [boardOn, root, stateSel, listState.fetchedAt, boardTick]);
 
+  /**
+   * What the agents have spent in this repository, by branch — one request for
+   * the whole board.
+   *
+   * Deliberately not per pull request. This is the heaviest panel in the app and
+   * a row-sized question here would be a row-sized round trip; the server
+   * answers with the repository's whole map (one SQL group-by plus one `git
+   * worktree list`) and the rows look themselves up in it below.
+   *
+   * Tied to `listState.fetchedAt` so it refreshes on the same beat as the list
+   * — including when Refresh is pressed — rather than running a clock of its
+   * own. A failure leaves the map empty, and an empty map draws no chips: the
+   * board is not worth degrading over a number beside the branch name.
+   */
+  const [spend, setSpend] = useState<RepoSpend | null>(null);
+  useEffect(() => {
+    if (!root) { setSpend(null); return; }
+    let live = true;
+    void api.prSpend(root).then((r) => { if (live) setSpend(r.ok ? r : null); }).catch(() => { if (live) setSpend(null); });
+    return () => { live = false; };
+  }, [root, listState.fetchedAt]);
+  const spendByBranch = useMemo(() => {
+    const m = new Map<string, BranchSpend>();
+    for (const b of spend?.branches ?? []) m.set(b.branch, b);
+    return m;
+  }, [spend]);
+
   // If the cursor's row is filtered out, move it to the first row still visible
   // rather than leaving a phantom highlight on a hidden PR — the same
   // reconciliation loadList does when the list itself changes. Only when a
@@ -2515,7 +3295,61 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     requestAnimationFrame(() => { if (document.activeElement === document.body) listRef.current?.focus(); });
   }, [active]);
 
-  const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  /*
+   * Ignoring whitespace, and where it happens.
+   *
+   * On the PARSED diff rather than on the request: the patch comes from GitHub
+   * already made, so there is no `-w` to pass. A deletion and an addition whose text
+   * differs only in blanks are the same line, and drawing them as one context line is
+   * what the flag means — see diffNoWhitespace.ts, which also explains why only a
+   * LEADING run of such pairs is folded.
+   *
+   * A preference rather than a per-visit toggle, because a repository that runs a
+   * formatter is a repository where it is the right default every time.
+   */
+  const [noWs, setNoWs] = useState(diffNoWhitespace);
+  /*
+   * What has moved since your own last review.
+   *
+   * Held here rather than in the Files tab because two surfaces show it — the tab
+   * filters by it and the Overview counts it — and two fetches of the same pair of
+   * commits could answer differently for a second, which is a panel disagreeing with
+   * itself about what you have read.
+   *
+   * Asked once per pair of commits: both ends are fixed, so the answer cannot change.
+   * Local git answers it — see filesSince for why GitHub's compare endpoint is not the
+   * source.
+   */
+  const since = useMemo(() => sinceRange(detail), [detail]);
+  /** Bumped to ask the comparison again — after a fetch, the same two commits have a
+   *  different answer, because one of them is finally in this clone. */
+  const [sinceTick, setSinceTick] = useState(0);
+  const [moved, setMoved] = useState<{ key: string; paths: Set<string>; missing?: boolean } | null>(null);
+  useEffect(() => {
+    if (!since || !root) { setMoved(null); return; }
+    const k = `${since.from}..${since.to}`;
+    let live = true;
+    api.prFilesSince(root, since.from, since.to)
+      .then((r) => { if (live) setMoved({ key: k, paths: new Set(r.paths ?? []), ...(r.missing ? { missing: true } : null) }); })
+      .catch(() => { if (live) setMoved({ key: k, paths: new Set() }); });
+    return () => { live = false; };
+  }, [root, since, sinceTick]);
+  /* Only the files this review actually contains. A trunk merge moves files that are
+     not part of this pull request at all, and counting those would put a number on the
+     chip that the list cannot show. */
+  const movedHere = useMemo(
+    () => (moved && !moved.missing && detail ? detail.files.filter((f) => moved.paths.has(f.path)).map((f) => f.path) : []),
+    [moved, detail],
+  );
+  /** Bumped to send somebody to Files with the "since your review" filter already on. */
+  const [wantSince, setWantSince] = useState(0);
+  const parsedRaw = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  const clean = useMemo(() => (noWs ? withoutWhitespace(parsedRaw) : null), [noWs, parsedRaw]);
+  const parsed = clean?.files ?? parsedRaw;
+  /** Files that hold NOTHING but whitespace changes, named for the Files tab: a file
+   *  that vanishes from a review with no explanation is a reader wondering what else
+   *  went missing. */
+  const wsOnly = clean?.onlyWhitespace ?? [];
   const byPath = useMemo(() => {
     const m = new Map<string, FileChange>();
     parsed.forEach((f, i) => m.set(f.path, toFileChange(f, i)));
@@ -2569,6 +3403,16 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * nothing on this branch would otherwise say "waiting" forever.
    */
   const [pushed, setPushed] = useState<{ number: number; at: number } | null>(null);
+  /*
+   * "Update branch" refused because base and head conflict.
+   *
+   * The button is only offered while neither GitHub nor the panel's own merge
+   * has said "conflict" — so the refusal is news, and until now it was a red
+   * line with nothing to press after it. Held against the revision it was
+   * refused on: `updatedAt` moves with a push, and a push is exactly what can
+   * make the refusal untrue.
+   */
+  const [refusedUpdate, setRefusedUpdate] = useState<{ number: number; updatedAt: string } | null>(null);
   const AWAIT_CHECKS_MS = 4 * 60_000;
 
   const act = useCallback(async (label: string, fn: () => Promise<{ ok: boolean; error?: string; detail?: string }>) => {
@@ -2635,8 +3479,8 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    * minutes, on the theory that closing the app is another way of leaving a
    * pull request. It is not. Hiding a window is not reading — and the first
    * thing that listener did in the wild was eat his markers when the app was
-   * restarted to install the build containing it: "quizás se marcaron como
-   * leídas, aunque yo no le di a marcar como leídas".
+   * restarted to install the build containing it: "maybe they got marked as
+   * read, even though I never clicked mark as read".
    *
    * The mark advances in two places, and both are the reader's own doing:
    * navigating away from this pull request, and pressing the button that says
@@ -2735,7 +3579,21 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
    */
   useEffect(() => {
     const branch = detail?.headRefName;
-    if (!root || !branch) return;
+    /*
+     * …and only while this view is the one on screen. The panels stay mounted
+     * when you leave them, so this poll and the half-minute one behind it went
+     * on asking git about a pull request nobody was looking at, for as long as
+     * the app was open — measured at ~158,000 child processes a day on a
+     * cockpit parked on the Terminal.
+     *
+     * `active` is in the dependencies deliberately: without it the effect never
+     * re-runs on the way back in, and coming back to a stale count would be a
+     * feature lost rather than a cost saved. With it, re-entering runs `read()`
+     * and `again()` immediately — so the answer is fresh the instant you look,
+     * which is what the `focus`/`visibilitychange` pair below already does for
+     * the window.
+     */
+    if (!active || !root || !branch) return;
     let live = true;
     const read = () => {
       api.prLocalHead(root, branch)
@@ -2763,7 +3621,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
       window.removeEventListener("focus", onBack);
       document.removeEventListener("visibilitychange", onBack);
     };
-  }, [root, detail?.headRefName]);
+  }, [active, root, detail?.headRefName]);
 
   const arrivedRef = useRef<{ key: string; last: number } | null>(null);
   useEffect(() => {
@@ -2837,6 +3695,39 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     });
     const id = detail?.nodeId;
     if (id) void api.prFileViewed(root, id, path, nowViewed).catch(() => { /* local tick still stands */ });
+  };
+
+  /**
+   * Tick, or un-tick, a whole list of files.
+   *
+   * The reason this exists rather than a loop at the call site: GitHub is told about
+   * each one, and forty files is forty requests. They go in a small number at a time
+   * so a big review does not open forty sockets, and the local ticks are written ONCE
+   * — the state that draws the tree must not be rewritten forty times while the
+   * requests are in flight.
+   *
+   * Nothing waits for GitHub. The tick has always been local-first here (see
+   * toggleSeen), and a refusal leaves the local answer standing rather than un-ticking
+   * something under the reader's cursor.
+   */
+  const setSeenMany = (paths: string[], on: boolean) => {
+    if (!key || !paths.length) return;
+    setSeen((cur) => {
+      const list = new Set(cur[key] ?? []);
+      for (const p of paths) { if (on) list.add(p); else list.delete(p); }
+      const next = { ...cur, [key]: [...list] };
+      saveMap(SEEN_KEY, next);
+      return next;
+    });
+    const id = detail?.nodeId;
+    if (!id) return;
+    void (async () => {
+      const AT_A_TIME = 6;
+      for (let i = 0; i < paths.length; i += AT_A_TIME) {
+        await Promise.allSettled(paths.slice(i, i + AT_A_TIME)
+          .map((p) => api.prFileViewed(root, id, p, on).catch(() => {})));
+      }
+    })();
   };
 
   /** Queue a line comment into the pending review. The body comes from the
@@ -3132,10 +4023,17 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     await act("Reviewers", () => api.prReviewers(root, detail.number, add, remove));
   };
 
-  const doCopyLink = async () => {
-    if (!detail) return;
-    try { await navigator.clipboard.writeText(detail.url); flash(true, "Link copied"); }
-    catch { flash(false, "Could not reach the clipboard"); }
+  /** The chase, written for you: who it waits on, what for, where — on the
+   *  clipboard always, and down the alerts' channel when one is configured. */
+  const doNudge = async () => {
+    if (!detail || !root) return;
+    const r = await api.prNudge(root, detail.number, true).catch(() => ({ ok: false, error: "the server did not answer" } as { ok: boolean; text?: string; channel?: boolean; sent?: boolean; error?: string }));
+    if (!r.ok || !r.text) { flash(false, r.error ?? "Could not compose the nudge"); return; }
+    let copied = false;
+    try { await navigator.clipboard.writeText(r.text); copied = true; } catch { /* the channel may still have taken it */ }
+    if (r.sent) flash(true, copied ? "Nudge sent to the channel, and copied" : "Nudge sent to the channel");
+    else if (copied) flash(true, r.channel ? `Nudge copied — the channel refused: ${r.error ?? "unknown"}` : "Nudge copied — paste it where they will see it (no channel is configured)");
+    else flash(false, r.error ?? "Could not reach the clipboard");
   };
 
   /** Hand a failing check to the chat pointed at this project, with the job that
@@ -3205,15 +4103,28 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
      per pull request here rather than inside a tab: Review lists them and Files
      draws them on the lines they belong to, and two fetches would be two
      answers that can disagree. */
+  /* What plugins wrote on this pull request, kept here and never on GitHub —
+     the Conversation draws the runs, the Files tab draws the notes at their
+     lines. */
+  const local = useLocalNotes(repo?.nameWithOwner, selected);
+  /* "Show me what the plugin wrote", from the header button, from the strip on
+     the Overview, and from a link that opened this pull request asking for it.
+     One move — the Conversation, filtered to the local lane — because a button
+     that says "2 high" and lands anywhere else has not answered the press. */
+  const showLocal = useCallback(() => { setConvWho("local"); setTab("conversation"); }, []);
   const [held, setHeld] = useState<PendingLine[]>([]);
   useEffect(() => {
     if (!selected) { setHeld([]); return; }
     let alive = true;
     api.prPendingReview(root, selected)
+      /* Replaced only when an answer lands, never cleared first — a refresh
+         must not blink the drafted comments off the Review tab on its way to
+         saying the same thing. An empty answer IS the answer when the draft was
+         deleted in the browser, which is what this re-read is for. */
       .then((r) => { if (alive && r.ok) setHeld(r.comments); })
       .catch(() => { /* offline — both tabs still work for what is queued here */ });
     return () => { alive = false; };
-  }, [root, selected]);
+  }, [root, selected, detailTick]);
   const d = detail;
 
   /* Asked once and handed to both readers. The masthead strip and the Overview
@@ -3234,7 +4145,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
     // than `warn`: amber on Checks means something is broken, and a colleague
     // answering you is not a failure — it is the one thing on this panel worth
     // walking towards.
-    { id: "conversation", label: "Conversation", n: lanes.humans.length + lanes.humanComments.length + d.threads.length + lanes.bots.length, hot: newAtoms.length },
+    { id: "conversation", label: "Conversation", n: lanes.humans.length + lanes.humanComments.length + d.threads.length + lanes.bots.length + groupByRun(local).length, hot: newAtoms.length },
     { id: "commits", label: "Commits", n: d.commits.length },
     // `one` because Files stopped being a list of diffs: it is the tree, the
     // diff and the rail at once, and a tab that behaves unlike its neighbours
@@ -3249,6 +4160,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
 
   return (
     <RepoCtx.Provider value={repo?.nameWithOwner}>
+    <ViewerCtx.Provider value={viewer}>
     <MentionCtx.Provider value={mentions}>
     <div className="flex flex-col h-full min-h-0">
       <style>{SCROLLBAR_CSS}{LINEBTN_CSS}{MD_CSS}{PR_ROW_CSS}</style>
@@ -3282,6 +4194,21 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
             the pull request list — the page somebody looking at this panel is
             most likely to want, and the one that takes the most clicks to
             reach from a repository landing page. */}
+        {/*
+          * WHICH repository, when the window is not scoped to one.
+          *
+          * The panel reads `repos[0]` for its remote, which is the project
+          * itself while a project is open — and an arbitrary one of a dozen
+          * under "All repos/projects", with nothing on screen to move it. The
+          * list here is PROJECTS, not checkouts: every worktree of a project
+          * shares its remote, so offering them would be a dozen ways to ask
+          * for the same pull requests.
+          */}
+        {projects.length > 1 && (
+          <CheckoutPicker repos={projects} value={projectRoot} onPick={setRoot}
+            placeholder="Pick a repository" triggerMaxWidth={220} branchLabel={null}
+            title="Which repository's pull requests" />
+        )}
         {repo && (
           <span className="flex items-center gap-1.5 min-w-0">
             {/* Two chips rather than two words. Grey text with an arrow after
@@ -3347,16 +4274,16 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
             {prs.length === 0
               ? (listState.loading ? "Loading pull requests…"
                 : listState.checksPending ? "Loading check states…"
-                : listState.fetchedAt ? `⟳ ${ago(new Date(listState.fetchedAt).toISOString())}` : "")
+                : listState.fetchedAt ? <span className="inline-flex items-center gap-1"><RefreshIcon size={ICON.xs} />{ago(new Date(listState.fetchedAt).toISOString())}</span> : "")
               : (listState.fetchedAt
-                ? `⟳ ${ago(new Date(listState.fetchedAt).toISOString())}${listState.loading || listState.checksPending ? " · updating" : ""}`
+                ? <span className="inline-flex items-center gap-1"><RefreshIcon size={ICON.xs} />{ago(new Date(listState.fetchedAt).toISOString())}{listState.loading || listState.checksPending ? " · updating" : ""}</span>
                 : "")}
           </span>
           {/*
             * Refresh means "ask again for what is in front of me".
             *
-            * It forced the main list and nothing else: the board'"'"'s own two
-            * lists were re-read from the server'"'"'s cache, so a pull request that
+            * It forced the main list and nothing else: the board's own two
+            * lists were re-read from the server's cache, so a pull request that
             * arrived after that cache was filled stayed invisible however many
             * times it was pressed. Reported that way — a review requested of
             * him, present in the list the server serves, and absent from the
@@ -3371,19 +4298,51 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
             * re-read everything around a diff that stayed as it was.
             */}
           <Btn onClick={() => {
+            const plan = refreshPlan(selected);
+            if (plan.pr != null) {
+              /* One pull request open: refresh that one. The lists, and the
+                 check, behind and card caches of every other row, stay as they
+                 are, so going back to the board does not reload every card. */
+              refreshBehind(root, plan.pr);
+              refreshRollup(root, plan.pr);
+              loadDetail(plan.pr, true);
+              diffFresh.current = true;
+              setDiffErr("");
+              /* Everything per-pull-request re-asks off this: the diff, and the
+                 review GitHub is holding for you. Nothing is emptied first —
+                 pressing Refresh must not make the page you are reading
+                 disappear for a second. */
+              setDetailTick((n) => n + 1);
+              return;
+            }
             forgetBehind();
             forgetRollups();
+            /* And the tracker cards, which were the one reading Refresh could
+               not shift: they are held here, not on the server, so re-asking
+               the server for the same rows brought the same card back. */
+            forgetCards();
             boardForce.current = true;
             setBoardTick((n) => n + 1);
             loadList(true);
-            if (selected != null) {
-              loadDetail(selected, true);
-              diffFresh.current = true;
-              setDiff(""); setDiffErr("");
-            }
-          }} disabled={busy} small>Refresh</Btn>
+          }} disabled={busy} small
+            title={selected != null ? "Refresh this pull request" : "Refresh the list"}>Refresh</Btn>
         </div>
       </div>
+
+      {/* Borrowed from elsewhere — see `away`. Under the header rather than
+          inside it: this is a state the whole panel is in, and it has to be
+          the thing you notice before you wonder why the list changed. */}
+      {away && (
+        <div className="flex items-center gap-2 px-2.5 py-1.5 shrink-0 text-[11px] border-b"
+          style={{ borderColor: "color-mix(in srgb, var(--warning) 30%, transparent)", background: "color-mix(in srgb, var(--warning) 8%, transparent)" }}>
+          <span style={{ color: "var(--warning)" }}>Showing {away.repo} on top of {away.back.repo}</span>
+          <span className="ml-auto">
+            <Btn onClick={() => { setAway(null); setSelected(null); setRoot(away.back.root); }} small>
+              Back to {away.back.repo}
+            </Btn>
+          </span>
+        </div>
+      )}
 
       {/* List or pull request, never both. The list used to live in a column
           narrow enough that a title was all it could fit, and everything worth
@@ -3408,32 +4367,39 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                 is up the board is not showing, and a lit pill over a table is
                 the panel telling you where you are and being wrong. Pressing it
                 mid-search clears the box, which is the only way back. */}
-            <button onClick={() => { if (searching) setQuery(""); setBoard(true); }}
+            {/*
+              * NOT A TOGGLE, and that was a real bug rather than a matter of
+              * taste. The inbox REPLACES what the panel shows — the render is
+              * `inboxOn ? <Inbox/> : board ? <TriageBoard/> : <table/>` — so it
+              * is a third view, the same kind of thing as the board and the
+              * five scopes beside it. Only its button disagreed: nothing else
+              * on this row ever cleared `inboxOn`, so with the inbox open,
+              * pressing Board or any scope changed the state underneath and
+              * left the screen exactly as it was. Asked, looking at it: "I don't
+              * see the point of putting a toggle there for it".
+              *
+              * So all seven are one exclusive group and say so — `role="tab"`,
+              * `aria-selected`, one of them lit. Picking any view is picking a
+              * view.
+              */}
+            <Pill on={boardShown} icon={<ColumnsIcon size={ICON.xs} />} label="Board"
               title={searching ? "Clear the search and go back to the lanes" : "Yours and the ones you were asked to look at, in lanes"}
-              className="agx-btn text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1 shrink-0"
-              style={{
-                color: boardShown ? "var(--bg)" : "var(--text2)",
-                background: boardShown ? "var(--primary)" : "transparent",
-                border: `1px solid ${boardShown ? "var(--primary)" : "color-mix(in srgb, var(--border) 45%, transparent)"}`,
-              }}>
-              ◫ Board
-            </button>
+              onClick={() => { if (searching) setQuery(""); setInboxOn(false); setBoard(true); }} />
+            {/* Its number is the only one on this row counting things nobody
+                has looked at yet, so it keeps the warning colour when it is not
+                the view you are in. */}
+            <Pill on={inboxOn} icon={<InboxIcon size={ICON.xs} />} label="Inbox"
+              title="What happened while you were away — GitHub's notifications, filtered to this repository"
+              count={inboxUnread || undefined} countTint="var(--warning)"
+              onClick={() => setInboxOn(true)} />
             <span className="self-center shrink-0" style={{ width: 1, height: 12, background: "color-mix(in srgb, var(--text) 14%, transparent)" }} />
             {VIEWS.map((v) => {
               const n = viewCount(v);
-              const on = !boardShown && activeView?.id === v.id;
+              const on = !boardShown && !inboxOn && activeView?.id === v.id;
               return (
-                <button key={v.id} onClick={() => { setBoard(false); setFilter(v.scope); setQuery(v.query); }} title={v.hint}
-                  className="agx-btn text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1 shrink-0"
-                  style={{
-                    color: on ? "var(--bg)" : "var(--text2)",
-                    background: on ? "var(--primary)" : "transparent",
-                    border: `1px solid ${on ? "var(--primary)" : "color-mix(in srgb, var(--border) 45%, transparent)"}`,
-                  }}>
-                  {v.tint && !on && <span className="rounded-full shrink-0" style={{ width: 5, height: 5, background: v.tint }} />}
-                  {v.label}
-                  {n != null && <span className="tabular-nums" style={{ opacity: on ? .8 : .75 }}>{n}</span>}
-                </button>
+                <Pill key={v.id} on={on} label={v.label} title={v.hint}
+                  dot={v.tint ?? undefined} count={n ?? undefined}
+                  onClick={() => { setInboxOn(false); setBoard(false); setFilter(v.scope); setQuery(v.query); }} />
               );
             })}
             {!activeView && (
@@ -3468,22 +4434,47 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
               onSearch={runSearch}
               pending={query.trim() !== serverQuery.trim()}
               searching={listState.loading}
-              checksPending={listState.checksPending}
               shown={visiblePrs.length}
+              unread={{
+                count: unreadPrs.length,
+                on: unreadOnly,
+                onToggle: () => setUnreadOnly((v) => !v),
+                /* Same population the chip counts — `unreadPrs`, not a second
+                   pass over `basePrs` that could drift from it. Mark first,
+                   then drop the filter: pressing this while it is narrowed to
+                   "unread" would otherwise leave the table showing zero rows
+                   with nothing on screen to say why. */
+                onMarkAllRead: () => {
+                  markAllSeen(unreadPrs.map((p) => p.number), repo?.key, Date.now());
+                  setUnreadOnly(false);
+                },
+              }}
         /* How much of the scope the filter actually saw. A count that says "12"
            over a scope of ninety-three, having read twenty-five of them, is a
            number nobody can act on. */
         swept={filters.text.trim() && sweep?.key === sweepKey ? { rows: sweep.rows.length, done: sweep.done } : undefined}
               total={listState.total ?? prs.length}
+              /* The half the pills cannot say: `is not`, `is set`, and rules
+                 joined together. Handed the same fields the pills offer, so the
+                 two lists can never disagree about what a field is. */
+              builder={<FilterBuilder fields={ruleFields} value={rules} onChange={setRules} />}
             />
           )}
           <div ref={listRef} tabIndex={-1} onKeyDown={onListKey} className="flex-1 overflow-y-auto min-h-0 agx-scroll outline-none">
-            {boardShown && repo && !listState.needsAuth ? (
+            {inboxOn ? (
+              <Inbox repo={repo?.nameWithOwner ?? ""} onFlash={flash} onUnread={setInboxUnread} />
+            ) : boardShown && repo && !listState.needsAuth ? (
               /* The board replaces the TABLE, not the panel: every pill, facet
                  and search above stays where it was, and picking any of them
                  switches back to the table it belongs to. */
               <TriageBoard
-                mine={boardMine} review={boardReview}
+                mine={boardMineShown} review={boardReviewShown}
+                /* The filter bar's own chip and switch — see the comment on
+                   `unreadOnly` above. The board used to keep a second, unwired
+                   copy of this switch and render a second chip for it, so
+                   pressing the bar's chip changed a state the board never
+                   read. One switch now; the board just reads and writes it. */
+                onlyUnread={unreadOnly} onOnlyUnread={setUnreadOnly}
                 /*
                  * Every open pull request, not the count for whichever filter
                  * happened to be selected — `listState.total` is the current
@@ -3496,9 +4487,14 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                 pinned={(n) => isPinned(repo.nameWithOwner, n)}
                 onOpen={openPr}
                 onTogglePin={(p) => togglePin(repo.nameWithOwner, p.number, p.title)}
-                onShowTable={() => { setBoard(false); setFilter("all"); setQuery(""); }}
+                onShowTable={() => { setInboxOn(false); setBoard(false); setFilter("all"); setQuery(""); }}
                 busy={busy}
                 loading={boardLoading} settling={boardSettling} acting={actingOn} root={root}
+                /* `repo.key`, because that is what the conversation's "last
+                   looked" marks are written under — see the `key` this panel
+                   builds for them. A different spelling of the same repository
+                   would give every card a badge for ever. */
+                repoKey={repo.key}
                 /* Whoever opened them. A pinned pull request of a colleague's
                    is in no lane on this board, which is exactly why the strip
                    exists. */
@@ -3571,8 +4567,10 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                 <PrTableHead />
                 {visiblePrs.map((p) => (
                   <PrRow key={p.number} p={p} active={p.number === rowCursor} q={filters.text}
+                    unread={unreadOf(p, repo?.key, seenMarks)}
                     onSelect={() => openPr(p.number)} onReview={() => doLocalReview(p.number)}
                     pinned={!!repo && isPinned(repo.nameWithOwner, p.number)}
+                    spend={spendChipFor(spendByBranch.get(p.headRefName), spend)}
                     onTogglePin={repo ? () => togglePin(repo.nameWithOwner, p.number, p.title) : undefined} />
                 ))}
               </div>
@@ -3650,17 +4648,21 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                   it lands on a click handler, and a bare reference would hand
                   the MouseEvent in as the pull request number. */}
               <Masthead
-                d={d} busy={busy}
+                d={d} busy={busy} local={local} onShowLocal={showLocal}
                 onEditTitle={doEditTitle} onDraft={() => act(d.isDraft ? "Mark ready" : "Convert to draft", () => api.prDraft(root, d.number, !d.isDraft))}
                 onClose={doClose} onLocalReview={(recipe) => doLocalReview(undefined, recipe)}
                 onReviewInTerminal={onReviewInTerminal && d ? (recipe) => onReviewInTerminal(root, d.number, recipe, cardRef(d)?.label ?? "") : undefined}
                 condensed={condensed}
-                onLabels={doLabels} onReviewers={doReviewers} onCopyLink={doCopyLink}
+                onLabels={doLabels} onReviewers={doReviewers} onNudge={doNudge}
                 onEditField={fieldPicker.open}
                 /* Your review, counted where the panel already counts it — the
                    strip is a reader of these three, never a second source. */
                 viewed={seenFiles.length} threads={openThreads.length} queued={myDrafts.length}
                 awaitingChecks={awaitingChecks}
+                /* Already in hand — the same answer the Update button reads, from
+                   the same store, so the header and that button cannot disagree
+                   about which checkout this branch is in. */
+                localHead={localHead}
               />
               {fieldPicker.node}
               <div className="flex border-b shrink-0 overflow-x-auto items-center" style={{ borderColor: "color-mix(in srgb, var(--text) 11%, transparent)" }}>
@@ -3775,11 +4777,14 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                     <div className="min-w-0 flex-1">
                       {tab === "overview" ? (
                         <Overview
-                          d={d} root={root} busy={busy} mergeWork={mergeWork} openThreads={openThreads.length}
+                          d={d} root={root} busy={busy} local={local} onShowLocal={showLocal}
+                          mergeWork={mergeWork} openThreads={openThreads.length}
                           conversationCount={d.comments.length + d.reviews.length + d.threads.length}
                           behind={behind} behindAsking={behindAsking} localHead={localHead} busyWhat={busyWhat}
                           conflictFiles={conflictFiles}
+                          updateRefused={!!refusedUpdate && refusedUpdate.number === d.number && refusedUpdate.updatedAt === d.updatedAt}
                           onEditRequest={() => setEditingBody(true)}
+                          onToggleTask={(newBody) => { void doEditBody(newBody); }}
                           onLocalReview={(recipe) => doLocalReview(undefined, recipe)}
                           onReviewInTerminal={onReviewInTerminal && d ? (recipe) => onReviewInTerminal(root, d.number, recipe, cardRef(d)?.label ?? "") : undefined}
                           onMerge={doMerge} onClose={doClose}
@@ -3794,7 +4799,10 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                                first, the store simply re-asks GitHub for a
                                count that has not changed yet and caches the old
                                one all over again. */
-                            return act("Update branch", () => api.prUpdateBranch(root, d.number, syncLocal))
+                            return act("Update branch", () => api.prUpdateBranch(root, d.number, syncLocal).then((r) => {
+                              if (r.conflict) setRefusedUpdate({ number: d.number, updatedAt: d.updatedAt });
+                              return r;
+                            }))
                               .finally(() => refreshBehind(root, d.number));
                           }}
                           onRerun={() => act("Re-run checks", () => api.prRerun(root, d.number))}
@@ -3802,6 +4810,44 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                           onCancelAutoMerge={() => act("Auto-merge cancelled", () => api.prMerge(root, d.number, mergeMethod, { disableAuto: true }))}
                           onDraft={() => act(d.isDraft ? "Mark ready" : "Convert to draft", () => api.prDraft(root, d.number, !d.isDraft))}
                           onGoThreads={() => setTab("conversation")}
+                          /*
+                           * The review, in THIS panel.
+                           *
+                           * It used to be `openExternal` — reported, and fairly: a
+                           * button that reads "go to it" beside a verdict this app
+                           * is already showing should not answer by launching the
+                           * system browser onto github.com. The whole review is a
+                           * row in the Conversation tab, twenty pixels away.
+                           *
+                           * Same two gotchas as the quote jump above: force the
+                           * segment to "all" first, or a Conversation filtered to
+                           * Humans scrolls to nothing; and defer TWO frames — one
+                           * for the tab to render and one for its content to lay
+                           * out, because a single frame finds an element whose
+                           * height is still zero.
+                           */
+                          onGoReview={(nodeId, url) => {
+                            if (!nodeId) { openExternal(url); return; }
+                            setConvWho("all");
+                            setTab("conversation");
+                            requestAnimationFrame(() => requestAnimationFrame(() => {
+                              const el = document.querySelector(`[data-node="${CSS.escape(nodeId)}"]`);
+                              /*
+                               * Outside only when there is genuinely nothing here to
+                               * land on — checked against the DOM rather than against
+                               * the review list, because a review can be in `reviews`
+                               * and still have no row: the timeline drops one that
+                               * said nothing, and the bot lanes are foldable. A
+                               * button that silently does nothing is worse than one
+                               * that leaves.
+                               */
+                              if (!(el instanceof HTMLElement)) { openExternal(url); return; }
+                              el.scrollIntoView({ block: "center", behavior: "smooth" });
+                              flashElement(el);
+                            }));
+                          }}
+                          movedSince={movedHere.length}
+                          onGoMoved={() => { setTab("files"); setWantSince((n) => n + 1); }}
                           awaitingChecks={awaitingChecks}
                         />
                       ) : (
@@ -3814,10 +4860,19 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                           onApply={doApplySuggestion}
                           onReact={doReact}
                           who={convWho} onWho={setConvWho}
+                          viewer={viewer}
+                          /* Saved through the same act() every other write here goes
+                             through, so a refusal is reported in the same strip and
+                             the pull request is re-read afterwards. */
+                          onSaveComment={(nodeId, kind, body) => act("Save", () => api.prEditComment(root, nodeId, body, kind))}
+                          onHideComment={(nodeId, on) => void act(on ? "Hide" : "Unhide", () => api.prHideComment(root, nodeId, on))}
+                          local={local}
+                          onOpenFile={(path) => { setTab("files"); setSelFile(path); }}
                         />
                       )}
                     </div>
-                    <PrSidebar d={d} root={root} onEditField={fieldPicker.open} />
+                    <PrSidebar d={d} root={root} onEditField={fieldPicker.open}
+                      spend={spendChipFor(spendByBranch.get(d.headRefName), spend)} />
                   </div>
                 ) : null}
 
@@ -3887,9 +4942,9 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                                 {c.isMerge && <Chip text="merge" tint="var(--text3)" title="Trunk catch-up, not work to review" />}
                                 {c.verified && <Chip text="verified" tint="var(--success)" title="Signature verified by GitHub" />}
                                 {c.checks && (
-                                  <span className="shrink-0 text-[11px]" title={`Checks on this commit: ${c.checks.toLowerCase()}`}
+                                  <span className="shrink-0 text-[11px] flex" title={`Checks on this commit: ${c.checks.toLowerCase()}`}
                                     style={{ color: c.checks === "SUCCESS" ? "var(--success)" : c.checks === "FAILURE" || c.checks === "ERROR" ? "var(--error)" : "var(--warning)" }}>
-                                    {c.checks === "SUCCESS" ? "✓" : c.checks === "FAILURE" || c.checks === "ERROR" ? "✕" : "•"}
+                                    {c.checks === "SUCCESS" ? <DoneIcon size={ICON.xs} /> : c.checks === "FAILURE" || c.checks === "ERROR" ? <CrossIcon size={ICON.xs} /> : <CircleIcon size={ICON.xs} />}
                                   </span>
                                 )}
                                 <span className="tabular-nums shrink-0 px-1.5 py-0.5 rounded" style={{ ...CODE_FONT_STYLE, fontSize: "10px", color: "var(--primary)", background: "color-mix(in srgb, var(--primary) 12%, transparent)" }}>{c.short}</span>
@@ -3926,8 +4981,13 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                   <div className="flex-1 min-w-0 h-full">
                   <FilesTab
                     d={d} root={root} byPath={byPath} loaded={!!diff} diffErr={diffErr} seenFiles={seenFiles} onSeen={toggleSeen}
+                    noWs={noWs} onNoWs={(v) => { setNoWs(v); setDiffNoWhitespace(v); }} wsOnly={wsOnly}
+                    onSeenMany={setSeenMany}
+                    since={since} moved={moved} movedHere={movedHere} wantSince={wantSince}
+                    onRefetchSince={() => setSinceTick((n) => n + 1)}
                     sel={selFile} onSel={setSelFile} onShowing={setShowingFile}
                     split={split} wrap={wrap} onSplit={setSplit} onWrap={setWrap} held={held}
+                    local={local}
                     drafts={myDrafts} onAddDraft={addDraft} onPostOne={postOneComment} onDropDraft={dropDraftItem}
                     onPeek={async (p) => {
                       // The pull request's copy, not the checkout's. A branch
@@ -3936,7 +4996,17 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                       // this file's name is the quiet kind of wrong.
                       const r = await api.prFileTemp(root, d.number, p);
                       if (!r.ok || !r.file) { flash(false, r.error || "Could not fetch that file from GitHub"); return; }
-                      setPeek({ root, path: r.file, label: `${p} · #${d.number} @ ${r.sha?.slice(0, 7)} · read-only` });
+                      /* Open it where the changes are, and hand the viewer the
+                         rest of them. Landing at line 1 of a nine-hundred-line
+                         file you opened BECAUSE of a diff is the step nobody
+                         wants to take twice. */
+                      const groups = groupPatch(fileSection(diff, p));
+                      setPeek({
+                        root, path: r.file,
+                        label: `${p} · #${d.number} @ ${r.sha?.slice(0, 7)} · read-only`,
+                        line: groups[0]?.from ?? 1,
+                        groups,
+                      });
                     }}
                     busy={busy} onReply={doReply}
                     onApply={doApplySuggestion}
@@ -4010,7 +5080,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
                     } : undefined}
                     onMerge={() => doMerge(mergeMethod)}
                     awaitingChecks={awaitingChecks}
-                    canMerge={d.mergeState === "CLEAN" || d.mergeState === "BEHIND"} />
+                    canMerge={githubWillMerge(d.mergeState) || d.mergeState === "BEHIND"} />
                   </div>
                 )}
 
@@ -4043,6 +5113,7 @@ export function PrView({ active, onOpenChatWith, onReviewInTerminal, jumpTo }: {
       {mergeDialog}
     </div>
     </MentionCtx.Provider>
+    </ViewerCtx.Provider>
     </RepoCtx.Provider>
   );
 }
@@ -4063,8 +5134,8 @@ export type { MergeMethod };
  * cut — so the pair can be pressed in either order, and the one you did not
  * press stays available.
  */
-function ConflictActions({ root, number, branch, base, disabled }: {
-  root: string; number: number; branch: string; base: string; disabled?: boolean;
+function ConflictActions({ root, number, branch, base, repo, title, disabled }: {
+  root: string; number: number; branch: string; base: string; repo: string; title: string; disabled?: boolean;
 }) {
   const [busy, setBusy] = useState<"" | "open" | "claude">("");
   const [err, setErr] = useState("");
@@ -4091,38 +5162,36 @@ function ConflictActions({ root, number, branch, base, disabled }: {
           requestWorktreeJump({ view: "git", root: p.root });
         }} disabled={disabled || !!busy} warn
         title={`Merge ${base} into ${branch} in a worktree of its own, and open it here. Your checkout is not touched.`}>
-        {busy === "open" ? "Preparing…" : "⚡ Resolve conflicts"}
+        {busy === "open" ? "Preparing…" : <><BoltIcon size={ICON.xs} />Resolve conflicts</>}
       </Btn>
       <Btn onClick={async () => {
           setBusy("claude");
           const p = await prepare();
-          setBusy("");
-          if (!p) return;
-          if (p.clean) { setNote(`Merged cleanly in ${p.root.split("/").pop()} — nothing to resolve, just push it`); return; }
+          if (!p) { setBusy(""); return; }
+          if (p.clean) { setBusy(""); setNote(`Merged cleanly in ${p.root.split("/").pop()} — nothing to resolve, just push it`); return; }
           // The same briefing the git panel writes, in a tmux window sitting in
           // the worktree the conflict is actually in — which is the difference
           // between an agent that can fix it and one being told about it.
-          requestTermIssue(
-            p.root,
-            `conflict-${number}`,
-            [
-              // The briefing reads two things off this — the branch's name and
-              // what it was cut from — and a pull request knows both.
-              ...conflictBriefing(
-                p.root,
-                { name: branch, base, upstream: null, ahead: 0, behind: 0, detached: false },
-                undefined, "merging", p.conflicts,
-              ),
-              ...CONFLICT_ASK,
-            ].join("\n"),
-            true,
+          const h = await conflictHandoff(
+            // The briefing reads two things off this — the branch's name and
+            // what it was cut from — and a pull request knows both.
+            conflictBriefing(
+              p.root,
+              { name: branch, base, upstream: null, ahead: 0, behind: 0, detached: false },
+              undefined, "merging", p.conflicts,
+            ),
+            () => api.prConflictPrompt({ worktree: p.root, files: p.conflicts, number, repo, branch, base, title }),
           );
+          requestTermIssue(p.root, `conflict-${number}`, h.prompt, true, false, "", h.model, h.effort);
+          // Held until here, not released after prepare(): the ask is fetched
+          // with a timeout, and a second press in that window opened a second tab.
+          setBusy("");
           // It opens somewhere you are not looking. Without this the button
           // did its whole job in silence and read as broken.
           setNote(`Claude is on it in a tmux window — "conflict-${number}", in ${p.root.split("/").pop()}`);
         }} disabled={disabled || !!busy}
         title={`Open a tmux window in that worktree with Claude, told which side is which and which files are in conflict.`}>
-        {busy === "claude" ? "Preparing…" : "✦ Hand to Claude in a terminal"}
+        {busy === "claude" ? "Preparing…" : <><SparkleIcon size={ICON.xs} />Hand to Claude in a terminal</>}
       </Btn>
       {/* On its own line, full width. Squeezed between the buttons it pushed
           them apart and ran off the row — and the sentences that matter here
@@ -4136,12 +5205,16 @@ function ConflictActions({ root, number, branch, base, disabled }: {
   );
 }
 
-function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversationCount, behind, behindAsking, localHead, conflictFiles, method, onMethod, onLocalReview, onReviewInTerminal, onMerge, onClose, onUpdateBranch, onRerun, onAutoMerge, onCancelAutoMerge, onDraft, onGoThreads, onEditRequest, awaitingChecks }: {
+function Overview({ d, root, busy, local, onShowLocal, busyWhat, mergeWork, openThreads, conversationCount, behind, behindAsking, localHead, conflictFiles, updateRefused, method, onMethod, onLocalReview, onReviewInTerminal, onMerge, onClose, onUpdateBranch, onRerun, onAutoMerge, onCancelAutoMerge, onDraft, onGoThreads, onGoReview, onGoMoved, movedSince, onEditRequest, onToggleTask, awaitingChecks }: {
   d: PrDetail;
   /** The checkout this pull request is being read from — where a conflict would
    *  be prepared. */
   root: string;
   busy: boolean;
+  /** What plugins have written here: the strip above the description, and the
+   *  state of every plugin button in the row. */
+  local: LocalNotes;
+  onShowLocal: () => void;
   /** What the merge is doing, "" when it is not running. `busy` cannot answer
    *  this: it is true for every action on the panel, so a merge button reading
    *  it would say "Merging…" while a comment was being posted. */
@@ -4156,6 +5229,8 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
   /** Which files would conflict, and whether the answer came from a fetch that
    *  worked. Null while the question is out, or when there is no conflict. */
   conflictFiles: { files: string[]; stale: boolean; resolvedLocally?: { branch: string; ahead: number } } | null;
+  /** "Update branch" was just refused over a conflict, on this revision. */
+  updateRefused: boolean;
   /** How this repository merges. Owned by the panel, not by this component, so
    *  it survives the Files tab and is remembered for next time. */
   method: MergeMethod; onMethod: (m: MergeMethod) => void;
@@ -4164,6 +5239,14 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
    *  the phone — and the button then behaves as it always did. */
   onReviewInTerminal?: (recipe?: string) => void; onMerge: (method: MergeMethod) => void; onClose: () => void;
   onRerun: () => void; onAutoMerge: () => void; onCancelAutoMerge: () => void; onDraft: () => void; onGoThreads: () => void;
+  /** Take me to that review inside this panel, by the node id of its row —
+   *  falling back to `url` outside when this panel has no row for it. */
+  onGoReview: (nodeId: string | undefined, url: string) => void;
+  /** Open Files with the "since your review" filter already on. */
+  onGoMoved: () => void;
+  /** How many of this review's files have changed since your own last review — see
+   *  sinceRange. Zero when there is no review of yours, or nothing has moved. */
+  movedSince: number;
   /** Still asking how far behind the branch is. The row keeps its place and
    *  says it is working, rather than growing a button a second later. */
   behindAsking?: boolean;
@@ -4172,13 +5255,19 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
   busyWhat?: string;
   onUpdateBranch: (syncLocal: boolean) => void;
   onEditRequest: () => void;
+  /** A real, clickable checkbox on the description's own checklist — GitHub's
+   *  own behaviour, not an edit of the whole body for one tick. Absent while
+   *  another write is already running, same as every other action here. */
+  onToggleTask?: (newBody: string) => void;
   /** This panel pushed to the branch a moment ago, so runs are expected — see
    *  the note on `pushed`. */
   awaitingChecks?: boolean;
 }) {
   const c = d.checks;
   const [allFiles, setAllFiles] = useState(false);
-  const canMerge = d.mergeState === "CLEAN";
+  /* GitHub's own "mergeable" — see githubWillMerge for why that is not only
+     CLEAN. */
+  const canMerge = githubWillMerge(d.mergeState);
   /*
    * Behind the base branch is a state GitHub lets you merge from, and we did
    * not.
@@ -4235,7 +5324,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
    *
    * GitHub computes `mergeable` lazily and keeps the old answer for a while
    * after a push, so "CONFLICTING" survives the very commit that fixed it —
-   * measured on #17329, which stayed blocked here after the merge was resolved,
+   * measured on #329, which stayed blocked here after the merge was resolved,
    * committed and pushed. When our own merge-tree of the SAME refs GitHub is
    * talking about comes back clean, and the fetch that got them succeeded, git
    * is simply the fresher of the two.
@@ -4244,29 +5333,51 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
    * whenever they last came down, and overriding GitHub on the strength of an
    * old copy would be guessing in the direction that unblocks a merge.
    */
-  const gitSaysClean = !!conflictFiles && !conflictFiles.stale && conflictFiles.files.length === 0;
+  const gitSaysClean = cleanMerge(conflictFiles);
 
-  const conflicted = (d.mergeable === "CONFLICTING" && !gitSaysClean)
-    // Or because we merged the two trees ourselves and found out. GitHub
-    // computes `mergeable` lazily and answers UNKNOWN until somebody asks
-    // twice — measured on this repository's own open pull request #464, which
-    // GitHub called UNKNOWN while git named the one file it conflicts in. A
-    // gate that waits for GitHub to make its mind up is a gate that is open
-    // exactly when the answer matters most.
-    //
-    // A stale answer does not get a vote: if the fetch failed, what is on
-    // screen is from whenever the refs were last pulled down, and taking
-    // buttons away on that basis would be guessing.
-    || (!!conflictFiles && !conflictFiles.stale && conflictFiles.files.length > 0);
+  // GitHub's verdict, git's, and an "Update branch" GitHub just refused over a
+  // conflict — weighed in lib/updateBranch.ts, where the order is tested.
+  const conflicted = prConflicted(d.mergeable, conflictFiles, updateRefused);
 
   // Whether "Update branch" is offered at all — asked once, because the button
   // and the line that explains what it will not touch have to appear and
   // disappear together.
   const canUpdate = !conflicted && ((behind ?? 0) > 0 || d.mergeState === "BEHIND") && d.viewerCanUpdate !== false;
 
+  /*
+   * Every reason it will not merge, ranked — see mergeBlockers.ts. The header
+   * names the first; the rows below name the rest, each with what to do.
+   *
+   * `refusal` is the one that takes the merge button away, and it can exist
+   * where GitHub's own state reads CLEAN: a merge queue, or a role without
+   * merge rights, never shows up in `mergeStateStatus`.
+   */
+  const blockers = useMemo(() => mergeBlockers({ ...d, openThreads, conflicted, awaitingChecks }),
+    [d, openThreads, conflicted, awaitingChecks]);
+  const refusal = mergeRefusal(blockers, d.mergeState);
+  const autoRefusal = autoMergeRefusal(blockers);
+  const headBlocker = blockers.find((b) => b.weight === "blocks") ?? null;
+  const shownBlocked = verdict.blocked || !!refusal;
+
 
   return (
     <div className="flex flex-col gap-3">
+      {/*
+        * "Three of these forty files moved since you reviewed them."
+        *
+        * The number that decides how a second pass starts, and it was only reachable
+        * by opening the Files tab and noticing a chip. Here it is a sentence with the
+        * trip attached: pressing it opens Files with the filter already on, which is
+        * the whole errand.
+        */}
+      {movedSince > 0 && (
+        <Reason tint="var(--warning)" glyph={<RefreshIcon size={ICON.xs} />}
+          action={<button onClick={onGoMoved} style={{ color: "var(--primary)" }}>Show them</button>}>
+          <b style={{ color: "var(--warning)" }}>{movedSince}</b>
+          {movedSince === 1 ? " file has" : " files have"} changed since your review
+        </Reason>
+      )}
+
       {d.forcePushedSinceReview && (
         <div className="text-[10.5px] px-2.5 py-2 rounded" style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 10%, transparent)" }}>
           The author force-pushed after the last review — that review was for code that is no longer here.
@@ -4283,7 +5394,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
           <div className="flex gap-2.5 items-start p-3">
             <span className="shrink-0 rounded-full flex items-center justify-center text-[13px]"
               style={{ width: 26, height: 26, background: d.state === "MERGED" ? "var(--primary)" : "color-mix(in srgb, var(--text3) 60%, transparent)", color: "var(--bg)" }}>
-              {d.state === "MERGED" ? "⏣" : "⊘"}
+              {d.state === "MERGED" ? <MergeIcon size={ICON.sm} /> : <BlockedIcon size={ICON.sm} />}
             </span>
             <span className="min-w-0">
               <span className="block text-[13px] font-semibold leading-tight" style={{ color: "var(--text)" }}>
@@ -4298,7 +5409,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
           </div>
           <div className="flex items-center gap-1.5 flex-wrap px-3 py-2.5"
             style={{ borderTop: "1px solid color-mix(in srgb, var(--text) 11%, transparent)", background: "color-mix(in srgb, var(--border) 12%, transparent)" }}>
-            {d.state === "CLOSED" && <Btn onClick={onClose} disabled={busy} pending={busyWhat === "Reopen"} title="Put it back to open, with its comments and reviews intact">↺ Reopen</Btn>}
+            {d.state === "CLOSED" && <Btn onClick={onClose} disabled={busy} pending={busyWhat === "Reopen"} title="Put it back to open, with its comments and reviews intact"><UndoIcon size={ICON.xs} />Reopen</Btn>}
             <a href={externalUrl(d.url)} target="_blank" rel="noreferrer noopener" className="text-[10.5px] px-2.5 py-1 rounded"
               style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--text) 24%, transparent)" }}>Open on GitHub ↗</a>
           </div>
@@ -4308,12 +5419,13 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
         <div className="flex gap-2.5 items-start p-3">
           <span className="shrink-0 rounded-full flex items-center justify-center text-[13px]"
             style={{ width: 26, height: 26,
-              background: allClear ? "var(--success)"
+              background: refusal ? "var(--error)"
+                : allClear ? "var(--success)"
                 : canMerge && standing === "awaiting" ? "var(--warning)"
                 : canMerge ? "var(--text3)"
                 : isBehind ? "var(--warning)" : "var(--error)",
               color: "var(--bg)" }}>
-            {allClear ? "✓" : canMerge && standing === "awaiting" ? "◯" : canMerge ? "·" : "!"}
+            {refusal ? "!" : allClear ? <DoneIcon size={ICON.xs} /> : canMerge && standing === "awaiting" ? <CircleIcon size={ICON.xs} /> : canMerge ? "·" : "!"}
           </span>
           <span className="min-w-0">
             <span className="block text-[13px] font-semibold leading-tight" style={{ color: "var(--text)" }}>
@@ -4322,31 +5434,120 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
                   did, on two of three cases. The blocked arms keep Overview's
                   own short headlines: there is room for a reason underneath
                   here and there is not in a 320px column. */}
-              {verdict.blocked
-                ? (isBehind ? "Behind the base branch" : "Merging is blocked")
+              {shownBlocked
+                ? (isBehind && !refusal ? "Behind the base branch" : "Merging is blocked")
                 : verdict.line}
             </span>
             <span className="block text-[11px] mt-1.5" style={{ color: "var(--text3)" }}>
-              {allClear ? "Nothing is standing in the way"
+              {refusal ? refusal.title
+                : allClear ? "Nothing is standing in the way"
                 : canMerge ? standingLine(standing, undefined)
                 : isBehind ? `You can merge anyway — ${mergeBlockedWhy(d.mergeState, c).replace(/^The base branch has moved — /, "")}`
-                : mergeBlockedWhy(d.mergeState, c)}
+                : headBlocker?.title ?? mergeBlockedWhy(d.mergeState, c)}
             </span>
           </span>
         </div>
 
         <div style={{ borderTop: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
-          {d.reviewDecision === "CHANGES_REQUESTED" && (
-            <Reason tint="var(--error)" glyph="✕"><b style={{ color: "var(--text)", fontWeight: 500 }}>Changes requested</b> by a reviewer with write access</Reason>
-          )}
+          {/*
+            * WHAT THE REVIEWER DECIDED, first, and drawn even when something
+            * else is blocking.
+            *
+            * This box used to list only obstacles, and a pull request approved
+            * sixteen hours earlier read as unapproved: "has this PR of mine been
+            * approved... because in the overview it looks like it hasn't". It had been. A
+            * failing check and five open threads were on screen; the approval
+            * was not, anywhere.
+            *
+            * Blocked and approved are different facts and both were true — the
+            * reviewer decided, CI had not caught up. Showing only the blocking
+            * one answers "can I merge" and drops "has anybody looked", which is
+            * the question asked first and the only one a person has to answer.
+            *
+            * FIRST in the list because it is the fact with a human behind it.
+            * The rest of these rows are things a machine noticed.
+            */}
+          {(() => {
+            /*
+             * ONE SOURCE, and the reason this had to change.
+             *
+             * The board said "Waiting on bjorn" and this box said
+             * "Reviewed, no verdict by the author" about the same pull request,
+             * because they asked two different things: the card reads
+             * `humanReview`, computed on the server from the reviews, and this
+             * read `reviewVerdict` over the roster in the browser. Both were
+             * defensible and they disagreed, which makes the app the thing you
+             * cannot trust — "it makes no sense".
+             *
+             * `humanReview` wins because it knows what the browser cannot: who
+             * the AUTHOR is (their own comments are not a review), and who is
+             * still outstanding (a request GitHub drops the moment it is
+             * answered). Both facts are what made the board's answer the right
+             * one.
+             *
+             * ALL FOUR STATES GET THE BAND. Approved was a band and changes
+             * requested was a grey line with a cross — same weight for the same
+             * kind of fact, which is what was asked for and what makes the two
+             * screens finally read alike.
+             */
+const v = p2Verdict(d.humanReview, reviewerRoster(d), d.reviewDecision, d.gate);
+            if (!v) return null;
+            return (
+              <div className="flex gap-2.5 items-center px-3 py-2 text-[12px]"
+                style={{
+                  background: `color-mix(in srgb, ${v.tint} 10%, transparent)`,
+                  borderLeft: `2px solid ${v.tint}`,
+                }}>
+                <span className="shrink-0 grid place-items-center rounded-full text-[12px]"
+                  style={{ width: 22, height: 22, background: v.tint, color: "var(--bg)" }}>
+                  {v.glyph}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <b style={{ color: "var(--text)", fontWeight: 600 }}>{v.head}</b>
+                  {v.who && <span style={{ color: "var(--text2)" }}>{" by "}{v.who}</span>}
+                  {v.note && (
+                    <span className="block text-[11px] mt-0.5" style={{ color: "var(--text3)" }}>{v.note}</span>
+                  )}
+                </span>
+                {v.url && (() => {
+                  /*
+                   * The same review, as a row this panel already draws.
+                   *
+                   * Matched on the URL rather than by parsing `#pullrequestreview-…`
+                   * out of it: `humanReview.url` and `PrReview.url` are the one
+                   * string GitHub gave for that submission, so equality is exact and
+                   * there is no fragment format to keep in step with.
+                   */
+                  const node = d.reviews?.find((r) => r.url && r.url === v.url)?.nodeId;
+                  return (
+                    <button className="agx-btn shrink-0 rounded px-1.5 py-0.5 text-[11px]"
+                      style={{ color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}
+                      title="Go to that review in the conversation"
+                      onClick={() => onGoReview(node, v.url!)}>Go to it</button>
+                  );
+                })()}
+              </div>
+            );
+          })()}
           {openThreads > 0 && (
-            <Reason tint="var(--warning)" glyph="◯" action={<button onClick={onGoThreads} style={{ color: "var(--primary)" }}>Go to thread</button>}>
-              {openThreads} review thread{openThreads === 1 ? "" : "s"} still open — <span style={{ color: "var(--text3)" }}>a reply is not a resolve</span>
+            <Reason tint={blockers.some((b) => b.kind === "threads") ? "var(--error)" : "var(--warning)"} glyph={<CircleIcon size={ICON.xs} />} action={<button onClick={onGoThreads} style={{ color: "var(--primary)" }}>Go to thread</button>}>
+              {openThreads} review thread{openThreads === 1 ? "" : "s"} still open — <span style={{ color: "var(--text3)" }}>
+                {blockers.some((b) => b.kind === "threads") ? "this branch requires them resolved before merging" : "a reply is not a resolve"}
+              </span>
             </Reason>
           )}
-          {c.failure > 0 && (
-            <Reason tint="var(--error)" glyph="✕">{c.failing.slice(0, 2).map((f) => f.name).join(", ")}{c.failing.length > 2 ? ` +${c.failing.length - 2} more` : ""} failing</Reason>
-          )}
+          {/*
+            * The rest of the reasons, one row each, in the order they would
+            * stop you. This used to be one red line of the first two failing
+            * names, which on the pull request that prompted this list hid the
+            * one REQUIRED check behind "+1 more" and said nothing about the
+            * base branch being locked.
+            *
+            * The kinds left out already have a row of their own in this box:
+            * conflicts (with the files), threads (above), behind (the header
+            * and its button) and running checks (the checks line).
+            */}
+          {blockers.filter((b) => BLOCKER_ROW.has(b.kind)).map((b) => <BlockerRow key={b.kind} b={b} />)}
           {/* Not "N checks passed" while some are still going. That line sat
               directly under a header saying merging was blocked, and the two
               disagreed inside one box — see mergeReason.ts. */}
@@ -4362,9 +5563,12 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
               the old base, so this exact combination is untested. Press again to go ahead.
             </Reason>
           )}
-          {checksLine(c, d.mergeable === "MERGEABLE" ? d.baseRefName : undefined) && (
-            <Reason tint={c.pending > 0 ? "var(--warning)" : "var(--success)"} glyph={c.pending > 0 ? "◯" : "✓"}>
-              {checksLine(c, d.mergeable === "MERGEABLE" ? d.baseRefName : undefined)}
+          {/* "No conflicts with <base>" only while the panel agrees: after a
+              refused update, or with git naming the files, GitHub's MERGEABLE
+              is the stale one, and the line sat right above Resolve conflicts. */}
+          {checksLine(c, d.mergeable === "MERGEABLE" && !conflicted ? d.baseRefName : undefined) && (
+            <Reason tint={c.pending > 0 ? "var(--warning)" : "var(--success)"} glyph={c.pending > 0 ? <CircleIcon size={ICON.xs} /> : <DoneIcon size={ICON.xs} />}>
+              {checksLine(c, d.mergeable === "MERGEABLE" && !conflicted ? d.baseRefName : undefined)}
             </Reason>
           )}
           {/* WHICH files, not just that there are some. GitHub says a pull
@@ -4384,7 +5588,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
             * you, and the difference is one push.
             */}
           {conflictFiles?.resolvedLocally && conflictFiles.resolvedLocally.ahead > 0 && (
-            <Reason tint="var(--success)" glyph="✓">
+            <Reason tint="var(--success)" glyph={<DoneIcon size={ICON.xs} />}>
               <b style={{ color: "var(--text)", fontWeight: 500 }}>Resolved here, not pushed</b>
               {" — "}
               <span className="font-mono">{conflictFiles.resolvedLocally.branch}</span> already has
@@ -4401,8 +5605,11 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
               than left as a red banner nobody can act on: there is nothing to
               do here but wait, and a warning you cannot act on is one you learn
               to scroll past. */}
-          {d.mergeable === "CONFLICTING" && gitSaysClean && (
-            <Reason tint="var(--success)" glyph="✓">
+          {/* Not after GitHub refused an update over the conflict: that is
+              GitHub trying the merge just now, and "nothing to do" beside the
+              buttons it brings would be the panel contradicting itself. */}
+          {d.mergeable === "CONFLICTING" && gitSaysClean && !updateRefused && (
+            <Reason tint="var(--success)" glyph={<DoneIcon size={ICON.xs} />}>
               <b style={{ color: "var(--text)", fontWeight: 500 }}>Already resolved</b> — git merged
               {" "}{d.headRefName} into {d.baseRefName} just now and found nothing to settle.
               <span className="block mt-1" style={{ color: "var(--text3)" }}>
@@ -4449,11 +5656,12 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
                  move runs AFTER the merge action has settled, so for those
                  seconds `busy` is false again and the button was live while the
                  second half of its own operation was still in flight. */
-              disabled={busy || !!mergeWork || (!canMerge && !isBehind)}
+              disabled={busy || !!mergeWork || !!refusal || (!canMerge && !isBehind)}
               title={mergeWork
                 ? (mergeWork === MOVING_CARD
                   ? "The pull request is merged. Moving its ClickUp card to the merged status — if this part fails, the merge still stands."
                   : "Merging…")
+                : refusal ? `${refusal.title} — ${refusal.detail}`
                 : canMerge
                 ? `${MERGE_LABEL[method]}${d.mergePolicy?.deletesBranch ? " — GitHub deletes the branch" : " and delete the branch"}`
                 : isBehind
@@ -4521,8 +5729,13 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
               /* The right button in the waiting window, so it says so there.
                  Somebody who has just restarted CI and wants to stop thinking
                  about this pull request is asking for exactly this. */
-              <Btn onClick={onAutoMerge} disabled={busy || autoOff} pending={busyWhat === "Auto-merge"}
-                title={autoOff
+              <Btn onClick={onAutoMerge} disabled={busy || autoOff || !!autoRefusal} pending={busyWhat === "Auto-merge"}
+                title={autoRefusal
+                  /* Arming it here would promise a merge that is not coming:
+                     auto-merge waits for checks and reviews, not for a lock to
+                     lift or a queue to take it. */
+                  ? autoRefusal
+                  : autoOff
                   ? "Auto-merge is off for this repository — Settings › General › Pull requests › Allow auto-merge"
                   : awaitingChecks
                     ? `Arm it now and walk away — ${MERGE_LABEL[method].toLowerCase()} the moment the checks that are starting come back green`
@@ -4564,8 +5777,10 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
             * a terminal, which is the other half of what people do with a
             * conflict.
             */}
-          {d.mergeable === "CONFLICTING" && (
-            <ConflictActions root={root} number={d.number} branch={d.headRefName} base={d.baseRefName} disabled={busy} />
+          {/* `conflicted` as well: git naming the files, or GitHub refusing the
+              update over them, is a conflict GitHub has not caught up with. */}
+          {(d.mergeable === "CONFLICTING" || conflicted) && (
+            <ConflictActions root={root} number={d.number} branch={d.headRefName} base={d.baseRefName} repo={/github\.com\/([^/]+\/[^/]+)\//.exec(d.url)?.[1] ?? ""} title={d.title} disabled={busy} />
           )}
           {/*
             * The space the answer will fill, while it is being fetched.
@@ -4599,7 +5814,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
               title={awaitingChecks
                 ? "The branch was just updated — waiting for the checks to start. Pushing again would restart them."
                 : updateMove.title}>
-              {updateMove.label}</Btn>
+              <RefreshIcon size={ICON.xs} />{updateMove.label}</Btn>
           )}
           {/* Only with something to re-run. `failure > 0` already implies the
               rollup is populated, so this cannot appear over an empty one. */}
@@ -4623,7 +5838,9 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
       </section>
       )}
 
-      <Description d={d} busy={busy} onEdit={onEditRequest} />
+      <LocalStrip local={local} onShow={onShowLocal} />
+
+      <Description d={d} busy={busy} onEdit={onEditRequest} onToggleTask={onToggleTask} />
 
       <div className="flex gap-1.5 flex-wrap items-center">
         {/* The same two destinations the masthead offers. Two buttons with the
@@ -4637,6 +5854,7 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
             them. */}
         <ReviewMenu d={d} canTerm={!!onReviewInTerminal}
           onPick={(recipe, where) => (where === "term" ? onReviewInTerminal?.(recipe) : onLocalReview(recipe))} />
+        <PluginPrActions number={d.number} local={local} onShowLocal={onShowLocal} />
         {/* The panel's own Btn, like its neighbour. A hand-rolled anchor with
             its own padding beside a Btn is two heights in a row of two. */}
         {/* `small`, like the Menu it stands beside. Without it this was the
@@ -4669,21 +5887,28 @@ function Overview({ d, root, busy, busyWhat, mergeWork, openThreads, conversatio
  * Write/Preview rather than a bare textarea: a description is markdown, and
  * finding out how it renders by saving it and looking is not a review flow.
  */
-function Description({ d, busy, onEdit }: { d: PrDetail; busy: boolean; onEdit: () => void }) {
+function Description({ d, busy, onEdit, onToggleTask }: {
+  d: PrDetail; busy: boolean; onEdit: () => void;
+  /** Absent while a write is already running — see the call site. */
+  onToggleTask?: (newBody: string) => void;
+}) {
   return (
-    <section className="rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
+    /* `data-pr-body` is an address, like `data-node` on a timeline entry: a
+       mention that lives in the description has to be scrollable-to as well.
+       See the jump in the panel. */
+    <section data-pr-body className="rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
       <div className="flex items-center gap-2 px-3 py-1.5"
         style={{ borderBottom: "1px solid color-mix(in srgb, var(--text) 11%, transparent)", background: "color-mix(in srgb, var(--border) 12%, transparent)" }}>
         <span className="text-[9.5px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>description</span>
         {/* Opening the editor is the shell's to do — it takes the whole column,
             so the click has to leave this box entirely. */}
-        <span className="ml-auto"><Btn onClick={onEdit} disabled={busy} small>✎ Edit</Btn></span>
+        <span className="ml-auto"><Btn onClick={onEdit} disabled={busy} small><EditIcon size={ICON.xs} />Edit</Btn></span>
       </div>
       <div className="p-3">
         {/* No checklist meter. The boxes are right there, ticked or not, three
             lines below — a bar counting them said nothing the list did not, and
             it said it above the description, where the description should be. */}
-        {d.body.trim() ? <Md body={d.body} /> : <div className="text-[11px]" style={{ color: "var(--text3)" }}>No description.</div>}
+        {d.body.trim() ? <Md body={d.body} onToggleTask={busy ? undefined : onToggleTask} /> : <div className="text-[11px]" style={{ color: "var(--text3)" }}>No description.</div>}
       </div>
     </section>
   );
@@ -4834,13 +6059,13 @@ function BodyEditor({ prNumber, initial, busy, onSave, onCancel, onOpenGithub }:
           <TBSep />
           <TB title="Quote" onClick={() => prefixLines(() => "> ")}>&ldquo;</TB>
           <TB title="Code" onClick={code}>&lt;/&gt;</TB>
-          <TB title="Link" onClick={link}>🔗</TB>
+          <TB title="Link" onClick={link}><LinkIcon size={ICON.sm} /></TB>
           <TBSep />
           <TB title="Numbered list" onClick={() => prefixLines((i) => `${i + 1}. `)}>1.</TB>
           <TB title="Bulleted list" onClick={() => prefixLines(() => "- ")}>•</TB>
-          <TB title="Task list" onClick={() => prefixLines(() => "- [ ] ")}>☑</TB>
+          <TB title="Task list" onClick={() => prefixLines(() => "- [ ] ")}><CheckboxIcon size={ICON.sm} checked /></TB>
           <TBSep />
-          <TB title="Attach an image" onClick={() => setAttachNote("An image")}>📎</TB>
+          <TB title="Attach an image" onClick={() => setAttachNote("An image")}><AttachIcon size={ICON.sm} /></TB>
           <TB title="Mention" onClick={mention}>@</TB>
         </div>
       )}
@@ -4851,7 +6076,7 @@ function BodyEditor({ prNumber, initial, busy, onSave, onCancel, onOpenGithub }:
           <span className="min-w-0 truncate"><b>{attachNote}</b> can't be attached from here — GitHub has no public upload API for attachments.</span>
           <button onClick={onOpenGithub} className="agx-btn ml-auto shrink-0 px-2 py-0.5 rounded"
             style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 45%, transparent)" }}>Attach on GitHub ↗</button>
-          <button onClick={() => setAttachNote(null)} className="agx-btn shrink-0 px-1" style={{ color: "var(--text3)" }} aria-label="Dismiss">×</button>
+          <button onClick={() => setAttachNote(null)} className="agx-btn shrink-0 grid place-items-center w-5 h-5 rounded" style={{ color: "var(--text3)" }} aria-label="Dismiss"><CloseIcon size={ICON.xs} /></button>
         </div>
       )}
 
@@ -4891,11 +6116,18 @@ function BodyEditor({ prNumber, initial, busy, onSave, onCancel, onOpenGithub }:
  * something. All three, because a menu that only closes one of those ways is
  * the kind of thing you only notice when it is stuck open over the diff.
  */
-function Menu({ label, title, children, align = "right", primary }: {
-  label: string; title?: string; children: (close: () => void) => React.ReactNode; align?: "left" | "right";
+export function Menu({ label, title, children, align = "right", primary, bare }: {
+  /** A node, not just a string: an icon-only trigger used to be a typographic
+   *  character, and `⌸` is an APL glyph most fonts do not carry — it fell back
+   *  to whatever was nearest, at about six pixels of actual mark. */
+  label: React.ReactNode; title?: string; children: (close: () => void) => React.ReactNode; align?: "left" | "right";
   /** For a menu that is an action rather than an overflow — it has to read as
    *  the thing you came here to press, not as a place other things are kept. */
   primary?: boolean;
+  /** No frame of its own: the trigger is already inside somebody else's — a
+   *  plugin's button and its caret are one control with one border, and a Btn
+   *  inside that draws a second. */
+  bare?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
@@ -4914,7 +6146,15 @@ function Menu({ label, title, children, align = "right", primary }: {
   // were never where they looked like they were.
   return (
     <div className="relative shrink-0 flex" ref={box}>
-      <Btn onClick={() => setOpen((v) => !v)} title={title} small primary={primary}>{label}</Btn>
+      {bare
+        ? (
+          <button type="button" onClick={() => setOpen((v) => !v)} title={title} aria-haspopup="menu" aria-expanded={open}
+            className="inline-flex items-center justify-center px-1 hover:brightness-125"
+            style={{ color: "inherit", background: "transparent", border: 0, borderLeft: "1px solid color-mix(in srgb, currentColor 30%, transparent)" }}>
+            {label}
+          </button>
+        )
+        : <Btn onClick={() => setOpen((v) => !v)} title={title} small primary={primary}>{label}</Btn>}
       {open && (
         <div className="absolute z-50 mt-1.5 rounded-lg overflow-hidden agx-menu" style={{ [align]: 0, minWidth: 216 }}>
           {children(() => setOpen(false))}
@@ -4924,12 +6164,15 @@ function Menu({ label, title, children, align = "right", primary }: {
   );
 }
 
-function MenuItem({ children, onClick, danger, kbd }: {
+export function MenuItem({ children, onClick, danger, kbd, icon }: {
   children: React.ReactNode; onClick: () => void; danger?: boolean; kbd?: string;
+  /** Drawn before the words, in the words' own colour. */
+  icon?: React.ReactNode;
 }) {
   return (
     <button onClick={onClick} className="agx-mi w-full text-left flex items-center gap-2 px-3 py-1.5 text-[11px]"
       style={{ color: danger ? "var(--error)" : "var(--text2)" }}>
+      {icon && <span className="shrink-0 flex">{icon}</span>}
       <span className="min-w-0 truncate">{children}</span>
       {kbd && <span className="ml-auto text-[9.5px] shrink-0" style={{ color: "var(--text3)" }}>{kbd}</span>}
     </button>
@@ -4975,6 +6218,31 @@ function ChatInstead({ onChat }: { onChat: () => void }) {
  * the menu appearing. `bumpReviewRecipes` is what Settings calls after a save,
  * which is the only event that can invalidate this.
  */
+/**
+ * The saved replies, read once per window and shared by every composer.
+ *
+ * Same shape as the recipe cache below it and for the same reason: a dozen composers
+ * can be mounted at once (every thread has one), and each of them fetching the same
+ * list is a dozen requests for a file that changes when somebody opens Settings.
+ */
+let replyCache: { id: string; title: string; text: string }[] | null = null;
+let replyAsked = false;
+const replySubs = new Set<() => void>();
+export function bumpSavedReplies(): void { replyCache = null; replyAsked = false; replySubs.forEach((f) => f()); }
+function useSavedReplies(): { id: string; title: string; text: string }[] {
+  const [, redraw] = useState(0);
+  useEffect(() => {
+    const fn = () => redraw((n) => n + 1);
+    replySubs.add(fn);
+    if (!replyAsked) {
+      replyAsked = true;
+      api.savedReplies().then((r) => { replyCache = r.replies ?? []; replySubs.forEach((f) => f()); }).catch(() => { replyCache = []; });
+    }
+    return () => { replySubs.delete(fn); };
+  }, []);
+  return replyCache ?? [];
+}
+
 let recipeCache: ReviewRecipe[] | null = null;
 const recipeSubs = new Set<() => void>();
 export function bumpReviewRecipes(): void { recipeCache = null; recipeSubs.forEach((f) => f()); }
@@ -4996,6 +6264,7 @@ const GROUP_LABEL: Record<ReviewRecipeGroup, string> = {
   // here because the record is total, and because the day this group does get
   // shown somewhere it must not appear as the word `telling`.
   telling: "Telling somebody",
+  conflicts: "Merge conflicts",
 };
 
 /** The prompt behind the Ping button, by id. In the same catalogue as the
@@ -5046,7 +6315,7 @@ function ReviewMenu({ d, onPick, canTerm, primary = true }: {
   const groups: ReviewRecipeGroup[] = ["reviewing", "focused", "mine"];
 
   return (
-    <Menu label="✦ Review with Claude ▾" title="Review this pull request" primary={primary}>
+    <Menu label={<><SparkleIcon size={ICON.xs} />Review with Claude<CaretIcon /></>} title="Review this pull request" primary={primary}>
       {(close) => (
         <div style={{ maxHeight: "min(62vh, 520px)", overflowY: "auto" }}>
           {/* The suggestion keeps the shape the button had before: a named
@@ -5130,7 +6399,12 @@ function Field({ label, title, max, children }: {
   return (
     <div className="min-w-0 flex flex-col gap-1" style={max != null ? { maxWidth: max } : undefined} title={title}>
       <span className="text-[10px] uppercase tracking-[.1em]" style={{ color: "var(--text4)" }}>{label}</span>
-      <span className="text-[11px] flex items-center gap-1 min-w-0" style={{ color: "var(--text2)" }}>{children}</span>
+      {/* `overflow-hidden`: `max` is a real cap, not just a suggestion — every
+          child in here already truncates or refuses to shrink on its own, and
+          without a cut edge on the ROW too, content past `max` painted over
+          whatever field sits next to it instead of stopping at the boundary
+          its own tooltip exists to cover for. */}
+      <span className="text-[11px] flex items-center gap-1 min-w-0 overflow-hidden" style={{ color: "var(--text2)" }}>{children}</span>
     </div>
   );
 }
@@ -5158,7 +6432,8 @@ function SidebarSection({ title, onEdit, children }: { title: string; onEdit?: (
         <span className="text-[9.5px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>{title}</span>
         {onEdit && (
           <button onClick={onEdit} title={`Edit ${title.toLowerCase()}`} aria-label={`Edit ${title.toLowerCase()}`}
-            className="agx-btn ml-auto text-[10px] px-1 rounded hover:bg-white/5" style={{ color: "var(--text3)" }}>✎</button>
+            className="agx-btn ml-auto rounded hover:bg-white/5 inline-flex items-center justify-center"
+            style={{ color: "var(--text3)", width: 20, height: 20 }}><EditIcon size={ICON.sm} /></button>
         )}
       </div>
       {children}
@@ -5168,6 +6443,50 @@ function SidebarSection({ title, onEdit, children }: { title: string; onEdit?: (
 
 /** Reviewers and assignees are both lists of people. Only a reviewer can be a
  *  team, so an assignee is one with nothing to flag. */
+/**
+ * Reviewers, the way GitHub lists them: everybody who has reviewed, with their
+ * verdict, plus everybody still being waited on.
+ *
+ * This used to print the OUTSTANDING request list under the heading
+ * "Reviewers", so a pull request where everybody had answered — two approvals
+ * and one request for changes — said "No reviewers" and left the three faces to
+ * the participants row at the bottom, which says nothing about state. Reported
+ * with both screens side by side. The roster and its order are in
+ * lib/prReviewers.
+ */
+function ReviewerList({ rows }: { rows: ReviewerRow[] }) {
+  if (!rows.length) return <span className="text-[10.5px]" style={{ color: "var(--text3)" }}>No reviewers</span>;
+  return (
+    <div className="flex flex-col gap-1">
+      {rows.map((r) => {
+        const mark = REVIEW_MARK[r.state];
+        return (
+          <span key={r.login} className="flex items-center gap-1.5 text-[11px] min-w-0" style={{ color: "var(--text2)" }}
+            title={`${r.login} — ${mark.said}${r.at ? ` ${ago(r.at)}` : ""}${r.again ? " · asked again since" : ""}`}>
+            <ReviewerFace r={{ login: r.login, isTeam: r.isTeam }} size={16} />
+            <span className="truncate min-w-0">{r.login}</span>
+            <span className="flex-1" />
+            {/* Asked again after answering — GitHub's ↻, and the reason a green
+                tick beside it is not the whole story. */}
+            {r.again && <span aria-hidden className="shrink-0 flex" style={{ color: "var(--text4)" }} title="Asked to look again"><RefreshIcon size={ICON.sm} /></span>}
+            <span aria-hidden className="shrink-0 flex" style={{ color: mark.tint }}>{mark.glyph}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One glyph and one word per verdict. The word is in the tooltip, because the
+ *  column is 248px wide and three of these read as a paragraph. */
+const REVIEW_MARK: Record<ReviewerState, { glyph: React.ReactNode; tint: string; said: string }> = {
+  changes: { glyph: <CrossIcon size={ICON.sm} />, tint: "var(--error)", said: "asked for changes" },
+  awaiting: { glyph: <CircleIcon size={ICON.sm} />, tint: "var(--text4)", said: "has not answered yet" },
+  approved: { glyph: <DoneIcon size={ICON.sm} />, tint: "var(--success, #98c379)", said: "approved" },
+  commented: { glyph: <CommentIcon size={ICON.sm} />, tint: "var(--text3)", said: "commented" },
+  dismissed: { glyph: <BlockedIcon size={ICON.sm} />, tint: "var(--text4)", said: "review dismissed" },
+};
+
 function SidebarPeople({ people, empty }: { people: PrReviewer[]; empty: string }) {
   if (!people.length) return <span className="text-[10.5px]" style={{ color: "var(--text3)" }}>{empty}</span>;
   return (
@@ -5234,6 +6553,28 @@ function FieldPicker({ anchor, title, hint, multi, loading, options, selected, o
   const [q, setQ] = useState("");
   const selRef = useRef(sel); selRef.current = sel;
   const box = useRef<HTMLDivElement>(null);
+  const filterInput = useRef<HTMLInputElement>(null);
+
+  /*
+   * `autoFocus` DOES NOTHING HERE, because this menu lives in a `<Portal>`.
+   *
+   * React applies `autoFocus` at commit time, in the same pass that first
+   * renders this input — and `Portal` only appends its container to
+   * `document.body` in ITS OWN effect, which (child effects run before
+   * parent effects) fires AFTER this one. So the input gets focused while
+   * its container is still a detached node nothing can put the caret in,
+   * `.focus()` is a silent no-op on it, and the menu opens with the mouse as
+   * the only way in: "without having to go moving the mouse around to click
+   * on the input".
+   *
+   * A `requestAnimationFrame` waits out that race without guessing at a
+   * delay: it always fires after every effect in this commit has run,
+   * Portal's included, by which point the node is really in the document.
+   */
+  useEffect(() => {
+    const id = requestAnimationFrame(() => filterInput.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, []);
 
   useEffect(() => {
     /*
@@ -5245,7 +6586,18 @@ function FieldPicker({ anchor, title, hint, multi, loading, options, selected, o
      * anyway. One writer, and it is the button. Escape and clicking away both
      * abandon, which is what a button at the bottom promises.
      */
-    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) onClose(); };
+    const away = (e: MouseEvent) => {
+      const t = e.target as Element | null;
+      if (box.current?.contains(t as Node)) return;
+      /* A menu opened FROM this picker is not "outside" it. The card's status
+         is chosen with the app's own Select, which portals its list to the body
+         so it can escape this column's clipping — so the press landed outside
+         `box` and closed the whole picker before the choice could be made.
+         Reported as "if I click the status, this modal/selector just closes
+         on me". */
+      if (t?.closest?.("[data-menu-layer]")) return;
+      onClose();
+    };
     const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); } };
     document.addEventListener("mousedown", away);
     document.addEventListener("keydown", key, true);
@@ -5284,7 +6636,7 @@ function FieldPicker({ anchor, title, hint, multi, loading, options, selected, o
     <Portal>
       <div ref={box} className="fixed rounded-lg overflow-hidden flex flex-col"
         style={{ left, top, width: W, maxHeight: maxH, border: "1px solid color-mix(in srgb, var(--text) 24%, transparent)", background: "color-mix(in srgb, var(--bg2) 98%, black)", boxShadow: "0 18px 44px -18px rgba(0,0,0,.8)" }}>
-        {/* `min-h-0`, and it is the whole bug: a flex child'"'"'s default floor is
+        {/* `min-h-0`, and it is the whole bug: a flex child's default floor is
             its content, so the people list grew past the menu instead of
             scrolling inside it — taking the ClickUp half and Done off the
             bottom with it, and leaving nothing to scroll. */}
@@ -5298,7 +6650,7 @@ function FieldPicker({ anchor, title, hint, multi, loading, options, selected, o
           <div className="text-[10px]" style={{ color: "var(--text3)" }}>{hint}</div>
         </div>
         <div className="p-1.5 shrink-0">
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…"
+          <input ref={filterInput} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter…"
             className="w-full px-2 py-1 rounded text-[11px] outline-none"
             style={{ background: "color-mix(in srgb, var(--text) 8%, transparent)", color: "var(--text)", border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }} />
         </div>
@@ -5313,7 +6665,7 @@ function FieldPicker({ anchor, title, hint, multi, loading, options, selected, o
               <button key={o.value || "∅"} onClick={() => toggle(o.value)}
                 className="agx-mi w-full text-left flex items-center gap-2 px-2.5 py-1.5 text-[11px]"
                 style={{ color: "var(--text2)" }}>
-                <span className="w-3.5 shrink-0 text-center" style={{ color: on ? "var(--primary)" : "transparent" }}>✓</span>
+                <span className="w-3.5 shrink-0 text-center" style={{ color: on ? "var(--primary)" : "transparent" }}><DoneIcon size={ICON.xs} /></span>
                 {o.color != null && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: `#${o.color}` }} />}
                 {o.avatar != null && <Avatar login={o.avatar} size={16} />}
                 <span className="truncate">{o.label}</span>
@@ -5458,8 +6810,8 @@ function ClickUpSide({ d, folded, onFold, onPlan, note }: {
    * `d` is a new object on every poll of the pull request, carrying the same
    * card — and this was memoized on `d`, so a new `ref` appeared every few
    * seconds, the effect below started over, and whoever you had just ticked was
-   * replaced by whoever the card had on it. Reported after measuring it: "a los
-   * segundos lo seleccionado se ha reiniciado al estado inicial".
+   * replaced by whoever the card had on it. Reported after measuring it: "a few
+   * seconds later what I had selected has reset to its initial state".
    */
   const ref = useMemo(() => mergeCardRef(d, setup), [d.headRefName, d.title, d.body, setup]);
   /* The card, as a string. Everything below keys off this rather than off `ref`
@@ -5596,7 +6948,7 @@ function ClickUpSide({ d, folded, onFold, onPlan, note }: {
   }
 
   return (
-    /* Under the people, not beside them: the menu'"'"'s height is what was going
+    /* Under the people, not beside them: the menu's height is what was going
        spare. Capped, so the list above it keeps most of the window and this
        never pushes Done off the bottom. */
     <div className="flex flex-col min-w-0 shrink-0" style={{ maxHeight: 260, borderTop: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
@@ -5686,7 +7038,7 @@ function ClickUpSide({ d, folded, onFold, onPlan, note }: {
                 <span className="truncate" style={{ color: on.has(m.id) ? "var(--success)" : "var(--text2)" }}>
                   {m.name}{m.me ? " · you" : ""}
                 </span>
-                {on.has(m.id) && <span className="ml-auto text-[10px]" style={{ color: "var(--success)" }}>✓</span>}
+                {on.has(m.id) && <span className="ml-auto flex" style={{ color: "var(--success)" }}><DoneIcon size={ICON.xs} /></span>}
               </button>
             ))}
           </div>
@@ -5720,15 +7072,20 @@ function usePrFieldPicker(d: PrDetail | null, root: string, act: PrAct,
   note: (ok: boolean, msg: string) => void) {
   const [facets, setFacets] = useState<Facets | null>(null);
   const [mentions, setMentions] = useState<Mentions | null>(null);
+  /* CODEOWNERS, read once per checkout when a picker is first opened. Empty rules
+     mean "this repository has no CODEOWNERS", which is a fine answer and the common
+     one — the picker then behaves exactly as it always did. */
+  const [owns, setOwns] = useState<{ rules: { pattern: string; owners: string[] }[]; path?: string }>({ rules: [] });
   const [loading, setLoading] = useState(false);
   const [picker, setPicker] = useState<{ field: SidebarField; anchor: DOMRect } | null>(null);
 
   const ensureOptions = useCallback(async () => {
     if (facets && mentions) return;
     setLoading(true);
-    const [f, m] = await Promise.all([api.prFacets(root), api.prMentions(root)]);
+    const [f, m, o] = await Promise.all([api.prFacets(root), api.prMentions(root), api.prCodeowners(root)]);
     if (f.ok && f.data) setFacets(f.data);
     if (m.ok && m.data) setMentions(m.data);
+    if (o.ok) setOwns({ rules: o.rules ?? [], ...(o.path ? { path: o.path } : null) });
     setLoading(false);
   }, [root, facets, mentions]);
 
@@ -5761,8 +7118,39 @@ function usePrFieldPicker(d: PrDetail | null, root: string, act: PrAct,
         selected={was} onClose={close} onCommit={commit(was, "Labels", (add, remove) => api.prLabels(root, d.number, add, remove))} />;
     } else if (picker.field === "reviewers") {
       const was = d.reviewers.map((r) => r.login);
-      node = <FieldPicker anchor={a} title="Request reviewers" hint="Collaborators on this repository" multi loading={loading}
-        options={(mentions?.users ?? []).map((u) => ({ value: u, label: u, avatar: u }))}
+      /*
+       * Who the repository says should look at this, above everybody else.
+       *
+       * CODEOWNERS is the answer to "who do I ask", and reading it meant opening the
+       * file and matching forty globs by hand — which is the sort of thing that gets
+       * skipped, after which the pull request waits a day on somebody who was never
+       * asked. The owners of the changed files sort to the top of the list and say how
+       * much of the review they own.
+       *
+       * A TEAM cannot be ticked here: requesting a team review is a different call
+       * from requesting a person's, and this list is people. So a team that owns files
+       * is named in the hint instead of being offered as something that would not
+       * work.
+       */
+      const owners = ownersOf(owns.rules, d.files.map((f) => f.path));
+      const ownedBy = new Map<string, number>();
+      const teams: string[] = [];
+      for (const o of owners) {
+        const login = loginOf(o.owner);
+        if (login) ownedBy.set(login.toLowerCase(), o.paths.length);
+        else teams.push(`${o.owner} (${o.paths.length})`);
+      }
+      const people = (mentions?.users ?? []).map((u) => {
+        const n = ownedBy.get(u.toLowerCase());
+        return { value: u, label: u, avatar: u, ...(n ? { sub: `owns ${n}` } : null) };
+      }).sort((x, y) => (ownedBy.get(y.value.toLowerCase()) ?? 0) - (ownedBy.get(x.value.toLowerCase()) ?? 0));
+      node = <FieldPicker anchor={a} title="Request reviewers" multi loading={loading}
+        hint={teams.length
+          ? `Owners first, from ${owns.path ?? "CODEOWNERS"} · ${teams.join(", ")} — ask a team on GitHub`
+          : ownedBy.size
+          ? `Owners first, from ${owns.path ?? "CODEOWNERS"}`
+          : "Collaborators on this repository"}
+        options={people}
         side={(h) => <ClickUpSide d={d} note={note} {...h} />}
         selected={was} onClose={close} onCommit={commit(was, "Reviewers", (add, remove) => api.prReviewers(root, d.number, add, remove))} />;
     } else if (picker.field === "assignees") {
@@ -5795,10 +7183,124 @@ function usePrFieldPicker(d: PrDetail | null, root: string, act: PrAct,
  * whether it is waiting on somebody: the status, in the colour its board gave
  * it, and who is on it.
  *
- * Read-only on purpose. Moving a card is the reviewer menu's errand, where it
- * belongs to a GitHub assignment somebody is already making; a second place to
- * change it is a second place to change it by accident.
+ * Editable, and that is a reversal. It was read-only because moving a card
+ * belonged to the reviewer menu, where it rides along with a GitHub assignment
+ * somebody is already making. That is the wrong shape for the thing he
+ * actually does: "if I only want to change the card status and the assignee… I
+ * don't want to add GH reviewers, only the card… and I don't want to go to the card,
+ * I want to do it from the PR".
+ *
+ * So the status and the people are controls here too. Each press is its own
+ * write — there is no Done button and nothing to forget — and the statuses and
+ * the team are fetched the first time you open one of them rather than with
+ * every pull request.
  */
+/**
+ * The card's status, changed from here.
+ *
+ * The list is asked for the first time you open it: a board's statuses are its
+ * own — one team's "Code Review" is another's "In review" — and fetching them
+ * for every pull request somebody merely looks at is a call per view for a
+ * control most views never touch.
+ *
+ * `updated` rides along with the write. ClickUp refuses a change made against a
+ * stamp older than the card's, which is the guard that stopped a batch of three
+ * from applying only its first — see the reviewer menu's note.
+ */
+function CardStatusPick({ task, query, onSaid }: { task: ProviderTask; query: string; onSaid: (s: string) => void }) {
+  const [statuses, setStatuses] = useState<CuStatus[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => {
+    if (statuses !== null || !task.listId) return;
+    void api.clickupList(task.listId)
+      .then((r) => setStatuses(r?.ok ? (r.statuses ?? []) : []))
+      .catch(() => setStatuses([]));
+  }, [statuses, task.listId]);
+
+  const move = async (status: string) => {
+    if (!status || status === task.status || busy) return;
+    setBusy(true);
+    onSaid("moving…");
+    const r = await api.clickupCard(task.id, { status }, task.updated)
+      .catch(() => ({ ok: false, error: "Could not reach the server" }));
+    setBusy(false);
+    onSaid(r.ok ? `now ${status}` : `!${r.error || "ClickUp refused that"}`);
+    if (r.ok) forgetCard(query);
+  };
+
+  return (
+    <span className="min-w-0" onMouseEnter={load}>
+      <Select
+        value={task.status}
+        onChange={(v) => { void move(v); }}
+        title="Status"
+        options={(statuses ?? [{ status: task.status, color: task.statusColor ?? "", type: task.statusKind ?? "" }])
+          .map((x) => ({ value: x.status, label: x.status, tint: x.color, pill: true, dim: x.type === "done" || x.type === "closed" }))}
+      />
+    </span>
+  );
+}
+
+/**
+ * And who is on it. One press is one write: picking somebody already on the
+ * card takes them off, which is what the tick beside their name means.
+ */
+function CardPeoplePick({ task, query, onSaid }: { task: ProviderTask; query: string; onSaid: (s: string) => void }) {
+  const [members, setMembers] = useState<CuMember[] | null>(null);
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState<number | null>(null);
+  const btn = useRef<HTMLButtonElement>(null);
+  const on = useMemo(
+    () => new Set((task.people ?? []).map((p: { id?: number | null }) => p.id).filter((n): n is number => n != null)),
+    [task.people],
+  );
+  const load = useCallback(() => {
+    if (members !== null || !task.listId) return;
+    void api.clickupMembers(task.listId)
+      .then((r) => setMembers(r?.ok ? (r.members ?? []) : []))
+      .catch(() => setMembers([]));
+  }, [members, task.listId]);
+
+  const toggle = async (m: CuMember) => {
+    const off = on.has(m.id);
+    setSaving(m.id);
+    const r = await api.clickupCard(task.id, off ? { rem: [m.id] } : { add: [m.id] }, task.updated)
+      .catch(() => ({ ok: false, error: "Could not reach the server" }));
+    setSaving(null);
+    onSaid(r.ok ? (off ? `${m.name} off` : `${m.name} on`) : `!${r.error || "ClickUp refused that"}`);
+    if (r.ok) forgetCard(query);
+  };
+
+  return (
+    <>
+      {/* The same control the card view uses — see components/PeoplePick. It
+          was a plain dropdown of names here, which ran off the bottom right of
+          the window and looked nothing like the one two views away. */}
+      <button ref={btn} onMouseEnter={load} onClick={() => { load(); setOpen((v) => !v); }}
+        className="agx-btn text-left rounded px-1 -mx-1 py-0.5 hover:bg-white/5 text-[11px] flex items-center gap-1.5"
+        style={{ color: "var(--text3)" }} title="Put somebody on this card, or take them off">
+        <span className="min-w-0 truncate">Assign or unassign…</span>
+        <span className="ml-auto shrink-0" style={{ color: "var(--text4)" }}>▾</span>
+      </button>
+      {open && (
+        <PeoplePick
+          anchor={btn}
+          members={members}
+          busy={members === null}
+          isOn={(m) => on.has(m.id)}
+          isSaving={(m) => saving === m.id}
+          onPick={(m) => { void toggle(m); }}
+          onClose={() => setOpen(false)}
+          face={(m) => (m.avatar
+            ? <img src={m.avatar} alt="" loading="lazy" referrerPolicy="no-referrer"
+                style={{ width: 16, height: 16, borderRadius: 999, objectFit: "cover", flexShrink: 0 }} />
+            : <span className="shrink-0 rounded-full inline-flex items-center justify-center"
+                style={{ width: 16, height: 16, background: m.color || "var(--bg4)", color: "#fff", fontSize: 8 }}>{m.initials}</span>)}
+        />
+      )}
+    </>
+  );
+}
 function CardFacts({ d, root }: { d: PrDetail; root: string }) {
   const setup = useClickupSetup();
   /* Whether the agent here can post to Slack — see server/src/slackreach.ts.
@@ -5837,11 +7339,17 @@ function CardFacts({ d, root }: { d: PrDetail; root: string }) {
   return (
     <SidebarSection title="ClickUp">
       <div className="flex flex-col gap-1.5 min-w-0">
-        <button onClick={() => openCard(ref.query, ref.label)}
-          title={`Open ${ref.label} in Tasks${task ? ` — ${task.title}` : ""}`}
-          className="agx-btn text-[11px] text-left truncate" style={{ color: "var(--primary)" }}>
-          {ref.label}
-        </button>
+        {/* The same pill the masthead wears, not a purple word that happens to
+            be clickable — one link to one card, drawn one way. */}
+        <span className="min-w-0">
+          {/* The priority, so this chip is the colour it is everywhere else.
+              `task` is a fresh read of the card rather than the board cache the
+              row uses, so when the two differ this one is the newer. */}
+          <CardPill label={ref.label}
+            priority={task?.priority ?? null}
+            onClick={() => openCard(ref.query, ref.label)}
+            title={`Open ${ref.label} in Tasks${task ? ` — ${task.title}` : ""}${task?.priority ? ` · ${task.priority} priority` : ""}`} />
+        </span>
         {/* Something in the hole while it is asked for, rather than a section
             that appears a second after the rest of the sidebar. */}
         {!task ? (
@@ -5850,7 +7358,7 @@ function CardFacts({ d, root }: { d: PrDetail; root: string }) {
           </span>
         ) : (
           <>
-            <span className="min-w-0"><StatusPill status={task.status} color={task.statusColor} dim={task.statusKind === "done"} /></span>
+            <CardStatusPick task={task} query={query} onSaid={setSaid} />
             {task.people?.length
               ? (
                 <div className="flex flex-col gap-1">
@@ -5872,6 +7380,7 @@ function CardFacts({ d, root }: { d: PrDetail; root: string }) {
                 </div>
               )
               : <span className="text-[10.5px]" style={{ color: "var(--text3)" }}>No one assigned</span>}
+            <CardPeoplePick task={task} query={query} onSaid={setSaid} />
 
             {/* Telling somebody it is ready.
                 Two routes, and they are not the same kind of thing. The card is
@@ -6019,9 +7528,11 @@ function pingPrompt(recipes: ReviewRecipe[], ctx: ReviewRecipeContext): string {
   return [skill, expandRecipe(body, ctx).trim()].filter(Boolean).join("\n\n");
 }
 
-function PrSidebar({ d, root, onEditField }: {
+function PrSidebar({ d, root, spend, onEditField }: {
   d: PrDetail;
   root: string;
+  /** What this branch cost locally, or null. See spendChipFor. */
+  spend?: SpendChip | null;
   onEditField: (field: SidebarField, e: React.MouseEvent<HTMLButtonElement>) => void;
 }) {
   return (
@@ -6044,10 +7555,56 @@ function PrSidebar({ d, root, onEditField }: {
      * five short sections fit anywhere, but a PR with thirty reviewers must not
      * pin a list whose bottom cannot then be reached.
      */
-    <aside className="sticky top-0 shrink-0 w-[248px] pl-4 hidden lg:block overflow-y-auto agx-scroll overscroll-contain"
+    /*
+     * `overflow-x-hidden` EXPLICITLY, and it is not redundant.
+     *
+     * This carried `overflow-y-auto` alone, which reads as "scroll vertically
+     * and leave the other axis be". CSS does not do that: when one axis is a
+     * scrolling value and the other is `visible`, the `visible` one computes to
+     * `auto` — so the column had a horizontal scrollbar too, and it was on
+     * screen, three quarters of the width, under a sidebar whose every section
+     * is a narrow label. "It makes no sense for this scroll to be here, there
+     * must never be sideways scroll here", and there is nothing here worth reaching
+     * sideways for: a long label wants truncating, never a second axis.
+     */
+    <aside className="sticky top-0 shrink-0 w-[248px] pl-4 hidden lg:block overflow-y-auto overflow-x-hidden agx-scroll overscroll-contain"
       style={{ borderLeft: "1px solid color-mix(in srgb, var(--text) 11%, transparent)", maxHeight: "calc(100vh - 6rem)" }}>
       <SidebarSection title="Reviewers" onEdit={(e) => onEditField("reviewers", e)}>
-        <SidebarPeople people={d.reviewers} empty="No reviewers" />
+        {(() => {
+          /*
+           * THE VERDICT, ABOVE THE ROSTER IT CAME FROM.
+           *
+           * The masthead used to carry this — "× Changes requested · asked
+           * again" — beside a second copy of the same three faces this
+           * section already lists below. Two homes for one fact, and the
+           * masthead one ran out of room the moment a verdict grew a note of
+           * its own. This sidebar is the only one open on every tab, so the
+           * headline moves here rather than disappearing with the row it
+           * used to sit on.
+           */
+          const rows = reviewerRoster(d);
+          const v = reviewVerdict(rows);
+          const tint = v.kind === "approved" ? "var(--success)"
+            : v.kind === "changes" ? "var(--error)"
+            : v.kind === "awaiting" ? "var(--warning)" : "var(--text3)";
+          const mark = v.kind === "approved" ? <DoneIcon size={ICON.sm} /> : v.kind === "changes" ? <CrossIcon size={ICON.sm} />
+            : v.kind === "commented" ? <CommentIcon size={ICON.sm} /> : <CircleIcon size={ICON.sm} />;
+          return (
+            <>
+              {v.kind !== "none" && (
+                <div className="flex items-center gap-1.5 text-[11px] mb-1.5" style={{ color: tint }} title={verdictLine(v)}>
+                  <span aria-hidden className="flex">{mark}</span>
+                  <b style={{ fontWeight: 500 }}>
+                    {v.kind === "approved" ? "Approved" : v.kind === "changes" ? "Changes requested"
+                      : v.kind === "commented" ? "Commented" : "Awaiting"}
+                  </b>
+                  {v.askedAgain && <span className="truncate" style={{ color: "var(--text4)" }}>· asked again</span>}
+                </div>
+              )}
+              <ReviewerList rows={rows} />
+            </>
+          );
+        })()}
       </SidebarSection>
       <SidebarSection title="Assignees" onEdit={(e) => onEditField("assignees", e)}>
         <SidebarPeople people={d.assignees.map((login) => ({ login }))} empty="No one assigned" />
@@ -6060,6 +7617,20 @@ function PrSidebar({ d, root, onEditField }: {
       <SidebarSection title="Milestone" onEdit={(e) => onEditField("milestone", e)}>
         <span className="text-[11px]" style={{ color: d.milestone ? "var(--text2)" : "var(--text3)" }}>{d.milestone || "No milestone"}</span>
       </SidebarSection>
+      {/* The one place with room to print the caveat rather than hide it behind
+          a hover. The row's chip has to be six characters wide; this column is
+          reference material, and a figure that is partly a guess should say so
+          in words where words fit. Absent entirely when no local agent has
+          spent anything on this branch — see spendChipFor for why that is not
+          drawn as zero. */}
+      {spend && (
+        <SidebarSection title="Local spend">
+          <div className="flex flex-col gap-0.5" title={spend.title}>
+            <span className="text-[13px] tabular-nums" style={{ color: "var(--text)" }}>{spend.text}</span>
+            <span className="text-[10px] leading-snug" style={{ color: "var(--text3)" }}>{spend.note}</span>
+          </div>
+        </SidebarSection>
+      )}
       {d.linkedIssues.length > 0 && (
         <SidebarSection title="Development">
           <div className="flex flex-col gap-1">
@@ -6114,15 +7685,25 @@ function PrSidebar({ d, root, onEditField }: {
  * green of a passing build (which is what tinting by check verdict did) says
  * exactly the wrong thing.
  */
-function prStateBadge(d: { state: PrSummary["state"]; isDraft: boolean }): { tint: string; state: string; glyph: string } {
-  if (d.state === "MERGED") return { tint: "var(--primary)", state: "Merged", glyph: "⏣" };
-  if (d.state === "CLOSED") return { tint: "var(--text3)", state: "Closed", glyph: "⊘" };
-  if (d.isDraft) return { tint: "var(--text3)", state: "Draft", glyph: "◌" };
-  return { tint: "var(--success)", state: "Open", glyph: "◉" };
+function prStateBadge(d: { state: PrSummary["state"]; isDraft: boolean }): { tint: string; state: string; glyph: React.ReactNode } {
+  if (d.state === "MERGED") return { tint: "var(--primary)", state: "Merged", glyph: <MergeIcon size={ICON.xs} /> };
+  if (d.state === "CLOSED") return { tint: "var(--text3)", state: "Closed", glyph: <BlockedIcon size={ICON.xs} /> };
+  if (d.isDraft) return { tint: "var(--text3)", state: "Draft", glyph: <DraftIcon size={ICON.xs} /> };
+  return { tint: "var(--success)", state: "Open", glyph: <PrIcon size={ICON.xs} /> };
 }
 
-function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onReviewInTerminal, onLabels, onReviewers, onCopyLink, onEditField, condensed, viewed, threads, queued, awaitingChecks }: {
+function Masthead({ d, busy, local, onShowLocal, onEditTitle, onDraft, onClose, onLocalReview, onReviewInTerminal, onLabels, onReviewers, onNudge, onEditField, condensed, viewed, threads, queued, awaitingChecks, localHead }: {
   d: PrDetail; busy: boolean;
+  /** What plugins have written here — what their buttons in this row say. */
+  local: LocalNotes;
+  onShowLocal: () => void;
+  /**
+   * This branch on THIS machine — which checkout has it, and whether that tree is
+   * dirty. Null while the question is out, and the cell is simply absent then:
+   * "not checked out anywhere" is a claim, and it is the wrong one to make before
+   * the answer has arrived.
+   */
+  localHead?: PrLocalHead | null;
   onEditTitle: () => void; onDraft: () => void; onClose: () => void; onLocalReview: (recipe?: string) => void;
   /** Absent when the workspace has no terminal to send it to. */
   onReviewInTerminal?: (recipe?: string) => void;
@@ -6130,7 +7711,7 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
   condensed?: boolean;
   /** The typed dialog behind the overflow menu; the inline ＋ buttons use the
    *  picker instead. */
-  onLabels: () => void; onReviewers: () => void; onCopyLink: () => void;
+  onLabels: () => void; onReviewers: () => void; onNudge?: () => void;
   /** Opens the shared reviewer/label picker anchored to the clicked ＋. */
   onEditField: (field: SidebarField, e: React.MouseEvent<HTMLButtonElement>) => void;
   /** How far YOUR review has got: files ticked off, threads still open, line
@@ -6212,7 +7793,17 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
     // people read from across the desk, so it is the part that must not lie.
     : standing === "none-reported" ? "var(--text3)"
     : "var(--warning)";
+  /* Three answers, and the one that matters is "not answered yet" — see wtCell.
+     Drawing "not checked out here" while the question is still out would be the
+     header claiming the opposite of the truth for the second before it lands. */
+  const wt = wtCell(localHead);
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  const copyLink = () => {
+    navigator.clipboard?.writeText(d.url)
+      .then(() => { setLinkCopied(true); setTimeout(() => setLinkCopied(false), 1400); })
+      .catch(() => { /* no clipboard permission */ });
+  };
   const copyNumber = () => {
     navigator.clipboard?.writeText(`#${d.number}`)
       .then(() => { setCopied(true); setTimeout(() => setCopied(false), 1400); })
@@ -6234,14 +7825,14 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
               className="agx-btn tabular-nums align-middle inline-flex items-center gap-1 mr-1.5 px-1.5 py-0.5 rounded-md text-[12px]"
               style={{ color: copied ? "var(--success)" : "var(--text2)", border: `1px solid color-mix(in srgb, ${copied ? "var(--success) 50%" : "var(--border) 55%"}, transparent)`, background: "color-mix(in srgb, var(--border) 14%, transparent)" }}>
               #{d.number}
-              <span aria-hidden style={{ fontSize: 10, opacity: 0.7 }}>{copied ? "✓" : "⧉"}</span>
+              <span aria-hidden className="flex" style={{ opacity: 0.7 }}>{copied ? <DoneIcon size={ICON.xs} /> : <CopyIcon size={ICON.xs} />}</span>
             </button>
             {/* Beside the number, not down in the fields: this is the pull
                 request's OTHER identity — the one the rest of the company files
                 it under — and it has to stay on screen once the metadata folds
                 away, which is exactly when you are deep enough in a diff to
                 have forgotten what the card asked for. */}
-            <CardChip pr={d} />
+            <PrCardChip pr={d} card={d.card} />
             {d.title}
           </span>
         </div>
@@ -6263,6 +7854,7 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
             read, not because it is the better place to send somebody. */}
         <ReviewMenu d={d} canTerm={!!onReviewInTerminal}
           onPick={(recipe, where) => (where === "term" ? onReviewInTerminal?.(recipe) : onLocalReview(recipe))} />
+        <PluginPrActions number={d.number} local={local} onShowLocal={onShowLocal} />
         {/* Out of the overflow, because it is the most-pressed thing in it.
             "Open on GitHub" is what you reach for whenever this panel does not
             do the thing — and burying the escape hatch two clicks deep is the
@@ -6272,7 +7864,13 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
             controls in a row came out three different heights — which is the
             only reason the group looked wrong. */}
         <Btn small onClick={() => openExternal(d.url)} title="Open on GitHub">GitHub ↗</Btn>
-        <Menu label="⋯" title="More actions">
+        {/* Out of the overflow too: the number beside the title copies "#N" for
+            a cross-reference, and this copies the address, which is the one
+            you paste into a chat. */}
+        <Btn small onClick={copyLink} title={linkCopied ? "Copied!" : "Copy the link to this pull request"}>
+          {linkCopied ? <DoneIcon size={ICON.xs} /> : <LinkIcon size={ICON.xs} />}{linkCopied ? "Copied" : "Copy link"}
+        </Btn>
+        <Menu label={<MoreIcon size={ICON.sm} />} title="More actions">
           {(close) => (
             <>
               {/* One family of glyphs, all thin outlines on the same optical
@@ -6286,15 +7884,17 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
                   does not offer them either. */}
               {d.state === "OPEN" && <>
                 <MenuItem onClick={() => { close(); onReviewers(); }}>&#9673; Request a review</MenuItem>
-                <MenuItem onClick={() => { close(); onDraft(); }}>◌ {d.isDraft ? "Mark ready for review" : "Convert to draft"}</MenuItem>
+                <MenuItem icon={<DraftIcon size={ICON.xs} />} onClick={() => { close(); onDraft(); }}>{d.isDraft ? "Mark ready for review" : "Convert to draft"}</MenuItem>
               </>}
-              <MenuItem onClick={() => { close(); onLabels(); }}>⌗ Edit labels</MenuItem>
+              <MenuItem icon={<TagIcon size={ICON.xs} />} onClick={() => { close(); onLabels(); }}>Edit labels</MenuItem>
               <MenuSep />
-              <MenuItem onClick={() => { close(); onCopyLink(); }}>&#9033; Copy link</MenuItem>
+              {onNudge && d.state === "OPEN" && (
+                <MenuItem onClick={() => { close(); onNudge(); }}>&#128276; Nudge the reviewers</MenuItem>
+              )}
               {d.state !== "MERGED" && <>
                 <MenuSep />
-                <MenuItem onClick={() => { close(); onClose(); }} danger={d.state !== "CLOSED"}>
-                  {d.state === "CLOSED" ? "↺ Reopen pull request" : "✕ Close pull request"}
+                <MenuItem icon={d.state === "CLOSED" ? <UndoIcon size={ICON.xs} /> : <CrossIcon size={ICON.xs} />} onClick={() => { close(); onClose(); }} danger={d.state !== "CLOSED"}>
+                  {d.state === "CLOSED" ? "Reopen pull request" : "Close pull request"}
                 </MenuItem>
               </>}
             </>
@@ -6323,7 +7923,7 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
           background: "color-mix(in srgb, var(--border) 14%, transparent)",
         }}>
         <Field label="Author"><Avatar login={d.author} size={14} />{d.author}</Field>
-        <Field label="Branch" max={330} title={`${d.headRefName} → ${d.baseRefName}`}>
+        <Field label="Branch" max={460} title={`${d.headRefName} → ${d.baseRefName}`}>
           {/* The branch name is a thing you paste into a shell — `git checkout`,
               a worktree, a comment — and it was selectable text you had to drag
               across, truncated, in a chip. One click copies it. A button rather
@@ -6355,16 +7955,59 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
           <span style={{ color: "var(--text4)" }}>→</span>
           <span className="truncate" style={{ color: isTrunk(d.baseRefName) ? "var(--text3)" : "var(--warning)" }}>{d.baseRefName}</span>
         </Field>
+        {/*
+          * Where this branch lives on this machine.
+          *
+          * Asked for after using the terminal's own header, which carries the
+          * worktree with Git and Diff beside it — the pull request knew the branch
+          * name and said nothing about the checkout it is sitting in, so "is this
+          * the one I have open" was a trip to a shell. It goes next to Branch
+          * because it is the same fact continued: the branch, and then where it is.
+          *
+          * Nothing at all until the answer is in (see the prop), and a plain
+          * sentence when the answer is "nowhere" — a branch nobody has checked out
+          * is worth knowing about, and it is not an error.
+          */}
+        {wt.kind !== "unknown" && (
+          <Field label="Worktree" max={380} title={wtCellTitle(localHead)}>
+            {wt.kind === "here" ? (
+              <>
+                {/* The same filled pill the terminal's header uses for a
+                    worktree, so the two headers say this one thing the same way. */}
+                <span className="px-1.5 py-0.5 rounded text-[9.5px] uppercase tracking-wider shrink-0"
+                  style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 14%, transparent)" }}>WT</span>
+                <span className="truncate" style={{ color: "var(--text2)" }}>{wt.folder}</span>
+                {/* A tree with work in it. The terminal's chip carries a count;
+                    the answer here is a yes or no (see PrLocalHead.dirty), so it
+                    says that and no more rather than inventing a number. */}
+                {wt.dirty && (
+                  <span title="That worktree has uncommitted changes" style={{ color: "var(--warning)" }}>●</span>
+                )}
+                {/* The two trips worth offering, and the same two the terminal
+                    offers, through the same request — so a press here and a press
+                    there land in the same place. */}
+                <button onClick={() => requestWorktreeJump({ view: "git", root: wt.root })}
+                  className="agx-btn inline-flex items-center gap-1 px-1.5 rounded shrink-0"
+                  title="Open that worktree in Source control"
+                  style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)" }}>
+                  Git <span className="t-dim2">↗</span>
+                </button>
+                <button onClick={() => requestWorktreeJump({ view: "diff", filter: wt.folder })}
+                  className="agx-btn inline-flex items-center gap-1 px-1.5 rounded shrink-0"
+                  title="Open its changes in File changes"
+                  style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)" }}>
+                  Diff <span className="t-dim2">↗</span>
+                </button>
+              </>
+            ) : (
+              <span style={{ color: "var(--text3)" }}>not checked out here</span>
+            )}
+          </Field>
+        )}
         <Field label="Changes">
           <span className="tabular-nums" style={{ color: "var(--success)" }}>+{d.additions}</span>
           <span className="tabular-nums" style={{ color: "var(--error)" }}>−{d.deletions}</span>
           <span style={{ color: "var(--text3)" }}>· {d.changedFiles} file{d.changedFiles === 1 ? "" : "s"}</span>
-        </Field>
-        <Field label="Reviewers" max={230}>
-          {d.reviewers.length === 0
-            ? <span style={{ color: "var(--text3)" }}>nobody yet</span>
-            : d.reviewers.map((r) => <span key={r.login} className="flex items-center gap-1 truncate"><ReviewerFace r={r} size={14} />{r.login}</span>)}
-          <button onClick={(e) => onEditField("reviewers", e)} disabled={busy} title="Request a review" className="agx-inline-add">＋</button>
         </Field>
         <Field label="Assignee" max={190}>
           {d.assignees.length === 0
@@ -6373,24 +8016,6 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
         </Field>
         <Field label="Milestone" max={190}>
           {d.milestone ? <span className="truncate">{d.milestone}</span> : <span style={{ color: "var(--text3)" }}>none</span>}
-        </Field>
-        {/* Plain text parted by `·`, which is how the mockup draws it, and the
-            one cell where I would have chosen otherwise: a label's colour is
-            picked in GitHub and is how people recognise it at a glance. The
-            strip won the argument. It is nine cells that have to read as one
-            row, and eight of them are words — a run of coloured boxes in the
-            middle of them is where the eye stops every time. The names are
-            still the names, and the colours are still one tab away. */}
-        <Field label="Labels" max={300}>
-          {d.labels.length === 0 && <span style={{ color: "var(--text3)" }}>none</span>}
-          {d.labels.map((l, i) => (
-            <span key={l.name} className="flex items-center gap-1.5 min-w-0">
-              {i > 0 && <span style={{ color: "var(--text4)" }}>·</span>}
-              <span className="uppercase tracking-wide truncate">{l.name}</span>
-            </span>
-          ))}
-          <button onClick={(e) => onEditField("labels", e)} disabled={busy} title="Edit labels" aria-label="Edit labels"
-            className="agx-inline-add" style={{ borderStyle: "dashed" }}>＋</button>
         </Field>
         {/*
           * The two the header never had.
@@ -6430,11 +8055,34 @@ function Masthead({ d, busy, onEditTitle, onDraft, onClose, onLocalReview, onRev
   );
 }
 
-function Reason({ tint, glyph, children, action }: { tint: string; glyph: string; children: React.ReactNode; action?: React.ReactNode }) {
+/** The reasons the merge box draws as rows of their own — see the note where
+ *  they are drawn for the kinds that already have one. */
+const BLOCKER_ROW = new Set<MergeBlocker["kind"]>([
+  "draft", "locked", "no-permission", "restricted", "merge-queue", "required-failing", "required-missing",
+  "review-required", "unexplained", "computing", "awaiting", "required-pending", "optional-failing", "hooks", "unseen",
+]);
+
+/** One reason it will not merge: what it is, in the weight it carries, and
+ *  underneath it what to do. */
+function BlockerRow({ b }: { b: MergeBlocker }) {
+  const tint = b.weight === "blocks" ? "var(--error)" : b.weight === "waits" ? "var(--warning)" : "var(--text3)";
+  const glyph = b.kind === "locked" || b.kind === "no-permission" || b.kind === "restricted" ? <BlockedIcon size={ICON.xs} />
+    : b.checks && b.weight !== "waits" ? <CrossIcon size={ICON.xs} />
+    : b.weight === "waits" ? <CircleIcon size={ICON.xs} />
+    : b.weight === "blocks" ? "!" : "·";
+  return (
+    <Reason tint={tint} glyph={glyph}>
+      <b style={{ color: "var(--text)", fontWeight: 500 }}>{b.title}</b>
+      <span className="block mt-0.5" style={{ color: "var(--text3)" }}>{b.detail}</span>
+    </Reason>
+  );
+}
+
+function Reason({ tint, glyph, children, action }: { tint: string; glyph: React.ReactNode; children: React.ReactNode; action?: React.ReactNode }) {
   return (
     <div className="flex items-center gap-2 px-3 py-1.5 text-[11.5px]"
       style={{ color: "var(--text)", borderBottom: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
-      <span className="shrink-0 w-3.5 text-center" style={{ color: tint }}>{glyph}</span>
+      <span className="shrink-0 w-3.5 flex justify-center" style={{ color: tint }}>{glyph}</span>
       <span className="min-w-0">{children}</span>
       {action && <span className="ml-auto shrink-0 text-[10px]">{action}</span>}
     </div>
@@ -6619,12 +8267,12 @@ function PeekButton({ path, onPeek }: { path: string; onPeek: (p: string) => voi
       title={busy ? "Fetching this file from GitHub at the pull request's head commit…" : "Open the whole file in an editor"}
       className="agx-btn shrink-0 flex items-center gap-1.5 text-[10px] px-1.5 py-0.5 rounded"
       style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--text) 18%, transparent)" }}>
-      {busy ? <><span className="agx-spin" style={{ width: 9, height: 9 }} />Opening…</> : "⧉ Open"}
+      {busy ? <><span className="agx-spin" style={{ width: 9, height: 9 }} />Opening…</> : <><FileIcon size={ICON.xs} />Open</>}
     </button>
   );
 }
 
-function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 }: {
+function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, moved, depth = 0 }: {
   node: TreeNode<PrFile>; sel: string | null; onPick: (p: string) => void;
   /** Open the whole file in an editor, over the panel. The diff shows what
    *  changed; this is for the times the answer is in the part that did not. */
@@ -6634,7 +8282,12 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
    *  A different thing from `drafts`, which never left this browser, and the
    *  reason the tree needs its own mark: a review you started on the website is
    *  invisible here otherwise, and you find out you had one by submitting. */
-  pending: (p: string) => number; depth?: number;
+  pending: (p: string) => number;
+  /** Changed since your own last review. Marked whether or not the list is filtered
+   *  to them, because the question "is this one of the three that moved" is asked of
+   *  a row while reading it, not only while filtering. */
+  moved?: (p: string) => boolean;
+  depth?: number;
 }) {
   return (
     <>
@@ -6643,7 +8296,7 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
           <div className="truncate text-[10px] px-1 py-0.5" style={{ paddingLeft: 6 + depth * 10, color: "var(--text3)" }} title={dir.path}>
             {dir.name}
           </div>
-          <FileTree node={dir} sel={sel} onPick={onPick} onPeek={onPeek} seen={seen} drafts={drafts} pending={pending} depth={depth + 1} />
+          <FileTree node={dir} sel={sel} onPick={onPick} onPeek={onPeek} seen={seen} drafts={drafts} pending={pending} moved={moved} depth={depth + 1} />
         </div>
       ))}
       {node.files.map((f) => {
@@ -6653,6 +8306,10 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
         const pend = pending(f.path);
         return (
           <button key={f.path} onClick={() => onPick(f.path)}
+            /* The marked row, findable from outside without a ref through a
+               recursive component. The tree brings it back into its own view
+               when the scrollspy moves the mark — see `keepRowInView`. */
+            data-sel={on ? "1" : undefined}
             // Alt-click opens it whole, which is the gesture that costs nothing
             // to learn because it costs nothing to not know.
             onAuxClick={(e) => { if (e.button === 1 && onPeek) { e.preventDefault(); onPeek(f.path); } }}
@@ -6669,6 +8326,13 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
                 opening it. */}
             {(() => { const g = statusGlyph(f.status); return <span className="shrink-0 text-center leading-none" style={{ width: 12, fontSize: 10, color: g.tint }} title={g.title}>{g.ch}</span>; })()}
             <span className="truncate text-[10.5px]">{base}</span>
+            {/* Moved since you reviewed it. A dot rather than a word: the row already
+                carries a status glyph, a draft mark and two counts, and the one thing
+                this has to do is survive being glanced at. */}
+            {moved?.(f.path) && (
+              <span className="shrink-0" title="Changed since your last review"
+                style={{ width: 6, height: 6, borderRadius: 999, background: "var(--warning)" }} />
+            )}
             {/* Something is drafted here, on GitHub. A count would read as the
                 thread count two marks along; a speech bubble with a pen says
                 what it is, and the title says the rest. */}
@@ -6683,7 +8347,7 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
             )}
             {n > 0 && <span className="ml-auto text-[10px] shrink-0" style={{ color: "var(--warning)" }}>{n}</span>}
             {f.comments > 0 && <span className="ml-auto text-[10px] shrink-0" style={{ color: "var(--primary)" }}>{f.comments}</span>}
-            {seen(f.path) && <span className="ml-auto text-[10px] shrink-0" style={{ color: "var(--success)" }}>✓</span>}
+            {seen(f.path) && <span className="ml-auto shrink-0 flex" style={{ color: "var(--success)" }}><DoneIcon size={ICON.xs} /></span>}
           </button>
         );
       })}
@@ -6697,10 +8361,17 @@ function FileTree({ node, sel, onPick, onPeek, seen, drafts, pending, depth = 0 
  * already marked viewed still show. `hiddenExts` is the set to leave out — empty
  * means every extension is on, which is why the boxes all start ticked.
  */
-function FilesFilterMenu({ facets, hiddenExts, onToggleExt, onClearExts, showViewed, onToggleViewed, viewedCount }: {
+function FilesFilterMenu({ facets, hiddenExts, onToggleExt, onClearExts, showViewed, onToggleViewed, viewedCount, shownCount, unseenCount, onSeenAll }: {
   facets: { ext: string; count: number }[];
   hiddenExts: string[]; onToggleExt: (e: string) => void; onClearExts: () => void;
   showViewed: boolean; onToggleViewed: () => void; viewedCount: number;
+  /** How many files the filter is showing, and how many of those are unticked —
+   *  the two numbers the bulk actions are about. */
+  shownCount: number; unseenCount: number;
+  /** Tick or un-tick everything on screen. Scoped to what the FILTER is showing on
+   *  purpose: "all" meaning "the forty you cannot see either" is how somebody ticks a
+   *  review they have not read. */
+  onSeenAll: (on: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -6734,7 +8405,7 @@ function FilesFilterMenu({ facets, hiddenExts, onToggleExt, onClearExts, showVie
                 return (
                   <button key={f.ext} role="menuitemcheckbox" aria-checked={on} onClick={() => onToggleExt(f.ext)}
                     className="px-2 py-1.5 rounded-lg text-left flex items-center gap-2 hover:bg-white/5">
-                    <span aria-hidden className="shrink-0 grid place-items-center text-[10px]" style={box(on)}>{on ? "✓" : ""}</span>
+                    <span aria-hidden className="shrink-0 grid place-items-center text-[10px]" style={box(on)}>{on ? <DoneIcon size={ICON.xs} /> : null}</span>
                     <span className="flex-1 truncate" style={{ ...CODE_FONT_STYLE, color: on ? "var(--text)" : "var(--text3)" }}>{f.ext}</span>
                     <span className="tabular-nums shrink-0 text-[10px]" style={{ color: "var(--text3)" }}>{f.count}</span>
                   </button>
@@ -6744,12 +8415,39 @@ function FilesFilterMenu({ facets, hiddenExts, onToggleExt, onClearExts, showVie
             <button role="menuitemcheckbox" aria-checked={showViewed} onClick={onToggleViewed}
               className="mt-1 px-2 py-1.5 rounded-lg text-left flex items-center gap-2 hover:bg-white/5"
               style={{ borderTop: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
-              <span aria-hidden className="shrink-0 grid place-items-center text-[10px]" style={box(showViewed)}>{showViewed ? "✓" : ""}</span>
+              <span aria-hidden className="shrink-0 grid place-items-center text-[10px]" style={box(showViewed)}>{showViewed ? <DoneIcon size={ICON.xs} /> : null}</span>
               <span className="flex-1" style={{ color: "var(--text2)" }}>Viewed files</span>
               <span className="tabular-nums shrink-0 text-[10px]" style={{ color: "var(--text3)" }}>{viewedCount}</span>
             </button>
             {hiddenExts.length > 0 && (
               <button onClick={onClearExts} className="mt-0.5 px-2 py-1 rounded-lg text-left text-[10.5px] hover:bg-white/5" style={{ color: "var(--text3)" }}>Reset extensions</button>
+            )}
+            {/*
+              * Ticking forty files one at a time is what this replaces — and it is
+              * kept here, in the menu, rather than put on the bar: it acts on every
+              * file on screen at once, which is not a thing to have under the pointer
+              * beside "Unified".
+              *
+              * Scoped to what the filter shows, and the label says so. "Mark all
+              * viewed" that included files the filter is hiding is how somebody ticks
+              * a review they have not read.
+              */}
+            {shownCount > 0 && (
+              <>
+                <div className="mt-1 mb-0.5" style={{ height: 1, background: "color-mix(in srgb, var(--border) 26%, transparent)" }} />
+                <button onClick={() => { onSeenAll(true); setOpen(false); }} disabled={unseenCount === 0}
+                  title={`Tick the ${shownCount} file${shownCount === 1 ? "" : "s"} this filter is showing${unseenCount === 0 ? " — they are all ticked already" : ""}`}
+                  className="px-2 py-1 rounded-lg text-left text-[10.5px] hover:bg-white/5 disabled:opacity-40"
+                  style={{ color: "var(--text2)" }}>
+                  <IconLabel icon={<DoneIcon size={ICON.xs} />}>Mark {shownCount} shown as viewed</IconLabel>
+                </button>
+                <button onClick={() => { onSeenAll(false); setOpen(false); }} disabled={viewedCount === 0}
+                  title="Un-tick every file this filter is showing"
+                  className="px-2 py-1 rounded-lg text-left text-[10.5px] hover:bg-white/5 disabled:opacity-40"
+                  style={{ color: "var(--text3)" }}>
+                  <UndoIcon size={ICON.xs} />Un-tick them
+                </button>
+              </>
             )}
           </div>
         </Portal>
@@ -6786,7 +8484,7 @@ function FindBar({ value, onChange, inputRef, listRef, hits, groups, at, onGo, o
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-2 px-2 py-1.5 rounded-md"
         style={{ background: "var(--bg)", border: edge }}>
-        <span className="shrink-0" style={{ color: "var(--primary)" }}>⌕</span>
+        <span className="shrink-0 flex" style={{ color: "var(--primary)" }}><SearchIcon size={ICON.xs} /></span>
         <input
           ref={inputRef} value={value} onChange={(e) => onChange(e.target.value)}
           placeholder={`Search the code of ${fileCount} file${fileCount === 1 ? "" : "s"}…`}
@@ -6931,12 +8629,34 @@ function DetailSkeleton({ number }: { number: number | null }) {
  *  because the component is what goes away when you change tab. */
 const FILES_SCROLL = new Map<string, number>();
 
-function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, onSel, onShowing, split, wrap, onSplit, onWrap, drafts, held, onAddDraft, onPostOne, onDropDraft, onPeek, onResolve, onReply, onApply, busy }: {
+function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, onSeenMany, noWs, onNoWs, wsOnly, since, moved, movedHere, wantSince, onRefetchSince, sel, onSel, onShowing, split, wrap, onSplit, onWrap, drafts, held, onAddDraft, onPostOne, onDropDraft, onPeek, onResolve, onReply, onApply, busy, local }: {
   d: PrDetail; root: string; byPath: Map<string, FileChange>; loaded: boolean;
+  /** Notes plugins wrote on this pull request, drawn at their lines. */
+  local?: LocalNotes;
   /** Why the diff is missing, when it is missing for a reason rather than for a
    *  moment. Without it a refusal is drawn as a spinner. */
   diffErr?: string;
   seenFiles: string[]; onSeen: (p: string) => void;
+  /** Tick or un-tick everything the filter is showing, in one go. */
+  onSeenMany: (paths: string[], on: boolean) => void;
+  /** Whitespace-only changes folded into context — see diffNoWhitespace.ts. A
+   *  preference, so it is set here and remembered. */
+  noWs: boolean; onNoWs: (v: boolean) => void;
+  /** Files that hold nothing BUT whitespace changes, and are therefore not in the
+   *  list at all while `noWs` is on. Named rather than silently dropped. */
+  wsOnly: string[];
+  /** Which two commits "since your review" is measuring, and the answer — both held
+   *  by the panel, because the Overview shows the same number and the two must not be
+   *  able to disagree. */
+  since: { from: string; to: string } | null;
+  moved: { key: string; paths: Set<string>; missing?: boolean } | null;
+  /** The moved files that are actually part of this review. */
+  movedHere: string[];
+  /** Bumped when somebody asks to arrive with the filter on. */
+  wantSince: number;
+  /** Ask the panel to compare again — after a fetch has brought the missing commit
+   *  into this clone. */
+  onRefetchSince: () => void;
   sel: string | null; onSel: (p: string | null) => void;
   /**
    * Which file is ACTUALLY on screen, which is not the same as which one was
@@ -7148,6 +8868,13 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
   const barRef = useRef<HTMLDivElement>(null);
   /** The frame the running jump has booked, so the next one can take it back. */
   const alignRaf = useRef(0);
+  /** True while `scrollToFileStable` is driving the scroller frame by frame, so
+   *  the scrollspy below does not read a position that is still on its way. */
+  const jumping = useRef(false);
+  /** The scrollspy's own frame token, so a flick of the wheel schedules one
+   *  measurement rather than one per scroll event. */
+  const spyRaf = useRef(0);
+  const treeRef = useRef<HTMLElement | null>(null);
   const [barH, setBarH] = useState(76);
   useEffect(() => {
     const el = barRef.current;
@@ -7185,6 +8912,17 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
     // would otherwise overlap, and two aligners with different targets writing
     // to the same scrollTop every frame is a shudder, not a scroll.
     cancelAnimationFrame(alignRaf.current);
+    /*
+     * The scrollspy stands down while this runs, and only while THIS runs.
+     *
+     * The aligner aims at `[data-file="active"]`, which the render derives from
+     * `sel` — so a spy that renamed `sel` from a half-finished frame would move
+     * the target the aligner is chasing, and the two would walk each other down
+     * the file list. The jumps that aim at a hunk or a thread need no such
+     * guard: they scroll to a fixed element, and a spy noticing you landed in
+     * another file is the right answer, not a fight.
+     */
+    jumping.current = true;
     let ticks = 0, still = 0, lastTop = NaN;
     const align = () => {
       const el = getEl();
@@ -7221,6 +8959,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
       // ~24 frames whatever happens, which is a third of a second nobody sees.
       ticks++;
       if (ticks < 60 && (ticks < 24 || still < 3)) alignRaf.current = requestAnimationFrame(align);
+      else jumping.current = false;
     };
     alignRaf.current = requestAnimationFrame(align);
   };
@@ -7412,12 +9151,32 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
     return () => window.removeEventListener("keydown", onWinKey, true);
   }, []);
 
+  const movedSet = useMemo(() => new Set(movedHere), [movedHere]);
+  const [sinceOnly, setSinceOnly] = useState(false);
+  /* Turned on from outside — the Overview's "3 files changed since your review"
+     brings you here with the filter already applied, because arriving at forty files
+     and being told to find the three yourself is the trip this feature removes. */
+  useEffect(() => { if (wantSince) setSinceOnly(true); }, [wantSince]);
+  const [fetching, setFetching] = useState(false);
+  /* Turned off by itself when it would select nothing — a filter with no answers is a
+     tab that looks empty for a reason nobody can see. */
+  useEffect(() => { if (sinceOnly && !movedHere.length) setSinceOnly(false); }, [sinceOnly, movedHere.length]);
+  useEffect(() => { setSinceOnly(false); }, [d.number]);
+
   const shownFiles = useMemo(() => {
     const needle = q.trim().toLowerCase();
+    const movedSet = new Set(movedHere);
+    const wsSet = new Set(wsOnly);
     const kept = d.files.filter((f) => {
       if (needle && !f.path.toLowerCase().includes(needle)) return false;
       if (hiddenExts.length && hiddenExts.includes(fileExt(f.path))) return false;
       if (!showViewed && seenFiles.includes(f.path)) return false;
+      if (sinceOnly && !movedSet.has(f.path)) return false;
+      /* A file whose every change was whitespace has nothing left to draw. It leaves
+         the list rather than sitting in it with an empty diff — and the line under the
+         tree says how many went, because a file that vanishes with no explanation is
+         a reader wondering what else did. */
+      if (wsSet.has(f.path)) return false;
       return true;
     });
     /* In the order the rail paints them, not the order GitHub sends them — see
@@ -7425,13 +9184,89 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
        the stack of diffs, j/k, and what "the next one" means to the Viewed tick.
        They agree only if the list is already in the order you read. */
     return treeOrder(kept);
-  }, [d.files, q, hiddenExts, showViewed, seenFiles]);
+  }, [d.files, q, hiddenExts, showViewed, seenFiles, sinceOnly, movedHere, wsOnly]);
 
   /* The same expression the render uses below, so the rail can never name a
      different file from the one drawn. In all-files mode there is no single
      answer and the honest one is none. */
   const showing = oneFile ? (sel ?? shownFiles[0]?.path ?? null) : sel;
   useEffect(() => { onShowing?.(showing); }, [showing, onShowing]);
+
+  /*
+   * Something is always selected, and it is always a file that is still listed.
+   *
+   * Two things this settles. Opening Files used to mark nothing until you
+   * clicked — the rail on the right read "Nothing selected" beside a diff that
+   * was plainly showing a file. And `sel` outlives the list it names: it is not
+   * reset when the pull request changes, and filtering (a search, "since your
+   * review", hiding viewed files) can drop the file it points at, leaving the
+   * tree with no mark and the rail describing a file that is not on screen.
+   *
+   * The first of `shownFiles` in both cases, which in this list means the first
+   * one you would read — `treeOrder`, not GitHub's order.
+   */
+  useEffect(() => {
+    if (!shownFiles.length) return;
+    if (sel && shownFiles.some((f) => f.path === sel)) return;
+    onSel(shownFiles[0].path);
+  }, [shownFiles, sel, onSel]);
+
+  /*
+   * WHICH FILE YOU ARE LOOKING AT, while you scroll.
+   *
+   * The tree marked whatever was last clicked and then sat there: eight files
+   * deep into a pull request the rail on the right was still explaining the
+   * first one, and nothing on screen said which of the eight the diff under the
+   * cursor belonged to.
+   *
+   * The one that has crossed the floor, not the one covering the most of the
+   * screen. Area sounds fairer and reads worse: half a page into a long file
+   * the previous one still owns more pixels, so the mark lags by half a screen
+   * — and the floor is exactly where `scrollToFileStable` parks a file, so
+   * scrolling to a file by hand and jumping to it with `j` agree on what
+   * "here" means.
+   *
+   * Measured on a frame rather than per event: a wheel flick is dozens of
+   * scroll events and each one would walk every file's rectangle.
+   */
+  const spy = useCallback(() => {
+    if (oneFile || jumping.current) return;
+    cancelAnimationFrame(spyRaf.current);
+    spyRaf.current = requestAnimationFrame(() => {
+      const frame = frameRef.current;
+      const sc = frame && vScrollerOf(frame);
+      if (!sc) return;
+      const floor = sc.getBoundingClientRect().top + (barRef.current?.offsetHeight ?? 76);
+      const cards = [...frame.querySelectorAll<HTMLElement>("[data-path]")];
+      const i = fileAtFloor(cards.map((el) => el.getBoundingClientRect().top), floor);
+      const hit = i < 0 ? null : cards[i].dataset.path ?? null;
+      if (hit && hit !== sel) onSel(hit);
+    });
+  }, [oneFile, shownFiles, sel, onSel]);
+  useEffect(() => () => cancelAnimationFrame(spyRaf.current), []);
+
+  /*
+   * The marked row, brought back into the tree's own view — and NOTHING else moved.
+   *
+   * Deliberately not `scrollIntoView`: that walks every scrollable ancestor,
+   * and the tree's nearest one is the frame holding the diff. Asking the tree
+   * to show a row would scroll the diff, which would move the scrollspy's
+   * answer, which would mark another row. The whole loop is avoided by writing
+   * this one element's `scrollTop` and no other's.
+   *
+   * `block: "nearest"` by hand: a row already on screen is left exactly where
+   * it is, because a list that re-centres itself under a still cursor is a list
+   * that feels like it is fighting you.
+   */
+  useEffect(() => {
+    const tree = treeRef.current;
+    const row = tree?.querySelector<HTMLElement>('[data-sel="1"]');
+    if (!tree || !row) return;
+    const box = tree.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    if (r.top < box.top) tree.scrollTop -= box.top - r.top;
+    else if (r.bottom > box.bottom) tree.scrollTop += r.bottom - box.bottom;
+  }, [showing]);
 
   const toggleFold = (p: string) => setFolded((cur) => {
     const next = new Set(cur);
@@ -7471,6 +9306,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
 
   // The same keyboard model as the changes modal, so the two review surfaces
   // don't diverge: j/k walk the file list, n/p walk the hunks of the open diff,
+  // [/] walk the comment threads across every file,
   // x toggles reviewed. The diff itself is ChangesModal's UnifiedDiff/SplitDiff,
   // so its [data-hunk] markers and [data-vscroll] container are reused verbatim.
   const stepFile = (dir: 1 | -1) => {
@@ -7510,12 +9346,42 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
     const target = dir === 1 ? tops.find((t) => t > eye + 4) : [...tops].reverse().find((t) => t < eye - 4);
     sc.scrollTo({ top: Math.max(0, (target ?? (dir === 1 ? tops[tops.length - 1] : tops[0])) - barH - 2), behavior: "smooth" });
   };
+  /*
+   * The next comment thread, wherever it is.
+   *
+   * `n` and `p` are hunks here, and they were the only way to walk a review: on
+   * twelve files with comments scattered through three of them, finding the next
+   * thread was scrolling and looking. `]` and `[` walk the THREADS instead, across
+   * files, in the order they are drawn — and an outdated or resolved one is not
+   * skipped, because "somebody answered this and I have not read it" is exactly the
+   * thing being looked for.
+   *
+   * Same geometry as jumpHunk, for the same reason: the sticky bar covers `barH` of
+   * the page, so the eye is `scrollTop + barH` and the destination gives it back.
+   */
+  const jumpThread = (dir: 1 | -1) => {
+    const frame = frameRef.current;
+    if (!frame) return;
+    const sc = vScrollerOf(frame) ?? frame;
+    const nodes = Array.from(sc.querySelectorAll<HTMLElement>("[data-thread]"));
+    if (!nodes.length) return;
+    const scTop = sc.getBoundingClientRect().top;
+    const cur = sc.scrollTop;
+    const tops = nodes.map((n) => n.getBoundingClientRect().top - scTop + cur);
+    const eye = cur + barH;
+    const target = dir === 1 ? tops.find((t) => t > eye + 4) : [...tops].reverse().find((t) => t < eye - 4);
+    /* Past the last one, stay on the last one rather than wrapping to the top: a
+       wrap in a long review reads as the page having jumped somewhere else. */
+    sc.scrollTo({ top: Math.max(0, (target ?? (dir === 1 ? tops[tops.length - 1] : tops[0])) - barH - 2), behavior: "smooth" });
+  };
   const onKey = (e: React.KeyboardEvent) => {
     // Never while a field owns the keys — the PR search box, a comment textarea,
     // or a row's reviewed checkbox. Same guard App.tsx and ChangesModal use.
     const inInput = /input|textarea/i.test((e.target as HTMLElement)?.tagName ?? "");
     if (inInput) return;
     const k = e.key.toLowerCase();
+    if (e.key === "]") { e.preventDefault(); e.stopPropagation(); jumpThread(1); return; }
+    if (e.key === "[") { e.preventDefault(); e.stopPropagation(); jumpThread(-1); return; }
     if (k === "j" || e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); stepFile(1); }
     else if (k === "k" || e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); stepFile(-1); }
     else if (k === "n") { e.preventDefault(); e.stopPropagation(); jumpHunk(1); }
@@ -7546,10 +9412,10 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
        * The first version saved in the effect's cleanup — and by the time a
        * passive cleanup runs the node is already out of the document, where
        * `scrollTop` reads 0. So it faithfully remembered zero, every time, and
-       * the tab always came back at the top. Reported as "el scroll de la file
-       * abierta no se mantiene nunca".
+       * the tab always came back at the top. Reported as "the scroll position of
+       * the open file is never kept".
        */
-      onScroll={(e) => { FILES_SCROLL.set(`${root}#${d.number}`, e.currentTarget.scrollTop); }}
+      onScroll={(e) => { FILES_SCROLL.set(`${root}#${d.number}`, e.currentTarget.scrollTop); spy(); }}
       className="agx-col3 agx-scroll text-[11px] flex flex-col gap-2 outline-none">
       {/* One bar, and it stays put: filter, view mode, progress. Everything that
           used to be repeated on each file's own toolbar lives here once.
@@ -7573,10 +9439,10 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
       <div className="flex items-center gap-2 flex-wrap">
         <span className="flex items-center gap-1.5 px-2 py-1 rounded shrink-0"
           style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
-          <span style={{ color: "var(--text3)" }}>⌕</span>
+          <span className="flex" style={{ color: "var(--text3)" }}><SearchIcon size={ICON.xs} /></span>
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter files…"
             className="bg-transparent outline-none text-[10.5px] w-28" style={{ color: "var(--text)" }} />
-          {q && <button onClick={() => setQ("")} title="Clear" style={{ color: "var(--text3)" }}>×</button>}
+          {q && <CloseButton onClick={() => setQ("")} title="Clear" size={ICON.xs} hit={20} />}
         </span>
         <FilesFilterMenu
           facets={extFacets} hiddenExts={hiddenExts}
@@ -7584,6 +9450,9 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
           onClearExts={() => setHiddenExts([])}
           showViewed={showViewed} onToggleViewed={() => setShowViewed((v) => !v)}
           viewedCount={viewedCount}
+          shownCount={shownFiles.length}
+          unseenCount={shownFiles.filter((f) => !seenFiles.includes(f.path)).length}
+          onSeenAll={(on) => onSeenMany(shownFiles.map((f) => f.path), on)}
         />
         {/* The filter to its left narrows the LIST by path; this searches the
             CODE. Two different questions, so they are two different controls —
@@ -7594,7 +9463,49 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
             if (find !== null) { setFind(null); return; }
             setFind("");
             requestAnimationFrame(() => findRef.current?.focus());
-          }}>⌕ Search code</Btn>
+          }}><SearchIcon size={ICON.xs} />Search code</Btn>
+        {/*
+          * "Since your review", where the filters are.
+          *
+          * Only when there is a review of yours to measure from and the branch has
+          * moved since it — see sinceRange. The three states it can be in are all
+          * different sentences, and the tooltip says which: n files moved, nothing
+          * moved, or the commit you reviewed is not in this checkout so nothing can
+          * be compared.
+          */}
+        {since && moved?.key === `${since.from}..${since.to}` && (movedHere.length > 0 || moved.missing) && (
+          moved.missing
+            /* The commit you reviewed is not in this clone — usually because it was
+               force-pushed away, or because nothing has fetched since. The chip said
+               so and left you to go and do it; it does it. A fetch is read-only on the
+               working tree, which is why this is a button rather than a warning. */
+            ? <Btn small disabled={fetching}
+                title={sinceTitle({ count: 0, from: since.from, missing: true, on: false })}
+                onClick={async () => {
+                  setFetching(true);
+                  await api.gitFetch(root).catch(() => {});
+                  setFetching(false);
+                  /* Ask again with the same pair: the answer is a different one now
+                     that the objects are here. */
+                  onRefetchSince();
+                }}>
+                {fetching ? "Fetching…" : "Fetch to compare"}
+              </Btn>
+            : <Btn small primary={sinceOnly}
+                title={sinceTitle({ count: movedHere.length, from: since.from, on: sinceOnly })}
+                onClick={() => setSinceOnly((v) => !v)}>
+                Since your review · {movedHere.length}
+              </Btn>
+        )}
+        {/* What git's `-w` does, done on the parsed patch because the patch arrives
+            already made. On a formatting pass this is the difference between reading
+            a review and reading the file twice. */}
+        <Btn small primary={noWs} onClick={() => onNoWs(!noWs)}
+          title={noWs
+            ? `Ignoring whitespace: a line that only changed its indentation is drawn as unchanged.${wsOnly.length ? ` ${wsOnly.length} file${wsOnly.length === 1 ? "" : "s"} left the list entirely — ${wsOnly.slice(0, 6).join(", ")}${wsOnly.length > 6 ? "…" : ""}` : ""}`
+            : "Ignore whitespace — fold a line that only changed its indentation back into context"}>
+          ⇥ {noWs ? "Ignoring space" : "Ignore space"}
+        </Btn>
         <Btn onClick={() => onSplit(false)} small primary={!split} title="One column, with a “+ Comment” target on every line">Unified</Btn>
         <Btn onClick={() => onSplit(true)} small primary={split} title="Before and after, side by side">Split</Btn>
         <Btn onClick={() => onWrap(!wrap)} small primary={wrap} title="Wrap long lines rather than scrolling them">Wrap</Btn>
@@ -7627,7 +9538,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                 : { color: "var(--text3)" }}>{label}</button>
           ))}
         </span>
-        <span><b>j/k</b> file · <b>n/p</b> hunk · <b>x</b> viewed · <b>↵</b> fold · <b>⌃F</b> search code</span>
+        <span><b>j/k</b> file · <b>n/p</b> hunk · <b>[/]</b> thread · <b>x</b> viewed · <b>↵</b> fold · <b>⌃F</b> search code</span>
         {shownFiles.length !== d.files.length && <span> · showing {shownFiles.length} of {d.files.length}</span>}
       </div>
       </div>
@@ -7645,7 +9556,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
         {/* Always present in one-file mode: it is the only way to reach the
             other eight, so hiding it below five files would strand you. */}
         {(oneFile || shownFiles.length > 4) && (
-          <aside className="shrink-0 agx-tree3 sticky top-[68px] z-10 agx-scroll hidden md:block pr-1"
+          <aside ref={treeRef} className="shrink-0 agx-tree3 sticky top-[68px] z-10 agx-scroll hidden md:block pr-1"
             style={{ borderRight: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
             {/* `showing`, not `sel`.
                 
@@ -7660,10 +9571,19 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
               onPick={(path) => { onSel(path); setFolded((cur) => { const n = new Set(cur); n.delete(path); return n; }); scrollToFileStable(() => frameRef.current?.querySelector(`[data-path="${CSS.escape(path)}"]`)); }}
               seen={(path) => seenFiles.includes(path)}
               drafts={draftsFor} pending={heldFor} onPeek={onPeek}
+              moved={(path) => movedSet.has(path)}
             />
           </aside>
         )}
         <div className="min-w-0 flex-1 flex flex-col gap-2">
+      {/* Said out loud, once, under the list: N files are not here because everything
+          they changed was whitespace. */}
+      {noWs && wsOnly.length > 0 && (
+        <div className="px-3 pb-1 text-[10px]" style={{ color: "var(--text3)" }}
+          title={wsOnly.join("\n")}>
+          {wsOnly.length} file{wsOnly.length === 1 ? "" : "s"} changed only in whitespace and {wsOnly.length === 1 ? "is" : "are"} not shown.
+        </div>
+      )}
       {shownFiles.length === 0 && (
         <div className="p-3 text-[10.5px]" style={{ color: "var(--text3)" }}>
           {q ? `No file matches “${q}”.` : "No files match the current filter."}
@@ -7712,6 +9632,17 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
             !!change?.hunks.some((h) => t.line! >= h.newStart && t.line! <= h.newStart + h.newLines - 1);
           if (anchored) { const arr = inlineThreads.get(t.line!) ?? []; arr.push(t); inlineThreads.set(t.line!, arr); }
           else belowThreads.push(t);
+        }
+        // Plugins' notes, placed by the same rule as a thread: under the line
+        // when the diff shows it, under the file when it does not. A note
+        // about a line of an older commit still lands on that line number;
+        // its card says which commit it was written against.
+        const inlineNotes = new Map<number, LocalNote[]>();
+        const belowNotes: LocalNote[] = [];
+        for (const n of local ? sortNotes(local.notes.filter((x) => x.path === f.path)) : []) {
+          const anchored = n.line != null && !!change?.hunks.some((h) => n.line! >= h.newStart && n.line! <= h.newStart + h.newLines - 1);
+          if (anchored) { const arr = inlineNotes.get(n.line!) ?? []; arr.push(n); inlineNotes.set(n.line!, arr); }
+          else belowNotes.push(n);
         }
         return (
           <div key={f.path} data-file={focused ? "active" : undefined} data-path={f.path} className="rounded"
@@ -7765,8 +9696,25 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                   <Chip text={`${heldOnFile} on GitHub`} tint="var(--primary)"
                     title="Drafted in GitHub's review UI and not submitted — sent when you submit from here" />
                 )}
-                <span className="ml-auto shrink-0 tabular-nums" style={{ color: "var(--success)" }}>+{f.additions}</span>
-                <span className="shrink-0 tabular-nums" style={{ color: "var(--error)" }}>−{f.deletions}</span>
+                {/* GitHub's own counts, EXCEPT while whitespace is being ignored:
+                    then they come from the diff on screen, or a file with 39
+                    re-indents and one real change would say +40 above a diff showing
+                    one line. The tooltip keeps the original, because "how big is this
+                    really" is still a question. */}
+                {(() => {
+                  const shown = noWs ? byPath.get(f.path) : null;
+                  const add = shown ? shown.additions : f.additions;
+                  const del = shown ? shown.deletions : f.deletions;
+                  const t = shown && (add !== f.additions || del !== f.deletions)
+                    ? `+${add} −${del} ignoring whitespace · +${f.additions} −${f.deletions} in full`
+                    : undefined;
+                  return (
+                    <span className="ml-auto shrink-0 flex items-center gap-1.5" title={t}>
+                      <span className="tabular-nums" style={{ color: "var(--success)" }}>+{add}</span>
+                      <span className="tabular-nums" style={{ color: "var(--error)" }}>−{del}</span>
+                    </span>
+                  );
+                })()}
               </button>
               {/* The diff shows what changed. Often the answer is in the part
                   that did not — the function three lines above, the import at
@@ -7835,8 +9783,9 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                         onPick={(pk) => pickLine(f.path, pk)}
                         sel={selRange?.path === f.path ? selRange.sel : null}
                         permalink={repoName && headSha ? (line) => `https://github.com/${repoName}/blob/${headSha}/${f.path}#L${line}` : undefined}
-                        rowAfter={(inlineThreads.size || pendingHere.size || heldHere.size || composing?.path === f.path) ? (newN, oldN) => {
+                        rowAfter={(inlineThreads.size || pendingHere.size || heldHere.size || inlineNotes.size || composing?.path === f.path) ? (newN, oldN) => {
                           const ts = newN != null ? inlineThreads.get(newN) : null;
+                          const ln = newN != null ? (inlineNotes.get(newN) ?? []) : [];
                           // A queued comment has to be visible where it was
                           // written. It used to exist only as a number on the
                           // file's header and a row in the Review tab, so
@@ -7847,7 +9796,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                           const composeHere = composing?.path === f.path &&
                             ((composing.side === "RIGHT" && composing.line === newN) || (composing.side === "LEFT" && composing.line === oldN));
                           const heldOnLine = newN != null ? (heldHere.get(newN) ?? []) : [];
-                          if (!ts?.length && !pend.length && !heldOnLine.length && !composeHere) return null;
+                          if (!ts?.length && !ln.length && !pend.length && !heldOnLine.length && !composeHere) return null;
                           const pfx = composing?.side === "LEFT" ? "L" : "R";
                           // Bounded and pinned to the left so it reads at a sane
                           // width and stays put while the code scrolls sideways.
@@ -7861,9 +9810,19 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                               // read as older than the app around it. One
                               // visible container: the card below.
                               position: "sticky", left: 0,
-                              width: split ? "min(560px, 46vw)" : "min(900px, 92vw)",
+                              // Never wider than the pane it is seen in. 46vw assumed
+                              // each half of a split diff is about half the window,
+                              // and with the file tree and the side panel open a
+                              // half is under 500px: the card ran past the edge and
+                              // its buttons were cut off (measured at 1600px wide:
+                              // a 560px card in a 482px pane). `100%` is no better —
+                              // that is the code's width, wider than the pane
+                              // whenever a line is long. `cqw` is the pane itself;
+                              // see the size containers in DiffLines.tsx.
+                              width: split ? "min(560px, calc(100cqw - 16px))" : "min(900px, calc(100cqw - 16px))",
                             }}>
                               {ts?.map((t) => <Thread key={t.id} t={t} inline onResolve={onResolve} onReply={onReply} onApply={onApply} busy={busy} />)}
+                              {ln.map((n) => <NoteCard key={`${n.plugin}/${n.id}`} n={n} compact md={localMd} onStatus={(st) => { void local?.setStatus(n, st); }} />)}
                               {pend.map((dc, i) => (
                                 <div key={`p${i}`} className="rounded-lg overflow-hidden text-[11.5px]" style={{
                                   background: "var(--bg2)",
@@ -7943,7 +9902,7 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                                       <button onClick={() => { if (repoName && headSha) void navigator.clipboard?.writeText(`https://github.com/${repoName}/blob/${headSha}/${f.path}#L${composing.line}`); }}
                                         disabled={!repoName || !headSha}
                                         title="Copy a link to this line on GitHub"
-                                        className="agx-btn px-1.5 py-0.5 rounded text-[10px]" style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>🔗</button>
+                                        className="agx-btn px-1.5 py-0.5 rounded text-[10px]" style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}><LinkIcon size={ICON.xs} /></button>
                                     </span>
                                   </div>
                                   <div className="p-2.5 flex flex-col gap-2">
@@ -8037,6 +9996,14 @@ function FilesTab({ d, root, byPath, loaded, diffErr, seenFiles, onSeen, sel, on
                 ))}
               </div>
             )}
+            {open && belowNotes.length > 0 && (
+              <div className="px-2.5 py-2 flex flex-col gap-1.5" style={{ borderTop: "1px solid color-mix(in srgb, var(--text) 11%, transparent)", background: "color-mix(in srgb, var(--primary) 4%, transparent)" }}>
+                <div className="flex items-center gap-2 text-[9.5px] uppercase tracking-wider" style={{ color: "var(--text3)" }}>
+                  <LocalMark />Notes on lines this diff does not show
+                </div>
+                {belowNotes.map((n) => <NoteCard key={`${n.plugin}/${n.id}`} n={n} compact md={localMd} onStatus={(st) => { void local?.setStatus(n, st); }} />)}
+              </div>
+            )}
             {open && belowThreads.length > 0 && (
               <div className="px-2.5 py-2 flex flex-col gap-2" style={{ borderTop: "1px solid color-mix(in srgb, var(--text) 11%, transparent)", background: "color-mix(in srgb, var(--border) 6%, transparent)" }}>
                 {/* Not anchored to a visible line — outdated threads, or ones on
@@ -8106,9 +10073,9 @@ function GhLink({ href, title }: { href: string; title: string }) {
       <a href={safe} target="_blank" rel="noreferrer noopener" title={title} className={box} style={wide}>
         <span className="inline-flex items-center" style={{ gap: 2 }}>
           <GhMark size={ICON.xs} />
-          {/* Raised like a superscript rather than sat on the baseline, where it
-              read as a second glyph of equal weight instead of a modifier. */}
-          <span aria-hidden style={{ fontSize: 8, lineHeight: 1, opacity: 0.75, transform: "translateY(-3px)" }}>↗</span>
+          {/* The "leaves the app" arrow, drawn: it was an 8px `↗` lifted 3px
+              as a superscript — five pixels of ink, and off the line it sat on. */}
+          <span aria-hidden className="flex" style={{ opacity: 0.75 }}><ArrowIcon size={ICON.xs} /></span>
         </span>
       </a>
       <button type="button" className={box} style={{ ...style, color: copied ? "var(--success)" : style.color }}
@@ -8240,10 +10207,31 @@ function AssocChip({ a }: { a?: PrAuthorAssociation }) {
   return <Chip text={label} tint={tint} title={`GitHub says this author is ${label}`} />;
 }
 
-function Card({ who, chip, when, tone, url, edited, assoc, nodeId, reactions, onReact, fresh, children }: {
+function Card({ who, chip, when, tone, url, edited, assoc, nodeId, reactions, onReact, fresh, body, mine, minimized, onQuote, onEdit, onHide, editor, children }: {
   who: string; chip?: React.ReactNode; when?: string; tone?: "chg" | "appr" | "bot"; url?: string;
   edited?: string | null; assoc?: PrAuthorAssociation;
   nodeId?: string; reactions?: PrReaction[]; onReact?: (nodeId: string, content: string, on: boolean) => void;
+  /**
+   * The markdown somebody actually wrote.
+   *
+   * Two of the menu items below are about the SOURCE rather than the rendering —
+   * "Copy Markdown" and "Quote reply" — and taking it off the page would give back
+   * the rendered text with the backticks and the `>` gone, which is the one thing
+   * neither of them may do.
+   */
+  body?: string;
+  /** Yours, so Edit is offered only where it would work. */
+  mine?: boolean;
+  /** Already folded away on GitHub. */
+  minimized?: boolean;
+  /** Seed the composer with this remark quoted. */
+  onQuote?: (body: string) => void;
+  /** Start editing it here. The editor itself arrives as `editor`. */
+  onEdit?: () => void;
+  /** Fold it away, or put it back — see hideComment. */
+  onHide?: (on: boolean) => void;
+  /** An editor for this remark, rendered INSTEAD of it while one is open. */
+  editor?: React.ReactNode;
   /** Said since this browser last looked at the pull request. Wins over the
    *  verdict tint: a two-day-old "requested changes" being green or red is
    *  history, and "this arrived while you were away" is news. */
@@ -8275,11 +10263,51 @@ function Card({ who, chip, when, tone, url, edited, assoc, nodeId, reactions, on
               reading may not be the words that were replied to. */}
           {edited && <span className="text-[10px]" title={`Edited ${ago(edited)}`} style={{ color: "var(--text3)" }}>· edited</span>}
           {url && <GhLink href={url} title="Open on GitHub" />}
+          {/*
+            * The same menu github.com hangs off a comment, and for the same reason:
+            * everything in it is a thing you want while READING one — the link to
+            * paste in a message, the source to quote, the fold for a remark that has
+            * been answered — and every one of them used to mean opening the browser.
+            *
+            * Only what can really be done from here is offered: Edit appears on your
+            * own, and nothing pretends to a permission it has not got — GitHub
+            * refuses what it refuses and the refusal is shown as it comes.
+            */}
+          {(url || body || onHide) && (
+            <Menu label={<MoreIcon size={ICON.sm} />} title="More actions">
+              {(close) => (
+                <>
+                  {url && (
+                    <MenuItem onClick={() => { close(); void navigator.clipboard?.writeText(url).catch(() => {}); }}>
+                      &#9033; Copy link
+                    </MenuItem>
+                  )}
+                  {body && (
+                    <MenuItem onClick={() => { close(); void navigator.clipboard?.writeText(body).catch(() => {}); }}>
+                      &#9033; Copy Markdown
+                    </MenuItem>
+                  )}
+                  {body && onQuote && (
+                    <MenuItem onClick={() => { close(); onQuote(body); }}>&#8221; Quote reply</MenuItem>
+                  )}
+                  {mine && onEdit && <><MenuSep /><MenuItem onClick={() => { close(); onEdit(); }}>&#9998; Edit</MenuItem></>}
+                  {onHide && (
+                    <MenuItem onClick={() => { close(); onHide(!minimized); }}>
+                      <EyeIcon size={ICON.xs} />{minimized ? "Unhide" : "Hide"}
+                    </MenuItem>
+                  )}
+                </>
+              )}
+            </Menu>
+          )}
         </span>
       </div>
       <div className="px-3 py-2.5">
-        {children}
-        <Reactions nodeId={nodeId} reactions={reactions} onReact={onReact} />
+        {/* An open editor takes the place of the remark rather than sitting under it:
+            two copies of the same paragraph, one of them editable, is a reader
+            wondering which one is real. */}
+        {editor ?? children}
+        {!editor && <Reactions nodeId={nodeId} reactions={reactions} onReact={onReact} />}
       </div>
     </div>
   );
@@ -8397,9 +10425,14 @@ function Thread({ t, onResolve, onReply, onApply, busy, inline, newSet, cameFrom
     () => (onApply && !t.isOutdated && t.line ? { apply: (text: string) => onApply(t, text), busy } : null),
     [onApply, t, busy],
   );
+  // `data-thread` below is what [ and ] walk in the Files tab. An id would have to be
+  // unique across a page that draws the same thread twice (inline in the diff and
+  // again under "Other comments"); a marker attribute is enough for "the next one
+  // down the page", which is the only question asked of it.
   return (
     <SuggestCtx.Provider value={suggest}>
-    <div className={`rounded-md overflow-hidden ${inline ? "" : "mb-2"}`} style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
+    <div data-thread={t.id} data-resolved={t.isResolved ? "1" : undefined}
+      className={`rounded-md overflow-hidden ${inline ? "" : "mb-2"}`} style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
       <div className="flex items-center gap-2 px-2.5 py-1.5 text-[10.5px]"
         style={{ background: "color-mix(in srgb, var(--border) 14%, transparent)",
           borderBottom: open ? "1px solid color-mix(in srgb, var(--text) 11%, transparent)" : undefined }}>
@@ -8578,12 +10611,12 @@ function groupCommitsByDay(commits: PrCommit[]): [string, PrCommit[]][] {
   return out;
 }
 
-const EVENT_GLYPH: Record<string, string> = {
-  "force-push": "↻", renamed: "✎", labeled: "🏷", unlabeled: "🏷",
-  assigned: "👤", unassigned: "👤", "review-requested": "👁", "review-request-removed": "👁",
-  "ready-for-review": "◉", "convert-to-draft": "◌", merged: "⏣", closed: "✕", reopened: "↺",
-  "cross-referenced": "🔗", milestoned: "◈", demilestoned: "◈", "head-ref-deleted": "⌫",
-  "auto-merge-enabled": "⏱", "auto-merge-disabled": "⏱",
+const EVENT_GLYPH: Record<string, React.ReactNode> = {
+  "force-push": <RefreshIcon size={ICON.xs} />, renamed: <EditIcon size={ICON.xs} />, labeled: <TagIcon size={ICON.xs} />, unlabeled: <TagIcon size={ICON.xs} />,
+  assigned: <UserIcon size={ICON.xs} />, unassigned: <UserIcon size={ICON.xs} />, "review-requested": <EyeIcon size={ICON.xs} />, "review-request-removed": <EyeIcon size={ICON.xs} />,
+  "ready-for-review": <PrIcon size={ICON.xs} />, "convert-to-draft": <DraftIcon size={ICON.xs} />, merged: <MergeIcon size={ICON.xs} />, closed: <CrossIcon size={ICON.xs} />, reopened: <UndoIcon size={ICON.xs} />,
+  "cross-referenced": <LinkIcon size={ICON.xs} />, milestoned: <FlagIcon size={ICON.xs} />, demilestoned: <FlagIcon size={ICON.xs} />, "head-ref-deleted": <BranchIcon size={ICON.xs} />,
+  "auto-merge-enabled": <ClockIcon size={ICON.xs} />, "auto-merge-disabled": <ClockIcon size={ICON.xs} />,
 };
 const EVENT_TINT: Record<string, string> = {
   "force-push": "var(--warning)", merged: "var(--primary)", closed: "var(--error)",
@@ -8708,7 +10741,7 @@ function NewRail({ container, atoms, onGo, depKey }: {
 }
 
 function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onReact, onApply, busy, who, onWho,
-  atoms, newSet, onMarkRead, sinceMine, onUnmarkRead }: {
+  atoms, newSet, onMarkRead, sinceMine, onUnmarkRead, viewer, onSaveComment, onHideComment, local, onOpenFile }: {
   d: PrDetail;
   lanes: { humans: PrReview[]; botReviews: PrReview[]; humanComments: PrComment[]; bots: PrComment[] };
   raw: boolean; onRaw: (v: boolean) => void;
@@ -8728,8 +10761,59 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
   /** How much arrived after your own last word here, marked read or not. Only
    *  to offer the way back when the marks have been cleared. */
   sinceMine: number; onUnmarkRead: () => void;
+  /** Which login is reading, so Edit is offered on your own remarks and nowhere
+   *  else. Undefined until the capability call lands — and then nothing is offered,
+   *  which is the honest state. */
+  viewer?: string;
+  /** Save an edited remark. `kind` is which mutation it needs — a review body and a
+   *  line comment are different objects on GitHub. */
+  onSaveComment?: (nodeId: string, kind: "issue" | "review", body: string) => Promise<boolean>;
+  /** Fold one away, or put it back. */
+  onHideComment?: (nodeId: string, on: boolean) => void;
+  /** What plugins wrote on this pull request, here only. See LocalReview.tsx. */
+  local?: LocalNotes;
+  onOpenFile?: (path: string, line?: number) => void;
 }) {
   const [newest, setNewest] = useState(false);
+  /** Which remark is being edited here, by node id. One at a time: two open editors
+   *  on one conversation is two half-written sentences and a wrong Save. */
+  const [editing, setEditing] = useState<string | null>(null);
+  useEffect(() => { setEditing(null); }, [d.number]);
+  /** The editor for one remark, or nothing. Built here rather than in `Card`, which
+   *  is a presentational component and has no business knowing how a save works. */
+  const editorFor = (nodeId: string | undefined, kind: "issue" | "review", body: string) =>
+    (nodeId && editing === nodeId && onSaveComment
+      ? <Composer initial={body} autoFocus busy={busy} placeholder="Edit this remark — markdown works here"
+          sendLabel="Save" onSend={async (b) => { const ok = await onSaveComment(nodeId, kind, b); if (ok) setEditing(null); return ok; }} />
+      : undefined);
+  /*
+   * Quote reply, into the composer at the foot of this conversation.
+   *
+   * Written into the composer's own stash and the composer remounted to pick it up,
+   * rather than lifted into state here: that stash is what already survives leaving
+   * the pull request and coming back (see COMPOSE_KEY), so a quote you have not sent
+   * yet survives the same way a sentence you were typing does. Appended, never
+   * replacing — the quote is usually the second thing in a reply that was already
+   * half written.
+   */
+  const [composerKey, setComposerKey] = useState(0);
+  const quote = (body: string) => {
+    const key = `say|${d.url}`;
+    writeStash(key, quoteReply(readStash(key), body));
+    setComposerKey((n) => n + 1);
+  };
+
+  /** The three menu props every human remark gets, in one place so a review and a
+   *  comment cannot end up with different menus. */
+  const acts = (o: { author: string; nodeId?: string; body: string; kind: "issue" | "review"; minimized?: boolean }) => ({
+    body: o.body,
+    mine: !!viewer && o.author.toLowerCase() === viewer.toLowerCase(),
+    minimized: o.minimized,
+    onQuote: quote,
+    onEdit: o.nodeId && onSaveComment ? () => setEditing(o.nodeId!) : undefined,
+    onHide: o.nodeId && onHideComment ? (on: boolean) => onHideComment(o.nodeId!, on) : undefined,
+    editor: editorFor(o.nodeId, o.kind, o.body),
+  });
   const setWho = onWho;
   const [cursor, setCursor] = useState(-1);
   /* Which person, inside Humans. Its own state and not part of `who`, because
@@ -8824,7 +10908,7 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
   /** Who said it, so the timeline can be narrowed to one kind of voice. An
    *  `event` is nobody speaking — a push, a label — and belongs to neither
    *  side, so it shows in the whole timeline and in no filtered view. */
-  type Lane = "human" | "bot" | "event";
+  type Lane = "human" | "bot" | "event" | "local";
   /** `ms` is what the timeline sorts on, and for a thread it is its LAST
    *  comment. It used to be the first, which is the ordering bug this whole
    *  feature was written for. */
@@ -8844,13 +10928,14 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
       at: r.submittedAt, ms: ms(r.submittedAt), key: `r${i}`, lane: "human", author: r.author,
       hot: hotOf([`r${r.author}-${r.submittedAt}`]) + mine.reduce((n, t) => n + threadHot(t), 0),
       node: <span style={{ color: tone === "chg" ? "var(--error)" : tone === "appr" ? "var(--success)" : "var(--text3)" }}>
-        {r.state === "CHANGES_REQUESTED" ? "✕" : r.state === "APPROVED" ? "✓" : "💬"}</span>,
+        {r.state === "CHANGES_REQUESTED" ? <CrossIcon size={ICON.xs} /> : r.state === "APPROVED" ? <DoneIcon size={ICON.xs} /> : <CommentIcon size={ICON.xs} />}</span>,
       body: (
         <>
           <span id={anchorId(`r${r.author}-${r.submittedAt}`)} />
           <Card who={r.author} when={ago(r.submittedAt)} url={r.url} tone={tone}
             fresh={newSet.has(`r${r.author}-${r.submittedAt}`)}
             edited={r.editedAt} assoc={r.association} nodeId={r.nodeId} reactions={r.reactions} onReact={onReact}
+            {...acts({ author: r.author, nodeId: r.nodeId, body: r.body, kind: "issue" })}
             chip={r.state === "CHANGES_REQUESTED" ? <Chip text="requested changes" tint="var(--error)" />
               : r.state === "APPROVED" ? <Chip text="approved" tint="var(--success)" /> : undefined}>
             {r.body ? <Md body={r.body} />
@@ -8868,10 +10953,11 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
   for (const c of lanes.humanComments) {
     entries.push({
       at: c.createdAt, ms: ms(c.createdAt), key: `c${c.id}`, lane: "human", author: c.author, hot: hotOf([`c${c.id}`]),
-      node: <span style={{ color: "var(--text3)" }}>💬</span>,
+      node: <span style={{ color: "var(--text3)" }}><CommentIcon size={ICON.xs} /></span>,
       body: <><span id={anchorId(`c${c.id}`)} />
         <Card who={c.author} when={ago(c.createdAt)} url={c.url} fresh={newSet.has(`c${c.id}`)}
-          edited={c.editedAt} assoc={c.association} nodeId={c.nodeId} reactions={c.reactions} onReact={onReact}><Md body={c.body} /></Card></>,
+          edited={c.editedAt} assoc={c.association} nodeId={c.nodeId} reactions={c.reactions} onReact={onReact}
+          {...acts({ author: c.author, nodeId: c.nodeId, body: c.body, kind: "issue" })}><Md body={c.body} /></Card></>,
     });
   }
   for (const t of orphanThreads) {
@@ -8897,14 +10983,14 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
       // exactly where it always did; one that has just been answered arrives
       // where the answer belongs.
       at: t.comments[0]?.createdAt ?? "", ms: threadLastAt(t), key: `t${t.id}`, lane, author: t.comments[0]?.author, hot: threadHot(t),
-      node: <span style={{ color: t.isResolved ? "var(--success)" : "var(--warning)" }}>{t.isResolved ? "✓" : "○"}</span>,
+      node: <span style={{ color: t.isResolved ? "var(--success)" : "var(--warning)" }}>{t.isResolved ? <DoneIcon size={ICON.xs} /> : <CircleIcon size={ICON.xs} />}</span>,
       body: <Thread t={t} onResolve={onResolve} onReply={onReply} onApply={onApply} busy={busy}
         newSet={newSet} cameFrom={cameFrom.get(t.id)} />,
     });
   }
   for (const [i, r] of lanes.botReviews.entries()) {
     entries.push({
-      at: r.submittedAt, ms: ms(r.submittedAt), key: `br${i}`, lane: "bot", node: <span style={{ color: "var(--info)" }}>⌬</span>,
+      at: r.submittedAt, ms: ms(r.submittedAt), key: `br${i}`, lane: "bot", node: <span style={{ color: "var(--info)" }}><AgentIcon size={ICON.xs} /></span>,
       body: <Card who={r.author} when={ago(r.submittedAt)} url={r.url} tone="bot"
         nodeId={r.nodeId} reactions={r.reactions} onReact={onReact}
         chip={<Chip text="automation" tint="var(--info)" />}><Md body={r.body} /></Card>,
@@ -8913,7 +10999,7 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
   for (const c of lanes.bots) {
     entries.push({
       at: c.createdAt, ms: ms(c.createdAt), key: `b${c.id}`, lane: "bot", hot: hotOf([`c${c.id}`]),
-      node: <span style={{ color: "var(--info)" }}>⌬</span>,
+      node: <span style={{ color: "var(--info)" }}><AgentIcon size={ICON.xs} /></span>,
       body: (
         <Card who={c.author} when={ago(c.createdAt)} url={c.url} tone="bot" chip={<Chip text="automation" tint="var(--info)" />}
           nodeId={c.nodeId} reactions={c.reactions} onReact={onReact}>
@@ -8942,6 +11028,22 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
     });
   }
 
+  // What plugins said about this pull request, on this machine only: one
+  // entry per pass, placed in time like everything else so a review read
+  // after a push sits after the push. Its own lane, so Humans and Bots stay
+  // what GitHub says they are.
+  if (local) {
+    for (const g of groupByRun(local)) {
+      entries.push({
+        at: new Date(g.ms).toISOString(), ms: g.ms, key: g.key, lane: "local",
+        node: <span style={{ color: "var(--primary)" }}><LocalGlyph size={ICON.xs} /></span>,
+        body: g.run
+          ? <RunCard run={g.run} notes={g.notes} publisher={local.publishers[g.run.plugin]} onStatus={local.setStatus} onOpenFile={onOpenFile} md={localMd} />
+          : <div className="flex flex-col gap-1.5">{g.notes.map((n) => <NoteCard key={`${n.plugin}/${n.id}`} n={n} md={localMd} onStatus={(st) => local.setStatus(n, st)} onOpenFile={onOpenFile} />)}</div>,
+      });
+    }
+  }
+
   entries.sort((a, b) => (newest ? b.ms - a.ms : a.ms - b.ms));
 
   // Events are not remarks, so they are not counted — Humans plus Bots adds up
@@ -8949,6 +11051,7 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
   // timeline, where the push that invalidated a review is part of the story.
   const humanCount = entries.filter((e) => e.lane === "human").length;
   const botCount = entries.filter((e) => e.lane === "bot").length;
+  const localCount = entries.filter((e) => e.lane === "local").length;
   const laned = who === "all" ? entries
     : who === "new" ? entries.filter((e) => !!e.hot)
     : entries.filter((e) => e.lane === who);
@@ -8991,7 +11094,7 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
      they would be making up. */
   const opened = (
     <div key="opened" className="agx-tiny">
-      <span className="agx-node">＋</span>
+      <span className="agx-node"><PlusIcon size={ICON.xs} /></span>
       <span><b>{d.author}</b> opened this pull request from <code style={{ ...CODE_FONT_STYLE, color: "var(--primary)" }}>{d.headRefName}</code> into <code style={{ ...CODE_FONT_STYLE, color: "var(--text2)" }}>{d.baseRefName}</code></span>
     </div>
   );
@@ -9000,12 +11103,15 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
      review — a judgement the raw event cannot make. */
   const forced = d.forcePushedSinceReview ? (
     <div key="forced" className="agx-tiny">
-      <span className="agx-node" style={{ color: "var(--warning)" }}>↻</span>
+      <span className="agx-node" style={{ color: "var(--warning)" }}><RefreshIcon size={ICON.xs} /></span>
       <span style={{ color: "var(--warning)" }}>The last review was for code that is no longer here — it was force-pushed over</span>
     </div>
   ) : null;
 
-  const composer = <Composer onSend={onComment} busy={busy} placeholder="Leave a comment — markdown works here" sendLabel="Comment" onOpenGithub={() => openExternal(d.url)} stash={`say|${d.url}`} />;
+  /* `key` so a quote lands: the composer reads its stash when it mounts, which is
+     the same mechanism that restores a half-written comment, and remounting is how a
+     quote written into that stash reaches the box somebody is about to type in. */
+  const composer = <Composer key={composerKey} onSend={onComment} busy={busy} placeholder="Leave a comment — markdown works here" sendLabel="Comment" onOpenGithub={() => openExternal(d.url)} stash={`say|${d.url}`} />;
 
   if (entries.length === 0) {
     return (
@@ -9110,11 +11216,12 @@ function Conversation({ d, lanes, raw, onRaw, onResolve, onReply, onComment, onR
           you came back with. It appears only when there is something under it —
           a filter that is always there and usually empty teaches people not to
           press it. */}
-      {(botCount > 0 || atoms.length > 0) && (
+      {(botCount > 0 || atoms.length > 0 || localCount > 0) && (
         <div className="flex mb-3 rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
           {([
-            ["all", "All", humanCount + botCount] as const,
+            ["all", "All", humanCount + botCount + localCount] as const,
             ...(botCount > 0 ? [["human", "Humans", humanCount] as const, ["bot", "Bots", botCount] as const] : []),
+            ...(localCount > 0 ? [["local", "Local", localCount] as const] : []),
             ...(atoms.length ? [["new", "New", atoms.length] as const] : []),
           ]).map(([id, label, n]) => (
             <button key={id} onClick={() => setWho(id)}
@@ -9232,6 +11339,17 @@ function Composer({ onSend, busy, placeholder, sendLabel, sendTitle, quiet, onOp
   const [preview, setPreview] = useState(false);
   const [sending, setSending] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  /** The saved replies, shared by every composer on the page — see useSavedReplies. */
+  const replies = useSavedReplies();
+  /** Drop one in where the caret is, replacing whatever was selected. */
+  const insertAtCaret = (body: string) => {
+    const ta = taRef.current;
+    const at = ta ? ta.selectionStart : text.length;
+    const to = ta ? ta.selectionEnd : text.length;
+    const next = text.slice(0, at) + body + text.slice(to);
+    setText(next);
+    requestAnimationFrame(() => { ta?.focus(); ta?.setSelectionRange(at + body.length, at + body.length); });
+  };
   /** Was there something here when the box opened? Worth saying — text that
    *  reappears without explanation reads as a bug, not as a rescue. */
   const [restored, setRestored] = useState(() => !!(stash && readStash(stash).trim()));
@@ -9360,6 +11478,32 @@ function Composer({ onSend, busy, placeholder, sendLabel, sendTitle, quiet, onOp
       <div className="flex items-center gap-1 px-2 py-1.5" style={{ borderBottom: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
         <Btn onClick={() => setPreview(false)} small primary={!preview}>Write</Btn>
         <Btn onClick={() => setPreview(true)} small primary={preview}>Preview</Btn>
+        {/*
+          * The sentences you write over and over on other people's pull requests.
+          *
+          * Dropped in at the caret, not over what is in the box: a saved reply is
+          * usually the middle of an answer rather than the whole of it. Edited in
+          * Settings, and the menu says so instead of leaving an empty list looking
+          * like something broken — there are no built-ins, because a canned sentence
+          * that ships with the app is the app putting words in somebody's mouth, and
+          * these get posted under their name.
+          */}
+        <span className="ml-auto">
+          <Menu label={<QuoteIcon size={ICON.sm} />} title="Saved replies">
+            {(close) => (
+              <>
+                {replies.length === 0 && (
+                  <div className="px-3 py-2 text-[10.5px]" style={{ color: "var(--text3)" }}>Nothing saved yet.</div>
+                )}
+                {replies.map((r) => (
+                  <MenuItem key={r.id} onClick={() => { close(); insertAtCaret(r.text); }}>{r.title}</MenuItem>
+                ))}
+                <MenuSep />
+                <MenuItem onClick={() => { close(); openSettings("saved-replies"); }}>&#9998; Edit saved replies…</MenuItem>
+              </>
+            )}
+          </Menu>
+        </span>
       </div>
       {imageNote && (
         <div className="flex items-center gap-2 px-2.5 py-1.5 text-[10.5px]"
@@ -9371,14 +11515,14 @@ function Composer({ onSend, busy, placeholder, sendLabel, sendTitle, quiet, onOp
             <button onClick={onOpenGithub} className="agx-btn ml-auto shrink-0 px-2 py-0.5 rounded"
               style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 45%, transparent)" }}>Attach on GitHub ↗</button>
           )}
-          <button onClick={() => setImageNote(null)} className="agx-btn shrink-0 px-1" style={{ color: "var(--text3)" }} aria-label="Dismiss">×</button>
+          <button onClick={() => setImageNote(null)} className="agx-btn shrink-0 grid place-items-center w-5 h-5 rounded" style={{ color: "var(--text3)" }} aria-label="Dismiss"><CloseIcon size={ICON.xs} /></button>
         </div>
       )}
       {restored && (
         <div className="flex items-center gap-2 px-2.5 py-1 text-[10px]"
           style={{ color: "var(--primary)", background: "color-mix(in srgb, var(--primary) 10%, transparent)", borderBottom: "1px solid color-mix(in srgb, var(--text) 11%, transparent)" }}>
           <span>Picked up where you left off — this was never sent.</span>
-          <button onClick={() => setRestored(false)} className="agx-btn ml-auto shrink-0 px-1" style={{ color: "var(--text3)" }} aria-label="Dismiss">×</button>
+          <button onClick={() => setRestored(false)} className="agx-btn ml-auto shrink-0 grid place-items-center w-5 h-5 rounded" style={{ color: "var(--text3)" }} aria-label="Dismiss"><CloseIcon size={ICON.xs} /></button>
         </div>
       )}
       {preview ? (
@@ -9452,8 +11596,8 @@ const CHECK_TINT: Record<PrCheck["state"], string> = {
   success: "var(--success)", failure: "var(--error)", pending: "var(--warning)",
   skipped: "var(--text3)", neutral: "var(--text3)",
 };
-const CHECK_GLYPH: Record<PrCheck["state"], string> = {
-  success: "✓", failure: "✕", pending: "•", skipped: "⊘", neutral: "⊘",
+const CHECK_GLYPH: Record<PrCheck["state"], React.ReactNode> = {
+  success: <DoneIcon size={ICON.xs} />, failure: <CrossIcon size={ICON.xs} />, pending: <CircleIcon size={ICON.xs} />, skipped: <BlockedIcon size={ICON.xs} />, neutral: <BlockedIcon size={ICON.xs} />,
 };
 
 /** "CI / Tests / django-tests" — the workflow is the prefix, and grouping by
@@ -9585,7 +11729,7 @@ function Checks({ d, root, jobs, onRerun, onRerunJobs, onAsk, busy, busyWhat }: 
       <div className="flex items-center gap-3 p-3 rounded-lg" style={{ border: "1px solid color-mix(in srgb, var(--text) 16%, transparent)" }}>
         <span className="shrink-0 rounded-full flex items-center justify-center text-[13px]"
           style={{ width: 26, height: 26, background: c.failure > 0 ? "var(--error)" : c.pending > 0 ? "var(--warning)" : "var(--success)", color: "var(--bg)" }}>
-          {c.failure > 0 ? "✕" : c.pending > 0 ? "•" : "✓"}
+          {c.failure > 0 ? <CrossIcon size={ICON.sm} /> : c.pending > 0 ? <CircleIcon size={ICON.sm} /> : <DoneIcon size={ICON.sm} />}
         </span>
         <span className="min-w-0">
           <span className="block text-[13px] font-semibold leading-tight" style={{ color: "var(--text)" }}>
@@ -9618,8 +11762,8 @@ function Checks({ d, root, jobs, onRerun, onRerunJobs, onAsk, busy, busyWhat }: 
               style={{ background: "color-mix(in srgb, var(--border) 14%, transparent)" }}>
               <span style={{ color: "var(--text3)" }}>{isOpen ? "▾" : "▸"}</span>
               <b style={{ color: "var(--text)", fontWeight: 500 }}>{name}</b>
-              {bad > 0 && <span style={{ color: "var(--error)" }}>{bad} ✕</span>}
-              {good > 0 && <span style={{ color: "var(--success)" }}>{good} ✓</span>}
+              {bad > 0 && <span className="inline-flex items-center gap-0.5" style={{ color: "var(--error)" }}>{bad}<CrossIcon size={ICON.xs} /></span>}
+              {good > 0 && <span className="inline-flex items-center gap-0.5" style={{ color: "var(--success)" }}>{good}<DoneIcon size={ICON.xs} /></span>}
               <span className="ml-auto tabular-nums" style={{ color: "var(--text3)" }}>{list.length}</span>
             </button>
             {isOpen && list.map((k, i) => {
@@ -9632,21 +11776,25 @@ function Checks({ d, root, jobs, onRerun, onRerunJobs, onAsk, busy, busyWhat }: 
                       it is the one row that opens into somewhere to go next. */}
                   <button onClick={() => bad && setOpenCheck(expanded ? null : id)} disabled={!bad}
                     className="w-full text-left flex items-center gap-2 px-2.5 py-1" style={{ cursor: bad ? "pointer" : "default" }}>
-                    <span className="shrink-0 w-3 text-center" style={{ color: CHECK_TINT[k.state] }}>{CHECK_GLYPH[k.state]}</span>
+                    <span className="shrink-0 w-3 flex justify-center" style={{ color: CHECK_TINT[k.state] }}>{CHECK_GLYPH[k.state]}</span>
                     <span className="truncate" style={{ color: k.state === "skipped" || k.state === "neutral" ? "var(--text3)" : "var(--text2)" }}>
                       {k.name.startsWith(name) ? k.name.slice(name.length).replace(/^\s*\/\s*/, "") || k.name : k.name}
                     </span>
+                    {/* GitHub's own merge box tags these, and it is the only
+                        way to tell the one red check that blocks from the
+                        three that do not. */}
+                    {k.required && <Chip text="Required" tint="var(--text2)" title="GitHub will not merge until this one passes" />}
                     <span className="ml-auto shrink-0 text-[9.5px] uppercase tracking-wide" style={{ color: CHECK_TINT[k.state] }}>{k.state}</span>
                     {bad && <span className="shrink-0" style={{ color: "var(--text3)" }}>{expanded ? "▾" : "▸"}</span>}
                   </button>
                   {expanded && (
                     <div className="flex items-center gap-1.5 flex-wrap px-2.5 pb-2 pt-0.5">
-                      {onAsk && <Btn onClick={() => onAsk(k)} primary small title="Check the pull request out locally and hand the failure to Claude">✦ Ask Claude why</Btn>}
+                      {onAsk && <Btn onClick={() => onAsk(k)} primary small title="Check the pull request out locally and hand the failure to Claude"><SparkleIcon size={ICON.xs} />Ask Claude why</Btn>}
                       {k.url && (
                         <a href={externalUrl(k.url)} target="_blank" rel="noreferrer noopener" className="agx-btn text-[10px] px-2 py-0.5 rounded"
                           style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--text) 24%, transparent)" }}>Open run ↗</a>
                       )}
-                      <Btn onClick={onRerun} disabled={busy} small pending={busyWhat === "Re-run checks"} title="Re-run every failing check on this pull request">↻ Re-run failed</Btn>
+                      <Btn onClick={onRerun} disabled={busy} small pending={busyWhat === "Re-run checks"} title="Re-run every failing check on this pull request"><RefreshIcon size={ICON.xs} />Re-run failed</Btn>
                       {/* GitHub offers all three, and "the whole run failed
                           again for one flaky job" is exactly when you want the
                           single-job one. */}
@@ -9655,8 +11803,8 @@ function Checks({ d, root, jobs, onRerun, onRerunJobs, onAsk, busy, busyWhat }: 
                         if (!job || !onRerunJobs) return null;
                         return (
                           <>
-                            <Btn onClick={() => onRerunJobs("job", job.id)} disabled={busy} small pending={busyWhat === "Re-run"} title={`Re-run only ${job.name}`}>↻ This job</Btn>
-                            <Btn onClick={() => onRerunJobs("all", job.runId)} disabled={busy} small pending={busyWhat === "Re-run"} title="Re-run every job in this run, passing ones included">↻ All jobs</Btn>
+                            <Btn onClick={() => onRerunJobs("job", job.id)} disabled={busy} small pending={busyWhat === "Re-run"} title={`Re-run only ${job.name}`}><RefreshIcon size={ICON.xs} />This job</Btn>
+                            <Btn onClick={() => onRerunJobs("all", job.runId)} disabled={busy} small pending={busyWhat === "Re-run"} title="Re-run every job in this run, passing ones included"><RefreshIcon size={ICON.xs} />All jobs</Btn>
                           </>
                         );
                       })()}
@@ -9860,16 +12008,16 @@ function ReviewTab({ d, root, held, drafts, seen, busy, busyWhat, draft, onDraft
           <div className="flex items-center gap-2 flex-wrap">
             <div className="flex rounded-lg overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--text) 18%, transparent)" }}>
               {([
-                ["approve", "✓ Approve", "Submit and mark the pull request approved.", "var(--success)"],
-                ["request_changes", "✕ Request changes", "Submit and block the merge until they land.", "var(--error)"],
-                ["comment", "💬 Comment", "Submit without a verdict.", "var(--text)"],
+                ["approve", <><DoneIcon size={ICON.xs} />Approve</>, "Submit and mark the pull request approved.", "var(--success)"],
+                ["request_changes", <><CrossIcon size={ICON.xs} />Request changes</>, "Submit and block the merge until they land.", "var(--error)"],
+                ["comment", <><CommentIcon size={ICON.xs} />Comment</>, "Submit without a verdict.", "var(--text)"],
               ] as const).map(([id, label, hint, tint], n) => {
                 const on = verb === id;
                 const off = id !== "comment" && d.viewerDidAuthor;
                 return (
                   <button key={id} onClick={() => setVerb(id)} disabled={off} aria-pressed={on}
                     title={off ? "GitHub does not let you approve or block your own pull request" : hint}
-                    className="agx-btn text-[11px] px-3 py-1.5 whitespace-nowrap"
+                    className="agx-btn text-[11px] px-3 py-1.5 whitespace-nowrap inline-flex items-center gap-1.5"
                     style={{
                       color: on ? tint : "var(--text2)",
                       fontWeight: on ? 650 : 400,

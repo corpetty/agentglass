@@ -6,6 +6,8 @@ import { Portal } from "./Portal.tsx";
 import { friendly, detail, DOT_COLOR } from "../lib/labels.ts";
 import { fmtTime, fmtMs, fmtUsd, agentKey, hashColor } from "../lib/format.ts";
 import { CloseButton } from "./CloseButton.tsx";
+import { ChartIcon, CopyIcon, CrossIcon, ExpandIcon, IconLabel } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 type Category = "all" | "tools" | "chat" | "alerts";
 
@@ -301,7 +303,7 @@ function FeedInner({ events, filter, sessionProvider, onSelect, onClearFilter }:
         color: "var(--primary-hover)",
       }}
     >
-      <span aria-hidden>⧉</span>
+      <span aria-hidden className="flex"><CopyIcon size={ICON.xs} /></span>
       <span className="font-semibold">Filtered</span>
       {filter.app && (
         <span className="chip" style={{ color: "var(--primary-hover)", background: "color-mix(in srgb, var(--primary) 22%, transparent)", borderColor: "color-mix(in srgb, var(--primary) 55%, transparent)" }}>
@@ -319,7 +321,7 @@ function FeedInner({ events, filter, sessionProvider, onSelect, onClearFilter }:
         className="ml-auto flex items-center gap-1 rounded-md px-2 py-0.5 font-semibold cursor-pointer"
         style={{ color: "var(--bg2)", background: "var(--primary)" }}
       >
-        Clear ✕
+        <span className="inline-flex items-center gap-1">Clear<CrossIcon size={ICON.xs} /></span>
       </button>
     </div>
   );
@@ -360,7 +362,7 @@ function FeedInner({ events, filter, sessionProvider, onSelect, onClearFilter }:
                   : { color: "var(--text4)" }
               }
             >
-              ⫴ Lanes
+              <IconLabel icon={<ChartIcon size={ICON.xs} />}>Lanes</IconLabel>
             </button>
           </div>
         </div>
@@ -400,7 +402,7 @@ function FeedInner({ events, filter, sessionProvider, onSelect, onClearFilter }:
               className="chip cursor-pointer"
               style={{ color: "var(--text3)" }}
             >
-              ⛶ Expand
+              <IconLabel icon={<ExpandIcon size={ICON.xs} />}>Expand</IconLabel>
             </button>
           </div>
         }

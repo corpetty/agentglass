@@ -11,7 +11,7 @@
 // One surface, reachable from the dashboard and from inside the workspace,
 // because "is 5173 still up?" is a question you have while looking at anything.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RefreshIcon } from "../lib/glyphIcons.tsx";
+import { CopyIcon, DiskIcon, IconLabel, RefreshIcon } from "../lib/glyphIcons.tsx";
 import { Portal } from "./Portal.tsx";
 import { api } from "../lib/api.ts";
 import type { GitLock, GitLocksReport, GitRepoRef, ProcDetail, MachineTotals, PortEntry, PortsReport, ProcEntry, ResourceReport, SpaceReport } from "../../../shared/types.ts";
@@ -106,7 +106,7 @@ function Ports({ onOpenBrowser }: { onOpenBrowser?: () => void }) {
   const hit = useCallback((p: PortEntry) => {
     const needle = q.trim().toLowerCase();
     if (!needle) return true;
-    return [String(p.port), p.proc ?? "", p.cwd ?? "", p.addr, ...p.ancestry.map((a) => a.name)]
+    return [String(p.port), p.proc ?? "", p.dir ?? p.cwd ?? "", p.addr, ...p.ancestry.map((a) => a.name)]
       .some((s) => s.toLowerCase().includes(needle));
   }, [q]);
   const mine = useMemo(() => data?.ports.filter((p) => p.mine && hit(p)) ?? [], [data, hit]);
@@ -139,7 +139,7 @@ function Ports({ onOpenBrowser }: { onOpenBrowser?: () => void }) {
 
   return (
     <div className="flex-1 min-h-0 flex">
-    <div className="flex-1 min-w-0 agx-scroll overflow-y-auto">
+    <div className="flex-1 min-w-0 agx-scroll overflow-y-auto overflow-x-hidden">
       {note && <div className="px-3.5 py-1.5 text-[10.5px]" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--primary) 10%, transparent)" }}>{note}</div>}
 
       {/* Above the groups rather than inside one: it filters both, and a filter
@@ -160,7 +160,7 @@ function Ports({ onOpenBrowser }: { onOpenBrowser?: () => void }) {
           actions={
             <>
               <IconBtn title={HAS_BROWSER && onOpenBrowser ? "Open in the browser tab" : "Open in your browser"} onClick={() => open(p)}>↗</IconBtn>
-              <IconBtn title="Copy the address" onClick={() => void navigator.clipboard?.writeText(`http://localhost:${p.port}`)}>⧉</IconBtn>
+              <IconBtn title="Copy the address" onClick={() => void navigator.clipboard?.writeText(`http://localhost:${p.port}`)}><CopyIcon size={ICON.xs} /></IconBtn>
               {p.pid != null && p.proc !== "agentglass-serv" && (
                 <IconBtn title="Ask this process to stop (SIGTERM)" tint="var(--error)" disabled={busy === p.pid} onClick={() => void stop(p)}><CloseIcon size={ICON.sm} /></IconBtn>
               )}
@@ -278,7 +278,7 @@ function MachineStrip({ m }: { m: MachineTotals }) {
  * `agentglass-work-2026-08-05` is a real directory name here — and the 1fr
  * column has room to give now that the panel is wider.
  */
-export const PORT_GRID = "8px 52px minmax(0, 1fr) 190px 176px 76px";
+export const PORT_GRID = "8px 52px minmax(0, 1fr) 420px 176px 76px";
 
 /**
  * The same row with the detail pane open.
@@ -403,13 +403,37 @@ function Row({ p, actions, dim, selected, onSelect, narrow }: {
           checkout gone
         </span>
       )}
+      {/* Three warnings about a listener nobody may want any more. Amber and
+          worded as a question of fact: none of them is proof, and none of them
+          is ever acted on for you. */}
+      {p.tmpLeftover && (
+        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap"
+          title={`It is serving from ${p.dir}, a scratch directory. Whatever it was for, nobody is likely to look at it again.`}
+          style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>
+          tmp leftover
+        </span>
+      )}
+      {p.duplicate && (
+        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap"
+          title={`Another ${p.proc} is serving the same folder (${p.dir}). One of them is probably left over.`}
+          style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>
+          duplicate
+        </span>
+      )}
+      {p.idleSec != null && (
+        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full whitespace-nowrap"
+          title={`Nothing has connected for ${forAge(p.idleSec!)}.`}
+          style={{ color: "var(--warning)", border: "1px solid color-mix(in srgb, var(--warning) 40%, transparent)" }}>
+          idle
+        </span>
+      )}
       </span>}
       {!narrow && <span className="flex items-center justify-end min-w-0 overflow-hidden">
-      {p.cwd && (
+      {(p.dir ?? p.cwd) && (
         <span className="min-w-0 truncate text-[10px] px-1.5 py-0.5 rounded-full max-w-full"
-          title={p.cwd}
+          title={p.dir && p.dir !== p.cwd ? `Serving ${p.dir}\nStarted in ${p.cwd ?? "?"}` : p.dir ?? p.cwd ?? ""}
           style={{ color: "var(--primary)", border: "1px solid color-mix(in srgb, var(--primary) 35%, transparent)" }}>
-          {p.cwd.split("/").filter(Boolean).pop()}
+          {(p.dir ?? p.cwd)!.split("/").filter(Boolean).pop()}
         </span>
       )}
       </span>}
@@ -532,7 +556,7 @@ function Resources() {
   return (
     <div className="flex-1 min-h-0 flex">
     <div className="flex flex-col min-h-0 flex-1 min-w-0">
-      <div className="flex-1 min-h-0 agx-scroll overflow-y-auto">
+      <div className="flex-1 min-h-0 agx-scroll overflow-y-auto overflow-x-hidden">
         {/* Under the totals rather than over them: the numbers at the top are
             the machine's and do not move when you filter, and a box above them
             would suggest they do. */}
@@ -729,7 +753,7 @@ function Space({ repos }: { repos: GitRepoRef[] }) {
   return (
     <div className="shrink-0" style={{ borderTop: edge(16), background: "color-mix(in srgb, var(--text) 5%, transparent)" }}>
       <div className="flex items-center gap-2 px-3.5 py-2 text-[11px] flex-wrap">
-        <span style={{ color: "var(--text3)" }}>⛁</span>
+        <span className="flex" style={{ color: "var(--text3)" }}><DiskIcon size={ICON.xs} /></span>
         <span style={{ color: "var(--text)", fontWeight: 500 }}>Disk</span>
         {/* Which checkout to measure — a one-shot argument for the scan, not a
             move: nothing else follows it anywhere. */}
@@ -752,7 +776,7 @@ function Space({ repos }: { repos: GitRepoRef[] }) {
             style={busy
               ? { color: "var(--text3)", border: edge(20) }
               : { color: "var(--primary)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", background: "color-mix(in srgb, var(--primary) 12%, transparent)" }}>
-            {busy ? "Measuring…" : data ? "⟳ Measure again" : "⟳ Measure"}
+            {busy ? "Measuring…" : <IconLabel icon={<RefreshIcon size={ICON.xs} />}>{data ? "Measure again" : "Measure"}</IconLabel>}
           </button>
         </span>
       </div>
@@ -851,7 +875,7 @@ function DetailPane({ pid, onClose }: { pid: number; onClose: () => void }) {
   };
 
   return (
-    <div className="shrink-0 flex flex-col min-h-0 agx-scroll overflow-y-auto"
+    <div className="shrink-0 flex flex-col min-h-0 agx-scroll overflow-y-auto overflow-x-hidden"
       // 420 rather than 340: this holds absolute paths and full command lines,
       // and at 340 both wrapped over three lines each, which is how a detail
       // pane becomes harder to read than the row it replaced.
@@ -990,7 +1014,7 @@ function Locks() {
 
   return (
     <div className="flex-1 min-h-0 flex">
-    <div className="flex-1 min-w-0 agx-scroll overflow-y-auto">
+    <div className="flex-1 min-w-0 agx-scroll overflow-y-auto overflow-x-hidden">
       {note && <div className="px-3.5 py-1.5 text-[10.5px]" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--primary) 10%, transparent)" }}>{note}</div>}
 
       {/* The count of checkouts is not decoration: an empty list has to be

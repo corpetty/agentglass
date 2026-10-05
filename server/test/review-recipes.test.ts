@@ -67,8 +67,8 @@ describe("the placeholders", () => {
  * personal, so the wording that actually goes out lives in the user's own file.
  * What is pinned here is the frame's two halves, because losing either is how
  * the feature failed the first time it was used — style copied from the channel
- * with no floor under the content produced a one-line "cuando puedas <link>",
- * and content with no style rule reads like an app wrote it.
+ * with no floor under the content produced a bare "when you can, <link>", and
+ * content with no style rule reads like an app wrote it.
  */
 describe("the prompt that asks somebody for a review", () => {
   const ping = () => C.BUILT_IN_RECIPES.find((r) => r.id === "ready-for-review")!;
@@ -139,10 +139,10 @@ describe("the menu", () => {
     expect(list.length).toBe(C.BUILT_IN_RECIPES.length);
     expect(list.every((r) => r.builtIn)).toBe(true);
     // Grouped, and in the catalogue's order inside each group.
-    // `telling` last, and in the list on purpose: an unknown group sorts to -1,
+    // `telling` and `conflicts` last, and in the list on purpose: an unknown group sorts to -1,
     // which would put it first and make this pass while the menu drew it in the
     // wrong place.
-    const ORDER = ["reviewing", "focused", "mine", "telling"];
+    const ORDER = ["reviewing", "focused", "mine", "telling", "conflicts"];
     expect(list.map((r) => r.group)).toEqual([...list.map((r) => r.group)].sort((a, b) =>
       ORDER.indexOf(a) - ORDER.indexOf(b)));
   });

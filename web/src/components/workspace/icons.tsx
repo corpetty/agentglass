@@ -169,6 +169,34 @@ export function ChatIcon({ size = ICON.md }: P) {
   return <svg {...svg} viewBox="1.16 1.16 21.69 21.69" strokeWidth={1.81} width={size} height={size}><path d="M20 4H4v12h5v4l5-4h6z" /></svg>;
 }
 
+/**
+ * Two of you, and the second one is drawn as a dotted line.
+ *
+ * The view is a scorecard of what a stand-in WOULD have done, so the glyph has
+ * to say two things at once: that there is a second actor, and that it is not
+ * real yet. A single figure says neither. Two solid figures say "a team", which
+ * is the users icon every app already has and is exactly the wrong promise —
+ * nothing here acts.
+ *
+ * The dashes carry that whole distinction, which is why they are 2.4 long
+ * rather than the 1px ticks a dotted border would use: at the rail's 26px a
+ * finer dash closes up into a solid stroke, and the icon quietly becomes the
+ * one it was drawn not to be. The understudy stands behind and to the side, as
+ * one does.
+ */
+export function UnderstudyIcon({ size = ICON.md }: P) {
+  return (
+    <svg {...svg} width={size} height={size}>
+      <g strokeDasharray="2.4 2.2">
+        <circle cx="16.6" cy="6.6" r="3" />
+        <path d="M11.6 17.6v-1a3.6 3.6 0 0 1 3.6-3.6h2.8a3.6 3.6 0 0 1 3.6 3.6v1" />
+      </g>
+      <circle cx="8.8" cy="9.2" r="3.6" />
+      <path d="M2.5 20.5v-1.2a4.3 4.3 0 0 1 4.3-4.3h4a4.3 4.3 0 0 1 4.3 4.3v1.2" />
+    </svg>
+  );
+}
+
 /** The single header button that replaced the five. A pane split off a frame. */
 export function WorkspaceIcon({ size = ICON.md }: P) {
   return <svg {...svg} width={size} height={size}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg>;
@@ -187,4 +215,72 @@ export function SkillsIcon({ size = ICON.md }: P) {
 
 export function CloseIcon({ size = ICON.md }: P) {
   return <svg {...svg} width={size} height={size}><path d="M6 6l12 12M18 6L6 18" /></svg>;
+}
+
+
+
+/** A lantern: it lights when somebody needs you. The flame is the one filled
+ *  shape on the rail — everything else here is strokes — because a flame
+ *  drawn as an outline is a leaf. */
+/*
+ * The orchestrator: one filled node with three it is holding.
+ *
+ * A chair was the first try and it read as a bracket at 16px — the size the
+ * rail actually draws. This is the hub every diagram of this idea uses, and it
+ * survives the size because it is three dots and three lines: the centre is
+ * FILLED when somebody is in the seat, which is the one fact the view exists
+ * to answer, and the ring is open when it is empty.
+ */
+export function SeatIcon({ size = ICON.md, seated = true }: P & { seated?: boolean }) {
+  return (
+    <svg {...svg} width={size} height={size}>
+      <path d="M12 9.4V6.2" />
+      <path d="M13.6 13.1l2.6 1.6" />
+      <path d="M10.4 13.1l-2.6 1.6" />
+      <circle cx="12" cy="4.4" r="1.9" />
+      <circle cx="17.8" cy="15.8" r="1.9" />
+      <circle cx="6.2" cy="15.8" r="1.9" />
+      <circle cx="12" cy="11.4" r="2.4" fill={seated ? "currentColor" : "none"} />
+    </svg>
+  );
+}
+
+/*
+ * The Lantern: a source and the cone it throws.
+ *
+ * It was a lantern — a body of six strokes with a flame inside — and the body
+ * crowded itself below 16px. This is the same idea with four: a lit centre and
+ * the beam under it. It also says the truer thing, since what this view does
+ * every fifteen minutes is sweep a field rather than sit on a table.
+ */
+export function LanternIcon({ size = ICON.md }: P) {
+  return (
+    <svg {...svg} width={size} height={size}>
+      <path d="M12 3.6v2.6" />
+      <path d="M5.6 6.4l1.9 1.9" />
+      <path d="M18.4 6.4l-1.9 1.9" />
+      <path d="M6.2 20l5-8.6h1.6l5 8.6z" />
+      <circle cx="12" cy="9.9" r="2.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+/** A gear: settings and configuration. The line icon every "⚙" in the app
+ *  becomes — the emoji draws in colour on some systems and matches nothing. */
+export function GearIcon({ size = ICON.md }: P) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3.1" />
+      <path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z" />
+    </svg>
+  );
+}
+
+/** A puzzle piece: the thing that fits into something else — a plugin's panels. */
+export function PluginsIcon({ size = ICON.md }: P) {
+  return (
+    <svg {...svg} width={size} height={size}>
+      <path d="M5 7.2h3.7a2.3 2.3 0 1 1 4.6 0H17v3.7a2.3 2.3 0 1 1 0 4.6v3.7h-3.7a2.3 2.3 0 1 0-4.6 0H5v-3.7a2.3 2.3 0 1 0 0-4.6z" />
+    </svg>
+  );
 }

@@ -21,6 +21,32 @@ export const LAYER = {
   viewer: 10020,
 
   /**
+   * The floating bench.
+   *
+   * Above the viewer and below the palette, and both halves are the design.
+   * Above the viewer because the bench is where the viewer sends a file to be
+   * edited — a window that opened underneath the thing that raised it would
+   * look like nothing happened. Below the palette because the palette is how
+   * you find the next file to send here, and it has to stay on top of what it
+   * feeds.
+   */
+  bench: 10030,
+
+  /**
+   * What a board opens while it is inside the bench.
+   *
+   * The pull-request and task boards can be shown in the bench (see
+   * boardHost.ts), and what they open — a menu, a card, the file viewer — goes
+   * through a Portal at the number it was written for, which is the view's
+   * world: 9999, or the viewer's 10020. Both are UNDER the bench: measured in
+   * the rendered app, the reviewer picker opened from a pull request in the
+   * bench was covered by the window at every point sampled. Portal lifts
+   * anything below this floor while its board is in the bench. Below the
+   * palette, which still has to cover what it feeds.
+   */
+  benchOverlay: 10035,
+
+  /**
    * The file palette.
    *
    * Above the viewer, and that is the whole design rather than a detail: the
@@ -29,6 +55,24 @@ export const LAYER = {
    * the list that produced it, which is the one behaviour this exists to avoid.
    */
   palette: 10040,
+
+  /**
+   * A picture opened from the palette.
+   *
+   * Above the palette, unlike the rule above it: this one COVERS the list it
+   * was raised from, because a screenshot is read at size and Esc is what puts
+   * the list back. It still sits under the menus and the needs panel.
+   */
+  paletteImage: 10045,
+
+  /**
+   * The "waiting on you" panel under the title-bar chip.
+   *
+   * Above the workspace's own layers because it is raised from the bar over
+   * whatever view is open; below the catalog and every sheet, which are opened
+   * on purpose and should not be covered by something that was not.
+   */
+  needs: 10055,
 
   /**
    * The Skills explorer.
@@ -56,6 +100,20 @@ export const LAYER = {
    * toasts above both is a bigger change than this one.
    */
   settings: 10120,
+
+  /**
+   * A dialog raised from inside the settings sheet.
+   *
+   * Settings is a full-height sheet at 10120, so anything it opens has to be
+   * above it or it opens invisibly behind the page that raised it. Below the
+   * menus, because a dropdown inside this dialog is still a menu and still has
+   * to escape it.
+   *
+   * Its own rung rather than `settings + 1`: the next person to open something
+   * from settings needs a name to reach for, and an arithmetic expression at a
+   * call site is how a stack of numbers stops being a table anybody can read.
+   */
+  settingsDialog: 10140,
 
   /**
    * A menu opened from inside any of the above.

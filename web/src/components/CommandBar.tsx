@@ -17,11 +17,16 @@
 // cap — enough for a day's work, few enough that the row can never grow into
 // the second scrolling strip this was meant to replace.
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { ICON } from "../lib/iconSize.ts";
+import { GearIcon } from "./workspace/icons.tsx";
 import { ContextMenu } from "./ContextMenu.tsx";
 import { RunDialog, runRecipeSteps } from "./RecipesPane.tsx";
 import type { GitRepoRef } from "../../../shared/types.ts";
 import { openSettings } from "../lib/openSettings.ts";
+import { searchSettings, type SettingsPage } from "../lib/settingsIndex.ts";
+import { SETTINGS_PAGES as ALL_SETTINGS_PAGES } from "../lib/settingsRows.gen.ts";
+import { HAS_BROWSER } from "../lib/desktop.ts";
 import type { Recipe } from "../../../shared/types.ts";
 import type { ProjectCommand, TerminalCommands } from "../../../shared/types.ts";
 import { api, IS_DEMO } from "../lib/api.ts";
@@ -29,6 +34,7 @@ import { retryLoad } from "../lib/retryLoad.ts";
 import { useDismiss } from "../lib/useDismiss.ts";
 import { keepTermFocus } from "../lib/keepFocus.ts";
 import { CloseButton } from "./CloseButton.tsx";
+import { IconLabel, PlusIcon, StarIcon } from "../lib/glyphIcons.tsx";
 
 /**
  * The four git one-liners this row used to hardcode as always-visible chips.
@@ -249,7 +255,7 @@ function CommandRow({ c, font, on, full, onRun, onPin }: {
         className={`shrink-0 text-[14px] leading-none rounded flex items-center justify-center hover:bg-white/10 ${on ? "" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"}`}
         style={{ width: 22, height: 22, color: on ? "var(--warning)" : "var(--text3)", opacity: !on && full ? 0.3 : undefined }}
         title={on ? "Unpin" : full ? `${MAX_PINS} pinned already — unpin one first` : `Pin ${r ? r.name : c.cmd} to the bar`}
-      >{on ? "★" : "☆"}</button>
+      ><StarIcon size={ICON.xs} filled={on} /></button>
     </div>
   );
 }
@@ -260,7 +266,23 @@ function CommandRow({ c, font, on, full, onRun, onPin }: {
  * `font` is the terminal's own face: a command is a thing you type, and it
  * reads as one when it is set in the face it will be typed in.
  */
-export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClose, dropUp }: {
+const MENU_W = 460;
+
+/**
+ * Hang the menu from the button's left edge when it fits there, from its right
+ * edge otherwise — the same flip a native menu does at the screen's edge.
+ * `left`/`right` are the button's edges and `viewport` the window width, in px.
+ */
+export function menuSide(left: number, right: number, viewport: number, width = MENU_W): "left" | "right" {
+  if (left + width <= viewport - 8) return "left";
+  return right - width >= 8 ? "right" : "left";
+}
+
+// The Browser page only exists where there is a browser, same as in Settings.
+const SETTINGS_PAGES = HAS_BROWSER ? ALL_SETTINGS_PAGES : ALL_SETTINGS_PAGES.filter((p) => p.id !== "browser");
+const SETTINGS_PAGES_NO_KW = SETTINGS_PAGES.map((p) => ({ ...p, kw: "" }) as SettingsPage);
+
+export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClose, dropUp, quiet }: {
   root: string;
   disabled: boolean;
   font: string;
@@ -280,6 +302,16 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
   /** Open upwards — for the console strip, which sits at the bottom of a panel
    *  and has nothing below it to open into. */
   dropUp?: boolean;
+  /**
+   * In the background: no count, no colour, no pinned strip.
+   *
+   * The terminal's bar wears this one. Commands is used from the Docker console
+   * far more than from the terminal — his words — and the count it carried
+   * ("(331)", or "(none)") is the number that helps least when choosing: the
+   * dropdown has a filter for exactly that. The pinned strip goes with it,
+   * because an empty one sat there inviting a pin nobody wanted.
+   */
+  quiet?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -288,6 +320,20 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
   const [customCmd, setCustomCmd] = useState("");
   const [customError, setCustomError] = useState("");
   const wrap = useRef<HTMLDivElement>(null);
+  /* Which edge of the button the menu hangs from, measured when it opens. The
+     button lives at the right end of the terminal's strip, and a menu hung
+     from its left edge ran past the window's right side on a narrower window. */
+  const [side, setSide] = useState<"left" | "right">("left");
+  useLayoutEffect(() => {
+    if (!open || !wrap.current) return;
+    const place = () => {
+      const r = wrap.current?.getBoundingClientRect();
+      if (r) setSide(menuSide(r.left, r.right, window.innerWidth));
+    };
+    place();
+    window.addEventListener("resize", place);
+    return () => window.removeEventListener("resize", place);
+  }, [open]);
   const cmds = useCommands(root);
   /* Your own, alongside the ones we found. Fetched here rather than threaded in
      because this menu is where "what can I run here" is answered, and a saved
@@ -420,6 +466,24 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
     onRun(decodeCustomPin(cmd)?.cmd ?? cmd);
   };
 
+  /*
+   * A settings row, or a whole settings page, opened from the SAME box this
+   * runs `make test` from — this is where "where is the thing that changes
+   * X" gets typed whether X is a shell target or a switch, and sending half
+   * of those questions to a different box is a second search box to
+   * remember exists. Pages always show (there are 24 of them, the same
+   * order of magnitude as "git — always available" below); ROWS only once
+   * something is typed, or the empty palette would carry 90-odd row entries
+   * nobody asked for on top of every make target in the repo.
+   */
+  const ql = query.trim().toLowerCase();
+  const settingsPageMatches = ql
+    ? SETTINGS_PAGES.filter((p) => p.label.toLowerCase().includes(ql))
+    : SETTINGS_PAGES;
+  const settingsRowMatches = ql
+    ? searchSettings(ql, SETTINGS_PAGES_NO_KW).filter((r) => r.row)
+    : [];
+
   const groups: [string, ProjectCommand[]][] = [];
   /*
    * Recipes first, because they are the ones somebody chose to keep — and there
@@ -470,17 +534,20 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
             `dismiss` so the focus goes back to the shell rather than nowhere. */}
         <button onMouseDown={keepTermFocus} onClick={() => (open ? dismiss() : setOpen(true))} disabled={!root || IS_DEMO}
           title="Ready-to-run project commands: Makefile targets & package scripts, with what each one does. Pin the ones you use."
-          className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg font-medium whitespace-nowrap"
-          style={{ color: n ? "var(--primary-hover)" : "var(--text2)", background: "color-mix(in srgb, var(--primary) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 30%, transparent)", opacity: root && !IS_DEMO ? 1 : 0.5 }}>
-          ⚙ Commands{n ? ` (${n})` : cmds ? " (none)" : " …"}<span className="t-dim2">▼</span>
+          className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg whitespace-nowrap"
+          style={quiet
+            ? { color: "var(--text3)", border: "1px solid color-mix(in srgb, var(--border) 25%, transparent)", opacity: root && !IS_DEMO ? 1 : 0.5 }
+            : { color: n ? "var(--primary-hover)" : "var(--text2)", background: "color-mix(in srgb, var(--primary) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 30%, transparent)", fontWeight: 500, opacity: root && !IS_DEMO ? 1 : 0.5 }}>
+          <GearIcon size={ICON.xs} />
+          Commands{quiet ? "" : n ? ` (${n})` : cmds ? " (none)" : " …"}<span style={{ color: "var(--text4)" }}>▾</span>
         </button>
         {open && (
           // keepTermFocus on the whole popover: a click on its padding, a
           // border, or a command row must not blur the filter input (it stays
           // yours to type in while the menu is open). The input itself is
           // excluded by the handler, so it can still be clicked into.
-          <div onMouseDown={keepTermFocus} className="absolute left-0 rounded-lg text-[11px] shadow-2xl flex flex-col"
-            style={{ zIndex: 40, background: "var(--bg2)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)", width: 460, maxHeight: 420, overflow: "hidden", ...(dropUp ? { bottom: "calc(100% + 4px)" } : { top: "calc(100% + 4px)" }) }}>
+          <div onMouseDown={keepTermFocus} className="absolute rounded-lg text-[11px] shadow-2xl flex flex-col"
+            style={{ zIndex: 40, background: "var(--bg2)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)", width: MENU_W, maxHeight: 420, overflow: "hidden", ...(side === "right" ? { right: 0 } : { left: 0 }), ...(dropUp ? { bottom: "calc(100% + 4px)" } : { top: "calc(100% + 4px)" }) }}>
             {/* A real project has more targets than fit on a screen — the repo
                 this was built against has 316 — so scrolling to find `migrate`
                 was the only way to run it. Matches the name and what the target
@@ -494,7 +561,7 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
               <button type="button" onClick={() => { setCustomOpen((v) => !v); setCustomError(""); }} disabled={full}
                 className="text-[10.5px] px-2 py-1 rounded-md"
                 style={{ color: full ? "var(--text3)" : "var(--primary-hover)", border: "1px dashed color-mix(in srgb, var(--primary) 35%, transparent)", opacity: full ? 0.55 : 1 }}>
-                ＋ Pin a custom command{full ? " (limit reached)" : ""}
+                <PlusIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Pin a custom command{full ? " (limit reached)" : ""}
               </button>
               {customOpen && !full && (
                 <form onSubmit={(e) => { e.preventDefault(); saveCustom(); }} className="mt-1.5 grid grid-cols-[92px_minmax(0,1fr)_auto] gap-1.5 items-center">
@@ -509,11 +576,30 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
                 </form>
               )}
             </div>
-            <div className="agx-scroll overflow-y-auto py-1" style={{ minHeight: 0 }}>
+            <div className="agx-scroll overflow-y-auto overflow-x-hidden py-1" style={{ minHeight: 0 }}>
               {!!gitMatches.length && (
                 <div>
                   <div className="px-3 pt-1.5 pb-0.5 t-dim2 text-[9.5px] uppercase tracking-wider">git — always available</div>
                   {gitMatches.map((c) => <CommandRow key={"g:" + c.cmd} c={c} font={font} on={pins.includes(c.cmd)} full={full} onRun={(cmd) => { const rr = (c as ProjectCommand & { recipe?: Recipe }).recipe; if (rr) runRecipe(rr); else run(cmd); }} onPin={pin} />)}
+                </div>
+              )}
+              {(!!settingsPageMatches.length || !!settingsRowMatches.length) && (
+                <div>
+                  <div className="px-3 pt-1.5 pb-0.5 t-dim2 text-[9.5px] uppercase tracking-wider">settings</div>
+                  {settingsPageMatches.map((p) => (
+                    <button key={"sp:" + p.id} onClick={() => { openSettings(p.id); dismiss(); }}
+                      className="w-full px-3 py-1.5 text-left hover:bg-[color-mix(in_srgb,var(--primary)_10%,transparent)]"
+                      style={{ color: "var(--text2)" }}>
+                      Settings: {p.label}
+                    </button>
+                  ))}
+                  {settingsRowMatches.map((r) => (
+                    <button key={"sr:" + r.pane + ":" + r.row} onClick={() => { openSettings(r.pane, r.row); dismiss(); }}
+                      className="w-full px-3 py-1.5 text-left hover:bg-[color-mix(in_srgb,var(--primary)_10%,transparent)]"
+                      style={{ color: "var(--text2)" }}>
+                      Settings: {SETTINGS_PAGES.find((p) => p.id === r.pane)?.label ?? r.pane} › {r.label}
+                    </button>
+                  ))}
                 </div>
               )}
               {/* The form takes the whole menu while it is up: you came here to
@@ -531,12 +617,12 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
                   {list.map((c) => <CommandRow key={label + ":" + c.cmd} c={c} font={font} on={pins.includes(c.cmd)} full={full} onRun={(cmd) => { const rr = (c as ProjectCommand & { recipe?: Recipe }).recipe; if (rr) runRecipe(rr); else run(cmd); }} onPin={pin} />)}
                 </div>
               ))}
-              {!asking && !gitMatches.length && !groups.length && (
+              {!asking && !gitMatches.length && !groups.length && !settingsPageMatches.length && !settingsRowMatches.length && (
                 <div className="px-3 py-2 t-dim2">{cmds ? `No command matches “${query.trim()}”` : "Reading the project…"}</div>
               )}
             </div>
             <div className="shrink-0 px-3 py-1.5 t-dim2 text-[10.5px] border-t" style={{ borderColor: "color-mix(in srgb, var(--border) 30%, transparent)" }}>
-              ☆ Pins a command to the bar — {pins.length} of {MAX_PINS} used, per repo
+              <StarIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Pins a command to the bar — {pins.length} of {MAX_PINS} used, per repo
             </div>
           </div>
         )}
@@ -551,7 +637,7 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
           offset. The row is capped at MAX_PINS, so a crowded bar is a
           truncation problem rather than a scrolling one: chips shrink, the
           label ellipses, and the full command stays in the tooltip. */}
-      <div className="flex items-center gap-1 min-w-0 overflow-hidden">
+      <div className="flex items-center gap-1 min-w-0 overflow-hidden" style={quiet ? { display: "none" } : undefined}>
         {pins.map((cmd) => (
           <span key={cmd} className="group flex items-center min-w-0 rounded-md"
             style={{ border: "1px solid color-mix(in srgb, var(--border) 30%, transparent)" }}>
@@ -574,7 +660,7 @@ export function CommandBar({ root, disabled, font, onRun, runTargetInTmux, onClo
           // steal the shell's cursor on the way there — see the trigger above.
           <button onMouseDown={keepTermFocus} onClick={() => setOpen(true)} className="text-[10px] px-2 py-1 rounded-md whitespace-nowrap shrink-0"
             style={{ color: "var(--text3)", border: "1px dashed color-mix(in srgb, var(--border) 30%, transparent)" }}
-            title={`Pin up to ${MAX_PINS} commands here — they stay one click away, per repo`}>☆ Pin a command</button>
+            title={`Pin up to ${MAX_PINS} commands here — they stay one click away, per repo`}><IconLabel icon={<StarIcon size={ICON.xs} />}>Pin a command</IconLabel></button>
         )}
       </div>
     </>

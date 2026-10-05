@@ -2,6 +2,9 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
 import { Avatar } from "./Avatar.tsx";
+import { StatusPill } from "./StatusPill.tsx";
+import { DoneIcon, DotIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 /**
  * A multi-select facet dropdown, GitHub-style: a pill that opens a checkbox list
@@ -21,6 +24,10 @@ export interface FacetMenuOption {
   count: number;
   /** A GitHub login, when this option is a person. */
   avatar?: string;
+  /** The colour this value carries elsewhere — a tracker status is a coloured
+   *  chip on the card, and the option that filters by it should look like the
+   *  thing it filters. */
+  tint?: string;
 }
 
 export function FacetMenu({
@@ -187,12 +194,22 @@ export function FacetMenu({
                             background: on ? "var(--primary)" : "transparent",
                             color: "var(--bg)",
                           }}>
-                          {on ? (mode === "radio" ? "●" : "✓") : ""}
+                          {on ? (mode === "radio" ? <DotIcon size={ICON.xs} /> : <DoneIcon size={ICON.xs} />) : null}
                         </span>
                         {/* The person, when the facet is about people — the face
                             is how you find a name in a list of twelve. */}
                         {o.avatar && <Avatar login={o.avatar} size={16} />}
-                        <span className="flex-1 truncate" style={{ color: on ? "var(--text)" : "var(--text2)" }}>{o.label}</span>
+                        {/* A value with a colour of its own is drawn AS that
+                            thing — a tracker status is a chip everywhere else
+                            in this app, and a column of grey words is a list
+                            you have to read where you could have recognised. */}
+                        {o.tint ? (
+                          <span className="flex-1 min-w-0">
+                            <StatusPill status={o.label} color={o.tint} dim={!on} />
+                          </span>
+                        ) : (
+                          <span className="flex-1 truncate" style={{ color: on ? "var(--text)" : "var(--text2)" }}>{o.label}</span>
+                        )}
                         {/* No count. It could only ever count the page in hand,
                             and the filter searches the whole repository; GitHub
                             shows no number in these menus for the same reason. */}

@@ -1,14 +1,21 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { WatchEvent, WsFrame, OpenToolCall } from "../../../shared/types.ts";
-import { WS_URL, IS_DEMO, hasToken, probeAuth } from "./api.ts";
+import type { WatchEvent, WsFrame, WsClientHello, OpenToolCall } from "../../../shared/types.ts";
+import { WS_URL, IS_DEMO, hasToken, probeAuth, whenServerUp } from "./api.ts";
 import * as demo from "./demo.ts";
 import { gitChanged } from "./gitBus.ts";
 import { emitControl } from "./controlBus.ts";
-import { emitBrowserAsk } from "./browserBus.ts";
-import { recordNote, fireDesktopAlert } from "./sysNotify.ts";
+import { clientId, emitBrowserAsk } from "./browserBus.ts";
+import { emitUnderstudy } from "./understudyBus.ts";
+import { emitPlugin } from "./pluginBus.ts";
+import { recordNote, fireDesktopAlert, firePopupOnly } from "./sysNotify.ts";
+import { pollGatesNow } from "./gateStore.ts";
 import { ciShouldNotify } from "./ciNotifyPref.ts";
+import { talkBody, talkShouldNotify, talkSummary, talkUrgency } from "./talkNotify.ts";
 import { raiseAlarm } from "./alarm.ts";
 import { nudgeReminders } from "./reminderStore.ts";
+import { receiveNotifyPrefs } from "./notifyPrefsStore.ts";
+import { showPaceAlert } from "./paceAlert.ts";
+import { applyMarkRows, syncMarks } from "./marksSync.ts";
 
 const MAX_EVENTS = 2000;
 const FLUSH_MS = 220; // coalesce bursts into ~5 renders/sec
@@ -157,6 +164,11 @@ export function useLive(paused = false): LiveData {
       firstFailAt.current = 0;
       opened.current = true;
       setConn("open");
+      // Name this window, so a browser ask is addressed to it and not broadcast.
+      try { ws.send(JSON.stringify({ type: "hello", clientId: clientId(), browser: true } satisfies WsClientHello)); } catch { /* closing */ }
+      // Marks that moved elsewhere while this socket was down were broadcast to
+      // nobody here; ask for them. A no-op in a window that never started sync.
+      void syncMarks();
     };
     ws.onclose = async () => {
       if (disposed.current || wsRef.current !== ws) return;
@@ -208,6 +220,51 @@ export function useLive(paused = false): LiveData {
         emitControl(frame.data);
         return;
       }
+      if (frame.type === "notify-prefs") {
+        // Saved from this tab (the round trip), another tab, or another
+        // device open on the same server — all three arrive the same way, so
+        // the store adopts whatever the server now says is current rather
+        // than trusting only its own save.
+        receiveNotifyPrefs(frame.data);
+        return;
+      }
+      if (frame.type === "marks") {
+        // Read on another device, or the echo of this one's own POST — applied
+        // the same way, and never sent back.
+        applyMarkRows(frame.data);
+        return;
+      }
+      if (frame.type === "pace-alert") {
+        // Decided once on the server; this only words it in this person's hours.
+        showPaceAlert(frame.data);
+        return;
+      }
+      if (frame.type === "plugin") {
+        // A plugin redrew a panel or wrote notes on a pull request. Only a
+        // pointer; the listener fetches what it needs.
+        emitPlugin(frame.data);
+        return;
+      }
+      if (frame.type === "understudy") {
+        /*
+         * The understudy's scorecard, recomputed. Announced the moment it
+         * lands, not through the 220ms buffer above.
+         *
+         * The buffer exists for one shape of traffic: a busy fleet emitting
+         * dozens of `event` frames a second, where coalescing turns dozens of
+         * renders into five. This frame is the opposite shape — one object, a
+         * recompute apart, and thirteen rows wide. Buffering it would add up to
+         * 220ms of latency to something that never bursts, and it could not
+         * ride that buffer anyway: `pending` is an array of WatchEvent, keyed by
+         * `id` for dedupe, and a scorecard is neither.
+         *
+         * Read-only, like the git nudge above it and unlike `control`: it says
+         * what a stand-in WOULD have done and commands nothing, which is why it
+         * is allowed to ride the same socket every browser tab holds open.
+         */
+        emitUnderstudy(frame.data);
+        return;
+      }
       if (frame.type === "alert" && frame.data?.kind === "reminder" && frame.data.id) {
         /* An alarm the user set. It does NOT go through fireDesktopAlert's list:
            a reminder that arrives as another grey row has failed at the only job
@@ -219,12 +276,45 @@ export function useLive(paused = false): LiveData {
         void nudgeReminders();
         return;
       }
+      if (frame.type === "alert" && frame.data?.kind === "understudy") {
+        /*
+         * THE CLONE IS STOPPED AND NEEDS A PERSON.
+         *
+         * Same treatment as an alarm, for the same reason: a machine that has
+         * stopped and will stay stopped until somebody looks has failed at the
+         * only job it had if its report arrives as another grey row. It takes
+         * the screen AND goes out as an OS notification at critical urgency, so
+         * it survives the window being behind something else — or closed.
+         *
+         * "It should warn me somehow… but not the usual notifications."
+         */
+        raiseAlarm({
+          id: `deputy-${Date.now()}`,
+          kind: "deputy",
+          title: frame.data.title.replace(/^🙋\s*/, ""),
+          when: frame.data.body,
+          at: Date.now(),
+        });
+        fireDesktopAlert(frame.data);
+        return;
+      }
       if (frame.type === "alert") {
         // agentglass's own push alert (gate hold, permission wait, tool error),
         // opted into on the server. Raise it as a native OS notification — the
-        // cross-platform replacement for notify-send. The notch already has the
-        // in-app copy through its own paths (gateStore et al.), so this does not
-        // also recordNote, which would double it there.
+        // cross-platform replacement for notify-send.
+        //
+        // A gate hold is the one case where the notch already HAS the in-app
+        // copy, through gateStore's own poll — announce() there recordNotes it
+        // under `gate:<id>` the moment it arrives. fireDesktopAlert would
+        // recordNote a second, unkeyed row for the same hold: measured, two
+        // rows for one Approve, neither one ever clearing on its own (urgency
+        // 2 never folds). So only the transient popup runs here; the durable
+        // row is gateStore's alone — but gateStore's poll is PAUSED while
+        // `document.hidden`, so a hold that starts and resolves entirely while
+        // the tab is hidden (timeout, fail-open deny, another device) would
+        // otherwise leave no bell record at all. Force the one read the poll
+        // would have done, hidden or not, so the row exists either way.
+        if (frame.data.source === "gate") { firePopupOnly(frame.data); void pollGatesNow(); return; }
         fireDesktopAlert(frame.data);
         return;
       }
@@ -256,6 +346,30 @@ export function useLive(paused = false): LiveData {
         });
         return;
       }
+      if (frame.type === "talk") {
+        /*
+         * A person said something on a pull request you have a stake in.
+         *
+         * In the bell rather than as an OS pop-up, like the card notes above:
+         * this is news and it has somewhere to go. Except a block — see
+         * talkUrgency — which is the one of these that is an instruction.
+         *
+         * Nothing is filtered here beyond the switch: the server has already
+         * dropped the machines and held the latch, so what arrives is one
+         * message about one pull request, from a person.
+         */
+        const t = frame.data;
+        if (!talkShouldNotify(t)) return;
+        recordNote({
+          app: "agentglass",
+          summary: talkSummary(t),
+          body: talkBody(t),
+          urgency: talkUrgency(t),
+          source: "pr",
+          goto: { kind: "pr", repo: t.repo, number: t.number },
+        });
+        return;
+      }
       if (frame.type === "ci") {
         /*
          * Only the pull requests that are about to merge, unless told
@@ -276,6 +390,7 @@ export function useLive(paused = false): LiveData {
             ? `${v.failing.slice(0, 3).join(", ")}${v.failing.length > 3 ? ` +${v.failing.length - 3} more` : ""}\n${v.title}`
             : v.title,
           urgency: v.verdict === "red" ? 2 : 1,
+          source: "ci",
           // Clickable. The verdict has always known which pull request it is
           // about; the note simply had nowhere to put it, so a list of PR
           // results was a list of dead ends.
@@ -382,7 +497,32 @@ export function useLive(paused = false): LiveData {
       return () => { disposed.current = true; stop(); if (timer.current) clearTimeout(timer.current); };
     }
 
-    connect();
+    /*
+     * The FIRST socket waits for a server; every reconnection after it does not.
+     *
+     * The sidecar is not listening at t=0 — measured at 559ms — and Chromium
+     * logs a refused socket whether or not the backoff picks it up again, the
+     * same reason the fetch layer stopped asking early.
+     *
+     * WHY THE WAIT IS HERE AND NOT INSIDE `connect`. Making `connect` async put
+     * an await between "decide to connect" and `wsRef.current = ws`, and three
+     * things reconnect on their own during that gap: the visibility handler and
+     * the online handler both read `!ws || CLOSED` — true while the ref is null
+     * — and the server-changed handler nulls the ref itself. Two sockets.
+     * `onclose` would survive that, because it checks `wsRef.current !== ws`;
+     * `onmessage` does not check anything, so BOTH sockets deliver and every
+     * frame is handled twice. That is a browser command from an agent run
+     * twice and a phone's toggle applied and immediately undone — not console
+     * noise. Keeping `connect` synchronous keeps the assignment in the same
+     * tick as the decision, and the race cannot exist.
+     *
+     * `then(first, first)`: a latch that rejected must still open the socket
+     * and fall into the normal backoff, rather than leave the app alive and
+     * silent. `!wsRef.current` covers a tab that woke during the wait and
+     * connected already.
+     */
+    const first = () => { if (!disposed.current && !wsRef.current) connect(); };
+    void whenServerUp().then(first, first);
     // Catch up the moment the tab becomes visible again — and, if the stream
     // died or gave up while we were away, reconnect right now instead of waiting
     // out a backoff. An auth wall is left alone: the token is still wrong until

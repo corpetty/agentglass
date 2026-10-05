@@ -19,8 +19,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
+import { TMUX_ISOLATED, startSession } from "./tmuxIsolated.ts";
 import { freePort } from "./freePort.ts";
+import { SERVER_BOOT_MS } from "./serverBoot.ts";
 
 let dir: string, base: string, socket: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -67,6 +68,9 @@ beforeAll(async () => {
        */
       TMUX_TMPDIR: dir,
       XDG_CONFIG_HOME: dir,
+      // State (audit log, ledgers, engine conf) jailed too: without this a booted
+      // server writes into the developer's real ~/.local/state/agentglass.
+      AGENTGLASS_STATE_DIR: `${dir}/state`,
       AGENTGLASS_ROOT: dir,
       AGENTGLASS_DB: join(dir, "f.db"),
       AGENTGLASS_SCAN_DISABLED: "1",
@@ -82,7 +86,7 @@ beforeAll(async () => {
     await Bun.sleep(100);
   }
   throw new Error("the server did not come up: " + (await new Response(proc.stderr as ReadableStream).text()).slice(0, 400));
-});
+}, SERVER_BOOT_MS);
 
 afterAll(() => {
   try { proc?.kill(); } catch { /* already gone */ }
@@ -186,9 +190,13 @@ describe("with a pane genuinely running", () => {
   const tmuxOk = Bun.spawnSync(["tmux", "-V"]).exitCode === 0;
   const tmux = (...args: string[]) =>
     Bun.spawnSync(["tmux", ...TMUX_ISOLATED, "-L", socket, ...args], { env: { ...process.env, TMUX_TMPDIR: dir } });
+  // Each test below kills the only session, which takes the server with it, and
+  // the next one starts it again at once — see `startSession`.
+  const sleeper = () =>
+    startSession(["tmux", ...TMUX_ISOLATED, "-L", socket, "new-session", "-d", "-s", A, "sleep", "300"], { ...process.env, TMUX_TMPDIR: dir });
 
   test.skipIf(!tmuxOk)("a pane no open chat points at is named an orphan", async () => {
-    tmux("new-session", "-d", "-s", A, "sleep", "300");
+    sleeper();
     try {
       // Nothing open: the state after a crash, where the panes are still there
       // and nothing in the app knows about any of them.
@@ -207,7 +215,7 @@ describe("with a pane genuinely running", () => {
   });
 
   test.skipIf(!tmuxOk)("and a pin shows up in the listing", async () => {
-    tmux("new-session", "-d", "-s", A, "sleep", "300");
+    sleeper();
     try {
       await post("/chat/pane/pin", { session: A, pinned: true });
       const j = await jsonOf(await fetch(base + "/chat/panes?open="));
@@ -221,7 +229,7 @@ describe("with a pane genuinely running", () => {
   });
 
   test.skipIf(!tmuxOk)("ending one actually ends it", async () => {
-    tmux("new-session", "-d", "-s", A, "sleep", "300");
+    sleeper();
     expect((await jsonOf(await post("/chat/pane/close", { session: A }))).killed).toBe(true);
     const j = await jsonOf(await fetch(base + "/chat/panes?open="));
     expect(j.panes.find((p: Json) => p.name === A)).toBeUndefined();

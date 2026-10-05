@@ -40,13 +40,23 @@ complement, rather than replace, the private reporting path below.
   `Host` that is not localhost or private (`AGENTGLASS_ALLOWED_HOSTS` allows a
   reverse-proxy name explicitly).
 - **Token.** `AGENTGLASS_TOKEN` is required on every route except `/health`, the
-  pairing handshake, and the telemetry intake sinks (`/ingest`, the OTLP
-  receivers) **when the request arrives on loopback**. Local hooks and OTel
-  exporters have no way to carry a secret, so the exemption exists for them; it
+  pairing handshake, and the local senders' own routes — the telemetry intake
+  sinks (`/ingest`, the OTLP receivers) and `/agents/status`, a hooked session
+  saying what it is working on — **when the request arrives on loopback**.
+  Local hooks and OTel exporters have no way to carry a secret, so the exemption exists for them; it
   is a property of where the request came from and not of the path alone,
   because those sinks write permanent rows and the alert they raise leaves the
-  machine. From anywhere else — including through a reverse proxy — they need
-  the token like everything else. `/health` stays open to anyone: it stores
+  machine, from a process of the same user (checked via `/proc` on Linux —
+  elsewhere loopback alone decides, the same as before). Same-user processes
+  can already read the 0600 token file, so the exemption serves only the
+  server's own uid; another account, or a host-networked container under a
+  different uid, dialing loopback needs the token — where one is configured
+  at all: a tokenless server (no `AGENTGLASS_TOKEN`, loopback-only bind) has
+  nothing for this check to gate and stays open to any uid, same as before —
+  it now warns loudly at startup that this is the case, but does not
+  refuse to run. From anywhere else —
+  including through a reverse proxy — they need the token like everything
+  else. `/health` stays open to anyone: it stores
   nothing, and the pairing screen probes it before it has a credential to carry.
   Binding off loopback — **or setting `AGENTGLASS_TRUST_LAN=1` at all** — makes a
   token mandatory; if none is set the server mints, persists (`0600`) and prints
@@ -56,7 +66,11 @@ complement, rather than replace, the private reporting path below.
   tailnet the loopback exemption above. Forwarding headers are never the
   decision on their own: `X-Forwarded-For` is consulted only when the socket peer
   is loopback *and* the uid owning that socket is tailscaled's, and a proxied
-  request is treated as remote unconditionally.
+  request is treated as remote unconditionally. The socket owner is checked for
+  every loopback connection, header or not, so a raw TCP forward
+  (`tailscale serve --tcp`) that adds no header is remote too. Not covered: a
+  forwarder running as your own user (`socat`, `ssh -R`, `ngrok tcp`), which is
+  indistinguishable from your own processes, and systems without `/proc`.
 - **Intake is rate-limited** rather than authenticated: `AGENTGLASS_RATE_MAX`
   requests per source-address+route inside `AGENTGLASS_RATE_WINDOW_MS`.
 - **Hooks refuse to send anywhere but this machine.** The hook and seed scripts
@@ -70,6 +84,13 @@ complement, rather than replace, the private reporting path below.
 - **Desktop-only routes.** The self-update route executes arbitrary code and is
   reachable from the packaged shell's own origin and nothing else — not from a
   browser, not from another machine.
+  It builds only an annotated release tag, pinned to the commit the tag names,
+  installs from the lockfile, and writes its log under the user's cache
+  rather than `/tmp`. The tag's signature MUST verify against one pinned SSH
+  key (`electron/release-allowed-signers`, committed) — checked against that
+  file alone, never the local machine's own gpg/ssh trust store, so a stray
+  key already configured there cannot pass. An unsigned tag, or one signed by
+  any other key, is refused before anything is built.
 - **The token is never served over any route, to anyone.** `/remote/status`
   reports where the server is reachable and whether a device has arrived, and
   the addresses it returns are addresses — nothing in that answer, or in any
@@ -88,9 +109,58 @@ complement, rather than replace, the private reporting path below.
   password dialog is what authorises it. The path is validated first, precisely
   so a crafted root cannot point a privileged `chown -R` somewhere else.
 - **The control plane is fail-open by default.** A `PreToolUse` gate that times
-  out (`AGENTGLASS_GATE_TIMEOUT`, 60s) falls through rather than blocking your
+  out (`AGENTGLASS_GATE_TIMEOUT`, 300s) falls through rather than blocking your
   agents. Set `AGENTGLASS_GATE_FAILCLOSED=1` if you would rather a timeout or an
   unreachable control plane denied the call.
+- **Who receives a browser ask is the app's to say.** Registering a window that
+  can drive the built-in browser (`/browser/ready`), or the app window that makes
+  lane hosts, decides who is sent every ask, fill text and URLs included, so it
+  is held to the same key as releasing a hold. The same ceiling applies. Where
+  the app **adopts** a server that is already running (a sidecar left from an
+  earlier launch, one started by hand), no pipe from this launch handed that
+  server a key, so the app claims its desk: it proves the server holds the token, names a fresh key
+  on `/desk/claim` and keeps that request open, and while it does the key is
+  what both gates ask for. Only the machine token itself may claim, with no
+  `Origin`, from a direct loopback socket — callers that could forge the app's
+  `Origin` anyway — so a claim made by something other than the app gains it
+  nothing it could not already reach by forging that `Origin`. The limit is first
+  come, first served: a token holder that claims before the app does, or in the
+  moment after the app's claim drops, holds the desk until it lets go, and the
+  app's own window is refused the browser role and a hold's release there (a
+  paired phone still answers). The app does not start a second server on the
+  same database to get around it; it says so in its log and in a banner in the
+  window, which claims again on Retry once the other process has let go, or
+  that server is restarted. A sidecar that outlived an earlier launch was piped
+  that launch's key and refuses a claim the same way. With no app attached, a server started by hand is on the
+  `Origin` rule. An agent's lane is likewise only as private as
+  `as` is honest: an identity is a claim, not a credential.
+- **The desktop app adopts only a server that proves it holds the token.** A
+  server already on its port must answer a fresh random challenge on `/health`
+  with an HMAC made with the token and bound to that port; until it does, the
+  app sends it nothing secret, and a server that cannot prove it (another
+  account's process, a container on the host network, a build from before the
+  check, a server started by hand without a token) is left alone while the app
+  starts its own on the next free port. If the app's own server then fails to
+  come up — something won the bind first, or every candidate port is taken —
+  the windows drop the token before they make a request. A development shell
+  (`make desktop-dev`) still adopts the tokenless `make dev` server on the
+  marker alone.
+  The proof is a point in time: if the proven server exits and another
+  process on this machine binds the same port before the app notices, the
+  app's next request — the desk claim included — carries the token to it.
+  Winning that race needs a local process watching the port.
+- **A held call is not released by the process being held.** Answering one
+  (`/gate/decide`) needs a paired device with the `answer` grant, or — where the
+  desktop app started the server — the app's own key, which it mints at launch
+  and hands only to its sidecar, down a pipe, and to its own renderer. There an
+  `Origin` opens nothing, and the same holds on a server the app adopted while
+  the app holds its claim (above). On a server started by hand, where no desk
+  holds a key, an `Origin` this server already trusts still does: a browser attaches one
+  to every POST it makes. The machine token on its own is not an answer, because
+  the agent whose call is held holds that token too. *Raising* a hold
+  (`POST /gate`) is untouched: that one is the hook asking to be stopped. What
+  this is and is not worth is in
+  [What the gate does not protect against](#what-the-gate-does-not-protect-against).
 
 ## Pairing a device
 
@@ -111,7 +181,10 @@ The handshake, in `server/src/pairing.ts`:
    code is shown on the screen and nowhere else. Both last two minutes.
 2. **The phone proves it can see that screen.** It scans the QR, generates a
    P-256 keypair that never leaves the browser, and types the code. Five wrong
-   guesses closes the invitation outright rather than refusing one attempt.
+   guesses from one address shuts that address out, even for the right code; ten
+   from all addresses together closes the invitation outright. Knowing the
+   invitation's id, which is in the QR, is not enough to close it from one
+   address; a guesser with several addresses can still spend the shared ten.
 3. **A person at the machine agrees.** The request appears in the Remote pane
    naming the device, the address it came from and the same six digits, and
    waits. Nothing is minted until somebody accepts, and accepting is where the
@@ -128,11 +201,14 @@ What this gives you, and what it does not:
 - **The credential never travels in the clear.** The server speaks plain HTTP
   over the LAN, so anything on that network sees the whole exchange — ticket,
   code, both public keys — and still has no key.
-- **It does not defend against an active on-path attacker.** Someone who can
-  rewrite traffic can substitute their own public key, and no handshake fixes
-  that without an authenticated channel. That is a TLS problem. On a network you
-  do not own, use the Tailscale address, which is encrypted end to end; the pane
-  says so where the choice is made.
+- **It does not defend against an active on-path attacker today.** The phone's
+  public key is not bound to the six-digit code shown only at the machine, so
+  someone who can rewrite traffic can substitute their own key and the pairing
+  completes anyway — that code is an out-of-band channel the handshake does
+  not use yet; comparing a fingerprint of the key against it at accept time
+  would detect the substitution. Until then, on a network you do not own, use
+  the Tailscale address, which is encrypted end to end; the pane says so where
+  the choice is made.
 - **Credentials are stored hashed** (`~/.config/agentglass/devices.json`, `0600`)
   and compared in constant time. A readable file is not a working key.
 
@@ -141,8 +217,8 @@ request is accepted and defaulting to `answer`:
 
 | Level | What it can do |
 |---|---|
-| `read` | Every GET, plus the POSTs that only read. Approves nothing, sends nothing. |
-| `answer` | The above, plus `/gate/decide` and replying to a session that is already running. |
+| `read` | Every GET but the desk's private ones (the terminal, browsing history, plugin settings, desktop notifications), plus the POSTs that only read. Approves nothing, sends nothing. |
+| `answer` | The above, plus `/gate/decide` and replying to a session that is running now — an open chat pane, not any session id it can read. It cannot allow a tool call in a session it sent the turn to: another device or the desk has to. |
 | `full` | Everything the machine can do: the terminal, git write, Docker, merging pull requests. |
 
 Enforcement is **deny by default**: anything that changes state and is not named
@@ -152,18 +228,185 @@ explicitly `full` despite arriving as a `GET` — a browser cannot put a header 
 a WebSocket upgrade, and a rule that trusted the method would hand a read-only
 device an interactive shell.
 
+Below `full`, two reads are narrowed further. The pull-request image proxy
+lends your GitHub token only to an image URL that a pull request this server
+has fetched actually carries; any other URL is fetched anonymously. And the
+Docker reads that start a process per request are capped at four in flight per
+credential.
+
 **Revoking one device** (Settings › Remote › Paired devices › Forget) revokes
 that credential and closes the sockets it is holding, and leaves every other
 device — and the desk — alone. Rotating the machine's token is still there for
 the case where you have lost the code itself, and still kicks everything.
+
+## What the gate does not protect against
+
+The `PreToolUse` gate stops an agent before a tool call and holds it until
+somebody answers. That is a brake on a workflow: the destructive command gets
+looked at before it runs, a phone gets somewhere to answer it from, and every
+decision leaves a line in the activity log. It is **not** a boundary against
+code running as you on this machine, and that is a limit worth stating here
+rather than waiting for somebody else to state it.
+
+Not because the routes are open — they are authenticated like the rest.
+`/gate/decide` is in the scope list, so a paired phone needs `answer` or `full`
+to reach it, and a caller from off this machine carrying no token is refused
+before any route sees it. Three narrower things are true, and all three end in
+the same place.
+
+- **The read routes carry no cross-origin check.** `/gate/decide` is behind
+  `trustedCaller`, which turns away a browser that is neither same-origin nor
+  private, and behind the release rule below on top of that. `/gate/status`,
+  `/gate/pending` and `/gate/history` sit behind the surface-wide origin gate
+  only, and that one waves an Origin-less caller through on purpose, because
+  the hooks and the OTLP exporters cannot send one. Reading the queue is not
+  answering it — but the queue holds the command an agent is about to run.
+- **A server started by hand has no token to check.** `resolveToken` returns
+  `{token: null}` when it is loopback-only and `AGENTGLASS_TOKEN` is unset
+  (`server/src/auth.ts`), so the shared-secret gate is skipped rather than
+  passed, and nothing downstream ever learns *who* is asking. Every rule graded
+  by that — the `answer` grant, the deny-by-default table, and the device half
+  of the release rule below — is not loosened on such a box, it is simply never
+  consulted, and what is left of the release rule there is the `Origin` header
+  alone. Remote callers are still refused outright; local ones were never being
+  asked for anything.
+
+  This is **not** how the desktop app runs. It mints a secret on first launch
+  and hands it to its own sidecar (`electron/main.js`), so the app is
+  authenticated on loopback too — which is what `docs/CONFIG.md` describes. The
+  tokenless case is `bun run dev`, a hand-started server, and anything else that
+  launches the sidecar itself. If that is you, set `AGENTGLASS_TOKEN`.
+- **The token does not separate you from your own agents.** When one is set it
+  is at `~/.config/agentglass/token`, `0600`, and the shipped hook reads it from
+  exactly there — which is something anything running under your account can do.
+  An agent that has swallowed a hostile instruction out of a README it cloned is
+  running under your account. `0600` stops another user on the box; it does not
+  stop a process that is already you. Answering a held call is the one thing
+  that credential no longer opens on its own, which is the rest of this section.
+
+### The one on that list that was a bug
+
+Everything above is a limit of what a tool pointed at your own machine can
+promise. One consequence of the last of them was not a limit but a defect, and
+it is worth writing down rather than quietly fixing.
+
+Until this change, the credential the shipped hook reads in order to **submit** a
+gate also opened the route that **answers** one. `/gate/decide` was behind the
+origin check the rest of the write surface uses, and that check waves an
+Origin-less caller through on loopback on purpose — because that is exactly what
+a hook is. An agent's own shell has the same shape. So the agent whose tool call
+was being held could release it with one `curl` carrying a token it already had,
+and two things followed. The decision was recorded as `local`, byte for byte
+what a person pressing Approve in the desktop app writes, so the activity log
+could not tell the two apart afterwards. And the stopped model was handed the
+sentence written for a human answer — *"A human reviewed this call in agentglass
+and approved it"* — so a call nobody had looked at came back to the agent as one
+somebody had. The case that matters here is not the agent that sets out to work
+around a hold. It is the helpful one, taking "approve the gate" as the next step
+of the task it was given; and the one told to by a pull-request description,
+which this app renders from whatever repository you happen to be triaging.
+
+So `/gate/decide` now asks for something the held party has no way to produce: a
+paired device with the `answer` grant, or one of the origins this server already
+trusts — a foreign website is turned away by that check as it always was. `curl`,
+`urllib` and the other libraries an agent reaches for send no such header, and
+the machine token on its own is no longer an answer — so the sentence the
+stopped model is handed, that a human reviewed this call, now costs one of those
+two things. Raising a hold is unchanged: `POST /gate` is the hook asking to be
+stopped, which was the half that worked.
+
+That much made self-release deliberate rather than incidental, and no more: a
+header is a string, and a local process that set `Origin: agentglass://app` on
+purpose, with the token it already had, released its own call. Closing that
+takes a credential the agent cannot read, one the desk holds and the token file
+does not, and where the desktop app runs the server that is what now stands in
+for the `Origin`. The app mints a key for each sidecar it starts and keeps it in
+memory. It hands it to that sidecar down a pipe on a descriptor of its own — not
+the environment and not the command line, which any process of this user reads
+in `/proc` — and to its own window through the preload, and to nothing the agent
+browser opens, nor to a server the app adopted instead of starting. The server
+reads it before anything it starts could inherit the pipe, and from then on a
+release carries that key or a paired device's credential, and an `Origin` counts
+for nothing (`server/src/desk.ts`). Accepting a pairing asks for the same,
+because a device accepted is a device that releases holds. That closes the
+`Origin` forgery. The other way in was the device store, and the server now
+holds that in memory (below).
+
+What is left, at no more than its real value:
+
+- **A server started by hand has no desk.** No key exists there, and the client
+  a person uses there without pairing first is a browser, which cannot hold a
+  secret an agent on the same machine could not also read. So the `Origin` rule
+  stands on such a server, with its limit: the obvious `curl` is refused and a
+  deliberate forgery passes. That is `bun run dev`, a sidecar you launch
+  yourself, and a desktop window that adopted a server it did not start — and,
+  for now, the desktop app on Windows, which does not hand its sidecar the pipe.
+- **Memory is not a wall against yourself either.** A process that can read
+  another's memory reads the key: `kernel.yama.ptrace_scope=0`, root, a core
+  dump the system keeps where you can read it (systemd-coredump does), or the
+  renderer's debugging port when you set `AGENTGLASS_DEBUG_PORT`. So does a
+  script running in the app's own window, as it reads the token. A key is only
+  good for the sidecar it was minted for, so one read out of a crashed sidecar
+  opens nothing the next one holds.
+- **The device store is read once.** `devices.json` is `0600` on this same
+  machine, which is the same *already you* the bullet above ends on. The server
+  used to read it on every request, so a process that wrote a device of its own
+  into it held a credential that answered gates. Now the server loads it when it
+  starts and changes it only through pairing: a row written behind its back is
+  not a device, the change is said on stderr and as an urgent notification at
+  the desk, and the next pairing write puts the server's own set back. A row
+  planted and then followed by a restart is loaded — the file is the store.
+- **Out of scope: a process that is you and sets out to.** One that can edit
+  the store and restart the server, or replace the app's files or the server's
+  binary, can make it trust anything. Nothing a server running as you checks
+  holds against code running as you with that intent; what these rules remove
+  is the accident, the helpful agent and the one an injected instruction sends.
+
+The record can only say what the caller proved, and it is worth reading it that
+way. A paired device signs its own line with the name that was accepted when it
+was paired — and accepting is now itself behind the same rule, because it was
+the sharper hole. A machine token alone could ask for a ticket, accept its own
+ticket, and mint a device with any label; releasing a hold through that device
+then needed no header at all, and the line read as a phone somebody had once
+approved. An audit log that invents a named human is worse than one that only
+fails to say which process it was, so `/pair/accept` asks for the same proof
+`/gate/decide` does. What that does not reach, and nothing here can, is a row
+appended to `devices.json` directly — same file, same 0600, same *already you*. Everything else is `local`, and
+`local` means *this machine*: the desk, the dashboard it serves, and anything
+here that got past the rule above by looking like one of them. Nothing about a
+person pressing Approve moved — the same actor, the same words to the agent, on
+the same routes — which is the regression that would have made this change worse
+than the bug it fixed. But the log is not a second line of defence: it records
+what was presented, which is the limit above seen from the other end.
+
+So the honest scope: the gate is a **human-workflow brake, not a security
+boundary against a process running as you**. It earns its place because the
+thing on the other side of it is a model that would otherwise run the command
+the moment it thought of it, and the pause is where a person gets to say no. The
+change above makes that sentence more true rather than obsolete: a brake the
+braked thing cannot release by accident is what a brake is, and something
+deliberately working around this one still runs as you, reads the same files,
+talks to the same port and can set the same header. Where a capability must not
+be exercised at all, turn it off — the knobs below hold in a way the gate does
+not.
 
 ## What agentglass stores, and how to get rid of it
 
 Everything below is on your machine and nowhere else. There is no account, no
 sync, and no upload — the hooks refuse to post anywhere but this host (see
 `AGENTGLASS_ALLOW_REMOTE` above). But it is worth saying plainly what lands on
-disk, because **nothing in the app deletes it**: there is no route, no button
-and no menu item that removes recorded data.
+disk, because **nothing in the app deletes it** on its own: there is no route,
+no button and no menu item that removes recorded history, and the only sweep is
+the retention window below. Four routes remove a row *you* asked the app to
+hold for you, and nothing else: `POST /understudy/work/unask` takes one task
+back out of the Clone's queue; `POST /agents/status` with `done: true` drops a
+session's own "what it is working on" line, and only when the same session that
+wrote it asks; `POST /agents/forget` drops such a line by name whoever wrote it
+— the Lantern's clear button, authenticated like every other route (so, on a
+loopback-only install with no token, open to local callers like the rest), for
+a session that ended without saying so; and `POST /bench/note` with empty text
+deletes that checkout's bench note, a file of its own under the data directory.
+None of the four touches an event, a session or a decision.
 
 One route is named as if it did: `/browser/places/forget` throws away the
 browsing history you imported from your own browser. That history is kept in
@@ -181,7 +424,7 @@ sessions.
 
 | Where | What is in it |
 |---|---|
-| `~/.local/share/agentglass/agentglass.db`<br><sub>or `$XDG_DATA_HOME/agentglass/`, or `./agentglass.db` if one is already there</sub> | Every event, with its `summary`, its `error_text` and the **raw hook payload** — which for a tool call is the command line, the file path, and the prompt. Plus session totals, the full-text search index, gate decisions, the daily rollup, and the **activity log** — every write the dashboard performed, with the address it came from. |
+| `~/.local/share/agentglass/agentglass.db`<br><sub>or `$XDG_DATA_HOME/agentglass/`; `$AGENTGLASS_STATE_DIR/agentglass.db` or `$AGENTGLASS_DB` when set. An `agentglass.db` in the working directory is never opened: it is copied here once if this one does not exist yet, and the original is left where it was — delete it yourself once the copy is checked</sub> | Every event, with its `summary`, its `error_text` and the **raw hook payload** — which for a tool call is the command line, the file path, and the prompt. Plus session totals, the full-text search index, gate decisions, the daily rollup, and the **activity log** — every write the dashboard performed, with the address it came from. |
 | `~/.config/agentglass/token` | The shared secret, `0600`, when one has been minted. |
 | `~/.config/agentglass/devices.json` | One row per paired device, `0600`: its name, its level, when it was added and last used, and a **SHA-256 of its credential** — never the credential. Revoked rows are kept rather than deleted, so "did I definitely cut that phone off" stays answerable. |
 | `~/.config/agentglass/config.json` | The active project scope and the UI switches. |
@@ -220,10 +463,37 @@ unwelcome, the panel is still correct without it — a person with no photo is
 drawn as their initials on their own colour, which is what happens today for
 anyone who never uploaded one.
 
-**One feature does send data off this machine, and it is the only one.** The AI
-**Explain** walkthrough hands your changed lines to a model — the local `claude`
-CLI, or the Anthropic API if you have set a key — so it can describe them. That
-is what the button is for, and it runs only when you press it.
+**One feature sends your code off this machine.** The AI **Explain**
+walkthrough hands your changed lines to a model — the local `claude` CLI, or the
+Anthropic API if you have set a key — so it can describe them. That is what the
+button is for, and it runs only when you press it. It has a switch of its own,
+`AGENTGLASS_WALKTHROUGH_DISABLED=1`, and where it sends is checked before either
+transport is chosen: a custom `ANTHROPIC_BASE_URL` is refused unless
+`AGENTGLASS_ALLOW_REMOTE=1` says otherwise, on the local CLI path as much as the
+API one. Three more paths exist and all three are off until you turn them on:
+`AGENTGLASS_WEBHOOK` (what travels through it is listed under
+[What leaves through the webhook](#what-leaves-through-the-webhook)); the
+Clone's judge, which hands `claude -p` the material it is comparing — through
+the same local CLI, only after the private-terms gate, and only with the `judge`
+setting on; and `AGENTGLASS_PRICING_REFRESH=1`, described next.
+
+### One request that carries nothing: the price catalogue
+
+With `AGENTGLASS_PRICING_REFRESH=1`, the server reads LiteLLM's published price
+table from `raw.githubusercontent.com` once at boot and once a day. It is a
+**GET of a public file** — no credential, no query string, no body, and nothing
+about you, your models or your spend goes with it. What comes back is validated
+before it can replace anything: over five megabytes is refused, a redirect is
+refused rather than followed, a catalogue with fewer than a hundred usable
+models is rejected whole, and the bundled table stays in place if any of that
+fails. Where it may go is checked by the same `outboundDestination()` that
+guards the webhook and `ANTHROPIC_BASE_URL`, with GitHub's raw host trusted for
+this one read the way the webhook trusts Slack's and Discord's.
+
+The observable fact is that the machine makes a request at all, which on a
+network you would rather stayed quiet is worth knowing: it is off by default,
+and off means no request. `AGENTGLASS_PRICING` — your own price file — disables
+the refresh outright and stays authoritative.
 
 What it will not send: files whose contents are a credential by design (`.env*`,
 `*.pem`, `*.key`, `id_rsa`, `credentials.json`, `.npmrc`, and their neighbours)
@@ -256,6 +526,26 @@ Two things about retention are easy to get wrong:
   (`local` for this machine, otherwise the IP — there are no accounts here, so
   a name would be invented). One row per thing a person pressed, which is tens
   a day rather than the thousands an hour the events table takes.
+- **The Clone's and the Lantern's tables have windows of their own**, and
+  `AGENTGLASS_RETENTION_DAYS` does not move them. They are swept hourly with the
+  events, on fixed clocks: what the Clone read to make a call
+  (`understudy_snapshots`) goes at **30 days**; the bare fact that it wrote
+  something (`understudy_ledger` stubs), a proposal once it has been answered
+  (`understudy_proposals`), a queued task once it has been taken or worked
+  (`understudy_asked`), a named agent once its window has ended
+  (`named_agent`), what a session was to the app (`session_role`), a scheduled
+  start once it has fired or been cancelled (`agent_schedule`) and a question
+  once it has been answered (`understudy_help`) all go at **90 days**. What
+  never expires is the part that is still owed to a person or still the score:
+  a *pending* proposal, a *queued* task, a *waiting* schedule, an *open*
+  question, and the ledger's `decision` and `fence` rows. Three more tables —
+  shifts that are not running (`understudy_shifts`), acts that have been undone
+  (`understudy_acts`) and runs that are not running (`understudy_work`) — go at
+  90 days too, except that **`AGENTGLASS_RETENTION_DAYS=0` keeps them for
+  ever**: they are the record of what ran unattended, and turning event pruning
+  off is read as wanting that record kept. A shift, an act not yet undone, or a
+  run still marked running is never swept, because "started, never finished" is
+  the only trace of an agent killed mid-task.
 
 To get rid of any of it, delete the files. Stop the server first — SQLite is
 open while it runs:
@@ -279,7 +569,13 @@ to the machine you opened it on, is the tool working.** In particular:
   the capability, and each one has a switch in the table below.
 - The gate is **fail-open by default and by design**. An agent proceeding
   because nobody answered in time, or because agentglass was not running, is
-  documented behaviour; `AGENTGLASS_GATE_FAILCLOSED=1` inverts it.
+  documented behaviour; `AGENTGLASS_GATE_FAILCLOSED=1` inverts it. Nor is it a
+  boundary against a process running as you — see
+  [What the gate does not protect against](#what-the-gate-does-not-protect-against),
+  which says so before a report has to. A local process that sets an `Origin`
+  header in order to release its own hold on a server started by hand, where no
+  desk holds a key, is that same case, and that section says so in as many
+  words rather than leaving it to be discovered.
 - Recorded data staying recorded (above) is a retention decision, not a leak.
 - Findings that require an attacker to already have a shell on the machine, or
   to already hold the token, are not separate issues — at that point they have
@@ -328,6 +624,345 @@ Values are offered, never typed: a status can only be one the list itself
 accepts, so an invalid one cannot be sent. And there are no bulk actions here on
 purpose — one wrong batch is thirty notifications to other people.
 
+## Reading outside the open project
+
+Everything under `/files/` is bounded by the open project: a cockpit pointed at
+one repository refuses a path that is not in it, so scoping narrows what you can
+*touch* and not only what you can *see*.
+
+The finder's **Machine** tab is the one deliberate exception, because "where is
+that document" is asked about files that are in no checkout — a ticket's
+evidence folder, a note in `~/Documents`. It is bounded separately, in
+`server/src/disk.ts`, and the bounds are narrow:
+
+- **your home directory and nothing above it.** Another root can be added with
+  `AGENTGLASS_DISK_ROOTS` (`:`-separated), which is an operator's decision.
+- **nothing hidden.** A dotted path component is refused, for searching and for
+  reading — `~/.ssh`, `~/.aws`, `~/.config/<app>` and every credentials file
+  that lives in one. The rule is the dot rather than a list of names.
+- **symlinks are resolved before the path is judged**, so a shortcut in your
+  home directory cannot point out of it.
+- **`AGENTGLASS_DISK_DISABLED=1` turns it off**, and so does
+  `AGENTGLASS_FS_BROWSE_DISABLED=1` — disabling the file browser must not leave
+  a second door standing.
+
+Three details of the same boundary, because each was once wrong:
+
+- **`/preview/raw` and `/preview/open` judge the real path.** Symlinks are
+  resolved *before* the scope check, and what is then read or handed to the
+  desktop opener is that resolved path — never the spelling that passed. Both
+  are refused outright under `AGENTGLASS_FS_BROWSE_DISABLED=1`.
+- **`/disk/find` and `/disk/grep` pass the query after `--`**, so a search
+  string that begins with a dash is a search string to `fd`, `rg` and `grep`,
+  not an option that changes where they look.
+- **`/docker/volume/peek` runs `busybox` or `alpine` and nothing else.** Looking
+  inside a volume means mounting it into a throwaway container, and the image
+  that container runs is matched against those two names; if neither is already
+  local the peek is refused rather than pulled or substituted.
+
+The boundary is covered by `server/test/disk-scope.test.ts`; a regression there
+is a hole rather than a bug, and it would not show up in a screenshot.
+
+## Plugins
+
+A plugin is a folder with a `plugin.json`, copied to
+`~/.config/agentglass/plugins/<name>/` by `POST /plugins/install` (or
+`/plugins/install-from-catalogue`) and run only after a person has read what it
+declares and pressed enable — nothing in the folder executes at install, and the
+master switch (`/plugins/master`) stops every plugin at once.
+[docs/PLUGINS.md](docs/PLUGINS.md) is the long form; the security facts are these.
+
+A plugin runs as **its own process**, started by this server with four
+variables in its environment (`PATH`, `HOME`, `AGENTGLASS_URL`,
+`AGENTGLASS_READ_TOKEN`) and nothing inherited. **On a host that can build a
+`bwrap` box it runs in one** (its own folder, the app's address and what its
+`sandbox` block lists; no internet by default); elsewhere it runs as you, and
+the scope limits that token, not the process. The token is minted at enable
+time at the scope the manifest asked for — `read`, `answer` or `full`, the same
+three a paired device has — lives only in the server's memory, and is revoked
+when the plugin is disabled or the process exits. What was approved is a
+fingerprint over the scope and a content hash of every file in the folder, so an
+update that changes the manifest, or changes the code behind an unchanged
+manifest, clears the approval and asks again.
+
+**A plugin token is its own kind of caller and can never answer a permission
+gate**, whatever scope it declares or was granted. `POST /gate/decide` asks for
+a credential no process on this machine could have minted for itself; a plugin's
+token sits in a process environment on this machine, readable by any agent
+running as the same user — exactly what the gate holds — so `auth.ts` names the
+kind and refuses it. `answer` for a plugin means replying to a running session,
+not releasing one.
+
+Two path rules and one network rule hold the install itself. A `name` that is
+`.`, `..` or begins with a dot is refused before anything is copied. Every path
+the installer removes or copies to is asserted to sit under the plugins root
+(`insidePluginsRoot`), so a manifest cannot steer a delete elsewhere. A
+catalogue (`GET /plugins/catalogue?url=`) is fetched over `https://` only, through
+the same guarded fetch the server uses for any address it did not choose: each
+hop is checked against private, loopback and link-local ranges before it is
+connected to, redirects are followed one hop at a time with that check repeated,
+five hops at most, and a body over 5 MB or a fetch over 15 seconds is dropped.
+Private addresses are recognised in every spelling of an IPv4 host inside an
+IPv6 address (`::ffff:127.0.0.1` and `::ffff:7f00:1` alike, NAT64 and 6to4
+too), and the connection is made to the address that was checked rather than to
+a second lookup of the name.
+
+## The Clone, unattended
+
+The Clone (the *understudy* in the code and the routes) takes a task from a
+queue, cuts a worktree of its own, seats an agent in it and lets the tests
+decide. It never pushes. Because nobody is watching while it works, what the
+agent inherits is fenced rather than trusted.
+
+**The environment fence** (`server/src/understudy-runenv.ts`) builds the run's
+environment by copying the server's and blanking, by name, `GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `SSH_AUTH_SOCK`, `AGENTGLASS_WEBHOOK` and
+`AGENTGLASS_TOKEN`, then every variable whose name matches `*_TOKEN`, `*_KEY`,
+`*_API_KEY`, `*_SECRET`, `*_PASSWORD`, `*_PASS`, `*_CREDENTIAL(S)`, `AWS_*`,
+`AZURE_*`, `GOOGLE_APPLICATION*`, `OPENAI_*`, `CLICKUP*`, `SLACK_*`, `DISCORD_*`,
+`NPM_TOKEN`, `PYPI*` or `DOCKER_*` (case-insensitive). The one exception is
+`ANTHROPIC_API_KEY`, which is the key the fenced CLI itself spends. `gh` is
+pointed at an empty, run-private config directory, git's credential helper is
+emptied and every `https://`, `git@` and `ssh://` push URL is rewritten to an
+address that does not resolve, so a push cannot succeed even if the agent tries
+one. Into that fenced environment the run receives **one credential of its
+own**: a per-run token (`AGENTGLASS_TOKEN` and `AGENTGLASS_READ_TOKEN` both name
+it) minted for the run and revoked when it ends, graded not by scope but by a
+short positive allowlist — every read, and only the writes the Clone owns; it
+can neither release a gate nor start a session.
+
+**The private-terms gate** keeps the material the Clone learns from
+(`POST /understudy/learn`: notes, transcripts, shell history, rules) and the
+judge's prompt free of names that must not leave a private repository. The list
+is one pattern per line at `~/.config/agentglass/private-terms.txt`;
+`AGENTGLASS_PRIVATE_TERMS` names another file; and when the app's own list is
+absent a git hook's list at `~/.config/git/private-terms.txt` is honoured, since
+a person who keeps one there has already said what is private. Without any list
+the Clone refuses to read at all. The one override is explicit consent — the
+desktop's *"Read anyway — nothing here is private"*, sent as
+`iAcceptNoTermsList: true` from the desktop's own origin and from nowhere else.
+A hit is recorded as an index into the list, never as the term.
+
+**The judge** — `claude -p` asked whether the Clone's call matched the person's
+— is **off by default** (the `judge` setting) and declines to run without a
+private-terms list. When it runs it does so in a room of its own: a fresh
+directory under the app's state directory created `0700`, with its own
+`CLAUDE_CONFIG_DIR` beside it (also `0700`), never under `/tmp`, so the model's
+hooks, settings and working files are the app's rather than whatever the
+person's own `claude` would load.
+
+**Seeding a worktree** from `.worktreeinclude` copies only files git ignores,
+skips anything tracked, never overwrites what git put there, refuses a line that
+climbs out of the repository, and never copies through or as a symlink — every
+path component is `lstat`ed without following, and the `.worktreeinclude` file
+itself must be a regular file.
+
+## The Lantern, and agents with names
+
+**The Lantern** is an observer. `GET /agents/board` reads every hooked session
+on this machine; `GET`/`POST /lantern/settings` holds two switches
+(`lanternWatch`, `lanternWatchMinutes`) that make the server re-read that board
+every N minutes on its own and send one notification when somebody is still
+stopped on you, a named agent's window has vanished, or claimed work has gone
+quiet. A notification goes wherever the app's alerts go: the bell in the app, a
+paired phone on the socket it holds, the desktop otherwise, and
+`AGENTGLASS_WEBHOOK` when one is set (see below). The Lantern's own chat is on
+the board as `role: "lantern"` and is never counted as needing you; a status
+line posted by it is accepted and dropped. It starts nothing and stops nothing.
+
+**`POST /agents/status`** is how a session says what it is working on, and it is
+**tokenless on loopback by design**: the shipped hook carries it and a hook has
+no token to give. It still passes the origin check. Its free-text fields are
+capped at the door — `name`, `worktree`, `branch` and `session` at 512
+characters, `doing` and `left` at 4096 — and trimmed again before storage, so a
+runaway agent cannot fill the database through it. `{name, done: true}` removes
+a line, and only the session that wrote the line may remove it: no `session` is
+a 400, another session's is a 403.
+
+**Named agents** (`GET /agents/named`, `POST /agents/named/{start,prompt,wait,
+read,keys,stop}`) and **schedules** (`GET`/`POST /agents/schedule`,
+`POST /agents/schedule/cancel`) seat a CLI by name in a checkout of the open
+project, now or at a time. Two rules hold whatever the caller passes. The
+skip-permissions mode (`--yolo`) is granted only if Settings allow it
+(`chatBypass`, or `AGENTGLASS_CHAT_BYPASS=1`), and a schedule checks that
+**again when it fires**, not only when it was written. And extra CLI arguments
+are refused when they are permission-shaped: any vendor's bypass flag, anything
+beginning `--dangerously-`, anything containing *bypass*, *skip-permission*,
+*dangerous*, *yolo* or *full-auto*, and `--permission-mode`, `--settings`,
+`--mcp-config`, `--sandbox`/`-s`, `-a`/`--ask-for-approval`, `-y`,
+`--approval-mode`, `--auto`, `--approve-for-me`, `--allowedTools`,
+`--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--add-dir` and
+`--include-directories`, and for Codex alone `-p`/`--profile` (a profile can
+set the approval policy; Claude's `-p` is print mode). A refused one-letter flag counts inside a group or with
+its value glued on (`-cy`, `-anever`). A Codex config override, `-c key=value`
+or `--config key=value` in any of its spellings (one word or two, quoted or
+not, glued), is refused when its key touches the approval policy, the sandbox,
+permissions, a project's trust level, a profile or MCP servers. The refusal is
+a 400 that names the flag; nothing is silently dropped. What an agent is
+allowed to do is decided in Settings, not in the arguments of the request that
+starts it.
+
+A **worker role** (`start --role`) adds a lock: a deny list of publishing,
+history-rewriting and network commands, handed to the CLI in its own rule
+syntax. On OpenCode the lock is merged with the directory's config, so each
+start asks OpenCode for the merged rules and refuses when a project rule wins
+over the lock. The lock is a list of command prefixes, not a sandbox. A project
+**OpenCode plugin** (`.opencode/plugin/`, or one named in the project's
+opencode.json) is arbitrary code that OpenCode runs inside the worker, and the
+lock does not cover it: a plugin can run any command itself without asking the
+permission system. A role on OpenCode is only as locked as the plugins in that
+checkout are trusted.
+
+## The browser, driven by an agent
+
+`bin/agentglass-browser` and `bin/agentglass-browser-mcp` drive the app's own
+built-in browser through the server's relay (`POST /browser/<verb>`), so an
+agent reaches the page the person is looking at — signed in as they are — and
+nothing else: the app's own renderer, and the token in it, are not on the other
+side of that relay. This is why the app is never started with a remote
+debugging port.
+
+That is also why there is no DevTools-protocol endpoint for Puppeteer,
+Playwright or a browser-use-style framework to connect to, and none is planned
+as a default. A raw protocol session is agent-supplied code on every page the
+browser holds, and it goes under everything this section describes — the URL
+policy, the allow-lists, read-only mode, the ownership check between agents,
+the redaction and the audit line per verb all sit above the verb, and a socket
+sits below it. What an agent that speaks the protocol gets instead is
+`browser_cdp`: one command at a time, through the relay, audited, and refused
+under read-only mode. If a drop-in is ever built it will be opt-in, scoped to
+one container, bound to loopback with a token, alive only while the process
+that asked for it is — and a decision made in the open, not a port that
+happens to be on.
+
+Some of those verbs **act**. `browser_eval` runs JavaScript in the page,
+`browser_addInitScript` installs JavaScript that runs before every page does,
+`browser_expose` gives the page a function that calls back into the agent, and
+`browser_cdp` sends raw DevTools Protocol commands to the page's session. All
+four are confined to the guest page, and all four — with clicking, typing, and
+every other verb not in the observe list — are refused under
+`AGENTGLASS_BROWSER_READONLY=1`, which leaves reading, screenshots and the
+network log working.
+
+`upload` attaches a file from this machine to a page, so it is bounded like a
+read of the disk: a path is admitted only if the open project admits it, or (with
+no project open) it is under your home directory and not hidden, or the
+machine-search roots (`AGENTGLASS_DISK_ROOTS`) admit it — and never `~/.ssh`,
+`~/.gnupg`, `~/.aws` or the app's own config directory, checked against the
+spelling and against the resolved path. It honours `AGENTGLASS_DISK_DISABLED=1`
+and `AGENTGLASS_FS_BROWSE_DISABLED=1` as refusals. The MCP server does not
+offer `ignoreCertErrors` at all. Both CLIs refuse to send the token over plain
+`http://` to any host that is not loopback — `https://` anywhere, `http://`
+only to this machine — before a single request is built. Cookies, storage
+state, HAR files and page snapshots the CLI writes land as `0600` files.
+
+Where the browser may be sent is held twice. The relay judges the literal host
+of every `open` before the browser sees it — `http(s)` only, and never
+link-local (169.254/16, where a cloud's metadata endpoint lives) or the
+unspecified address; loopback and LAN addresses are allowed on purpose, since a
+dev server on this machine is ordinary use. A hostname cannot be judged there,
+because the browser resolves it again when it connects and a name may answer
+differently the second time. So the desktop app also runs an **egress guard**:
+a proxy on a loopback port that every browsing session is pointed at, which
+resolves each name once per connection, refuses any answer in those ranges,
+opens the socket to the address it judged, reaches a name that answers a public
+and a private address in one set at the public ones only, and refuses a name
+that has ever answered a public address when it later answers a private or
+loopback one — the DNS rebinding shapes. A public name is remembered for the
+life of the app and never forgotten to make room; when the memory is full (100k
+names) a new public name is refused by name rather than let through unpinned,
+for every tab until a restart. The memory does not survive a restart, while a
+persistent profile's service workers and cache do: a page kept from an earlier
+run meets a guard that has not seen its name yet. A name that has only ever
+answered private (a hosts-file entry, a LAN box) is judged fresh every time and
+stays allowed, so nothing about local development changes.
+`AGENTGLASS_BROWSER_EGRESS=off` turns the guard off; a proxy set through the
+`session` verb replaces it while set, and the verb says so — which is also the
+ceiling: an agent with the `session` verb can replace the guard with a direct
+rule before it opens a name, and the reply says the guard is off rather than
+refusing. The verb is one that acts, so read-only mode refuses it.
+
+The guard is about **names**, not a private-network firewall: it refuses a
+*name* that has ever answered public from later answering private or
+loopback, but a public page's own subresources can still request a loopback
+or LAN address written as a literal — Chromium sends those straight through,
+without the proxy. What the guard closes is the rebinding trick where a name
+changes its answer after being trusted; a page that already knows the address
+it wants does not need the name to lie.
+
+### The cockpit over MCP
+
+`bin/agentglass-cockpit-mcp` answers questions about the cockpit's own data —
+sessions, spend, tool latency, errors, the agent board, pending gates — and
+nothing else. It reaches the app only with GET requests (one request is built
+in the file, and a test holds it to GET), so no argument makes it write, kill
+or approve.
+
+What it reads is what the app's token reads, and that is a lot. For every
+session in scope: its title, project, model and spend, and which of its tool
+calls failed recently. The agent board, with what each agent says it is
+doing. Every held gate, with the tool and the call it holds. And, through
+`cockpit_session`, a session's own text: its conversation, each message up
+to 20,000 characters; its timeline, with each tool's output up to 4,000
+characters — a `printenv`, a `cat` of a config file; its file changes with
+their diffs; its first prompt and its last answer. And, through
+`cockpit_errors`, the text of its failed tool calls, up to 2,000 characters.
+
+That text comes for the caller's own session only: the one Claude Code names
+in `CLAUDE_CODE_SESSION_ID` when it starts the server over stdio — inherited,
+so any other client started from inside that session takes it as its own too.
+Another session's is left out, and the answer says what it withheld and why, unless
+`AGENTGLASS_COCKPIT_TRANSCRIPTS=all` is set. Over HTTP no session is the
+caller's own, so there it takes that setting too, and with it on, anyone
+holding the cockpit token reads every session's text.
+
+The gate ids it lists do not release anything by themselves: on a server the
+desktop app started, letting a hold go takes the app's key or a paired device,
+and elsewhere the `Origin` rule and its limit apply (see
+[The one on that list that was a bug](#the-one-on-that-list-that-was-a-bug)).
+
+This is the tool's default, not a boundary. The app token the cockpit carries
+reads `/session` directly, as the desk does, so any process holding that token
+— an agent's own shell included — reads every transcript without going through
+this server. What the default stops is the agent that asks its tools rather
+than writing a `curl`: the helpful one, and the one an injected instruction
+sends to read its neighbours.
+
+Over HTTP it runs behind the browser MCP server's transport, imported rather
+than copied: a loopback bind unless `--expose`, any `Origin` refused, only
+`application/json` bodies, and a bearer of its own, `AGENTGLASS_COCKPIT_TOKEN`,
+refused at start if it equals the app's token or the browser endpoint's. A
+cockpit token that leaks reads the cockpit; it does not drive the browser or
+open the app. Its bind and expose variables are its own as well, so setting
+the browser endpoint's never starts or exposes this one.
+
+## What leaves through the webhook
+
+`AGENTGLASS_WEBHOOK` is off unless set. With it set, the server POSTs
+`{"text": …}` to that one URL (a Slack- or Discord-shaped incoming webhook) in
+three cases, and this is everything that travels:
+
+- **Alerts** — the same title and body the desktop notification carries: a
+  gate waiting on you, a reminder, the Clone stuck on a question, and the
+  Lantern's watch notices, which name agents, the base name of a checkout,
+  what an agent said it was working on, and the reason a permission prompt or a
+  held gate gave — each line cut at 200 characters.
+- **Pull-request nudges** — `POST /prs/nudge` with `send: true` posts the chase
+  it wrote: the reviewers' logins as `@`-handles, the PR number, its title, a
+  phrase for what is being asked (a first look, another look, a re-check), and
+  the PR's URL.
+
+No transcript, no diff and no token goes through it, and the variable is blanked
+out of every Clone run so an unattended agent cannot post through it either.
+
+Where it may point is checked once, at boot, and the host it resolved to is
+printed then — so nothing is being sent somewhere you do not know about.
+Loopback and the two hosts the feature exists for (`hooks.slack.com`,
+`discord.com`) are accepted as they are; any other destination needs
+`AGENTGLASS_ALLOW_REMOTE=1`, and without it the channel is refused rather than
+posted to. What is logged is the host, never the path — a webhook URL's path
+*is* its credential.
+
 ## Hardening knobs
 
 Each capability has its own switch — see the README's configuration table for
@@ -340,17 +975,49 @@ the full list and defaults:
 | `AGENTGLASS_GIT_WRITE_DISABLED` | git mutations **and** every pull-request action |
 | `AGENTGLASS_DOCKER_WRITE_DISABLED` | container start/stop/restart/rm |
 | `AGENTGLASS_COMMIT_DISABLED` | the diff viewer's commit composer |
-| `AGENTGLASS_FS_BROWSE_DISABLED` | directory completion in the project picker |
+| `AGENTGLASS_FS_BROWSE_DISABLED` | directory completion in the project picker, and everything under `/files/` and `/disk/` |
+| `AGENTGLASS_DISK_DISABLED` | the finder's **Machine** tab: searching and reading documents under your home directory |
 | `AGENTGLASS_EDITOR_DISABLED` | opening a file in your editor from the app |
 | `AGENTGLASS_SCAN_DISABLED` | the machine-wide transcript scanner |
+| `AGENTGLASS_WALKTHROUGH_DISABLED` | the AI **Explain** walkthrough, whatever provider is available |
+| `AGENTGLASS_BROWSER_READONLY` | every acting verb of the built-in browser when an agent drives it — clicks, typing, `eval`, `cdp`, init scripts, uploads — leaving reads and screenshots |
+| `AGENTGLASS_BUDGET_WRITE_DISABLED` | changing spend budgets from the app (`POST /budgets/set`) |
+| `AGENTGLASS_TASK_WRITE_DISABLED` | writes to your Taskwarrior list from the Tasks view |
+| `AGENTGLASS_UNDERSTUDY=0` | the Clone, whatever its settings file says — the variable can force it off, never on |
+| `AGENTGLASS_TMUX_OBSERVE_ONLY` | every tmux command that writes to a session — see [docs/BLAST-RADIUS.md](docs/BLAST-RADIUS.md) |
+| `AGENTGLASS_CLICKUP_WRITE=1` | *(opposite sense)* turns **on** writes to a ClickUp board, which are off by default |
 | `AGENTGLASS_GATE_FAILCLOSED=1` | *(opposite sense)* makes the gate deny on timeout instead of allowing |
 
-Two things are **not** individually switchable, and it is worth knowing which:
-the AI **Explain** walkthrough (it follows `AGENTGLASS_COMMIT_DISABLED`'s
-surface but has no knob of its own) and the `/control` UI-navigation endpoint,
-which is unswitchable by design — it grants no capability the keyboard does not
-already have.
+One thing is **not** individually switchable, and it is worth knowing which:
+the `/control` UI-navigation endpoint, which is unswitchable by design — it
+grants no capability the keyboard does not already have.
 
 Beyond the knobs, **scope is itself a boundary**: with a project open, git
-writes, the terminal, chat, pull-request actions and editor opens are all
-refused outside it.
+writes and git reads, the terminal, chat, pull-request actions and editor opens
+are all refused outside it.
+
+**Git never takes a command from a repository it merely found.** Every git call
+the server makes runs with `safe.bareRepository=explicit`, so a directory that
+only looks like a repository (committed as ordinary files inside a project) is
+not one, and with `core.fsmonitor=false`; reads also run with hooks off. A real
+checkout's own `.git/config` is still yours and is honoured as your terminal
+honours it — that is the limit.
+
+## What it can do to your tmux
+
+agentglass attaches to the tmux server you already run rather than starting one
+of its own, which means it can write to sessions it did not create — resize a
+window, rename it, move it, switch your client. That is a capability, not a
+vulnerability, but it is one worth being able to look up rather than discover.
+[docs/BLAST-RADIUS.md](docs/BLAST-RADIUS.md) lists every such command, what
+triggers it, and the `AGENTGLASS_TMUX_OBSERVE_ONLY=1` switch that turns all of
+them off while leaving the read-only cockpit working.
+
+## The phone app and plain http
+
+The native app keeps cleartext http allowed for every host. Pairing over a bare
+LAN or tailnet address is plain http, Android's network security config cannot
+scope cleartext by address range, and the pairing token is the protection, not
+the transport (see the handshake above: the credential is sealed to the phone's
+key). The config does restrict https to the system certificate store, so a
+certificate authority installed on the phone cannot vouch for a host.

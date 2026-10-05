@@ -17,7 +17,7 @@ const BY_ID = new Map(VIEWS.map((v) => [v.id, v] as const));
  *  list with the dragged view taken out. */
 type Slot = { place: RailPlace; index: number };
 
-export type RailPip = { dot?: boolean; count?: number };
+export type RailPip = { count?: number };
 
 /** Icon-only switcher down the side of the workspace.
  *
@@ -58,6 +58,11 @@ function useRailActive(): string {
   }, []);
   return colour;
 }
+
+
+/** The rail's width. Exported because the bench, grown, fills everything the
+ *  rail and the top bar leave — see FloatingBench's GROWN_GAP. */
+export const RAIL_W = 52;
 
 export function ViewRail({
   view, onSelect, onSkills, onSettings, onMachine, pips,
@@ -238,9 +243,6 @@ export function ViewRail({
         {pip?.count ? (
           <span className="absolute top-[5px] right-[6px] min-w-[14px] h-[14px] px-1 grid place-items-center rounded-full text-[10px] font-bold tabular-nums"
             style={{ background: "var(--success)", color: "#06281c" }}>{pip.count}</span>
-        ) : pip?.dot ? (
-          <span className="absolute top-[7px] right-[9px] w-[6px] h-[6px] rounded-full"
-            style={{ background: "var(--success)", boxShadow: "0 0 0 3px color-mix(in srgb, var(--success) 22%, transparent)" }} />
         ) : null}
       </button>
     );
@@ -300,10 +302,23 @@ export function ViewRail({
         if (dragId && !e.currentTarget.contains(e.relatedTarget as Node | null)) setSlot(null);
       }}
       onDrop={commit}
-      className="w-[52px] shrink-0 flex flex-col gap-1 p-2 overflow-visible"
+      className="shrink-0 flex flex-col gap-1 p-2 overflow-visible"
       style={{
-        borderRight: "1px solid color-mix(in srgb, var(--primary) 14%, transparent)",
-        background: "color-mix(in srgb, var(--bg) 55%, transparent)",
+        width: RAIL_W,
+        /* THE RAIL IS CHROME, and it was painting the content's own colour.
+         *
+         * Measured across the whole window: 98.4% of every pixel this app
+         * paints was one tone — `--bg` — because the rail's fill was
+         * `color-mix(--bg 55%, transparent)`, which is --bg blended with the
+         * --bg behind it and therefore --bg. A navigation strip that is
+         * literally the same colour as the pane beside it is not a strip, and
+         * "it all looks like the same view" is the accurate reading of that.
+         *
+         * --surface-nav is the same token the settings navigation uses, and it
+         * leans toward --bg2 rather than away from it, so it lifts on a dark
+         * palette and sinks on a light one without a second value. */
+        borderRight: "1px solid var(--surface-line)",
+        background: "var(--surface-nav)",
       }}
     >
       {/* flex-1 so the empty run below the last icon still belongs to this
@@ -311,7 +326,7 @@ export function ViewRail({
           "put it at the bottom of the top group", and a container sized to its
           contents would have quietly refused. */}
       <div
-        className="flex-1 flex flex-col gap-1"
+        className="flex-1 min-h-0 flex flex-col gap-1"
         onDragOver={(e) => overDrawer(e, "work")}
         onDrop={commit}
       >
@@ -337,7 +352,11 @@ export function ViewRail({
         {dragging && !base.utility.length && !at(slot, "utility", 0) && <div className="h-6" />}
       </div>
 
-      <div className="flex flex-col gap-1">
+      {/* `shrink-0`: this cluster is the way back — Ports, Resources, Settings —
+          and it is the one thing on the rail that must never be the part that
+          gets pushed off the bottom. Reported from a short window: the
+          Resources button "looks cutoff". */}
+      <div className="shrink-0 flex flex-col gap-1">
         {/* A second hairline, because everything below is not a view at all:
             these open OVER whatever you are in and hand it straight back. A
             divider is the cheapest way to say "these do not change where you
@@ -355,10 +374,9 @@ export function ViewRail({
           *
           * It used to be two. A drag raised a dashed bin of its own directly
           * ABOVE this button, so the moment you picked something up there were
-          * two dashed squares stacked in the corner of the rail: one to drop it
-          * into and one that opens the drawer it lands in. Reported as "es muy
-          * raro… ese botón debería ser el de agregar" — which it now is, in both
-          * directions.
+          * two dashed squares stacked in the corner of the rail: one to drop
+          * it into and one that opens the drawer it lands in. One button, in
+          * both directions, is what that should always have been.
           *
           * Shown while dragging even with nothing hidden yet, or the first view
           * you ever put away would have nowhere to be dropped.
@@ -386,7 +404,7 @@ export function ViewRail({
             data-tip={dragging
               ? "Drop to take it off the rail — it comes back from here"
               : `Hidden views · ${hiddenViews.length} put away`}
-            className="agw-tip relative h-10 w-full grid place-items-center rounded-[10px] transition-colors"
+            className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
             style={{
               color: aimingHidden ? "var(--error)" : restoreAt ? "var(--primary-hover)" : "var(--text4)",
               // Only while something is in the air. A dashed outline the rest of
@@ -412,7 +430,7 @@ export function ViewRail({
           onClick={() => onMachine("ports")}
           aria-label="Ports"
           data-tip="Ports · what is listening, and from which checkout"
-          className="agw-tip relative h-10 w-full grid place-items-center rounded-[10px] transition-colors"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
           style={{ color: "var(--text4)" }}
         >
           <PortsIcon size={ICON.rail} />
@@ -421,7 +439,7 @@ export function ViewRail({
           onClick={() => onMachine("resources")}
           aria-label="Resources"
           data-tip="Resources · CPU, memory and disk, by checkout"
-          className="agw-tip relative h-10 w-full grid place-items-center rounded-[10px] transition-colors"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
           style={{ color: "var(--text4)" }}
         >
           <ResourcesIcon size={ICON.rail} />
@@ -430,7 +448,7 @@ export function ViewRail({
           onClick={onSettings}
           aria-label="Settings"
           data-tip="Settings · preferences, exports, shortcuts"
-          className="agw-tip relative h-10 w-full grid place-items-center rounded-[10px] transition-colors"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
           style={{ color: "var(--text4)" }}
         >
           <RailGear size={ICON.rail} />
@@ -442,7 +460,7 @@ export function ViewRail({
           onClick={onSkills}
           aria-label="Skills catalog"
           data-tip="Skills catalog · what this fleet can do"
-          className="agw-tip relative h-10 w-full grid place-items-center rounded-[10px] transition-colors"
+          className="agw-tip relative h-10 min-h-[30px] shrink w-full grid place-items-center rounded-[10px] transition-colors"
           style={{ color: "var(--text4)" }}
         >
           <SkillsIcon size={ICON.rail} />

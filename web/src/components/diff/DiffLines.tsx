@@ -13,10 +13,11 @@
  * test and nearly invisible in a 400-row diff, which is exactly how the
  * "\ No newline at end of file" off-by-one survived as long as it did.
  */
-import { createContext, Fragment, memo, useContext, useMemo, useRef } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode, WheelEvent as ReactWheelEvent } from "react";
+import { createContext, Fragment, memo, useContext, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode, RefObject, WheelEvent as ReactWheelEvent } from "react";
 import { HiliteCtx } from "../../lib/diffHighlight.ts";
 import type { DiffHunk, FileChange } from "../../../../shared/types.ts";
+import { pairsIn, tokenDiff, type Seg } from "../../../../shared/tokenDiff.ts";
 
 // --- shared type + style vocabulary ------------------------------------------
 
@@ -56,14 +57,31 @@ export const SPLIT_SEL_CSS = '.agx-split[data-sel="l"] [data-side="r"]{user-sele
    containing block just as well, so the absolutely placed "+" is unaffected. */
 export const LINEBTN_CSS = '.agx-gutter{position:sticky}.agx-linebtn{position:absolute;right:-14px;top:50%;transform:translateY(-50%);width:20px;height:20px;display:flex;align-items:center;justify-content:center;border-radius:6px;background:var(--primary);color:#fff;font-size:16px;font-weight:600;line-height:1;opacity:0;transition:opacity .12s,transform .12s;cursor:pointer;z-index:3;box-shadow:0 1px 3px rgba(0,0,0,.35)}.agx-gutter:hover .agx-linebtn,.agx-linebtn:focus-visible,.agx-linebtn[data-open="1"]{opacity:1}.agx-linebtn:hover{transform:translateY(-50%) scale(1.08)}';
 
+/*
+ * A pane that has handed its scrollbar to the rail below it.
+ *
+ * `.agw-noscrollbar` already existed and could not do this job: it lives inside
+ * `@layer components`, and an UNLAYERED rule beats every layered one no matter
+ * how specific — `SCROLLBAR_CSS` is injected as a plain <style> in the tree, so
+ * `.agx-scroll{scrollbar-width:thin}` won and the pane kept its bar. Measured
+ * in the running app: `scrollbar-width` computed `thin` and `offsetHeight -
+ * clientHeight` was 10px on both split panes, which is the bar he kept finding
+ * at the bottom of the file after the rail was already there.
+ *
+ * Unlayered and two classes deep, so it wins on specificity wherever it lands,
+ * and rendered by the diff components themselves so no caller can forget it.
+ */
+export const PANE_CSS = '.agx-scroll.agx-nobar{scrollbar-width:none}.agx-scroll.agx-nobar::-webkit-scrollbar{width:0;height:0;display:none}';
+
 /** Themed, slim scrollbars for the diff's scrollers (primary-tinted thumb). */
 export const SCROLLBAR_CSS = '.agx-scroll{scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--primary) 45%,transparent) transparent}.agx-scroll::-webkit-scrollbar{width:11px;height:11px}.agx-scroll::-webkit-scrollbar-track{background:transparent}.agx-scroll::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--primary) 38%,transparent);border-radius:999px;border:3px solid transparent;background-clip:padding-box}.agx-scroll::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--primary) 62%,transparent);background-clip:padding-box}.agx-scroll::-webkit-scrollbar-corner{background:transparent}';
 
 // --- the row model (pure; everything below the components depends on it) -----
 
 export type DiffKind = "ctx" | "del" | "add";
-/** A run of a line's text, `hi` when the intra-line diff says it changed. */
-export type Seg = { text: string; hi: boolean };
+/** A run of a line's text, `changed` when the intra-line diff says it did.
+ *  Re-exported so the components below keep their own vocabulary. */
+export type { Seg } from "../../../../shared/tokenDiff.ts";
 /** One unified row: at most one of the two gutters carries a number. */
 export type URow = { oldN: number | null; newN: number | null; text: string; kind: DiffKind; segs?: Seg[] | null };
 /** One side of one split row. Absent (`null` in `SplitRow`) means the other
@@ -100,66 +118,27 @@ function parseLine(line: string): { kind: DiffKind; text: string } | null {
 
 // --- intra-line (token-level) diff --------------------------------------------
 
-// Whitespace runs, identifier runs, and every other character on its own: the
-// three alternatives cover any string, so the tokens of a line always
-// reconstruct it exactly. Callers rely on that — a segment list that lost a
-// character would render code the file does not contain.
-const WORD_RE = /\s+|[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/g;
-const tokenize = (s: string): string[] => s.match(WORD_RE) ?? [];
-
-/**
- * Token LCS between two lines → highlighted segments per side, or null when the
- * lines are too dissimilar to be "the same line, modified".
+/*
+ * The rule itself is `shared/tokenDiff.ts`, and it is shared for a reason that
+ * had already happened: the phone grew its own a week after this one, and the
+ * two disagreed about when a deleted line and an added one are a rewrite of
+ * each other. One reader, two screens, two answers.
  *
- * The null cases are the point. Removals and additions are paired by position,
- * which is a guess, so two unrelated lines regularly land opposite each other;
- * without the similarity floor the guess gets painted as a word-level change
- * and the reader is told to look at noise. The size caps exist because the DP
- * table is O(n·m) and a minified bundle in a diff is one line of 200k.
+ * What moved out is the whole of it — the tokeniser, the similarity floor, the
+ * bounded table — and what came back is a better bound than this file had. It
+ * used to give up entirely on a pair longer than 4,000 characters; the shared
+ * one trims the common prefix and suffix first, so a minified line changed at
+ * its end is still marked at its end.
  */
-export function tokenDiff(a: string, b: string): { left: Seg[]; right: Seg[] } | null {
-  if (!a || !b || a === b || a.length + b.length > 4000) return null;
-  const ta = tokenize(a), tb = tokenize(b);
-  const n = ta.length, m = tb.length;
-  if (n + m > 600) return null;
-  const dp = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
-      dp[i][j] = ta[i] === tb[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const left: Seg[] = [], right: Seg[] = [];
-  // Adjacent runs of the same verdict are merged as they are pushed, so the
-  // renderer emits one <span> per visible change instead of one per token.
-  const push = (arr: Seg[], text: string, hi: boolean) => {
-    const last = arr[arr.length - 1];
-    if (last && last.hi === hi) last.text += text; else arr.push({ text, hi });
-  };
-  let i = 0, j = 0, eq = 0;
-  while (i < n && j < m) {
-    if (ta[i] === tb[j]) { push(left, ta[i], false); push(right, tb[j], false); eq += ta[i].length; i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) push(left, ta[i++], true);
-    else push(right, tb[j++], true);
-  }
-  while (i < n) push(left, ta[i++], true);
-  while (j < m) push(right, tb[j++], true);
-  if ((2 * eq) / (a.length + b.length) < 0.4) return null; // too different → render plain
-  return { left, right };
-}
 
 /** In a unified row list, pair each removal with the addition at the same offset
  *  in the following add block, and attach token segments to those pairs. Blocks
  *  are matched in order and never across a context line, because a context line
  *  is git telling us the change block ended. */
 export function attachTokenDiff(rows: URow[]): void {
-  let i = 0;
-  while (i < rows.length) {
-    if (rows[i].kind !== "del") { i++; continue; }
-    let d = i; while (d < rows.length && rows[d].kind === "del") d++;
-    let a = d; while (a < rows.length && rows[a].kind === "add") a++;
-    for (let k = 0; k < Math.min(d - i, a - d); k++) {
-      const td = tokenDiff(rows[i + k].text, rows[d + k].text);
-      if (td) { rows[i + k].segs = td.left; rows[d + k].segs = td.right; }
-    }
-    i = a;
+  for (const [del, add] of pairsIn(rows)) {
+    const td = tokenDiff(rows[del].text, rows[add].text);
+    if (td) { rows[del].segs = td.left; rows[add].segs = td.right; }
   }
 }
 
@@ -250,7 +229,7 @@ function gutterWidth(maxLine: number): string {
 
 function Marked({ segs, kind }: { segs: Seg[]; kind: "del" | "add" }) {
   const bg = kind === "del" ? "color-mix(in srgb, var(--error) 22%, transparent)" : "color-mix(in srgb, var(--success) 22%, transparent)";
-  return <>{segs.map((s, i) => (s.hi ? <span key={i} style={{ background: bg, borderRadius: "2px" }}>{s.text}</span> : <span key={i}>{s.text}</span>))}</>;
+  return <>{segs.map((s, i) => (s.changed ? <span key={i} style={{ background: bg, borderRadius: "2px" }}>{s.text}</span> : <span key={i}>{s.text}</span>))}</>;
 }
 
 /** Segment list → character ranges, so the token diff can be re-applied on top
@@ -259,7 +238,7 @@ function changedRanges(segs?: Seg[] | null): Array<[number, number]> {
   const out: Array<[number, number]> = [];
   if (!segs) return out;
   let off = 0;
-  for (const s of segs) { if (s.hi) out.push([off, off + s.text.length]); off += s.text.length; }
+  for (const s of segs) { if (s.changed) out.push([off, off + s.text.length]); off += s.text.length; }
   return out;
 }
 
@@ -349,6 +328,103 @@ type DiffProps = {
   sel?: LineSel;
 };
 
+// --- the sideways scrollbar, kept where the eyes are -------------------------
+
+/*
+ * A diff pane scrolls sideways and never vertically: its height IS the file's,
+ * and the column around it does the scrolling. That is the fix for the double
+ * scrollbar and it stays. But a scrollbar belongs to its own box, so the
+ * sideways one sat at the bottom of a 2800px pane — to reach it you scrolled to
+ * the end of the file, and by then you were nowhere near the line you wanted to
+ * read sideways. Reported with three screenshots of exactly that trip.
+ *
+ * So the pane keeps the scrolling and gives up the bar. `agw-noscrollbar` hides
+ * it, and this rail is the bar: a sticky 11px strip holding a spacer as wide as
+ * the file, pinned to the bottom of whatever is scrolling vertically — however
+ * tall the file is, it is always the strip across the bottom of the view.
+ *
+ * The two mirror each other's scrollLeft behind a flag cleared on the next
+ * frame: assigning one fires the other's scroll event, and two boxes echoing
+ * each other stutter the wheel. It is the same guard the split panes already
+ * use for their vertical sync, for the same reason.
+ */
+type Rail = {
+  railRef: RefObject<HTMLDivElement>;
+  /** Content width in px, or 0 while the file fits — then the rail hides, so a
+   *  narrow diff has no strip laid across it. */
+  width: number;
+  onPaneScroll: () => void;
+  onRailScroll: () => void;
+};
+
+function useHRail(pane: RefObject<HTMLDivElement>): Rail {
+  const railRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  const lock = useRef(false);
+  /* Measured, never assumed, and re-measured after every render: the width of a
+     diff changes when the file changes, when highlighting lands, and when a
+     splitter moves. `setWidth` returning `prev` unchanged is React's own bail
+     out, which is what keeps a no-deps effect from looping. */
+  useEffect(() => {
+    const el = pane.current;
+    if (!el) return;
+    const measure = () => setWidth((prev) => {
+      const next = el.scrollWidth > el.clientWidth + 1 ? el.scrollWidth : 0;
+      return next === prev ? prev : next;
+    });
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    if (el.firstElementChild) ro.observe(el.firstElementChild);
+    return () => ro.disconnect();
+  });
+  const mirror = (from: HTMLElement | null, to: HTMLElement | null) => {
+    if (!from || !to || lock.current) return;
+    lock.current = true;
+    to.scrollLeft = from.scrollLeft;
+    requestAnimationFrame(() => { lock.current = false; });
+  };
+  return {
+    railRef,
+    width,
+    onPaneScroll: () => mirror(pane.current, railRef.current),
+    onRailScroll: () => mirror(railRef.current, pane.current),
+  };
+}
+
+function HRail({ rail, className, style }: { rail: Rail; className?: string; style?: CSSProperties }) {
+  /* `visibility`, not `display`: a rail that leaves the layout hands its width
+     to its neighbour, and the surviving bar then stretched across BOTH columns
+     — measured at 1243px under a 621px pane. Hidden in place, each bar stays
+     under the column it belongs to.
+     *
+     * And when it IS shown, the property is left alone rather than set to
+     * `visible`. The workspace hides the view you are not looking at with
+     * `visibility: hidden` on its box, and `visible` on a descendant overrides
+     * that — so this 12px bar went on painting, sticky to the bottom of the
+     * window, over the terminal, over git, over everything: "that fixed horizontal
+     * scroll bar shows up in EVERY view of the app". Inheriting is what
+     * keeps a hidden view hidden. */
+  return (
+    <div ref={rail.railRef} data-hrail className={`agx-scroll ${className ?? ""}`} onScroll={rail.onRailScroll}
+      style={{ overflowX: "auto", overflowY: "hidden", height: 12, visibility: rail.width ? undefined : "hidden",
+        background: "color-mix(in srgb, var(--text) 7%, var(--bg))", ...style }}>
+      <div style={{ width: rail.width || 1, height: 1 }} />
+    </div>
+  );
+}
+
+/** The strip itself: gone entirely when nothing in the diff overflows, so a
+ *  narrow file has no band laid across the bottom of it. */
+function HRailRow({ rails, children }: { rails: Rail[]; children: ReactNode }) {
+  return (
+    <div className="sticky bottom-0 z-20 flex" data-hrail-row
+      style={{ display: rails.some((r) => r.width) ? "flex" : "none", boxShadow: "0 -1px 0 0 color-mix(in srgb, var(--border) 30%, transparent)" }}>
+      {children}
+    </div>
+  );
+}
+
 // --- unified diff, with old|new gutters, uncapped -----------------------------
 
 /*
@@ -371,9 +447,13 @@ export function UnifiedDiff({ c, hunks, wrap, hunkAction, rowAfter, onPick, sel 
   const source = hunks ?? c?.hunks ?? NO_HUNKS;
   const built = useMemo(() => source.map((h) => ({ h, rows: unifiedRows(h) })), [source]);
   const gw = useMemo(() => gutterWidth(source.reduce((n, h) => Math.max(n, h.oldStart + h.oldLines, h.newStart + h.newLines), 0)), [source]);
+  const paneRef = useRef<HTMLDivElement>(null);
+  const rail = useHRail(paneRef);
   return (
-    <div className="agx-scroll flex-1 min-w-0 text-[12px] leading-[1.6]" data-vscroll
-      style={{ ...CODE_FONT_STYLE, overflowX: "auto", overflowY: "hidden" }}>
+    <div className="flex flex-col flex-1 min-w-0 text-[12px] leading-[1.6]" style={CODE_FONT_STYLE}>
+    <style>{PANE_CSS}</style>
+    <div ref={paneRef} className="agx-scroll agx-nobar min-w-0" data-vscroll data-hpane
+      onScroll={rail.onPaneScroll} style={{ overflowX: "auto", overflowY: "hidden", containerType: "inline-size" }}>
       {/*
        * One width for the whole file, and it is the widest line in it.
        *
@@ -450,6 +530,10 @@ export function UnifiedDiff({ c, hunks, wrap, hunkAction, rowAfter, onPick, sel 
       ))}
       </div>
     </div>
+      <HRailRow rails={[rail]}>
+        <HRail rail={rail} className="flex-1 min-w-0" />
+      </HRailRow>
+    </div>
   );
 }
 
@@ -461,6 +545,9 @@ export function UnifiedDiff({ c, hunks, wrap, hunkAction, rowAfter, onPick, sel 
  * bottom of the pane). Vertical scroll is kept in sync between the two so rows
  * stay aligned; only the right side shows the vertical scrollbar.
  */
+/* The scrolling panes below are size containers (`container-type: inline-size`)
+   so a card under a line can be as wide as the pane you SEE rather than as wide
+   as the code, which is wider whenever one line is long: `100cqw` is the pane. */
 export function SplitDiff({ c, hunks, wrap, rowAfter, onPick, sel }: DiffProps) {
   const source = hunks ?? c?.hunks ?? NO_HUNKS;
   const built = useMemo(() => source.map((h) => ({ h, rows: splitRows(h) })), [source]);
@@ -468,6 +555,8 @@ export function SplitDiff({ c, hunks, wrap, rowAfter, onPick, sel }: DiffProps) 
   const wrapCls = wrap ? "whitespace-pre-wrap break-all" : "whitespace-pre";
   const leftRef = useRef<HTMLDivElement>(null);
   const rightRef = useRef<HTMLDivElement>(null);
+  const lRail = useHRail(leftRef);
+  const rRail = useHRail(rightRef);
   const syncing = useRef(false);
   const onDown = (e: ReactMouseEvent) => {
     const el = (e.target as HTMLElement).closest("[data-side]") as HTMLElement | null;
@@ -528,7 +617,7 @@ export function SplitDiff({ c, hunks, wrap, rowAfter, onPick, sel }: DiffProps) 
   if (wrap) {
     return (
       <div className="agx-split agx-scroll flex-1 min-w-0 text-[12px] leading-[1.6]" data-vscroll
-        style={{ ...CODE_FONT_STYLE, overflowX: "auto", overflowY: "hidden" }} onMouseDown={onDown}>
+        style={{ ...CODE_FONT_STYLE, overflowX: "auto", overflowY: "hidden", containerType: "inline-size" }} onMouseDown={onDown}>
         <style>{SPLIT_SEL_CSS}</style>
         {built.map(({ h, rows }, hi) => (
           <div key={hi}>
@@ -556,17 +645,27 @@ export function SplitDiff({ c, hunks, wrap, rowAfter, onPick, sel }: DiffProps) 
   }
 
   return (
-    <div className="agx-split flex flex-1 min-w-0 text-[12px] leading-[1.6]" style={CODE_FONT_STYLE} onMouseDown={onDown}>
-      <style>{SPLIT_SEL_CSS}</style>
-      <div ref={leftRef} data-side="l" className="agx-scroll flex-1 min-w-0" style={{ overflowX: "auto", overflowY: "hidden" }} onWheel={onLeftWheel}>
-        {side("l")}
+    <div className="agx-split flex flex-col flex-1 min-w-0 text-[12px] leading-[1.6]" style={CODE_FONT_STYLE} onMouseDown={onDown}>
+      <style>{SPLIT_SEL_CSS}{PANE_CSS}</style>
+      <div className="flex min-w-0">
+        <div ref={leftRef} data-side="l" data-hpane className="agx-scroll agx-nobar flex-1 min-w-0" style={{ overflowX: "auto", overflowY: "hidden", containerType: "inline-size" }} onWheel={onLeftWheel} onScroll={lRail.onPaneScroll}>
+          {side("l")}
+        </div>
+        {/* Both sides horizontal-only now, so neither is a vertical scroller and
+            the sync below has nothing left to fight over: they grow to the same
+            height inside whatever scrolls the page. */}
+        <div ref={rightRef} data-side="r" data-vscroll data-hpane className="agx-scroll agx-nobar flex-1 min-w-0 border-l" style={{ overflowX: "auto", overflowY: "hidden", containerType: "inline-size", borderColor: "color-mix(in srgb, var(--text) 16%, transparent)" }}
+          onScroll={() => { syncTop(); rRail.onPaneScroll(); }}>
+          {side("r")}
+        </div>
       </div>
-      {/* Both sides horizontal-only now, so neither is a vertical scroller and
-          the sync below has nothing left to fight over: they grow to the same
-          height inside whatever scrolls the page. */}
-      <div ref={rightRef} data-side="r" data-vscroll className="agx-scroll flex-1 min-w-0 border-l" style={{ overflowX: "auto", overflowY: "hidden", borderColor: "color-mix(in srgb, var(--text) 16%, transparent)" }} onScroll={syncTop}>
-        {side("r")}
-      </div>
+      {/* One rail per column, because the columns scroll independently: a long
+          line on the left is not a long line on the right, and a single bar
+          would have to lie about one of them. */}
+      <HRailRow rails={[lRail, rRail]}>
+        <HRail rail={lRail} className="flex-1 min-w-0" />
+        <HRail rail={rRail} className="flex-1 min-w-0 border-l" style={{ borderColor: "color-mix(in srgb, var(--text) 16%, transparent)" }} />
+      </HRailRow>
     </div>
   );
 }

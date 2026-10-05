@@ -148,8 +148,21 @@ const CHORD_RESERVED = new Set(["mod+k", "mod+\\", "mod+[", "mod+]", "mod+0", "m
 
 /** `Ctrl+Alt+J` -> `mod+alt+j`. Null when nothing but modifiers is held, or
  *  when no modifier is — a bare key is the other binding, not this one. */
-export function chordFromEvent(e: { key: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }): string | null {
-  const k = e.key;
+export function chordFromEvent(e: { key: string; code?: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }): string | null {
+  /*
+   * A digit is the KEY YOU PRESSED, whatever the layout makes of it.
+   *
+   * Ctrl+Alt is AltGr on a Spanish keyboard, and AltGr+1..4 there are `|`, `@`,
+   * `#` and `~` — so `Ctrl+Alt+4` arrived as `mod+alt+~` and matched nothing.
+   * Reported as "ctrl alt 4 does not open the card". `code` is the physical key and
+   * says `Digit4` on every layout; the number row and the keypad both answer to
+   * the digit somebody is looking at on the keycap.
+   *
+   * Only for digits. A letter's `key` is already layout-correct and using
+   * `code` there would bind Dvorak users to QWERTY positions.
+   */
+  const digit = /^(?:Digit|Numpad)([0-9])$/.exec(e.code ?? "");
+  const k = digit ? digit[1]! : e.key;
   if (!k || ["Shift", "Control", "Alt", "Meta"].includes(k)) return null;
   const mod = IS_MAC ? e.metaKey : e.ctrlKey;
   // Ctrl on a Mac is a distinct modifier from ⌘; treating it as `mod` there
@@ -308,7 +321,7 @@ function persistChords() {
  * else's. If it collides with something in your shell you must be able to move
  * it, and that is a preference, not a fault.
  */
-export type AppChordId = "files.palette";
+export type AppChordId = "files.palette" | "bench.toggle" | "pane.git" | "pane.diff" | "pane.pr" | "pane.card" | "windows.switcher";
 
 /**
  * Ctrl+Shift+P, not Ctrl+P — the same reasoning as isFindChord in termKeys.ts.
@@ -320,12 +333,87 @@ export type AppChordId = "files.palette";
  */
 export const APP_CHORD_DEFAULTS: Record<AppChordId, string> = {
   "files.palette": "mod+shift+p",
+  /*
+   * Ctrl+Alt+A for the bench, and the Alt is what makes it safe.
+   *
+   * This one also has to survive a live shell, and the shifted forms are
+   * crowded: Ctrl+Shift+A is "select all" in half the terminals and a tmux
+   * prefix in some configurations. Alt-modified chords are the ones a terminal
+   * passes through as an escape sequence nothing common binds — and it is the
+   * chord the floating workspace this is modelled on already uses, which is one
+   * less thing to relearn.
+   */
+  "bench.toggle": "mod+alt+a",
+  /*
+   * The four doors of the pane you are typing in, as the four digits.
+   *
+   * The twins of the buttons that pane draws in its corner — for the hand
+   * already on the keyboard, and the only way in when the block is folded away
+   * or switched off.
+   *
+   * NOT tmux bindings, and that is the whole design. The obvious spelling was
+   * `prefix p`, and prefix + p is tmux's own "previous window" — as prefix + d
+   * is detach and prefix + c is a new window. Taking those would break the
+   * three chords somebody uses most to give them one they use rarely. An app
+   * chord never reaches tmux at all.
+   *
+   * Digits rather than initials: "maybe it could be ctrl alt 1/2/3/4, I think
+   * that is easier" — and they are, because the block they belong to is a 2×2
+   * read the same way. 1 and 2 on top are the checkout (git, changes); 3 and 4
+   * underneath are the work (the pull request, the card).
+   *
+   * Alt-modified for the same reason the bench is: Ctrl+Shift+letter is
+   * crowded in a live shell, and Alt chords arrive as an escape sequence
+   * nothing common binds.
+   */
+  "pane.git": "mod+alt+1",
+  "pane.diff": "mod+alt+2",
+  "pane.pr": "mod+alt+3",
+  "pane.card": "mod+alt+4",
+  /*
+   * Ctrl+Alt+J, not Ctrl+J, and the plain one was the first choice.
+   *
+   * Ctrl+J is a line feed: readline takes it as Enter, and agent CLIs take it
+   * as "new line in the prompt" — the one key for a multi-line message in
+   * several of them. An app chord never reaches the pane, so binding it would
+   * take that away in every terminal in the app.
+   *
+   * Ctrl+Alt+J is not free either, only far less used: readline's emacs mode
+   * binds M-C-j to "switch to vi editing", and in a plain Chrome tab on a Mac
+   * ⌘⌥J is the JavaScript console. Losing those is the trade taken for a key
+   * that is pressed all day; it is rebindable for whoever uses either.
+   */
+  "windows.switcher": "mod+alt+j",
 };
 
 export const APP_CHORD_LABELS: Record<AppChordId, { label: string; hint: string }> = {
   "files.palette": {
     label: "Find a file",
     hint: "search any checkout from anywhere — names, contents, or what you opened recently",
+  },
+  "bench.toggle": {
+    label: "The bench",
+    hint: "the floating window and its tabs — a shell, a file, a note, an agent — over whatever you were looking at",
+  },
+  "pane.git": {
+    label: "This pane's source control",
+    hint: "opens Source control on the worktree the pane you are typing in is working in",
+  },
+  "pane.diff": {
+    label: "This pane's changes",
+    hint: "opens File changes on that worktree — the same door the pane's second button opens",
+  },
+  "pane.pr": {
+    label: "This pane's pull request",
+    hint: "opens the pull request of the tmux pane you are typing in — the same door its corner button opens",
+  },
+  "pane.card": {
+    label: "This pane's card",
+    hint: "opens the card the pane's branch came from, in Tasks or in your tracker",
+  },
+  "windows.switcher": {
+    label: "Go to a window",
+    hint: "every tmux window with what its agent is doing, the ones waiting for you first — press it again for the next one waiting",
   },
 };
 

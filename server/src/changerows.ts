@@ -26,7 +26,7 @@
 import { statSync, readFileSync } from "node:fs";
 import { resolve, dirname, sep } from "node:path";
 import { gitAsync } from "./git.ts";
-import { inScope } from "./config.ts";
+import { inScope, type Scope, staysIn } from "./config.ts";
 import type { ChangeRow, ChangeRowsResult, FileDiff, DiffHunk, GitRepoRef } from "../../shared/types.ts";
 
 /** Git's empty tree, so a repo's first commit (which has no parent) diffs as
@@ -194,7 +194,7 @@ function countUntracked(abs: string): { add: number; binary: boolean; tooBig: bo
 
 /* ── one repo ─────────────────────────────────────────────────────────────── */
 
-async function workingRows(repo: GitRepoRef, scope: string | null): Promise<ChangeRow[]> {
+async function workingRows(repo: GitRepoRef, scope: Scope): Promise<ChangeRow[]> {
   const root = repo.root;
   const [status, unstaged, staged] = await Promise.all([
     gitAsync(root, ["-c", "core.quotePath=false", "status", "--porcelain=v2", "-z", "--untracked-files=all"]),
@@ -213,7 +213,7 @@ async function workingRows(repo: GitRepoRef, scope: string | null): Promise<Chan
     const abs = resolve(root, e.path);
     const c = counts.get(e.path);
     let add = c?.add ?? 0, del = c?.del ?? 0, binary = c?.binary ?? false, tooBig = false;
-    if (e.untracked && read < UNTRACKED_READ_MAX) {
+    if (e.untracked && read < UNTRACKED_READ_MAX && staysIn(root, abs)) {
       read++;
       const u = countUntracked(abs);
       add = u.add; binary = u.binary; tooBig = u.tooBig;
@@ -266,7 +266,7 @@ async function ignoredSet(root: string, paths: string[]): Promise<Set<string>> {
  * commit touching every file the merge brought — none of it yours, and hundreds
  * of files of it.
  */
-async function committedRows(repo: GitRepoRef, scope: string | null): Promise<ChangeRow[]> {
+async function committedRows(repo: GitRepoRef, scope: Scope): Promise<ChangeRow[]> {
   const root = repo.root;
   const head = (await gitAsync(root, ["rev-list", "--no-merges", "--max-count=1", "HEAD"])).stdout.trim();
   if (!head) return [];
@@ -348,7 +348,7 @@ export function parseNameStatus(out: string): Map<string, { status: ChangeRow["s
 export async function changeRows(
   repos: GitRepoRef[],
   mode: Mode,
-  scope: string | null,
+  scope: Scope,
   max = 2000,
 ): Promise<ChangeRowsResult> {
   const failed: string[] = [];
@@ -438,6 +438,18 @@ export async function fileDiff(rootIn: string, path: string, mode: Mode): Promis
   // Untracked: git has nothing to diff against, so the file IS the diff.
   const tracked = await gitAsync(root, ["ls-files", "--error-unmatch", "-z", "--", path]);
   if (tracked.code !== 0) {
+    // Untracked means "in a repository, not yet added". Outside one, ls-files
+    // fails too, and reading the file as the diff made this a reader for any
+    // path at all.
+    if ((await gitAsync(root, ["rev-parse", "--git-dir"])).code !== 0) {
+      return { key, sig: "", hunks: [], truncated: false, binary: false, error: "not a git repository" };
+    }
+    // And by where it lands: an untracked file is read below as the diff, so
+    // an untracked link must stay inside the repository. A tracked link is
+    // diffed by git as its target's name, so it needs no check.
+    if (!staysIn(root, abs)) {
+      return { key, sig: "", hunks: [], truncated: false, binary: false, error: "path outside the repository" };
+    }
     const u = untrackedDiff(abs);
     return { key, sig: sigOf(root, path, mode, ""), ...u };
   }

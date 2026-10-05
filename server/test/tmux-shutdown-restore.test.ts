@@ -25,6 +25,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { endPhoneSession } from "../src/tmuxctl.ts";
 import { TEST_TERM } from "./tmuxTerm.ts";
+import { freePort } from "./freePort.ts";
 
 /*
  * Short paths, and it is a hard limit rather than a preference: a unix socket
@@ -152,7 +153,7 @@ beforeAll(async () => {
 
   dir = join(TMPDIR, "agx-server");
   mkdirSync(dir, { recursive: true });
-  port = 4970 + Math.floor(Math.random() * 20);
+  port = await freePort();
   server = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
     /*
      * A named environment, never `...process.env` — and two of these entries
@@ -177,6 +178,9 @@ beforeAll(async () => {
       LANG: process.env.LANG ?? "C.UTF-8",
       TMUX_TMPDIR: TMPDIR,
       XDG_CONFIG_HOME: dir,
+      // State (audit log, ledgers, engine conf) jailed too: without this a booted
+      // server writes into the developer's real ~/.local/state/agentglass.
+      AGENTGLASS_STATE_DIR: `${dir}/state`,
       AGENTGLASS_ROOT: dir,
       AGENTGLASS_DB: join(dir, "f.db"),
       AGENTGLASS_SCAN_DISABLED: "1",

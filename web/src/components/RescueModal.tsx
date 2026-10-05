@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from "motion/react";
 import type { WorktreeLeftovers, LeftoverEntry } from "../../../shared/types.ts";
 import { Portal } from "./Portal.tsx";
 import { preselected, fmtBytes, rescueKey, rescuePicks } from "../lib/goneCleanup.ts";
+import { DoneIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 /**
  * The last thing between somebody's notes and `rm -rf`.
@@ -35,7 +37,7 @@ function Tick({ on, dim }: { on: boolean; dim?: boolean }) {
         background: on ? (dim ? "var(--warning)" : "var(--primary)") : "transparent",
         border: `1px solid ${on ? (dim ? "var(--warning)" : "var(--primary)") : "color-mix(in srgb, var(--border) 60%, transparent)"}`,
       }}
-    >{on ? "✓" : ""}</span>
+    >{on ? <DoneIcon size={ICON.xs} /> : null}</span>
   );
 }
 
@@ -136,7 +138,7 @@ export function RescueModal({ reports, progress, onCancel, onConfirm }: {
               </div>
             </div>
 
-            <div ref={listRef} className="agx-scroll overflow-y-auto flex-1 px-2 py-2" style={{ opacity: working ? 0.45 : 1, pointerEvents: working ? "none" : "auto" }}>
+            <div ref={listRef} className="agx-scroll overflow-y-auto overflow-x-hidden flex-1 px-2 py-2" style={{ opacity: working ? 0.45 : 1, pointerEvents: working ? "none" : "auto" }}>
               {nothingToOffer && (
                 <div className="px-3 py-6 text-[11.5px] text-center" style={{ color: "var(--text3)" }}>
                   Nothing unique in these checkouts — everything in them is either a cache or already in the main checkout.

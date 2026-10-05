@@ -1,5 +1,5 @@
 /*
- * Whether this machine tracks work anywhere, and what the Inbox does about it.
+ * Whether this machine tracks work anywhere, and what the bar does about it.
  *
  * The question this app was getting wrong is not "is ClickUp connected". It is
  * the general one — ClickUp is one task provider of several, and a phone that
@@ -13,7 +13,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderId, ProviderState, ProviderStatus } from "../../shared/providers.ts";
-import { tracksWork } from "../src/model/taskProviders.ts";
+import { providerTitle, taskProvider, tracksWork } from "../src/model/taskProviders.ts";
 import { BAR, taskDestinations, type Destination } from "../src/nav/bar.ts";
 
 const at = (id: ProviderId, state: ProviderState): ProviderStatus => ({ id, state });
@@ -60,7 +60,7 @@ describe("tracksWork", () => {
 });
 
 describe("taskDestinations", () => {
-  const all: Destination[] = [...BAR.filter((d) => d.route !== "index"), { route: "repos", label: "Source control" }];
+  const all: Destination[] = BAR;
 
   test("keeps cards when something is tracked", () => {
     expect(taskDestinations(all, true).map((d) => d.route)).toContain("tasks");
@@ -76,10 +76,8 @@ describe("taskDestinations", () => {
   });
 
   test("drops cards and nothing else", () => {
-    /* There is nothing to promote in its place, and that is not an oversight:
-       the five-slot bar that made a removal need a replacement is retired, and
-       source control — the destination that would have been promoted — is
-       already in this list. */
+    /* There is nothing to promote in its place: four is not an arithmetic
+       the bar needs to keep, the way the odd count that centred the star was. */
     const before = all.map((d) => d.route);
     const after = taskDestinations(all, false).map((d) => d.route);
     expect(after).toEqual(before.filter((r) => r !== "tasks"));
@@ -93,10 +91,63 @@ describe("taskDestinations", () => {
   });
 
   test("BAR itself is untouched — it is the claim, not the drawing", () => {
-    // Every other reader of BAR (the Inbox's own list, keyLayout's ordering)
-    // still sees the five this app is for.
+    // Every other reader of BAR (the launch route, keyLayout's ordering)
+    // still sees the four this app is for.
     taskDestinations(all, false);
     expect(BAR.map((d) => d.route)).toContain("tasks");
-    expect(BAR.length).toBe(5);
+    expect(BAR.length).toBe(4);
+  });
+});
+
+describe("taskProvider — which tracker the Cards tab reads", () => {
+  test("ClickUp connected is the board", () => {
+    expect(taskProvider([at("clickup", "connected")])?.id).toBe("clickup");
+    // Even beside a connected local list: the board has views to choose from.
+    expect(taskProvider([at("taskwarrior", "connected"), at("clickup", "connected")])?.id).toBe("clickup");
+  });
+
+  test("another tracker connected, ClickUp never set up: that tracker", () => {
+    /* The bug this fixes: a machine tracking work in Taskwarrior got an empty
+       ClickUp board and an "Open in ClickUp" button. */
+    expect(taskProvider([at("taskwarrior", "connected"), at("clickup", "needs-auth")])?.id).toBe("taskwarrior");
+  });
+
+  test("a set-up ClickUp outranks another tracker's state, error included", () => {
+    /* The bug this fixes: ClickUp's own notification poll got one 404, its
+       state flipped to "error", and a connected Taskwarrior outranked it —
+       the board a person had set up disappeared behind a tracker they never
+       touched. ClickUp still counts as set up (see `setUp`), and the screen
+       that reads the board is where the error shows, not this ranking. */
+    expect(taskProvider([at("taskwarrior", "connected"), at("clickup", "error")])?.id).toBe("clickup");
+  });
+
+  test("a refused token is still the tracker when nothing else is", () => {
+    // The Cards tab is where "ClickUp refused this token" gets read.
+    expect(taskProvider([at("clickup", "error"), at("taskwarrior", "missing-tool")])?.id).toBe("clickup");
+  });
+
+  test("nothing set up is null; no answer is undefined", () => {
+    expect(taskProvider([at("clickup", "needs-auth"), at("taskwarrior", "missing-tool")])).toBe(null);
+    expect(taskProvider(null)).toBe(undefined);
+    expect(taskProvider(undefined)).toBe(undefined);
+    expect(taskProvider([])).toBe(undefined);
+    expect(taskProvider([at("github", "connected")])).toBe(undefined);
+  });
+
+  test("it answers with the catalogue's row, not a copy", () => {
+    const got = taskProvider([at("taskwarrior", "connected")]);
+    expect(got?.title).toBe("Taskwarrior");
+    expect(got?.kind).toBe("task");
+  });
+});
+
+describe("providerTitle", () => {
+  test("the catalogue's spelling", () => {
+    expect(providerTitle("clickup")).toBe("ClickUp");
+    expect(providerTitle("taskwarrior")).toBe("Taskwarrior");
+  });
+  test("a neutral word, never an id, when there is no provider to name", () => {
+    expect(providerTitle(null)).toBe("the tracker");
+    expect(providerTitle(undefined)).toBe("the tracker");
   });
 });

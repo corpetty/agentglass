@@ -76,8 +76,8 @@ describe("one width for the whole file", () => {
 /*
  * And the numbers stay while it scrolls.
  *
- * Reported straight after the paint fix: "los números de las líneas se deben
- * quedar, ¿no?". They were already written as sticky and had never once stuck,
+ * Found straight after the paint fix. They were already written as sticky and
+ * had never once stuck,
  * because `.agx-gutter{position:relative}` — the rule that places the hover "+"
  * — sits on the same element and wins the cascade. Measured, not read: a probe
  * in headless Chrome reported `position: relative` and the gutter at x=-170
@@ -133,9 +133,9 @@ describe("the same rule where lines are painted next to code", () => {
 /*
  * And exactly one thing scrolls vertically in a column.
  *
- * Reported twice — "no entiendo este doble scroll", then "sigue estando… es
- * como que el scroll de dentro no funciona, es inútil". Measured in the real
- * app this time (headless Chrome over the demo build, Files tab, window shrunk
+ * Two scroll containers in one column, the inner one behaving as though it
+ * did nothing. Fixed once, reported again, and measured in the real app the
+ * second time (headless Chrome over the demo build, Files tab, window shrunk
  * until things overflow): before, the split panes reported `overflowY: auto`
  * and were scroll containers nobody had asked for; after, `overflowY: hidden`
  * and the only vertical scroller left in that column is the column itself.
@@ -151,8 +151,10 @@ describe("the diff pane scrolls sideways and nothing else", () => {
     /* Four panes: unified, split-wrapped, and the split pair. The split's LEFT
        column was written this way from the start — its vertical scroll was
        always the right column's job — which is the shape the other three have
-       now adopted. */
-    expect((src.match(/overflowX: "auto", overflowY: "hidden"/g) ?? []).length).toBe(4);
+       now adopted. The fifth is the sticky rail that stands in for a pane's own
+       scrollbar (see diff-hrail.test.ts): a proxy for a horizontal scroller is
+       a horizontal scroller, and the same rule applies to it. */
+    expect((src.match(/overflowX: "auto", overflowY: "hidden"/g) ?? []).length).toBe(5);
     // `overflow-auto` on a pane is the shape this replaced: it is both axes.
     expect(src).not.toContain("min-w-0 overflow-auto text-[12px]");
   });

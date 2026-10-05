@@ -20,6 +20,8 @@ import { consoleRoot, runInConsole } from "./TerminalPanel.tsx";
 import { CloseButton } from "./CloseButton.tsx";
 import { SettingRow } from "./SettingRow.tsx";
 import { CheckoutPicker } from "./CheckoutPicker.tsx";
+import { IconLabel, PlusIcon } from "../lib/glyphIcons.tsx";
+import { ICON } from "../lib/iconSize.ts";
 
 const edge = (pct: number) => `1px solid color-mix(in srgb, var(--border) ${pct}%, transparent)`;
 const PARAM_TYPES: RecipeParam["type"][] = ["text", "choice", "flag", "repo", "worktree", "branch"];
@@ -100,7 +102,7 @@ export function RecipesPane({ open }: { open: boolean }) {
         <div className="py-2">
           <button onClick={() => setEditing(blank())} className="text-[12px] px-2.5 py-1 rounded-lg"
             style={{ border: "1px solid color-mix(in srgb, var(--primary) 40%, transparent)", color: "var(--text)" }}>
-            ＋ New recipe
+            <IconLabel icon={<PlusIcon size={ICON.xs} />}>New recipe</IconLabel>
           </button>
         </div>
       )}
@@ -115,7 +117,15 @@ export function RecipesPane({ open }: { open: boolean }) {
  *  so the settings column's one padding rule reaches this page. Written out
  *  rather than imported because SettingsModal imports this file. */
 function Wrap({ children }: { children: React.ReactNode }) {
-  return <div className="pb-5 agx-settings-section"><div className="agx-settings-rows">{children}</div></div>;
+  return (
+    <div className="agx-settings-section">
+      <div className="agx-settings-head">
+        <div className="agx-settings-head-t">Project commands</div>
+        <div className="agx-settings-head-d">Ready-to-run commands for the project that is open, and the five you pinned.</div>
+      </div>
+      <div className="agx-settings-rows">{children}</div>
+    </div>
+  );
 }
 
 function Editor({ r, repos, onChange, onSave, onDrop, onCancel }: {
@@ -214,7 +224,7 @@ function Editor({ r, repos, onChange, onSave, onDrop, onCancel }: {
           </div>
         ))}
         <button onClick={() => set({ boot: false, params: [...(r.params ?? []), { key: "", label: "", type: "text" }] })}
-          className="self-start text-[10.5px] px-2 py-0.5 rounded" style={{ border: edge(20), color: "var(--text3)" }}>＋ parameter</button>
+          className="self-start text-[10.5px] px-2 py-0.5 rounded" style={{ border: edge(20), color: "var(--text3)" }}><IconLabel icon={<PlusIcon size={ICON.xs} />}>parameter</IconLabel></button>
       </div>
 
       <div className="flex gap-2 flex-wrap pt-1">

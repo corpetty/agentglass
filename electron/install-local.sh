@@ -6,6 +6,25 @@
 # baked in, then installs it under ~/.local — the desktop spec picks it up.
 set -euo pipefail
 
+# Everything below is the Linux install: electron-builder's `linux-unpacked`,
+# ~/.local/share, a .desktop file, symlinks into ~/.local/bin. There is no macOS
+# half, and on a Mac the script used to spend the packaging minutes first and
+# then stop at `[ -x "$SRC/agentglass" ]` with a line about electron-builder
+# not producing the binary — the wrong diagnosis for a build that was fine and
+# a layout that was another OS's. Say so before doing anything, and say what a
+# Mac does instead: the .dmg, per architecture, named as the release job names
+# it (see .github/workflows/desktop-binaries.yml).
+case "$(uname -s)" in
+  Darwin)
+    cat >&2 <<'MSG'
+install-local.sh installs the Linux layout (~/.local/share + a .desktop file) and has no macOS half.
+On a Mac, install from the .dmg on the latest release: https://github.com/SirAllap/agentglass/releases/latest
+  Apple silicon: agentglass_<version>_arm64.dmg      Intel: agentglass_<version>_x64.dmg
+To build one from this checkout instead: (cd electron && node build.mjs && bunx electron-builder --mac dmg)
+MSG
+    exit 2 ;;
+esac
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$HOME/.local/share/agentglass-desktop"
 BIN="$HOME/.local/bin"
@@ -81,6 +100,21 @@ for exe in "$SRC/agentglass" "$SRC/resources/agentglass-server"; do
   esac
 done
 
+# THE DEPUTY IS MID-RUN? THEN NOT NOW.
+#
+# The check itself lives in appctl.sh, next to the other things this script
+# asks about the machine, because it is driven by tests: the version that lived
+# here counted with a `grep -o` pipeline, and grep's "matched nothing" exit
+# aborted the install under `set -e` whenever no run was going — the refusal
+# fired when it was safe and stayed quiet when it did.
+#
+# shellcheck source=appctl.sh
+. "$HERE/appctl.sh"
+# Before the deputy check and the stop, so a queued install asks both questions
+# about the machine as it is when its turn comes. See take_install_lock.
+take_install_lock || exit 1
+refuse_if_deputy_busy || exit 1
+
 # A running instance holds these files open, and `rm -rf` under it leaves the
 # app alive on deleted inodes — it keeps running the old code and its sidecar
 # keeps :4000, so the next launch adopts a stale server. Stop it first.
@@ -99,8 +133,6 @@ done
 # `agentglass --ozone-platform=wayland` or `--no-sandbox` is an ordinary way to
 # start this app. A stop step that silently matches nothing is the original bug
 # with extra steps: the script would sail past it into rm -rf. See appctl.sh.
-# shellcheck source=appctl.sh
-. "$HERE/appctl.sh"
 if ! stop_app; then
   echo "refusing to install over a running app: $(app_pids | tr '\n' ' ')survived SIGKILL" >&2
   exit 1
@@ -195,6 +227,30 @@ echo "==> verified: the installed renderer is the one just built ($bundle)"
 if [ -f "$APP/resources/bin/agentglass-browser" ]; then
   chmod +x "$APP/resources/bin/agentglass-browser" 2>/dev/null || true
   ln -sf "$APP/resources/bin/agentglass-browser" "$BIN/agentglass-browser"
+  # The same browser as an MCP server, for clients that would rather have tools
+  # with schemas than a command whose output they must parse back.
+  if [ -f "$APP/resources/bin/agentglass-browser-mcp" ]; then
+    chmod +x "$APP/resources/bin/agentglass-browser-mcp" 2>/dev/null || true
+    ln -sf "$APP/resources/bin/agentglass-browser-mcp" "$BIN/agentglass-browser-mcp"
+  fi
+fi
+# The cockpit as a read-only MCP server. It imports the browser MCP server's
+# transport from the file beside it, so it is linked only when both shipped.
+if [ -f "$APP/resources/bin/agentglass-cockpit-mcp" ] && [ -f "$APP/resources/bin/agentglass-browser-mcp" ]; then
+  chmod +x "$APP/resources/bin/agentglass-cockpit-mcp" 2>/dev/null || true
+  ln -sf "$APP/resources/bin/agentglass-cockpit-mcp" "$BIN/agentglass-cockpit-mcp"
+fi
+# The named-agent CLI: a script's launcher and liveness for unattended agents
+# on the engine. Same home as the browser CLI, for the same reason.
+if [ -f "$APP/resources/bin/agentglass-agent" ]; then
+  chmod +x "$APP/resources/bin/agentglass-agent" 2>/dev/null || true
+  ln -sf "$APP/resources/bin/agentglass-agent" "$BIN/agentglass-agent"
+fi
+# The plugin CLI. `validate` runs with no app at all, which is the point: a
+# plugin's own CI checks its manifest with the same rules the app applies.
+if [ -f "$APP/resources/bin/agentglass-plugin" ]; then
+  chmod +x "$APP/resources/bin/agentglass-plugin" 2>/dev/null || true
+  ln -sf "$APP/resources/bin/agentglass-plugin" "$BIN/agentglass-plugin"
 fi
 
 # The skill that tells an agent the CLI exists.
@@ -206,10 +262,11 @@ fi
 #
 # Copied rather than symlinked: this outlives any particular build, and a
 # dangling skill is a tool an agent believes in and cannot use.
-if [ -f "$APP/resources/skills/browser-use/SKILL.md" ]; then
-  mkdir -p "$HOME/.claude/skills/browser-use"
-  cp "$APP/resources/skills/browser-use/SKILL.md" "$HOME/.claude/skills/browser-use/SKILL.md"
-fi
+for _s in browser-use orchestrator; do
+  [ -f "$APP/resources/skills/$_s/SKILL.md" ] || continue
+  mkdir -p "$HOME/.claude/skills/$_s"
+  cp "$APP/resources/skills/$_s/SKILL.md" "$HOME/.claude/skills/$_s/SKILL.md"
+done
 
 # Chromium won't run unsandboxed: it wants chrome-sandbox owned by root with
 # the setuid bit, and the namespace sandbox it would otherwise fall back to is
@@ -241,24 +298,39 @@ if [ "$sandbox_ok" = false ]; then
 fi
 
 install -m644 "$HERE/icons/icon-512.png" "$APP/icon.png" 2>/dev/null || true
+# The plugins page's Install button opens agentglass://plugin/install?url=…
+# On Linux `app.setAsDefaultProtocolClient` is not enough on its own: the
+# desktop database is what a browser consults, and it only knows what a
+# .desktop file declares. `%u` on the Exec line is the other half — without it
+# the URL is never passed to the process that was launched for it.
+#
+# Out here rather than next to the line it explains: the heredoc is unquoted
+# so that $APP expands, and a backtick inside it runs what it wraps.
 cat > "$DESKTOP/agentglass.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=agentglass
 Comment=Real-time cockpit for your Claude Code agents
-Exec=$APP/agentglass
+Exec=$APP/agentglass %u
 Icon=$APP/icon.png
 Terminal=false
 Categories=Development;
+MimeType=x-scheme-handler/agentglass;
 EOF
 chmod 644 "$DESKTOP/agentglass.desktop"
 command -v update-desktop-database >/dev/null && update-desktop-database "$DESKTOP" 2>/dev/null || true
+# And say it out loud, because `update-desktop-database` alone leaves a
+# desktop that already had a default for the scheme pointing wherever it
+# pointed before.
+command -v xdg-mime >/dev/null && xdg-mime default agentglass.desktop x-scheme-handler/agentglass 2>/dev/null || true
 
 echo "installed:"
 echo "  app      $APP/agentglass"
 echo "  stamp    $STAMP"
 echo "  command  agentglass"
 [ -L "$BIN/agentglass-browser" ] && echo "  agent cli agentglass-browser (drives the built-in browser)"
+[ -L "$BIN/agentglass-browser-mcp" ] && echo "  mcp      claude mcp add agentglass-browser -- agentglass-browser-mcp"
+[ -L "$BIN/agentglass-cockpit-mcp" ] && echo "  mcp      claude mcp add agentglass-cockpit -- agentglass-cockpit-mcp"
 [ -f "$HOME/.claude/skills/browser-use/SKILL.md" ] && echo "  skill    ~/.claude/skills/browser-use (so agents know it is there)"
 echo "  launcher $DESKTOP/agentglass.desktop"
 

@@ -43,18 +43,32 @@ import {
 } from "react-native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
-import type { CardPr, ProviderTask, TaskDetail } from "../../../shared/providers.ts";
+import type { CardPr, ProviderId, ProviderTask, TaskDetail } from "../../../shared/providers.ts";
 import type { GitRepoRef, SkillInfo } from "../../../shared/types.ts";
 import { ask } from "../../src/lib/api.ts";
+import { announceCard } from "../../src/state/card-edits.ts";
 import { useAgentglass } from "../../src/state/host-context.tsx";
+import { Md, outline } from "../../src/md/Md.tsx";
 import { usePaletteTick } from "../../src/state/use-palette.ts";
+import { providerTitle } from "../../src/model/taskProviders.ts";
+import { openLinkedPr } from "../../src/state/open-pr.ts";
 import { requestHandoff } from "../../src/terminal/handoff.ts";
 import { mainCheckouts } from "../../src/model/prRows.ts";
 import { cardSkills, namedForIt, skillCommand, skillModes, windowName } from "../../../shared/cardSkills.ts";
 import { dueIn, since } from "../../src/lib/dates.ts";
-import { Btn, Card, Label, Note, Sheet, SheetRow, TAP, Toggle } from "../../src/ui.tsx";
-import { ChevronIcon } from "../../src/nav/icons.tsx";
-import { C, MONO, RADIUS, SPACE, T } from "../../src/theme.ts";
+import { Btn, Card, Chip, Group, GroupTitle, Label, LabelChip, Note, Row, Sheet, SheetRow, Switch, TAP } from "../../src/ui.tsx";
+import { ChevronIcon, PrsIcon } from "../../src/nav/icons.tsx";
+import { Glyph } from "../../src/nav/glyphs.tsx";
+import { C, MONO, RADIUS, SPACE, T, tint } from "../../src/theme.ts";
+
+/**
+ * Where this card lives. Every route this screen reads is `/clickup/…`, so
+ * this is the route's own name and not a guess — and it is spelled once, here,
+ * so the button that opens the card in the tracker takes the catalogue's title
+ * (`providerTitle`) rather than a word typed into JSX. A `ProviderTask` does
+ * not carry its provider, which is why the screen has to say.
+ */
+const PROVIDER: ProviderId = "clickup";
 
 /** GitHub's three states, in the colours this app already uses for them.
  *  Draft is grey rather than green: it is open and it is not asking to be
@@ -74,7 +88,9 @@ function prInk(pr: { state: string; draft?: boolean }): string {
 /** How much description opens by default. 900 is about a screenful and a half
  *  at this size — enough that most cards are shown whole and a specification is
  *  visibly cut rather than silently truncated. */
-const BODY_CAP = 900;
+/** How much of a description shows before the fold. Blocks, not
+ *  characters: a cut mid-sentence is a cut nobody chose. */
+const BODY_BLOCKS = 5;
 
 /** One status the card can be moved to, as the list defines it. */
 interface Status { status: string; color?: string; type?: string }
@@ -99,6 +115,13 @@ export default function CardScreen(): React.ReactNode {
   const [repos, setRepos] = useState<GitRepoRef[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);
+  /** The last successful move: what it was on before, so "Undo" has
+   *  somewhere to send it back to. Its own state rather than folded into
+   *  `said` — the confirmation belongs beside the chips that caused it, not
+   *  buried under the assignee row where a one-tap board write used to leave
+   *  its only trace, with no way back short of tapping through the other
+   *  status again by hand. */
+  const [moved, setMoved] = useState<{ from: string; to: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   /** Everything on the card that is not the card's own row. Null until the
    *  first read lands — an empty description and "not read yet" are different
@@ -133,6 +156,7 @@ export default function CardScreen(): React.ReactNode {
   const [picked, setPicked] = useState<{ skill: SkillInfo; mode?: string } | null>(null);
   const [find, setFind] = useState("");
   const [say, setSay] = useState("");
+  const [commenting, setCommenting] = useState(false);
 
   /*
    * `/clickup/task` answers with a whole TaskDetail and this screen used to
@@ -199,23 +223,52 @@ export default function CardScreen(): React.ReactNode {
     return () => { gone = true; };
   }, [host, mayWrite]);
 
+  /**
+   * The write routes answer with the card as it stands afterwards — re-read by
+   * the server, not assumed — and this screen used to drop it and re-fetch.
+   * The list behind this screen never heard either way, so going back showed
+   * the old column until a pull-to-refresh. Now the returned card goes on
+   * screen at once and out to whoever holds a list (state/card-edits.ts);
+   * `load` still follows, for the description, comments and subtasks the
+   * write route does not carry.
+   */
+  const landed = useCallback((task: ProviderTask | undefined): void => {
+    if (!task) return;
+    setCard(task);
+    announceCard(task);
+  }, []);
+
   const move = useCallback(async (status: string): Promise<void> => {
     if (!host || !card) return;
+    const from = card.status;
+    setMoved(null);
     setBusy(status);
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    const answer = await ask<{ ok: boolean; error?: string }>(host, "/clickup/status", {
-      method: "POST",
-      body: { id: card.id, status },
-    });
+    /*
+     * `updated` rides along, as it does on `claim` below and did not here: the
+     * server's stale-write guard only runs when it is given the stamp the
+     * screen read, so a move without it was the one write on this screen that
+     * two people could both win. The comment on `comment` said this write
+     * sent the stamp; the code did not.
+     */
+    const answer = await ask<{ ok: boolean; error?: string; conflict?: boolean; task?: ProviderTask }>(
+      host, "/clickup/status", { method: "POST", body: { id: card.id, status, updated: card.updated } },
+    );
     setBusy(null);
     if (!answer.ok) { setSaid({ ok: false, text: answer.error }); return; }
     if (!answer.value.ok) {
-      setSaid({ ok: false, text: answer.value.error ?? "The board refused that." });
+      setSaid({
+        ok: false,
+        text: answer.value.conflict
+          ? "The card moved on the board while this was open — reopen it and try again."
+          : answer.value.error ?? "The board refused that.",
+      });
       return;
     }
-    setSaid({ ok: true, text: `Moved to ${status}` });
+    landed(answer.value.task);
+    setMoved({ from, to: status });
     await load();
-  }, [host, card, load]);
+  }, [host, card, load, landed]);
 
   /**
    * A note on the card's activity.
@@ -257,7 +310,7 @@ export default function CardScreen(): React.ReactNode {
     if (!host || !card) return;
     setBusy("assign");
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    const answer = await ask<{ ok: boolean; error?: string; conflict?: boolean }>(host, "/clickup/assign", {
+    const answer = await ask<{ ok: boolean; error?: string; conflict?: boolean; task?: ProviderTask }>(host, "/clickup/assign", {
       method: "POST",
       body: { id: card.id, on, updated: card.updated },
     });
@@ -274,9 +327,10 @@ export default function CardScreen(): React.ReactNode {
       });
       return;
     }
+    landed(answer.value.task);
     setSaid({ ok: true, text: on ? "Assigned to you." : "Taken off you." });
     await load();
-  }, [host, card, load]);
+  }, [host, card, load, landed]);
 
   /* After the card, and only once it has an id to search for. A failure is
      left as an empty list rather than an error on the screen: "no pull request
@@ -326,7 +380,9 @@ export default function CardScreen(): React.ReactNode {
    * were written against and what their own descriptions quote.
    */
   const hand = useCallback((repo: GitRepoRef): void => {
-    if (!card) return;
+    // The terminal needs `full`; a phone without it is not offered this and,
+    // if it gets here, does not go. See model/scope.ts.
+    if (!card || !mayWrite) return;
     const label = card.customId || card.id;
     const command = picked
       ? `${skillCommand(picked.skill.name, card)}${picked.mode ? ` ${picked.mode}` : ""}`
@@ -343,7 +399,7 @@ export default function CardScreen(): React.ReactNode {
     setHanding(false);
     setPicking(false);
     router.push("/terminal");
-  }, [card, picked, router]);
+  }, [card, picked, router, mayWrite]);
 
   /* The search, over name and description both — the same two fields the
      matcher itself reads, so a skill found by its description is findable by
@@ -367,6 +423,9 @@ export default function CardScreen(): React.ReactNode {
      so the emptiness test is on the trimmed text and the trimmed text is what
      gets drawn. */
   const body = (detail?.description ?? "").trim();
+  /* What the fold hides, named. A specification's next heading is the whole
+     of what a reader needs to decide whether to open it. */
+  const bodyRest = useMemo(() => outline(body, BODY_BLOCKS), [body]);
 
   /* Subtasks and checklist items counted as one number, because they are one
      question — what is left underneath this card. A subtask is done when the
@@ -407,78 +466,87 @@ export default function CardScreen(): React.ReactNode {
 
         {card ? (
           <>
-            <View style={{ gap: SPACE.sm }}>
-              <Text style={{ color: C.text, fontSize: T.head, fontWeight: "700", lineHeight: 26 }}>
+            <View style={{ gap: 10, paddingHorizontal: SPACE.xs }}>
+              <Text style={{ color: C.text, fontSize: T.head, fontWeight: "600", lineHeight: 26 }}>
                 {card.title}
               </Text>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm, flexWrap: "wrap" }}>
-                <View style={{
-                  paddingHorizontal: SPACE.sm, paddingVertical: 2, borderRadius: RADIUS.sm,
-                  borderWidth: 1, borderColor: statusInk(card.statusColor),
-                }}>
-                  <Text style={{ color: statusInk(card.statusColor), fontSize: T.eyebrow }}>
-                    {card.status}
-                  </Text>
-                </View>
-                {card.list ? <Text style={{ color: C.text4, fontSize: T.eyebrow }}>{card.list}</Text> : null}
-                {card.sprint ? <Text style={{ color: C.text4, fontSize: T.eyebrow }}>· {card.sprint}</Text> : null}
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <LabelChip name={card.status} color={card.statusColor} />
                 {when ? (
-                  <Text style={{ color: when.late ? C.error : C.text4, fontSize: T.eyebrow }}>{when.text}</Text>
+                  <Chip
+                    label={when.late && when.text !== "today" ? when.text : `Due ${when.text}`}
+                    tone={when.late ? "bad" : "warn"}
+                    icon={<Glyph name="clock" color={when.late ? C.error : C.warning} size={14} />}
+                  />
                 ) : null}
+                {card.priority ? <Chip label={card.priority[0]!.toUpperCase() + card.priority.slice(1)} /> : null}
+                {card.tags.map((t) => <Chip key={t} label={t} />)}
               </View>
+              {card.list || card.sprint ? (
+                <Text style={{ color: C.text3, fontSize: T.small }}>
+                  {[card.list, card.sprint].filter(Boolean).join(" · ")}
+                </Text>
+              ) : null}
             </View>
 
-            {said ? (
-              <Note tone={said.ok ? "quiet" : "bad"}>{said.text}</Note>
-            ) : null}
-
-            {/* Verbatim, and capped. Markdown is not rendered here for the
-                reason the pull request and issue screens both give: a
-                description is prose somebody wrote, and half-rendered markup
-                reads worse than none. The cap is because a ClickUp description
-                is regularly a specification, and a screen that opens on eight
-                hundred words has buried the status and the buttons under
-                them. */}
-            {body ? (
-              <Card>
-                <Text style={{ color: C.text2, fontSize: T.body, lineHeight: 21 }}>
-                  {wholeBody ? body : body.slice(0, BODY_CAP)}
-                  {!wholeBody && body.length > BODY_CAP ? "…" : ""}
-                </Text>
-                {body.length > BODY_CAP ? (
-                  <Pressable
-                    accessibilityRole="button"
-                    onPress={() => setWholeBody((was) => !was)}
-                    style={{ minHeight: TAP, justifyContent: "center" }}
-                  >
-                    <Text style={{ color: C.primary, fontSize: T.small, fontWeight: "600" }}>
-                      {wholeBody ? "Show less" : `Show all ${body.length} characters`}
-                    </Text>
-                  </Pressable>
+            {/*
+              Where it goes next, straight under what it is. A card is moved far
+              more often than it is read to the end, and the statuses were below
+              the description and a comment box, a scroll away from the status
+              they change.
+            */}
+            {mayWrite && moves.length ? (
+              <>
+                <GroupTitle text="Move to" />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ flexGrow: 0 }} contentContainerStyle={{ gap: SPACE.sm }}>
+                  {moves.map((m) => {
+                    const ink = statusInk(m.color);
+                    return (
+                      <Pressable
+                        key={m.status}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Move to ${m.status}`}
+                        disabled={!!busy}
+                        onPress={() => { void move(m.status); }}
+                        hitSlop={{ top: 4, bottom: 4 }}
+                        style={({ pressed }) => ({
+                          flexDirection: "row", alignItems: "center", gap: 6, height: 40, paddingHorizontal: 14,
+                          borderRadius: 20, borderWidth: 1, borderColor: tint(ink, 0.5),
+                          opacity: busy && busy !== m.status ? 0.4 : 1,
+                          transform: [{ scale: pressed ? 0.97 : 1 }],
+                        })}
+                      >
+                        {busy === m.status
+                          ? <ActivityIndicator color={ink} size="small" />
+                          : <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: ink }} />}
+                        <Text style={{ color: C.text, fontSize: 13, fontWeight: "500" }}>{m.status}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
+                {/* Beside the chips that caused it, not under the assignee row
+                    a scroll away: the one thing a one-tap board write needs is
+                    a way back, next to where the tap happened. */}
+                {moved ? (
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.md, paddingTop: SPACE.sm }}>
+                    <Text style={{ color: C.text3, fontSize: T.small, flexShrink: 1 }}>Moved to {moved.to}</Text>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Undo, move back to ${moved.from}`}
+                      disabled={!!busy}
+                      onPress={() => { const from = moved.from; void move(from); }}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                      <Text style={{ color: C.primary, fontSize: T.small, fontWeight: "600" }}>Undo</Text>
+                    </Pressable>
+                  </View>
                 ) : null}
-              </Card>
+              </>
             ) : null}
-
-            <Card style={{ gap: SPACE.sm }}>
-              <Label text="On the card" />
-              {card.assignees.length ? (
-                <Note>{card.assignees.join(", ")}</Note>
-              ) : (
-                <Note>Nobody is assigned.</Note>
-              )}
-              {card.priority ? <Note>Priority: {card.priority}</Note> : null}
-              {card.tags.length ? <Note>{card.tags.join(" · ")}</Note> : null}
-              {card.comments !== undefined && card.comments > 0 ? (
-                <Note>{card.comments} {card.comments === 1 ? "comment" : "comments"} on the board.</Note>
-              ) : null}
-            </Card>
 
             {/*
-              Taking it, and saying something.
-
-              Only with `full`, not drawn otherwise — the rule repos.tsx set
-              and the one every write in this app follows. Both of these are
-              writes to somebody else's workspace.
+              Taking it, as a switch: on is yours. It was a box beside a
+              sentence whose wording changed with the state.
 
               `mine` is the server's answer, not a search of `assignees` for a
               name the phone would have to know. Its own comment says why:
@@ -486,65 +554,62 @@ export default function CardScreen(): React.ReactNode {
               client has no business knowing your user id".
             */}
             {mayWrite ? (
-              <Card style={{ gap: SPACE.sm }}>
-                <Toggle
-                  on={card.mine === true}
-                  label={card.mine ? "It is yours" : "Take it"}
-                  sub={
-                    card.mine
-                      ? "Turning this off takes you off the card."
-                      : "Puts you on the card, alongside anybody already there."
-                  }
-                  disabled={busy !== null}
-                  onPress={() => { void claim(card.mine !== true); }}
-                />
-                <TextInput
-                  value={say}
-                  onChangeText={setSay}
-                  placeholder="A note on the card…"
-                  placeholderTextColor={C.text4}
-                  multiline
-                  style={{
-                    minHeight: 72, borderWidth: 1, borderColor: C.border,
-                    borderRadius: RADIUS.sm, backgroundColor: C.bg,
-                    color: C.text, padding: SPACE.sm, fontSize: T.body,
-                  }}
-                />
-                <Btn
-                  label="Post it"
-                  busy={busy === "comment"}
-                  disabled={!say.trim() || busy !== null}
-                  onPress={() => { void comment(); }}
-                />
+              <View style={{ paddingTop: SPACE.md }}>
+                <Group>
+                  <Row
+                    title="Assigned to you"
+                    sub={(() => {
+                      const others = card.assignees.length - (card.mine ? 1 : 0);
+                      if (card.mine) return others > 0 ? `Also on it: ${others} more` : "Nobody else is on it";
+                      return card.assignees.length ? `On it: ${card.assignees.join(", ")}` : "Nobody is on it";
+                    })()}
+                    checked={card.mine === true}
+                    trail={<Switch on={card.mine === true} disabled={busy !== null} />}
+                    disabled={busy !== null}
+                    onPress={() => { void claim(card.mine !== true); }}
+                  />
+                </Group>
+              </View>
+            ) : card.assignees.length ? (
+              <Text style={{ color: C.text3, fontSize: T.small, paddingHorizontal: SPACE.xs }}>
+                On it: {card.assignees.join(", ")}
+              </Text>
+            ) : null}
+
+            {said ? (
+              <Note tone={said.ok ? "quiet" : "bad"}>{said.text}</Note>
+            ) : null}
+
+            {/* Rendered, and folded by blocks rather than by characters. The
+                fold is still here for the reason it always was — a ClickUp
+                description is regularly a specification, and a screen that
+                opens on eight hundred words has buried the status and the
+                buttons under them — but a cut between two things somebody
+                wrote beats a cut at character nine hundred, and the expander
+                can name what is under it. */}
+            {body ? (
+              <Card style={{ gap: SPACE.md }}>
+                <Md text={body} host={host} limit={wholeBody ? undefined : BODY_BLOCKS} />
+                {bodyRest.hidden ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() => setWholeBody((was) => !was)}
+                    style={{ minHeight: TAP, justifyContent: "center" }}
+                  >
+                    <Text style={{ color: C.primary, fontSize: T.small, fontWeight: "600" }}>
+                      {wholeBody
+                        ? "Show less"
+                        : bodyRest.nextHeading
+                          ? `${bodyRest.nextHeading}${bodyRest.hidden > 1 ? ` and ${bodyRest.hidden - 1} more` : ""}`
+                          : `${bodyRest.hidden} more`}
+                    </Text>
+                  </Pressable>
+                ) : null}
               </Card>
             ) : null}
 
-            {mayWrite && moves.length ? (
-              <View style={{ gap: SPACE.sm }}>
-                <Label text="Move to" />
-                <View style={{ flexDirection: "row", gap: SPACE.sm, flexWrap: "wrap" }}>
-                  {moves.map((s) => {
-                    const ink = statusInk(s.color);
-                    return (
-                      <Pressable
-                        key={s.status}
-                        accessibilityRole="button"
-                        disabled={!!busy}
-                        onPress={() => { void move(s.status); }}
-                        style={({ pressed }) => ({
-                          minHeight: TAP, justifyContent: "center", paddingHorizontal: SPACE.md,
-                          borderRadius: RADIUS.md, borderWidth: 1, borderColor: ink,
-                          opacity: busy && busy !== s.status ? 0.4 : pressed ? 0.6 : 1,
-                        })}
-                      >
-                        <Text style={{ color: ink, fontSize: T.small, fontWeight: "600" }}>
-                          {busy === s.status ? "…" : s.status}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </View>
+            {card.comments !== undefined && card.comments > 0 && !detail?.comments.length ? (
+              <Note>{card.comments} {card.comments === 1 ? "comment" : "comments"} on the board.</Note>
             ) : null}
 
             {!mayWrite ? (
@@ -572,9 +637,11 @@ export default function CardScreen(): React.ReactNode {
                       onPress={() => router.push({ pathname: "/card/[id]", params: { id: sub.id } })}
                       style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm, minHeight: TAP }}
                     >
-                      <Text style={{ color: statusInk(sub.statusColor), fontSize: T.eyebrow }}>
-                        {sub.statusKind === "done" ? "✓" : "○"}
-                      </Text>
+                      <Glyph
+                        name={sub.statusKind === "done" ? "ok_circle" : "circle"}
+                        color={statusInk(sub.statusColor)}
+                        size={18}
+                      />
                       <Text
                         numberOfLines={1}
                         style={{
@@ -598,9 +665,7 @@ export default function CardScreen(): React.ReactNode {
                              test/tap-floor.test.ts has nothing to weigh. */
                           style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm, paddingVertical: 3 }}
                         >
-                          <Text style={{ color: item.done ? C.success : C.text4, fontSize: T.eyebrow }}>
-                            {item.done ? "✓" : "○"}
-                          </Text>
+                          <Glyph name={item.done ? "ok_circle" : "circle"} color={item.done ? C.success : C.text3} size={16} />
                           <Text
                             style={{
                               color: item.done ? C.text4 : C.text2, fontSize: T.small, flex: 1,
@@ -621,34 +686,30 @@ export default function CardScreen(): React.ReactNode {
                 the rest. A reader deciding whether the work is done should know
                 which they are looking at. */}
             {prs?.length ? (
-              <View style={{ gap: SPACE.sm }}>
-                <Label text={`Pull requests · ${prs.length}`} />
-                <Card style={{ gap: SPACE.xs }}>
+              <View>
+                <GroupTitle text={`Pull requests · ${prs.length}`} />
+                <Group inset={50}>
                   {prs.map((pr) => (
-                    <Pressable
+                    <Row
                       key={pr.number}
-                      accessibilityRole="button"
-                      onPress={() => { void Linking.openURL(pr.url); }}
-                      style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm, minHeight: TAP }}
-                    >
-                      <Text style={{ color: prInk(pr), fontSize: T.eyebrow, fontFamily: MONO, width: 52 }}>
-                        #{pr.number}
-                      </Text>
-                      <Text numberOfLines={1} style={{ color: C.text2, fontSize: T.small, flex: 1 }}>
-                        {pr.title || pr.url}
-                      </Text>
-                      <Text style={{ color: prInk(pr), fontSize: T.eyebrow }}>
-                        {pr.draft ? "draft" : pr.state.toLowerCase()}
-                      </Text>
-                    </Pressable>
+                      title={`#${pr.number} ${pr.title || pr.url}`}
+                      sub={`${pr.draft ? "Draft" : pr.state[0] + pr.state.slice(1).toLowerCase()}${pr.stated ? "" : " · found by search"}`}
+                      lead={<PrsIcon color={prInk(pr)} size={20} />}
+                      chevron
+                      // In the app when the computer has a checkout of it — see
+                      // model/prRef.ts — and the browser only when it has not.
+                      onPress={() => { if (host) void openLinkedPr(host, router, pr.url); }}
+                    />
                   ))}
-                  {prs.some((pr) => !pr.stated) ? (
+                </Group>
+                {prs.some((pr) => !pr.stated) ? (
+                  <View style={{ paddingHorizontal: SPACE.xs, paddingTop: SPACE.xs }}>
                     <Note>
                       Found by searching GitHub for this card&apos;s id, so one of these may belong to
                       something else that mentions it.
                     </Note>
-                  ) : null}
-                </Card>
+                  </View>
+                ) : null}
               </View>
             ) : null}
 
@@ -663,7 +724,7 @@ export default function CardScreen(): React.ReactNode {
                     <View key={c.id} style={{ gap: 2 }}>
                       <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm }}>
                         <Text style={{ color: C.text, fontSize: T.small, fontWeight: "600" }}>{c.who}</Text>
-                        <Text style={{ color: C.text4, fontSize: T.eyebrow }}>{since(c.at, now)}</Text>
+                        <Text style={{ color: C.text3, fontSize: T.eyebrow }}>{since(c.at, now)}</Text>
                       </View>
                       {c.text ? (
                         <Text style={{ color: C.text2, fontSize: T.body, lineHeight: 20 }}>{c.text}</Text>
@@ -680,7 +741,7 @@ export default function CardScreen(): React.ReactNode {
                         }}>
                           <View style={{ flexDirection: "row", alignItems: "center", gap: SPACE.sm }}>
                             <Text style={{ color: C.text2, fontSize: T.eyebrow, fontWeight: "600" }}>{r.who}</Text>
-                            <Text style={{ color: C.text4, fontSize: T.eyebrow }}>{since(r.at, now)}</Text>
+                            <Text style={{ color: C.text3, fontSize: T.eyebrow }}>{since(r.at, now)}</Text>
                           </View>
                           <Text style={{ color: C.text3, fontSize: T.small, lineHeight: 18 }}>{r.text}</Text>
                         </View>
@@ -695,11 +756,11 @@ export default function CardScreen(): React.ReactNode {
             ) : null}
 
             <View style={{ gap: SPACE.xs }}>
-              <Text style={{ color: C.text4, fontSize: T.eyebrow, fontFamily: MONO }}>
+              <Text style={{ color: C.text3, fontSize: T.eyebrow, fontFamily: MONO }}>
                 {card.customId || card.id}
               </Text>
               {card.url ? (
-                <Btn label="Open in ClickUp" onPress={() => { void Linking.openURL(card.url); }} />
+                <Btn label={`Open in ${providerTitle(PROVIDER)}`} onPress={() => { void Linking.openURL(card.url); }} />
               ) : null}
             </View>
           </>
@@ -711,13 +772,47 @@ export default function CardScreen(): React.ReactNode {
           paddingHorizontal: SPACE.lg, paddingTop: SPACE.md, paddingBottom: SPACE.lg,
           borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.bg2,
         }}>
-          <Btn
-            label="✦ Hand to Claude"
-            tone="primary"
-            onPress={() => { setFind(""); setPicking(true); }}
-          />
+          <View style={{ flexDirection: "row", gap: SPACE.sm }}>
+            <Btn label="Comment" style={{ flex: 1 }} onPress={() => setCommenting(true)} />
+            <Btn
+              label="Start with Claude"
+              tone="primary"
+              style={{ flex: 1.6 }}
+              onPress={() => { setFind(""); setPicking(true); }}
+            />
+          </View>
         </View>
       ) : null}
+
+      {/* Saying something, in a sheet from the bar. It was a box open in the
+          middle of the page between the facts and the statuses, where the
+          keyboard pushed everything that mattered off the screen. Read-only
+          history stays on the page ("Said on the board"); answering a
+          specific comment is a thread, which ClickUp models and this does not. */}
+      <Sheet open={commenting} onClose={() => setCommenting(false)} title="Comment on the card">
+        <View style={{ gap: SPACE.md, paddingBottom: SPACE.md }}>
+          <TextInput
+            value={say}
+            onChangeText={setSay}
+            placeholder="A note on the card…"
+            placeholderTextColor={C.text3}
+            multiline
+            autoFocus
+            style={{
+              minHeight: 96, borderWidth: 1, borderColor: C.border2,
+              borderRadius: RADIUS.md, backgroundColor: C.bg,
+              color: C.text, padding: SPACE.md, fontSize: T.body, textAlignVertical: "top",
+            }}
+          />
+          <Btn
+            label="Post it"
+            tone="primary"
+            busy={busy === "comment"}
+            disabled={!say.trim() || busy !== null}
+            onPress={() => { void comment().then(() => setCommenting(false)); }}
+          />
+        </View>
+      </Sheet>
 
       {/* WHAT, before WHERE. The order is the point: the checkout is a detail of
           running it and the instruction is the decision. */}

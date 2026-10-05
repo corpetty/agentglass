@@ -8,13 +8,17 @@
 //
 // Here each kind gets its own section, toggles look like toggles and say what
 // they control, and downloads say what you actually get.
+import { PluginSettingsPane } from "./plugins/PluginSettingsPane.tsx";
 import { Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { RecipesPane } from "./RecipesPane.tsx";
 import { ReviewPromptsPane } from "./ReviewPromptsPane.tsx";
+import { SavedRepliesPane } from "./SavedRepliesPane.tsx";
 import { lastTerminalRoot } from "./TerminalPanel.tsx";
 import { Filter, Fold, SettingRow } from "./SettingRow.tsx";
+import { resetShown } from "../lib/settingsModified.ts";
+import { pageScore, searchSettings, absentFor, expandWord, rowId, type SettingsPage } from "../lib/settingsIndex.ts";
 import { motion, AnimatePresence } from "motion/react";
-import { Portal } from "./Portal.tsx";
+import { Portal, PortalFloor } from "./Portal.tsx";
 import { LAYER } from "../lib/layers.ts";
 import { api } from "../lib/api.ts";
 import { browserPlaces, CAN_IMPORT_COOKIES, cookieSources, importCookies, forgetCookies, type CookieSource, type CookieImportReply } from "../lib/desktop.ts";
@@ -22,26 +26,42 @@ import { loadProfiles } from "../lib/browserProfiles.ts";
 import { addVisible, allSites, bestSource, dropVisible, lockedWhy, reachable, siteView } from "../lib/cookiePick.ts";
 import { PROVIDERS, type ProviderSpec, type ProviderStatus, type ProviderState } from "../../../shared/providers.ts";
 import { checkedLine } from "../lib/providerFreshness.ts";
-import { fmtAgo } from "../lib/format.ts";
-import type { ActionRecord, GateRecord } from "../../../shared/types.ts";
-import { mergeActivity, gateLine, actorLabel, type ActivityRow } from "../lib/activity.ts";
+import { fmtAgo, minutesAgo } from "../lib/format.ts";
+import { useClipped } from "./TopBarNotes.tsx";
+import type { ActionRecord, GateRecord, UnderstudyClassRow } from "../../../shared/types.ts";
+import { mergeActivity, gateLine, actorLabel, activityDays, type ActivityRow, type ActivityRun } from "../lib/activity.ts";
 import { ingestUpdate } from "../lib/updateStore.ts";
 import { ReleaseNotesModal } from "./ReleaseNotesModal.tsx";
 import { installedNotes, type NotesTarget } from "../lib/whatsNew.ts";
-import { autostartEnabled, setAutostart, isFullscreen, toggleFullscreen, IS_DESKTOP, HAS_BROWSER } from "../lib/desktop.ts";
+import { autostartEnabled, setAutostart, isFullscreen, toggleFullscreen, IS_DESKTOP, IS_MAC_DESKTOP, HAS_BROWSER } from "../lib/desktop.ts";
+import { overlayOpen } from "../lib/overlays.ts";
 import { Select } from "./Select.tsx";
+import { WORKER_ROLES } from "../../../shared/workerRoles.ts";
 import { ALARM_VOICES, NOTIFY_VOICES, findVoice, playVoice, type Voice } from "../lib/sounds.ts";
 import { alarmVoiceId, setAlarmVoice } from "../lib/alarm.ts";
 import { SEARCH_ENGINE_LABELS, type SearchEngine } from "../lib/browserUrl.ts";
 import { homePageRaw, setHomePage, searchEngine, setSearchEngine, importHistory, setImportHistory, importBookmarks, setImportBookmarks, pickImportRows } from "../lib/browserPrefs.ts";
 import { RemoteAccessPane } from "./RemoteAccessPane.tsx";
+import { NOTIFY_KINDS, NOTIFY_CHANNELS, NOTIFY_KIND_LABEL, NOTIFY_CHANNEL_LABEL, type NotifyKind, type NotifyChannel } from "../../../shared/notifyPrefs.ts";
+import { getNotifyPrefs, subscribeNotifyPrefs, saveNotifyPrefs } from "../lib/notifyPrefsStore.ts";
+import { PluginsPane } from "./PluginsPane.tsx";
+import { TerminalIcon, DiffIcon, BrowserIcon, UnderstudyIcon, LanternIcon } from "./workspace/icons.tsx";
+import {
+  SlidersIcon, ThemeIcon, BellIcon, SidebarIcon, KeyboardIcon, BudgetIcon, PulseIcon,
+  CommandIcon, ReviewIcon, QuoteIcon, PanesIcon, PlugIcon, ServerIcon, PhoneIcon,
+  PuzzleIcon, ShieldIcon, InfoIcon, ChecklistIcon,
+} from "./settingsNavIcons.tsx";
+import { resolvePane, openSettings } from "../lib/openSettings.ts";
 import { RunningPanes } from "./RunningPanes.tsx";
+import { ThemePicker } from "./diff/DiffControls.tsx";
 import { BudgetsPane } from "./BudgetsPane.tsx";
 import { AgentsPane } from "./AgentsPane.tsx";
 import { rendererPref, setRendererPref, type RendererPref } from "../lib/termRenderer.ts";
-import { TERM_FONTS, CURSORS, fontAvailable, currentTermFont, currentTermSize, currentTermCursor, currentTermLineHeight, setTermFont, setTermSize, setTermCursor, setTermLineHeight, SIZE_MIN, SIZE_MAX, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, type CursorStyle } from "../lib/termPrefs.ts";
+import { TERM_FONTS, CURSORS, fontAvailable, currentTermFont, currentTermSize, currentTermCursor, currentTermLineHeight, setTermFont, setTermSize, setTermCursor, setTermLineHeight, SIZE_MIN, SIZE_MAX, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, DEFAULT_SIZE, DEFAULT_LINE_HEIGHT, type CursorStyle } from "../lib/termPrefs.ts";
 import { focusFollowsMouse, setFocusFollowsMouse } from "../lib/termFocusPref.ts";
-import { diffSplit, diffWrap, setDiffSplit, setDiffWrap } from "../lib/diffPrefs.ts";
+import { parseRules, setTabGroupRulesText, setTabGroupsOn, tabGroupRulesText, tabGroupsOn } from "../lib/tabGroups.ts";
+import { paneActionsMode, setPaneActionsMode, type PaneActionsMode } from "../lib/paneActionsPref.ts";
+import { diffThemePref, setDiffThemePref, diffSplit, diffWrap, setDiffSplit, setDiffWrap, DEFAULT_SPLIT, DEFAULT_WRAP } from "../lib/diffPrefs.ts";
 import {
   TASK_SOURCES, taskSourceShown, setTaskSourceShown,
   orderedTaskSources, moveTaskSource, resetTaskSourceOrder, type TaskSourceId,
@@ -52,10 +72,12 @@ import {
   currentScrollback, currentWordSeparators, copyOnSelect, rightClickPaste,
   setScrollback, setWordSeparators, setCopyOnSelect, setRightClickPaste,
 } from "../lib/termPrefs.ts";
-import { canZoomIn, canZoomOut, fmtScale } from "../lib/uiScale.ts";
+import { canZoomIn, canZoomOut, fmtScale, DEFAULT_SCALE } from "../lib/uiScale.ts";
+import { currentAccent, setAccentPref } from "../lib/accent.ts";
+import { applyTheme } from "../lib/themes.ts";
 import { MOD_KEY } from "../lib/format.ts";
 import { externalUrl } from "../lib/externalUrl.ts";
-import type { UpdateStatus, ReleaseNotes, HookSetupStatus, BrowserUseStatus } from "../../../shared/types.ts";
+import type { UpdateStatus, ReleaseNotes, HookSetupStatus, BrowserUseStatus, LogDigest } from "../../../shared/types.ts";
 import {
   sysNotifyMode, setSysNotifyMode, setSysNotifyOn, subscribeSysNotifyMode,
   notifyVoiceId, setNotifyVoice,
@@ -67,7 +89,11 @@ import { chatEnginePref, setChatEnginePref, type ChatEnginePref } from "../lib/c
 import type { TmuxEngineInfo } from "../../../shared/types.ts";
 import type { DepReport, DepStatus } from "../../../shared/deps.ts";
 import { clock24, setClock24 } from "../lib/clockPref.ts";
+import { setSplashOn, splashOn } from "../lib/splashPref.ts";
 import { usageRefreshOn, setUsageRefreshOn } from "../lib/usageRefreshPref.ts";
+import { paceConfig, setPaceConfig, subscribePaceConfig } from "../lib/paceConfig.ts";
+import { hourLabel, type PaceConfig } from "../../../shared/pace.ts";
+import { useDialogs } from "./ConfirmDialog.tsx";
 import { bindings, rebind, resetBindings, subscribeBindings, isCustomised, LABELS, DEFAULTS, type ActionId,
          chordFor, hasCustomChord, rebindChord, clearChord, resetChords, chordsCustomised, chordFromEvent, chordLabel,
          appChordFor, hasCustomAppChord, rebindAppChord, resetAppChords, appChordsCustomised,
@@ -80,15 +106,30 @@ import { AppearancePane } from "./ThemePicker.tsx";
 import { ShellConsole } from "./ShellConsole.tsx";
 import { CloseButton } from "./CloseButton.tsx";
 import { ICON } from "../lib/iconSize.ts";
+import { CheckboxIcon, ClockIcon, CrossIcon, DoneIcon } from "../lib/glyphIcons.tsx";
 import { ciOnlyApproved, setCiOnlyApproved } from "../lib/ciNotifyPref.ts";
+import { setTalkNotify, talkNotify, type TalkNotify } from "../lib/talkNotify.ts";
+import { RETENTION, setUnderstudyEnabled, useUnderstudy } from "./understudy/UnderstudyPanel.tsx";
+import { Appearance, closedCount } from "./understudy/Appearance.tsx";
+import { Teach } from "./understudy/Teach.tsx";
+import { Persona } from "./understudy/persona/Persona.tsx";
+import { setCosmetic, useCosmetic } from "./understudy/persona/cosmeticStore.ts";
+import { emitControl } from "../lib/controlBus.ts";
+import { refreshUnderstudy } from "../lib/understudyStore.ts";
+import { mutedSources, setMuted, sourceLabel, subscribeMuted } from "../lib/notePolicy.ts";
+import { MuteGlyph } from "./TopBarNotes.tsx";
 
 /** A heading inside a Section, for a pane that answers the same question about
  *  two different sources. Without it "Quiet" and "Alert sounds" sit in one flat
  *  list and you have to read every hint to work out which switch is about your
  *  machine and which is about this app. */
 function Group({ children }: { children: React.ReactNode }) {
+  // `agx-settings-group-heading` is what index.css hides a group by, when a
+  // search has filtered away every row between it and the next one (or the
+  // end of the section) — see the CSS comment there for why a sibling
+  // selector, not a wrapping container, is what answers it here.
   return (
-    <div className="px-3 pt-2.5 pb-0.5">
+    <div className="agx-settings-group-heading px-3 pt-2.5 pb-0.5">
       <span className="text-[10px] t-dim2 uppercase tracking-wider">{children}</span>
     </div>
   );
@@ -144,7 +185,7 @@ function SetupCard({ title, steps, note, error }: {
   const done = known.filter((s) => s.done).length;
   const all = known.length > 0 && done === known.length;
   return (
-    <div className="mb-5 rounded-xl overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)", background: "var(--bg2)" }}>
+    <div className="agx-inset mb-5 rounded-xl overflow-hidden" style={{ border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)", background: "var(--bg2)" }}>
       <div className="flex items-center gap-3 px-4 py-2.5" style={{ borderBottom: "1px solid color-mix(in srgb, var(--border) 35%, transparent)" }}>
         <span className="text-[13.5px] font-medium" style={{ color: "var(--text)" }}>{title}</span>
         <span className="ml-auto text-[11.5px] tabular-nums px-2 py-0.5 rounded-full"
@@ -164,7 +205,7 @@ function SetupCard({ title, steps, note, error }: {
                 : st.done === false
                   ? { color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 16%, transparent)" }
                   : { color: "var(--text4)", background: "color-mix(in srgb, var(--text) 8%, transparent)" }}>
-              {st.done === true ? "✓" : i + 1}
+              {st.done === true ? <DoneIcon size={ICON.xs} /> : i + 1}
             </span>
             <span className="min-w-0">
               <span className="block text-[13px]" style={{ color: "var(--text)" }}>{st.title}</span>
@@ -196,14 +237,16 @@ function SetupCard({ title, steps, note, error }: {
   );
 }
 
-function Toggle({ on, onClick, label, hint, disabled }: {
+function Toggle({ on, onClick, label, hint, disabled, modified }: {
   on: boolean; onClick: () => void; label: string; hint: string;
+  /** Differs from the shipped default: SettingRow draws the dot. */
+  modified?: boolean;
   /** A host that cannot do this at all — the row stays, greyed, saying why in
    *  its hint, because a switch that vanishes reads as a feature you imagined. */
   disabled?: boolean;
 }) {
   return (
-    <SettingRow label={label} hint={hint} onClick={onClick} disabled={disabled}
+    <SettingRow label={label} hint={hint} onClick={onClick} disabled={disabled} modified={modified}
       role="switch" ariaChecked={on}
       /* A real switch: position carries the state, so it reads at a glance
          instead of having to be parsed. */
@@ -273,12 +316,12 @@ function SourceRow({ id, i, n, onChanged }: {
 /** A row of mutually exclusive choices, for a preference with three answers
  *  rather than two. A toggle would have forced "show me their message" and
  *  "just tell me someone wrote" to be the same decision. */
-function Choice<T extends string>({ label, hint, value, options, onPick, disabled, disabledHint }: {
+function Choice<T extends string>({ label, hint, value, options, onPick, disabled, disabledHint, modified }: {
   label: string; hint: string; value: T; options: { v: T; label: string }[];
-  onPick: (v: T) => void; disabled?: boolean; disabledHint?: string;
+  onPick: (v: T) => void; disabled?: boolean; disabledHint?: string; modified?: boolean;
 }) {
   return (
-    <SettingRow label={label} hint={disabled ? disabledHint ?? hint : hint} disabled={disabled}
+    <SettingRow label={label} hint={disabled ? disabledHint ?? hint : hint} disabled={disabled} modified={modified}
       control={
         <span className="flex items-center gap-1 rounded-lg p-0.5 justify-self-end"
           style={{ background: "color-mix(in srgb, var(--border) 28%, transparent)" }}>
@@ -300,13 +343,14 @@ function Choice<T extends string>({ label, hint, value, options, onPick, disable
 /** A −/value/+ stepper. A slider would imply the value is continuous and let
  *  you drag the window into a size the cockpit grid can't lay out; the ladder
  *  is short and every rung is one that works, so buttons say more. */
-function Stepper({ label, hint, value, onDec, onInc, canDec, canInc }: {
+function Stepper({ label, hint, value, onDec, onInc, canDec, canInc, modified }: {
   label: string; hint: string; value: string; onDec: () => void; onInc: () => void; canDec: boolean; canInc: boolean;
+  modified?: boolean;
 }) {
   const btn = "w-7 h-7 rounded-md text-[14px] leading-none flex items-center justify-center disabled:opacity-30 enabled:hover:bg-white/10";
   const border = "1px solid color-mix(in srgb, var(--border) 55%, transparent)";
   return (
-    <SettingRow label={label} hint={hint}
+    <SettingRow label={label} hint={hint} modified={modified}
       control={
         <span className="flex items-center gap-1 justify-self-end">
           <button onClick={onDec} disabled={!canDec} className={btn} style={{ border, color: "var(--text2)" }} aria-label="Smaller">−</button>
@@ -318,6 +362,14 @@ function Stepper({ label, hint, value, onDec, onInc, canDec, canInc }: {
   );
 }
 
+/** A dot, not a checkbox: green when the state is already true, nothing to
+ *  press either way. Clicking the row still takes you to where it's fixed. */
+function OnboardingMark({ done }: { done: boolean }) {
+  return done
+    ? <span className="justify-self-end rounded-full" style={{ width: 6, height: 6, background: "var(--success)" }} />
+    : <span className="justify-self-end text-[11px]" style={{ color: "var(--text4)" }}>Not yet</span>;
+}
+
 function Row({ label, hint, kbd, href, download, onClick }: { label: string; hint: string; kbd?: string; href?: string; download?: string; onClick?: () => void }) {
   return (
     <SettingRow label={label} hint={hint} href={href} download={download} onClick={href ? undefined : onClick}
@@ -325,37 +377,67 @@ function Row({ label, hint, kbd, href, download, onClick }: { label: string; hin
   );
 }
 
-type Pane = "recipes" | "review-prompts" | "appearance" | "prefs" | "terminal" | "diff" | "tasks" | "privacy" | "chat" | "notifications" | "browser" | "rail" | "keys" | "open" | "export" | "log" | "budgets" | "hooks" | "connections" | "tmux" | "remote" | "about";
-/** "" is the ungrouped tail: a heading over one item is a rule that separates
- *  nothing, so About sits alone at the foot of the nav. */
-type TabGroup = "Interface" | "Agents & work" | "Connections" | "Your data" | "";
+type Pane = "recipes" | "review-prompts" | "saved-replies" | "appearance" | "prefs" | "terminal" | "diff" | "tasks" | "privacy" | "notifications" | "browser" | "rail" | "keys" | "lantern" | "log" | "budgets" | "hooks" | "connections" | "tmux" | "remote" | "plugins" | "understudy" | "about" | "onboarding"
+  /** A plugin's own settings page, one per plugin that declares any. */
+  | `plugin:${string}`;
+/** "" is a page that is in no group and so not in the nav (see LINK_ONLY).
+ *
+ *  "Get started" is never in TAB_GROUPS below, on purpose: it is not a ring,
+ *  it is a row that answers whether the other rings have anything left to
+ *  set up, and a ring with one member that vanishes the moment you finish it
+ *  is not a ring. Keeping its own tab entry (for the page title and search)
+ *  while leaving it out of the render order lets it live pinned above every
+ *  ring instead of filed into one — see the pinned button before the group
+ *  loop, which is the only place this literal is read. */
+type TabGroup = "General" | "Workspace" | "Agents" | "Library" | "Connections" | "System" | "Get started" | "";
 // Rendered in this order; a group with no matching tab is dropped, so search
 // collapses to just the sections that still have something in them.
 /*
- * Four rings, outward from you.
+ * Six groups, each named for the object its pages configure.
  *
- * "Data" was a junk drawer and it is worth naming why, because the failure has
- * a name: NN/g calls a group defined by what its members are NOT — "More",
- * "Tools", "Data" — a bucket with low information scent, and says it comes
- * from having a list of features and nowhere to put them. Ours held a view
- * filter (Tasks), a money policy (Budgets), a log (Activity), a launcher
- * (Open), an authoring surface (Commands) and five download links (Export).
- * They shared nothing except not being Interface and not being Setup.
+ * General is the app window and how it talks to you (startup, look,
+ * notifications, sidebar, shortcuts). Workspace is where work happens
+ * (terminal, diff, browser, tasks). Agents is the agents themselves and what
+ * they spend. Library is text you author and reuse. Connections is what the
+ * app reaches out to. System is what it runs on and what it keeps.
  *
- * The rings are: what you look at, what works for you, what it reaches out to,
- * and what it keeps. A pane is filed under the OBJECT it configures, never
- * under how often it is opened — frequency is personal and it moves, objects
- * do not.
+ * The old four rings put a view filter (Tasks), a money policy (Budgets), a
+ * log and five download links in one drawer called "Your data". A group
+ * defined by what its members are NOT ("More", "Tools", "Data") has low
+ * information scent; a pane is filed under the OBJECT it configures, never
+ * under how often it is opened. Placements whose reason is written beside
+ * them in TABS below stay with that reason.
  *
- * Privacy and About were groups of one. A header over a single item is a rule
- * that separates nothing, so they join the ring they belong to; that takes the
- * nav from 5 headers over 21 items to 4 over 21.
+ * Six headers over 22 pages: no group holds a single page, so none is a rule
+ * that separates nothing.
  */
-const TAB_GROUPS: TabGroup[] = ["Interface", "Agents & work", "Connections", "Your data", ""];
+/** How long the first Escape stays armed. Long enough to be a second press
+ *  rather than a double-tap, short enough that nobody arms it, walks away, and
+ *  loses the page to an unrelated keystroke. */
+const ESC_CONFIRM_MS = 2200;
+const TAB_GROUPS: TabGroup[] = ["General", "Workspace", "Agents", "Library", "Connections", "System"];
+/** Pages that are not in the nav on purpose and are reached by a link: the
+ *  palette's "Activity log" and a row on Data & privacy, both openSettings("log").
+ *  A page reachable by link, still rendered by Settings when it is the pane.
+ *  Ceiling: it is a page inside Settings, not a view of its own; a standalone
+ *  view is the next step and is not here. */
+const LINK_ONLY: Pane[] = ["log"];
 // `kw` are the words the search box also matches — the things people call a
 // setting that aren't in its label ("keyboard" for Shortcuts, "theme" for
 // Appearance), so the box finds a page by what it does, not just its name.
 const LAST_PANE_KEY = "agentglass.settings.pane";
+
+/*
+ * How well one page answers a query used to be `tabScore`, right here: two
+ * tiers, a page's title and its `kw` bag, because `kw` was the only place a
+ * row's own words lived and there was no cheaper way to ask "does this page
+ * have a row for that". `kw` bags still exist — pageScore still reads them —
+ * but the per-row index in settingsRows.gen.ts (generated from the pages
+ * themselves, not hand-kept) means a page's ROWS can be scored directly
+ * instead of through a bag of words somebody copied out of them. See
+ * pageScore in settingsIndex.ts, and settings-search-ranks-matches.test.ts /
+ * settings-search-lands-on-a-page.test.ts for what moved with it.
+ */
 
 /**
  * One line per page, above whatever it holds.
@@ -366,13 +448,36 @@ const LAST_PANE_KEY = "agentglass.settings.pane";
  * about its own scope ("only terminals", "paths, not contents") without
  * repeating it in every hint underneath.
  */
-const TABS: { id: Pane; label: string; group: TabGroup; kw: string; what?: string }[] = [
-  { id: "prefs", label: "Preferences", group: "Interface", kw: "display size zoom sound clock fullscreen start login", what: "The window itself — size, sound, and how it starts." },
-  { id: "appearance", label: "Appearance", group: "Interface", kw: "theme accent colour color font dark light mode palette", what: "Theme, accent and how dense the app is drawn." },
-  { id: "terminal", label: "Terminal", group: "Interface", kw: "terminal font size cursor typography monospace face renderer gpu focus follows mouse hover pane sloppy", what: "Type, renderer, mouse and how much scrollback each shell keeps." },
-  { id: "chat", label: "Chat", group: "Agents & work", kw: "chat engine tmux panes warm cli claude how new chats run", what: "How a new chat runs, and where." },
-  { id: "diff", label: "Diff", group: "Interface", kw: "diff split side by side inline unified wrap word wrap changes review default view", what: "How a diff opens, everywhere the app shows one." },
-  { id: "tasks", label: "Tasks", group: "Agents & work", kw: "tasks sources github issues local taskwarrior clickup hide show providers", what: "Which sources the Tasks view offers you." },
+/**
+ * `status: true` marks a page that reports what is already happening —
+ * a scorecard, a log, a "is it ready" check — rather than a page you set.
+ * Measured, not renamed: Understudy, Activity and Tools & services are
+ * each described by their OWN `what` line above as something that watches
+ * or reports, and they render today as the exact same button as
+ * Appearance or Shortcuts, which is a switch. The ring each page is filed
+ * under (Agents, System, Connections) is right — it says WHAT
+ * object the page is about, and that stays; this only says HOW the page
+ * behaves once you're on it, which the ring was never meant to answer.
+ * Plugins and Remote are not marked: they already carry their own live
+ * signal (the badge below, and Plugins' own state dot on its page), and
+ * a second, static mark next to a page that already has a real one would
+ * be the decorative kind he deletes.
+ */
+const TABS: { id: Pane; label: string; group: TabGroup; kw: string; what?: string; status?: boolean; icon: (p: { size?: number }) => React.ReactElement }[] = [
+  // "sound" removed: it named the Notifications rows, not anything on this
+  // page, and once pageScore reads a page's own rows a stray word in `kw`
+  // only wins ties it should lose — "notification sound" now reaches
+  // Notifications on the strength of its OWN rows, so Window does not need
+  // to keep claiming a word it has nothing behind.
+  { id: "prefs", label: "Window & startup", group: "General", kw: "display size zoom clock fullscreen start login launch animation splash preferences", what: "The window itself — size, fullscreen, the clock, and how it starts.", icon: SlidersIcon },
+  { id: "appearance", label: "Appearance", group: "General", kw: "theme accent colour color font dark light mode palette", what: "Theme, accent and how dense the app is drawn.", icon: ThemeIcon },
+  { id: "notifications", label: "Notifications", group: "General", kw: "notifications sound alert desktop notify quiet chime ping alert sounds message mirror this machine approved reminder alarm somebody says collect without interrupting only when pull request something much them agentglass keep what stopped interrupts muted mute unmute lantern silence none all", what: "What is allowed to interrupt you, and how.", icon: BellIcon },
+  // Next to Shortcuts on purpose: which drawer a view sits in is what decides
+  // whether it has a number, so the two pages answer one question between them.
+  { id: "rail", label: "Sidebar", group: "General", kw: "rail sidebar views order icons hide show reorder tabs drawer group arrange", what: "Which views are on the sidebar, in which drawer, and in what order.", icon: SidebarIcon },
+  { id: "keys", label: "Shortcuts", group: "General", kw: "keyboard keys bindings shortcut chord rebind reset to defaults columns some others", what: "Every binding, rebindable.", icon: KeyboardIcon },
+  { id: "terminal", label: "Terminal", group: "Workspace", kw: "terminal font size cursor typography monospace face renderer gpu focus follows mouse hover pane sloppy scrollback copy on select right-click paste line height tab tabs group groups grouping project name rules prefix runs on engine own tmux shell", what: "Type, renderer, mouse, tab groups, how much scrollback each shell keeps, and what a Terminal opens on.", icon: TerminalIcon },
+  { id: "diff", label: "Diff", group: "Workspace", kw: "diff split side by side inline unified wrap word wrap changes review default view wrap long lines syntax theme colours", what: "How a diff opens, everywhere the app shows one.", icon: DiffIcon },
   // Only where there is a browser to configure. A settings tab for something
   // that is not there reads as a broken feature rather than one that doesn't apply.
   // ONE browser page.
@@ -382,26 +487,22 @@ const TABS: { id: Pane; label: string; group: TabGroup; kw: string; what?: strin
   // logins looks under a heading about agents, and the browser's own menu sent
   // people to the wrong one of the two because I picked the obvious name. A
   // setting is filed under the thing it configures.
-  ...(HAS_BROWSER ? [{ id: "browser" as const, label: "Browser", group: "Interface" as const, kw: "browser web page zoom agent cli skill automation drive login cookies import chrome firefox zen profile", what: "The built-in browser: how it opens, your logins, and whether an agent can drive it." }] : []),
-  { id: "notifications", label: "Notifications", group: "Interface", kw: "notifications sound alert desktop notify quiet chime ping", what: "What is allowed to interrupt you, and how." },
-  // Next to Shortcuts on purpose: which drawer a view sits in is what decides
-  // whether it has a number, so the two pages answer one question between them.
-  { id: "rail", label: "Rail", group: "Interface", kw: "rail sidebar views order icons hide show reorder tabs drawer group arrange", what: "Which views are on the rail, in which drawer, and in what order." },
-  { id: "keys", label: "Shortcuts", group: "Interface", kw: "keyboard keys bindings shortcut chord rebind", what: "Every binding, rebindable." },
-  { id: "budgets", label: "Budgets", group: "Agents & work", kw: "budget spend cost limit money threshold", what: "What the fleet may spend before it says something." },
-  { id: "log", label: "Activity", group: "Your data", kw: "activity log history events feed", what: "What the app itself has been doing." },
-  { id: "open", label: "Opening files", group: "Interface", kw: "open external editor file reveal", what: "What opens a file when you ask for it outside the app." },
-  { id: "recipes", label: "Commands", group: "Agents & work", kw: "commands recipes custom script make run shortcut alias task saved own", what: "Commands you keep, with the parts that change asked for when you run them." },
+  ...(HAS_BROWSER ? [{ id: "browser" as const, label: "Browser", group: "Workspace" as const, kw: "browser web page zoom login cookies import chrome firefox zen profile home search engine", what: "The built-in browser: how it opens, and the logins it borrows.", icon: BrowserIcon }] : []),
+  { id: "tasks", label: "Tasks", group: "Workspace", kw: "tasks sources github issues local taskwarrior clickup hide show providers view opens on", what: "Which sources the Tasks view offers you.", icon: ChecklistIcon },
+  { id: "hooks", label: "Agents", group: "Agents", kw: "agents hooks claude code install setup worker roles scout builder verifier lock model opencode qwen how new chats run warm panes browser agent skill drive", what: "Wire Claude Code into this app, how new chats run, whether an agent can drive the browser, what else is installed, and which CLI each worker role runs on.", icon: PlugIcon },
+  { id: "lantern", label: "Lantern", group: "Agents", kw: "lantern reminder status what doing needs you ask sessions working on interval orchestrator seat wake floor chair post", what: "What the Lantern may ask of a session, and how often it looks.", icon: LanternIcon },
+  /* Filed beside Agents rather than under System, and the two readings are
+     both defensible: it is a store of what you did, and it is a thing that
+     watches agents work. It is here because the question people arrive with is
+     "what is that face in the rail", and the face is about the work. */
+  { id: "understudy", label: "Knowledge", group: "Agents", kw: "knowledge clone learn sources teach precedents decisions bank recall exclusions never see private terms consent portrait persona art look how it looks scorecard watch score", what: "Where the orchestrator learns how you decide — what it may read, what it must never see, and the face it wears.", status: true, icon: UnderstudyIcon },
+  { id: "budgets", label: "Usage & budgets", group: "Agents", kw: "usage pace plan budget spend cost limit money threshold codex usage current quota github api rate limit search remaining", what: "Budgets, plan pace, the Codex usage refresh and the GitHub API budget.", icon: BudgetIcon },
+  { id: "recipes", label: "Commands", group: "Library", kw: "commands recipes custom script make run shortcut alias task saved own", what: "Commands you keep, with the parts that change asked for when you run them.", icon: CommandIcon },
   /* Filed under the work rather than under the pull-request panel: these are
      prompts an agent is given, and the panel is only where the button happens
      to be. */
-  { id: "review-prompts", label: "Review prompts", group: "Agents & work", kw: "review prompts pr pull request claude menu skill re-review reviewer wording edit", what: "What ✦ Review with Claude offers, and the words it sends." },
-  { id: "export", label: "Export", group: "Your data", kw: "export download data json csv", what: "Take your data out, in a shape a spreadsheet or a script can read." },
-  /* Its own section, not a block inside Tools & services: it is the engine
-     every pane and every chat runs on, with a binary, a config and a restore of
-     its own — three settings deep is not a row in a list of "is it installed". */
-  { id: "tmux", label: "Pane engine", group: "Agents & work", kw: "tmux engine pane prefix key binary bundled config override restore reboot layout scrollback resume socket status bar", what: "The tmux these panes run on — its binary, its config, its prefix, and what survives a reboot." },
-  { id: "hooks", label: "Agents", group: "Agents & work", kw: "agents hooks claude code install setup", what: "Wire Claude Code into this app, and see what else is installed." },
+  { id: "review-prompts", label: "Review prompts", group: "Library", kw: "review prompts pr pull request claude menu skill re-review reviewer wording edit", what: "What Review with Claude offers, and the words it sends.", icon: ReviewIcon },
+  { id: "saved-replies", label: "Saved replies", group: "Library", kw: "saved replies canned comment pr pull request review wording snippet template", what: "The sentences you write over and over on other people's pull requests.", icon: QuoteIcon },
   /*
    * One page for everything outside this app.
    *
@@ -417,10 +518,30 @@ const TABS: { id: Pane; label: string; group: TabGroup; kw: string; what?: strin
   /* Named for its contents, not for its drawer: "Connections" inside a group
    called Connections is a heading repeating itself, which is the same noise as
    a heading over one item. */
-  { id: "connections", label: "Tools & services", group: "Connections", kw: "requirements dependencies deps tmux git docker install integrations providers connect github gitlab clickup taskwarrior token api credentials account rate limit budget quota", what: "The tools and services this app leans on, and whether they are ready." },
-  { id: "remote", label: "Remote", group: "Connections", kw: "remote access pair phone tailscale token device", what: "Reach this machine from your phone." },
-  { id: "privacy", label: "Privacy", group: "Your data", kw: "privacy telemetry data local storage retention database credentials tokens tracking analytics who sees", what: "Where your data is, and what leaves this machine." },
-  { id: "about", label: "About", group: "", kw: "about version update release notes changelog", what: "Version, release notes and updates." },
+  { id: "connections", label: "Tools & services", group: "Connections", kw: "requirements dependencies deps tmux git docker install integrations providers connect github gitlab clickup taskwarrior token api credentials account rate limit budget quota", what: "The tools and services this app leans on, and whether they are ready.", status: true, icon: ServerIcon },
+  { id: "remote", label: "Remote", group: "Connections", kw: "remote access pair phone tailscale token device", what: "Reach this machine from your phone.", icon: PhoneIcon },
+  /* Filed beside Remote rather than under Agents: a plugin is
+     someone else's code holding a scoped credential to this server, the
+     same trust shape a paired device has — install, review what it
+     declares, grant it, take it back. It is not an agent and it renders
+     nothing of its own; see the note at the top of server/src/plugins.ts. */
+  { id: "plugins", label: "Plugins", group: "Connections", kw: "plugins install extension manifest scope review approve enable disable remove entrypoint publisher source running pid re-consent reconsent", what: "Install, review and switch on someone else's code — and see whether it is actually running.", icon: PuzzleIcon },
+  /* Its own section, not a block inside Tools & services: it is the engine
+     every pane and every chat runs on, with a binary, a config and a restore of
+     its own — three settings deep is not a row in a list of "is it installed". */
+  { id: "tmux", label: "Pane engine (tmux)", group: "System", kw: "tmux panes engine pane prefix key binary bundled config override restore reboot layout scrollback resume socket status bar chat warm cli claude", what: "What a pane runs on — the tmux binary, its config and prefix, and restore.", icon: PanesIcon },
+  { id: "privacy", label: "Data & privacy", group: "System", kw: "export download data json csv daily totals markdown events skills catalog take out privacy telemetry data local storage retention database credentials tokens tracking analytics who sees", what: "Where your data is, what leaves this machine, and how to take it out.", icon: ShieldIcon },
+  { id: "about", label: "About", group: "System", kw: "about version update release notes changelog credit attribution licence license portrait art", what: "Version, release notes, updates and the third-party licences this build carries.", icon: InfoIcon },
+  { id: "log", label: "Activity", group: "", kw: "activity log history events feed", what: "What the app itself has been doing.", status: true, icon: PulseIcon },
+  /* Three things, not the eight a checklist usually lists, because three is
+     what the app can actually tell without asking you to swear to it: an
+     agent wired in, a provider connected, and the pane engine on PATH are
+     each one read away (a settings file, a token, a binary). Whether you
+     have opened a project, run a chat, or read the docs are not — those are
+     either true the moment the app can run at all, or true only if you say
+     so, and a step nobody can fail is not a step. Eight-minus-three lies
+     would have been worse than three honest ones. */
+  { id: "onboarding", label: "Get started", group: "Get started", kw: "get started setup onboarding checklist new agent provider pane engine wired connected ready", what: "Three things this app can tell are done — nothing here to check off yourself.", icon: ChecklistIcon },
 ];
 
 /**
@@ -509,7 +630,7 @@ const PLACE_LABEL: Record<RailPlace, string> = { work: "Top group", utility: "Bo
 const PLACE_NOTE: Record<RailPlace, string> = {
   work: "Where you work. The only group the numbers count through — ⌘1 to ⌘9, in this order.",
   utility: "What you go and look at, down with settings and ports. No numbers here; record a combination on the Shortcuts page if one of these needs a key.",
-  hidden: "Off the rail. Nothing is lost — put one back from here, or from the ＋ at the foot of the rail.",
+  hidden: "Off the rail. Nothing is lost — put one back from here, or from the + at the foot of the rail.",
 };
 
 /**
@@ -530,7 +651,8 @@ function RailPane() {
   const [drag, setDrag] = useState<{ id: ViewId; from: RailPlace } | null>(null);
 
   return (
-    <Section>
+    <Section title="What is on the rail"
+      desc="Which views get an icon, and whether they sit at the top or the bottom of it.">
       {/* Twenty views, three drawers, five controls each: the one thing that
           makes this readable is that the controls of every view land on the
           same lines, and that is what the row grid is for. The icon rides in
@@ -592,10 +714,14 @@ function RailPane() {
                  * the page and a select cannot express "one higher".
                  */
                 control={<span className="flex items-center gap-2">
-                  <span className="text-[11px] tabular-nums w-[52px] text-right"
+                  {/* A link, not a second recorder: the chord is rebound on the
+                      Shortcuts page, and this lands on that view's row. */}
+                  <button type="button" onClick={() => openSettings("keys", rowId(LABELS[`view.${v.id}`].label))}
+                    title="Change this shortcut on the Shortcuts page"
+                    className="text-[11px] tabular-nums w-[52px] text-right hover:underline"
                     style={{ color: chord ? "var(--text2)" : undefined, opacity: chord ? 0.75 : 0.35 }}>
                     {chord ? chordLabel(chord) : "—"}
-                  </span>
+                  </button>
                   {/* Order only matters where the rail draws it, and in the top
                       group it also decides which number you get. Kept out of
                       sight until wanted: `agx-reveal` is opacity-only, so the
@@ -668,13 +794,115 @@ function MiniBtn({ label, disabled, onClick, children }: { label: string; disabl
  * The title is optional, because a page whose only group repeats the page name
  * says "Terminal" twice before the first setting.
  */
-function Section({ title, children }: { title?: string; children: React.ReactNode }) {
+/** Panes whose content is a grid of cards, not a column of rows. */
+const WIDE_PANES = new Set(["plugins"]);
+
+const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/** The hours a plan's weekly budget is spread over. See shared/pace.ts. */
+function PacePane() {
+  const cfg = useSyncExternalStore(subscribePaceConfig, paceConfig, paceConfig);
+  const working = cfg.spread === "working";
   return (
-    /* agx-settings-section: when a search has hidden every row inside it, the
-       heading goes with them. A lone eyebrow over nothing reads as a section
-       whose contents failed to load. */
-    <div className="pb-5 agx-settings-section">
-      {title && <div className="panel-eyebrow pb-1">{title}</div>}
+    <>
+      <Group>Plan pace</Group>
+      <Choice<PaceConfig["spread"]>
+        label="Spread the week's budget over"
+        hint="Working hours earn the budget, so the pace marker holds still overnight and at weekends. Every hour is a straight line across the week."
+        value={cfg.spread}
+        onPick={(spread) => setPaceConfig({ spread })}
+        options={[{ v: "working", label: "Working hours" }, { v: "all", label: "Every hour" }]} />
+      <SettingRow label="Working days" disabled={!working}
+        hint={working && !cfg.workDays.some(Boolean) ? "None ticked: every hour counts, as if Every hour were chosen." : "Days that earn budget."}
+        control={
+          <span className="flex items-center gap-1 justify-self-end">
+            {DAY_NAMES.map((d, i) => (
+              <button key={d} disabled={!working} aria-pressed={cfg.workDays[i]}
+                onClick={() => setPaceConfig({ workDays: cfg.workDays.map((x, j) => (j === i ? !x : x)) })}
+                className="text-[11px] px-1.5 py-1 rounded-md disabled:cursor-not-allowed"
+                style={cfg.workDays[i]
+                  ? { background: "color-mix(in srgb, var(--primary) 55%, transparent)", color: "var(--text)" }
+                  : { color: "var(--text3)" }}>
+                {d}
+              </button>
+            ))}
+          </span>
+        } />
+      <Stepper label="Work starts" hint="Hour the day begins earning budget"
+        value={hourLabel(cfg.workStart)} canDec={working && cfg.workStart > 0} canInc={working && cfg.workStart < cfg.workEnd - 1}
+        onDec={() => setPaceConfig({ workStart: cfg.workStart - 1 })} onInc={() => setPaceConfig({ workStart: cfg.workStart + 1 })} />
+      <Stepper label="Work ends" hint="Hour it stops"
+        value={hourLabel(cfg.workEnd)} canDec={working && cfg.workEnd > cfg.workStart + 1} canInc={working && cfg.workEnd < 24}
+        onDec={() => setPaceConfig({ workEnd: cfg.workEnd - 1 })} onInc={() => setPaceConfig({ workEnd: cfg.workEnd + 1 })} />
+      <Toggle on={cfg.rollover} onClick={() => setPaceConfig({ rollover: !cfg.rollover })}
+        label="Roll unused share forward"
+        hint="Room left over from earlier today may be spent later, up to one extra day's share. Off, a day's share is a hard cap." />
+      <Choice<"1" | "3" | "6">
+        label="Recent burn looks back"
+        hint="How far back the runs-out projection measures your speed"
+        value={String(cfg.burnWindowHours) as "1" | "3" | "6"}
+        onPick={(v) => setPaceConfig({ burnWindowHours: Number(v) })}
+        options={[{ v: "1", label: "1h" }, { v: "3", label: "3h" }, { v: "6", label: "6h" }]} />
+      <Choice<"80" | "90" | "95">
+        label="Alert when a weekly window reaches"
+        hint="One notification per window, and only while Usage is on under Notifications (off by default)"
+        value={String(cfg.alertAt) as "80" | "90" | "95"}
+        onPick={(v) => setPaceConfig({ alertAt: Number(v) })}
+        options={[{ v: "80", label: "80%" }, { v: "90", label: "90%" }, { v: "95", label: "95%" }]} />
+    </>
+  );
+}
+
+/**
+ * "Page › Section" — the label above each page's own content while more
+ * than one page is showing at once (a search result), so a card of rows
+ * with no page title of its own (most of them; the single-page title below
+ * only ever names ONE page) does not read as belonging to whichever page
+ * happens to be above it. Absent outside search: the single big title
+ * already says which page you are on, and a second one under it would
+ * repeat it for no reason.
+ */
+function PageMatchHeading({ id, onOpen }: { id: Pane; onOpen: () => void }) {
+  const t = TABS.find((x) => x.id === id);
+  if (!t) return null;
+  return (
+    <button onClick={onOpen}
+      className="w-full text-left pt-6 pb-2 px-1 text-[13px] font-semibold uppercase tracking-[0.08em] agx-hover"
+      style={{ color: "var(--text3)" }}>
+      {t.label}
+    </button>
+  );
+}
+
+/** `headerControl` is a card's master switch, right-aligned in its heading.
+ *  Nothing on this slice has a natural spot for one; the notifications page
+ *  is the first user. */
+function Section({ title, desc, headerControl, children }: {
+  title?: string; desc?: string; headerControl?: React.ReactNode; children: React.ReactNode;
+}) {
+  return (
+    /* FLAT ON PURPOSE — a heading and a rows box, siblings.
+     *
+     * The card, the corner clipping and the gap to the next group are all
+     * drawn by `.agx-settings-col .agx-settings-section` in index.css, and
+     * that is the whole point: half the settings pages never call this
+     * component and build the same two boxes by hand. A card that lived here
+     * reached the pages that imported it and left the rest flat, which is how
+     * this ended up half-redesigned.
+     *
+     * agx-settings-section also hides itself when a search has filtered every
+     * row inside it away — a heading over nothing reads as a group whose
+     * contents failed to load. */
+    <div className="agx-settings-section">
+      {title && (
+        <div className="agx-settings-head flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="agx-settings-head-t">{title}</div>
+            {desc && <div className="agx-settings-head-d">{desc}</div>}
+          </div>
+          {headerControl !== undefined && <div className="shrink-0">{headerControl}</div>}
+        </div>
+      )}
       <div className="agx-settings-rows">{children}</div>
     </div>
   );
@@ -714,7 +942,7 @@ function KeyRow({ id, keyName, capturing, onCapture, error, chord }: {
             // not reach. Still clickable: recording one is exactly how you give
             // a bottom-drawer or hidden view a key of its own.
             title={chord.custom
-              ? `${chordLabel(chord.key)} opens this — click to record another, ✕ to go back to its rail position`
+              ? `${chordLabel(chord.key)} opens this — click to record another, or the cross to go back to its rail position`
               : chord.key
                 ? `${chordLabel(chord.key)} opens this, from its position in the top group — click to record your own`
                 : "Only the top group is numbered — click to record a combination for this one"}
@@ -790,15 +1018,23 @@ function ActivityPane({ open }: { open: boolean }) {
     // happened without anybody asking. See lib/activity.ts.
     Promise.all([
       api.actions(200).then((r) => r.actions).catch(() => [] as ActionRecord[]),
-      api.gateHistory(200).then((r) => r.gates).catch(() => [] as GateRecord[]),
-    ]).then(([a, g]) => { if (alive) setRows(mergeActivity(a, g)); });
+      // A rule writes a row for every call its allow list waves through, so
+      // those are read on their own: in one list of 200 they pushed out the
+      // gates nobody decided, which are what this pane exists to show.
+      api.gateHistory(200, { ruleAllows: false }).then((r) => r.gates).catch(() => [] as GateRecord[]),
+      api.gateHistory(50).then((r) => r.gates).catch(() => [] as GateRecord[]),
+    ]).then(([a, g, recent]) => {
+      if (!alive) return;
+      const seen = new Set(g.map((x) => x.id));
+      setRows(mergeActivity(a, [...g, ...recent.filter((x) => !seen.has(x.id))]));
+    });
     return () => { alive = false; };
   }, [open]);
 
-  if (!rows) return <Section><div className="px-3 py-3 text-[11.5px] t-dim2">Loading…</div></Section>;
+  if (!rows) return <Section title="What this app has done"><div className="px-3 py-3 text-[11.5px] t-dim2">Loading…</div></Section>;
   if (!rows.length) {
     return (
-      <Section>
+      <Section title="What this app has done">
         <div className="py-3 text-[12.5px] t-dim">
           Nothing yet. Every write this dashboard performs — staging, discarding, pushing,
           merging, container actions, gate decisions — is recorded here as it happens.
@@ -808,15 +1044,46 @@ function ActivityPane({ open }: { open: boolean }) {
   }
 
   return (
-    <Section>
-      <div className="pb-2 text-[12px] t-dim">
-        Newest first. Kept indefinitely — these are the changes you made, not telemetry.
-        Held tool calls appear here whoever resolved them, including the ones the timeout
-        decided while nobody was looking.
-      </div>
+    <Section title="What this app has done"
+      desc="Newest first, kept indefinitely — these are the changes you made, not telemetry. Held tool calls appear here whoever resolved them, including the ones the timeout decided while nobody was looking.">
+      {/* The paragraph that stood here is the card's own description now. As a
+          first ROW it read as the first entry in the log — a line of prose at
+          the top of a list of events, on the same ground and the same rhythm as
+          the events. */}
       {/* No wrapper: a padded div around the lines would indent them past the
           column's edge, which every other page sits on. */}
-      {rows.map((r) => (r.kind === "gate" ? <GateLine key={r.key} g={r.row} /> : <ActionLine key={r.key} a={r.row} />))}
+      {/*
+        RUNS, not one line each.
+       *
+        Measured on his own log: twenty-three consecutive lines reading
+        "pending review pull request <repo> #375" with "2d" beside every one
+        of them. Polling a pull request writes one row per poll, which is
+        correct as a record and useless as a page — the reader's question is
+        "what happened", and the answer was buried under the same sentence
+        printed twenty-three times.
+       *
+        Consecutive and identical only. Two runs of the same action with
+        something else between them stay two runs, because the thing between
+        them is the fact that makes the sequence worth reading. And a failure
+        never folds into a success: a run collapsed on its words alone would
+        hide the one poll out of twenty that came back an error, which is the
+        only line on that screen anybody needs.
+      */}
+      {/* A DAY HEADING where the day changes, and the age comes off the rows
+          under it. Every line was carrying its own "2d", which on a screen
+          where twenty lines in a row share a day is the same word printed
+          twenty times and no answer at all to "when was this". Said once, at
+          the boundary, it becomes the thing it was trying to be. */}
+      {activityDays(rows).map(({ day, runs }) => (
+        <Fragment key={day}>
+          <div className="pt-3 pb-1 text-[10.5px] uppercase tracking-[0.12em]" style={{ color: "var(--text4)" }}>{day}</div>
+          {runs.map((run) => (
+            run.kind === "gate"
+              ? <GateLine key={run.key} g={run.row} />
+              : <ActionLine key={run.key} a={run.row} times={run.times} />
+          ))}
+        </Fragment>
+      ))}
     </Section>
   );
 }
@@ -825,13 +1092,25 @@ function ActivityPane({ open }: { open: boolean }) {
  *  git line cannot drift into two different ways of saying the same thing. */
 function Who({ actor, at }: { actor: string; at: number }) {
   return (
-    <span className="text-[9.5px] t-dim2 tabular-nums shrink-0 text-right">
-      {actor && `${actor} · `}{fmtAgo(at)}
+    /* The clock time, not the age. The day is said once above the group, so
+       the useful thing on the row is where in that day it fell — and "2d"
+       repeated down a column answered a question nobody was asking twice. */
+    <span className="text-[9.5px] t-dim2 tabular-nums shrink-0 text-right"
+      title={new Date(at).toLocaleString()}>
+      {actor && `${actor} · `}{new Date(at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
     </span>
   );
 }
 
-function ActionLine({ a }: { a: ActionRecord }) {
+/**
+ * Fold a run of identical neighbours into one row with a count.
+ *
+ * The key is the WORDS the row would draw plus whether it succeeded, which is
+ * exactly the thing the reader would see repeated. Gates never fold: each one
+ * is a decision somebody (or the timeout) made about a specific call, so two
+ * of them are two facts even when they read the same.
+ */
+function ActionLine({ a, times = 1 }: { a: ActionRecord; times?: number }) {
   return (
     <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-x-3 items-baseline py-1.5 rounded-lg agx-hover">
       <span
@@ -839,11 +1118,18 @@ function ActionLine({ a }: { a: ActionRecord }) {
         style={{ color: a.ok ? "var(--text4)" : "var(--error)" }}
         title={a.ok ? "succeeded" : a.detail || "failed"}
       >
-        {a.ok ? "·" : "✕"}
+        {a.ok ? "·" : <CrossIcon size={ICON.xs} />}
       </span>
       <span className="min-w-0">
         <span className="text-[11.5px]" style={{ color: "var(--text)" }}>{verb(a.action)}</span>
         {a.target && <span className="text-[11.5px] t-dim"> {a.target}</span>}
+        {times > 1 && (
+          <span className="ml-1.5 text-[10px] px-1.5 rounded-full tabular-nums"
+            title={`${times} of these in a row, newest first`}
+            style={{ color: "var(--text4)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)" }}>
+            ×{times}
+          </span>
+        )}
         {!a.ok && a.detail && <span className="block text-[10px] mt-1.5" style={{ color: "var(--error)" }}>{a.detail}</span>}
       </span>
       <Who actor={actorLabel({ kind: "action", at: a.at, key: "", row: a })} at={a.at} />
@@ -867,9 +1153,9 @@ function GateLine({ g }: { g: GateRecord }) {
       <span
         className="text-[9.5px] font-semibold tabular-nums shrink-0"
         style={{ color: nobody ? "var(--warning)" : g.decision === "deny" ? "var(--error)" : "var(--text4)" }}
-        title={nobody ? "nobody decided this" : "decided by a person"}
+        title={g.resolution === "rule" ? "a gate rule decided this" : nobody ? "nobody decided this" : "decided by a person"}
       >
-        {nobody ? "⏱" : "·"}
+        {nobody ? <ClockIcon size={ICON.xs} /> : "·"}
       </span>
       <span className="min-w-0">
         <span className="text-[11.5px]" style={{ color: "var(--text)" }}>{did}</span>
@@ -929,6 +1215,204 @@ function verb(action: string): string {
   return what || action;
 }
 
+/**
+ * The understudy's own page: the master switch, and what it keeps and for how
+ * long.
+ *
+ * Small on purpose. Everything that is a JUDGEMENT — which class stands where,
+ * what is in the way of it, what it may never do — is in the view, because it
+ * needs the scorecard beside it to mean anything. What is left here is what a
+ * settings page is for: the one switch and the facts about storage.
+ *
+ * The art credit that used to live here moved to the About page — it is a
+ * licence obligation, not an understudy setting, and it was only filed here
+ * because that is where the portrait art was built. NOTICE.md's pointer moved
+ * with it.
+ */
+function UnderstudyPane({ open, onLeave }: { open: boolean; onLeave: () => void }) {
+  const frame = useUnderstudy();
+  const [err, setErr] = useState<string | null>(null);
+
+  // The switch has to show the server's answer, not this dialog's guess: it is
+  // refused outright when the server has no auth token (there would be no
+  // principal to hold the understudy to its allowlist), and a toggle that
+  // flipped anyway would be lying about the only thing it says.
+  useEffect(() => { if (open) void refreshUnderstudy(); }, [open]);
+
+  const on = !!frame?.enabled;
+  return (
+    <>
+      {/*
+       * WHAT IT LEARNS FROM, first — because that is what this page is for now.
+       *
+       * This used to be the Clone's settings page, under the Clone's view, and
+       * the consent list lived in the view rather than here. The view is gone
+       * and the bank it filled became the orchestrator's memory, so the thing
+       * that decides what the orchestrator knows about you belongs on a
+       * settings page and not behind a tab in a scoreboard.
+       */}
+      <Section title="What the orchestrator learns from">
+        <Teach active={open} />
+      </Section>
+      <Section title="Keeping score">
+        <Toggle
+          label="Let the clone watch"
+          hint={frame?.halted
+            ? "Halted — it is enabled and stopped. Switching it on again is what lowers the fence; there is no timer."
+            : "Separate from the knowledge above, and off is a reasonable answer: this writes down what a stand-in would have done and scores it against what you did. Reading the bank does not depend on it — the orchestrator remembers you either way."}
+          on={on}
+          onClick={() => {
+            void setUnderstudyEnabled(!on).then((r) => {
+              setErr(r.ok ? null : r.error ?? "that did not work");
+              void refreshUnderstudy();
+            });
+          }} />
+      </Section>
+      {err && <div className="px-3.5 pb-3 text-[12px]" style={{ color: "var(--error)" }}>{err}</div>}
+      <UnderstudyLook classes={frame?.classes ?? []} />
+      <Section title="What it keeps">
+        <Row label={`Sealed situations — ${RETENTION.snapshotDays} days`}
+          hint="The material it read, kept only long enough to check a prediction against it. Swept on a fixed window of its own, deliberately not on the events retention you set: turning that off must not silently turn this off too." />
+        <Row label={`The fact of a write — ${RETENTION.stubDays} days`}
+          hint="Route, method and how it answered. Never the request body — there is no column for one." />
+        <Row label="The score — kept"
+          hint="Decisions and refusals do not expire. They are the score, and a score with holes in it is not a score." />
+      </Section>
+    </>
+  );
+}
+
+/**
+ * The face, and everything that changes it.
+ *
+ * The portrait sticks to the top of the pane while the rows scroll under it,
+ * because a picker whose result you cannot see while you use it is the one
+ * thing a picker must never be — every pick in the first version meant
+ * scrolling back up to find out what it did. 192px is twice the art's native
+ * size, the largest exact multiple that leaves the rows room beside it.
+ *
+ * The rows and the portrait read the same store as the understudy view, so
+ * there is no Save and nothing to apply: a pick is on both faces at once.
+ */
+function UnderstudyLook({ classes }: { classes: readonly UnderstudyClassRow[] }) {
+  const cos = useCosmetic();
+  const closed = closedCount(classes);
+  return (
+    /*
+     * TWO COLUMNS, and the portrait is the one that stays.
+     *
+     * "I need the clone anchored, so that when I change the look I can see it
+     * without scrolling up and down every time" — and he is right: the pickers
+     * run to nine screens of hair, eyes, brows, nose and mouth, so with the
+     * face at the top every single pick was a scroll up, a look, and a scroll
+     * back down.
+     *
+     * It was sticky once and I took it out, because the way it was built could
+     * not work: it was a child of the rows box INSIDE the card, and a card
+     * clips its corners with `overflow: hidden`, which makes it a scroll
+     * container that never scrolls — so the portrait stuck to a box it was
+     * already inside and stopped moving at all. What it did on the way there
+     * was shear the preset tiles in half against an edge with no rule and no
+     * shadow.
+     *
+     * So the portrait comes OUT of the card. It is its own column, and the
+     * thing it sticks to is the settings scroller — the one element on this
+     * screen that actually scrolls. Nothing between them clips.
+     */
+    <div className="agx-look">
+      <aside className="agx-look-portrait">
+        <div className="agx-card p-3.5 flex flex-col items-center gap-3">
+          <Persona px={200} cos={cos} label="The clone" />
+          <div className="text-[12px] leading-relaxed" style={{ color: "var(--text3)" }}>
+            What the clone wears. Start from one of the faces beside this and change what is not you;
+            every pick lands here the moment you make it, and in the view.
+          </div>
+        </div>
+      </aside>
+
+      <div className="min-w-0">
+        <div className="agx-settings-section">
+          <div className="agx-settings-head flex items-baseline gap-2">
+            <span className="agx-settings-head-t">How it looks</span>
+            {closed > 0 && <span className="chip t-dim tabular-nums">{closed} closed</span>}
+          </div>
+          <div className="agx-settings-rows">
+            <p className="px-4 py-3 m-0 text-[11.5px]" style={{ color: "var(--text4)" }}>
+              A closed option opens on the same measurement the capabilities do, and the reason beside it is the
+              server's own sentence about that class — never a second rule kept here. Three are sealed and never open.
+            </p>
+            <Appearance value={cos} onChange={setCosmetic} classes={classes} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What the server's own error log says. Quiet on purpose: a section you open
+ * and a dot on this page's nav row, never a notification — an error the server
+ * recovered from is not a person's emergency, only a thing worth knowing.
+ */
+/** One line of the digest: severity dot, count, message, last seen. The message
+ *  holds two lines and opens on a click; the columns are fixed so a wrapped
+ *  message never pushes the count or the time out of line. Wrapping is at word
+ *  boundaries (`overflow-wrap:anywhere` only breaks a token that is longer than
+ *  the line, a path or an address); `break-all` cut "the network" in half.
+ *  A row is a button only while its text is actually clamped (or opened): a
+ *  short line that fits already shows all it holds, and a pointer and hover
+ *  over it promised a click that did nothing. */
+function LogRow({ level, count, text, when }: { level: "error" | "warn"; count: string; text: string; when: string }) {
+  const [open, setOpen] = useState(false);
+  const textRef = useRef<HTMLSpanElement>(null);
+  const clamped = useClipped([textRef], !open, [text]);
+  const clickable = open || clamped;
+  const Row = clickable ? "button" : "div";
+  return (
+    <Row
+      {...(clickable
+        ? { type: "button" as const, "aria-expanded": open, title: open ? undefined : "Show the whole line", onClick: () => setOpen((v) => !v) }
+        : {})}
+      className={`${clickable ? "agx-logrow cursor-pointer" : ""} grid items-start gap-x-2 text-left w-full bg-transparent border-0 p-0`}
+      style={{ gridTemplateColumns: "8px 2.25rem minmax(0,1fr) 5rem", color: "var(--text2)", font: "inherit" }}
+    >
+      <span
+        aria-label={level} title={level}
+        className="rounded-full box-border self-start"
+        // Filled = error, ring = warning: the two theme colours can sit close
+        // together, so the shape carries the difference as well as the hue.
+        style={{ width: 7, height: 7, marginTop: "0.42em", ...(level === "error"
+          ? { background: "var(--error)" }
+          : { border: "1.5px solid var(--warning)" }) }}
+      />
+      <span className="tabular-nums text-right">{count}</span>
+      <span ref={textRef} style={{ overflowWrap: "anywhere", ...(open ? {} : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }) }}>{text}</span>
+      <span className="text-right t-dim2 tabular-nums whitespace-nowrap">{when}</span>
+    </Row>
+  );
+}
+
+function LogDigestSection({ d }: { d: LogDigest | "failed" | null }) {
+  const desc = "Errors and warnings the server logged in the last 24 hours, grouped.";
+  const fold = (body: React.ReactNode) => <Section title="Server log" desc={desc}><Fold label="Server log digest">{body}</Fold></Section>;
+  if (d === "failed") return fold(<div className="px-3 py-2 text-[11px] t-dim2">Could not read the log digest.</div>);
+  if (!d) return fold(<div className="px-3 py-2 text-[11px] t-dim2">Reading…</div>);
+  const ago = (t: number) => minutesAgo(t);
+  return fold(
+      <div className="px-3 py-2 flex flex-col gap-1.5 text-[11.5px]" style={{ color: "var(--text2)" }}>
+        {d.crashLoops.map((l) => (
+          <LogRow key={`c-${l.sig}`} level="error" count={`${l.count}×`} text={`${l.example} — inside a minute`} when={ago(l.at)} />
+        ))}
+        {d.spikes.map((sp) => (
+          <LogRow key={`s-${sp.sig}`} level="warn" count={`${sp.recent}×`} text={`${sp.example} — last hour, was ${sp.perHourBefore}/h`} when="last hour" />
+        ))}
+        {d.total === 0
+          ? <div className="t-dim2">Nothing logged in the last 24 hours.</div>
+          : d.groups.map((g) => <LogRow key={g.sig} level={g.level} count={String(g.count)} text={g.example} when={ago(g.last)} />)}
+      </div>
+  );
+}
+
 function AboutPane({ open }: { open: boolean }) {
   const [st, setSt] = useState<UpdateStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -979,14 +1463,15 @@ function AboutPane({ open }: { open: boolean }) {
   };
 
   if (stErr) return (
-    <Section>
+    <Section title="This build"
+      desc="Which version is running, and whether a newer one is out.">
       <div className="px-3 py-2 text-[11px] flex flex-col gap-1" style={{ color: "var(--text2)" }}>
         <span>Could not read this build's version.</span>
         <span className="text-[10px] t-dim2 break-all">{stErr}</span>
       </div>
     </Section>
   );
-  if (!st) return <Section><div className="px-3 py-2 text-[11px] t-dim2">Reading version…</div></Section>;
+  if (!st) return <Section title="This build"><div className="px-3 py-2 text-[11px] t-dim2">Reading version…</div></Section>;
 
   // The stamp, not the commit. This row rendered `commit.slice(0, 7)` as seven
   // authoritative hex characters for a build packaged from a dirty tree, so it
@@ -998,7 +1483,9 @@ function AboutPane({ open }: { open: boolean }) {
   const dirty = !!st.info.dirty;
   const mine = installedNotes(st.info.baseTag, st.info.distance, st.branch);
   return (
-    <Section>
+    <>
+    <Section title="This build"
+      desc="Which version is running, and whether a newer one is out.">
       {/* The build you are running, as a row like any other: what it is on the
           left, and the one thing you can do about it on the right. The notes
           used to appear once, on the launch after an update, and were
@@ -1093,7 +1580,7 @@ function AboutPane({ open }: { open: boolean }) {
                 toolchain has to be here before it starts — said up front
                 rather than left to fail the build and report it in the panel
                 above, after the app has already gone down to restart. */}
-            <div className="text-[10.5px] px-2.5 py-1.5 rounded-lg" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
+            <div className="agx-inset text-[10.5px] px-2.5 py-1.5 rounded-lg" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
               Built on your machine from source — needs <span style={{ color: "var(--warning)" }}>git</span> and <span style={{ color: "var(--warning)" }}>bun</span> installed, and is Linux-only for now.
             </div>
             <div className="flex items-center gap-2">
@@ -1131,6 +1618,30 @@ function AboutPane({ open }: { open: boolean }) {
         notes={notes?.notes ?? ""}
         onClose={() => setWant(null)}
       />
+    </Section>
+    <AboutCredits />
+    </>
+  );
+}
+
+/**
+ * THIS ROW IS NOT DECORATION. The understudy's pixel-art portrait layers are
+ * CC BY 4.0 by Viktor Hahn and are compiled into the application binary — a
+ * NOTICE file at the root of a source repository is invisible to anybody
+ * actually running it, so this row is where the licence obligation is
+ * actually discharged. NOTICE.md says so in as many words, and names this
+ * page. Do not remove it.
+ *
+ * It lives on About rather than on Understudy, where it was built: About is
+ * where a version, a changelog and a licence are expected to be, and the
+ * understudy is not the only thing in this app wearing that art any more.
+ */
+function AboutCredits() {
+  return (
+    <Section title="Credits">
+      <Row label="Portrait art by Viktor Hahn — CC BY 4.0"
+        hint="The pixel-art portrait layers are his work, used under the Creative Commons Attribution 4.0 International licence. They are recoloured at paint time and otherwise unmodified."
+        href="https://creativecommons.org/licenses/by/4.0/" />
     </Section>
   );
 }
@@ -1325,7 +1836,7 @@ function CookieImport() {
                 <button key={s.site} onClick={() => setChosen((c) => { const n = new Set(c); if (on) n.delete(s.site); else n.add(s.site); return n; })}
                   className="agx-btn w-full text-left px-2 py-1 rounded flex items-center gap-2 text-[11px]"
                   style={{ background: on ? "color-mix(in srgb, var(--primary) 13%, transparent)" : "transparent", color: "var(--text)" }}>
-                  <span style={{ color: on ? "var(--primary-hover)" : "var(--text4)" }}>{on ? "☑" : "☐"}</span>
+                  <span className="flex" style={{ color: on ? "var(--primary-hover)" : "var(--text4)" }}><CheckboxIcon size={ICON.sm} checked={on} /></span>
                   <span className="flex-1 truncate">{s.site}</span>
                   <span className="t-dim2 tabular-nums text-[10px]">{s.cookies}</span>
                 </button>
@@ -1352,12 +1863,12 @@ function CookieImport() {
           <span className="t-dim2">Bring along:</span>
           <button onClick={() => { const next = !wantHistory; setWantHistory(next); setImportHistory(next); }}
             className="agx-btn flex items-center gap-1.5 px-1.5 py-0.5 rounded" title="Your browsing history, so the address bar completes what you type.">
-            <span style={{ color: wantHistory ? "var(--primary-hover)" : "var(--text4)" }}>{wantHistory ? "☑" : "☐"}</span>
+            <span className="flex" style={{ color: wantHistory ? "var(--primary-hover)" : "var(--text4)" }}><CheckboxIcon size={ICON.sm} checked={wantHistory} /></span>
             <span>browsing history</span>
           </button>
           <button onClick={() => { const next = !wantBookmarks; setWantBookmarks(next); setImportBookmarks(next); }}
             className="agx-btn flex items-center gap-1.5 px-1.5 py-0.5 rounded" title="The pages you bookmarked, ranked first in the address bar.">
-            <span style={{ color: wantBookmarks ? "var(--primary-hover)" : "var(--text4)" }}>{wantBookmarks ? "☑" : "☐"}</span>
+            <span className="flex" style={{ color: wantBookmarks ? "var(--primary-hover)" : "var(--text4)" }}><CheckboxIcon size={ICON.sm} checked={wantBookmarks} /></span>
             <span>bookmarks</span>
           </button>
           <span className="t-dim2 text-[10px]">— cookies are chosen per site above</span>
@@ -1383,6 +1894,11 @@ function CookieImport() {
   );
 }
 
+/** Where a .dmg install keeps the CLIs: electron-builder copies `bin/` into the
+ *  bundle's Resources (electron/package.json "build.extraResources"), and
+ *  /Applications is where a dragged .dmg lands. */
+const MAC_BUNDLE_BIN = "/Applications/agentglass.app/Contents/Resources/bin";
+
 function AgentBrowserPane({ open }: { open: boolean }) {
   const [st, setSt] = useState<BrowserUseStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1406,10 +1922,17 @@ function AgentBrowserPane({ open }: { open: boolean }) {
   if (!st) return <Section title="Agent browser use"><div className="px-3 py-2 text-[11px] t-dim2">Reading…</div></Section>;
 
   const mono = { color: "var(--text)" };
+  /* A Mac has no installer to reinstall: the .dmg carries the CLI inside the
+     bundle, and "reinstall the app to get it" sent people round a loop that
+     ends where it started. Agents the app seats already find it — the shell
+     puts that directory on the sidecar's PATH — so this line is for the
+     person's own terminal, and it names the two ways to get there. */
   const cliSays =
     st.cli.state === "installed" ? `On your PATH at ${st.cli.path}`
       : st.cli.state === "dangling" ? `${st.cli.path} points at ${st.cli.target ?? "nothing"}, which is not there — every call an agent makes fails while the command still resolves`
-        : `Not on your PATH. The installer puts it at ${st.cli.path}; reinstall the app to get it.`;
+        : IS_MAC_DESKTOP
+          ? `Not on your PATH. The app carries it at ${MAC_BUNDLE_BIN}/agentglass-browser — add ${MAC_BUNDLE_BIN} to your PATH, or run: ln -s ${MAC_BUNDLE_BIN}/agentglass-browser ${st.cli.path}`
+          : `Not on your PATH. The installer puts it at ${st.cli.path}; reinstall the app to get it.`;
   const skillSays =
     st.skill.state === "current" ? `Installed at ${st.skill.path}`
       : st.skill.state === "stale" ? `Installed at ${st.skill.path}, but this build ships a newer one`
@@ -1455,8 +1978,6 @@ function AgentBrowserPane({ open }: { open: boolean }) {
             style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>Check again</button>
         </div>
 
-        <CookieImport />
-
         {/* Something to paste, because "it is installed" and "I know what to say
             to it" are different problems and only the first one is solved by a
             green line. Folded: useful the first time, in the way every time
@@ -1492,6 +2013,29 @@ function HooksPane({ open }: { open: boolean }) {
     return () => { live = false; };
   }, [open]);
 
+  /*
+   * THE GATE IS ITS OWN SWITCH, and the copy has to say why.
+   *
+   * The forwarder streams what happened. The gate HOLDS a tool call until
+   * somebody decides, and an outward one — a push, a pull request, a comment,
+   * a review, a merge, a ticket, a message in a channel — is held closed. Two
+   * different bargains, so two different buttons: nobody should acquire a
+   * thing that can stop their agents by asking for telemetry.
+   */
+  const gate = async (on: boolean) => {
+    setBusy(true); setErr(null); setNote(null);
+    const r = await api.hooksGate(on)
+      .catch(() => ({ ok: false, installed: false, changed: false, settingsPath: "", error: "Could not reach the server" }));
+    setBusy(false);
+    if (!r.ok) { setErr(r.error || "Could not update the gate"); return; }
+    setSt((cur) => (cur ? { ...cur, gate: on } : cur));
+    setNote(!r.changed
+      ? (on ? "The gate was already on." : "The gate was already off.")
+      : on
+        ? "The gate is on. Start a new Claude Code session for it to take effect."
+        : "The gate is off. Sessions already running keep it until they restart.");
+  };
+
   const act = async (kind: "install" | "uninstall") => {
     setBusy(true); setErr(null); setNote(null);
     const r = await (kind === "install" ? api.hooksInstall() : api.hooksUninstall())
@@ -1518,7 +2062,7 @@ function HooksPane({ open }: { open: boolean }) {
       <div className="py-2 flex flex-col gap-2.5">
 
         {!st.bundled ? (
-          <div className="text-[11px] px-2.5 py-2 rounded-lg" style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
+          <div className="agx-inset text-[11px] px-2.5 py-2 rounded-lg" style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
             This build does not carry the hook scripts, so there is nothing to wire. Install from a Release, or run <span className="t-mono">bun run setup</span> in a checkout.
           </div>
         ) : (
@@ -1546,12 +2090,45 @@ function HooksPane({ open }: { open: boolean }) {
         {/* What the checklist below is FOR, which is read once. The checklist
                 itself already names the file it writes to, on its own step. */}
                 <Fold label="What wiring this actually changes">
-              Every Claude Code session streams here live, and gate approvals
-              (<span className="tabular-nums">PreToolUse</span>) reach the app instead of only the terminal.
+              Every Claude Code session streams here live — what ran, what it
+              cost, when it stopped for you. It watches; it never stops a tool
+              call, and its command ends in <span className="t-mono text-[11px]">|| exit 0</span> so that stays true
+              even if the script goes missing. Holding calls is the gate below, which is a separate switch.
               It edits <span className="t-mono text-[11px]" style={{ color: "var(--text)" }}>{st.settingsPath}</span>,
               backing it up first, and leaves your other hooks untouched.
                 </Fold>
-            <div className="flex items-center gap-2">
+
+            {/* The gate. Below the forwarder because it is the stronger thing,
+                and read second for the same reason. */}
+            <div className="agx-inset flex flex-col gap-1.5 px-2.5 py-2 rounded-lg"
+              style={{ background: "color-mix(in srgb, var(--primary) 7%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 26%, transparent)" }}>
+              <div className="flex items-center gap-2">
+                <span className="text-[12px]" style={{ color: "var(--text)" }}>
+                  Hold what leaves this machine {st.gate ? "· on" : "· off"}
+                </span>
+                <span className="flex-1" />
+                {!st.gateBundled ? (
+                  <span className="text-[10.5px] t-dim2">not in this build</span>
+                ) : (
+                  <button onClick={() => void gate(!st.gate)} disabled={busy}
+                    className="text-[11.5px] px-3 py-1.5 rounded-lg hover:opacity-80"
+                    style={st.gate
+                      ? { color: "var(--error)", background: "color-mix(in srgb, var(--error) 12%, transparent)", border: "1px solid color-mix(in srgb, var(--error) 34%, transparent)", opacity: busy ? 0.5 : 1 }
+                      : { color: "var(--text)", background: "color-mix(in srgb, var(--primary) 16%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 40%, transparent)", opacity: busy ? 0.5 : 1 }}>
+                    {busy ? "Working…" : st.gate ? "Turn the gate off" : "Turn the gate on"}
+                  </button>
+                )}
+              </div>
+              <span className="text-[10.5px]" style={{ color: "var(--text2)" }}>
+                A push, a pull request, a comment, a review, a merge, a ticket or a message in a channel
+                waits here with the text it would send, and nobody answering means it does not happen.
+                Everything local — writing code, running tests, cutting a worktree — is never held.
+              </span>
+              <span className="text-[9.5px] t-dim2">
+                Until you turn this on, that line is held by each agent remembering it.
+              </span>
+            </div>
+            <div className="flex items-center gap-2 pt-3">
               {!st.installed ? null : (
                 <button onClick={() => act("uninstall")} disabled={busy}
                   className="text-[11.5px] px-3 py-1.5 rounded-lg hover:opacity-80"
@@ -1563,7 +2140,7 @@ function HooksPane({ open }: { open: boolean }) {
             {/* The forwarder is a python script; the install writes the command
                 but cannot make an interpreter appear. Said up front rather than
                 left to a session that streams nothing and no error anywhere. */}
-            <div className="text-[10.5px] px-2.5 py-1.5 rounded-lg" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
+            <div className="agx-inset text-[10.5px] px-2.5 py-1.5 rounded-lg" style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--warning) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--warning) 30%, transparent)" }}>
               The hooks run under <span style={{ color: "var(--warning)" }}>{st.python}</span> — it has to be on your PATH for events to arrive. Takes effect on the next Claude Code session; hooks load at startup.
             </div>
             <span className="text-[9.5px] t-dim2">
@@ -1584,6 +2161,356 @@ function HooksPane({ open }: { open: boolean }) {
  * the answer to "can I use my other CLI with this" one tab further away than
  * the question that prompts it.
  */
+/**
+ * THE LANTERN REMINDER — the one setting the Lantern has.
+ *
+ * Translated from Herdr's Lantern: its board is full because every agent it
+ * seats is handed a rule to narrate what it is working toward. Here the ask
+ * rides the hook every session already runs — on a prompt, the server may
+ * answer with one line asking the session to `POST /agents/status`, and the
+ * session reads it the way it reads the memory-save reminder. This is where
+ * that is switched and paced. Two controls and no more: whether, and how often
+ * one session may be asked again.
+ */
+function LanternSection({ open }: { open: boolean }) {
+  const [seatWake, setSeatWake] = useState(4);
+  useEffect(() => { if (open) void api.seatWake().then((r) => { if (r.ok) setSeatWake(r.hours); }).catch(() => {}); }, [open]);
+  const [nudge, setNudge] = useState(true);
+  const [minutes, setMinutes] = useState(20);
+  const [watch, setWatch] = useState(true);
+  const [watchMinutes, setWatchMinutes] = useState(15);
+  const [cacheTtl, setCacheTtl] = useState(5);
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const take = (r: { nudge?: boolean; minutes?: number; watch?: boolean; watchMinutes?: number; cacheTtlMinutes?: number }) => {
+    if (typeof r.nudge === "boolean") setNudge(r.nudge);
+    if (typeof r.minutes === "number") setMinutes(r.minutes);
+    if (typeof r.watch === "boolean") setWatch(r.watch);
+    if (typeof r.watchMinutes === "number") setWatchMinutes(r.watchMinutes);
+    if (typeof r.cacheTtlMinutes === "number") setCacheTtl(r.cacheTtlMinutes);
+  };
+  const load = () => api.lanternSettings()
+    .then((r) => { take(r); setErr(null); })
+    .catch(() => setErr("Could not reach the server — the Lantern settings are unavailable."));
+  useEffect(() => { if (open) void load(); }, [open]);
+  const save = (f: { nudge?: boolean; minutes?: number; watch?: boolean; watchMinutes?: number; cacheTtlMinutes?: number }) => {
+    setNote(null);
+    api.lanternSettingsSave(f)
+      .then((r) => {
+        if (!r.ok) { setNote(r.error ?? "Could not save."); return; }
+        take(r);
+        setNote(f.watch !== undefined || f.watchMinutes !== undefined
+          ? "Saved. The next look is one interval from now."
+          : "Saved. Applies to the next prompt in every hooked session.");
+      })
+      .catch(() => setNote("Could not save."));
+  };
+  const STEPS = [10, 20, 45, 90] as const;
+  const near = String(STEPS.find((m) => m >= minutes) ?? 90);
+  const WATCH_STEPS = [5, 10, 15, 30, 60] as const;
+  const nearWatch = String(WATCH_STEPS.find((m) => m >= watchMinutes) ?? 60);
+  return (
+    <Section title="Lantern"
+      desc="What the Lantern (the rail's lantern icon) may ask of a session. It never starts, stops or queues anything; this is the one thing it says to an agent.">
+      {err && <div className="text-[11px] px-1" style={{ color: "var(--error)" }}>{err}</div>}
+      <Toggle on={nudge} onClick={() => save({ nudge: !nudge })}
+        label="Ask sessions what they are working on"
+        hint="On a prompt, a hooked session may be handed one line asking it to post its task (POST /agents/status). Off, and the Lantern lists sessions by name and pane only." />
+      <Choice label="How often one session may be asked again" value={near}
+        hint="A session that has already answered is left alone for this long, whatever name it chose."
+        options={STEPS.map((m) => ({ v: String(m), label: `${m} min` }))}
+        onPick={(m) => save({ minutes: Number(m) })} disabled={!nudge}
+        disabledHint="Nothing is asked while the reminder is off." />
+      <Toggle on={watch} onClick={() => save({ watch: !watch })}
+        label="Watch the agents and notify me"
+        hint="Every few minutes the agents are re-read and one notification goes out — the app's bell, the phone when paired, the desktop otherwise — if somebody is still stopped on you, a worker's window vanished, or work that was claimed has gone quiet for an hour. The instant alerts stay either way; this is the sweep behind them." />
+      <Choice label="How often it looks" value={nearWatch}
+        hint="One notification per look at most, while something needs you."
+        options={WATCH_STEPS.map((m) => ({ v: String(m), label: `${m} min` }))}
+        onPick={(m) => save({ watchMinutes: Number(m) })} disabled={!watch}
+        disabledHint="Nothing is looked at while the watch is off." />
+      {/* The seat's floor lives here because it rides the same look: the watch
+          re-reads the field, and the orchestrator is prompted only when what
+          it found CHANGED. This is how long a quiet field may stay quiet
+          before it gets a line anyway. */}
+      <Choice label="Wake the orchestrator at least every" value={String(seatWake)}
+        hint="The seat is woken when the field changes. This is the floor under that, so a quiet day still gets a line rather than a silence you cannot tell from a dead agent."
+        options={[1, 2, 4, 8, 12, 24].map((h) => ({ v: String(h), label: h === 1 ? "1 hour" : `${h} hours` }))}
+        onPick={(h) => { void api.seatWakeSave(Number(h)).then(() => setSeatWake(Number(h))); }} />
+      <Choice label="How long the prompt cache stays warm" value={String(cacheTtl === 60 ? 60 : 5)}
+        hint="Each card counts it down from the session's last turn: a turn sent while it is warm is the cheap one. Five minutes on most plans; an hour on some."
+        options={[{ v: "5", label: "5 min" }, { v: "60", label: "1 hour" }]}
+        onPick={(m) => save({ cacheTtlMinutes: Number(m) })} />
+      {note && <div className="text-[11px] px-1" style={{ color: "var(--text3)" }}>{note}</div>}
+    </Section>
+  );
+}
+
+/**
+ * WORKER ROLES — which CLI and model each context-diet role runs on.
+ *
+ * One row per role: the CLI (only the ones with a lock, since a role on any
+ * other would be refused at start) and a model handed to it as it is. A CLI
+ * that is offered but not installed says so rather than disappearing, so a
+ * choice made on another machine still reads.
+ */
+function WorkerRolesSection({ open }: { open: boolean }) {
+  type Choice = { provider: string; model: string };
+  const [roles, setRoles] = useState<Record<string, Choice>>({});
+  const [clis, setClis] = useState<{ id: string; title: string; installed: boolean }[]>([]);
+  const [models, setModels] = useState<Record<string, string>>({});
+  const [note, setNote] = useState<string | null>(null);
+  const take = (r: { roles?: Record<string, Choice> }) => {
+    if (!r.roles) return;
+    setRoles(r.roles);
+    setModels(Object.fromEntries(Object.entries(r.roles).map(([k, v]) => [k, v.model])));
+  };
+  useEffect(() => {
+    if (!open) return;
+    void api.workerRoles().then((r) => { take(r); setClis(r.providers ?? []); })
+      .catch(() => setNote("Could not reach the server — the worker roles are unavailable."));
+  }, [open]);
+  const save = (role: string, c: Choice) => {
+    setNote(null);
+    void api.workerRoleSave(role, c.provider, c.model)
+      .then((r) => { if (!r.ok) setNote(r.error ?? "Could not save."); else { take(r); setNote("Saved. Applies to the next worker started in that role."); } })
+      .catch(() => setNote("Could not save."));
+  };
+  const field = { color: "var(--text)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)" };
+  return (
+    <Section title="Worker roles"
+      desc="Which CLI and model a worker started in a role runs on (agentglass-agent start --role). Every role is locked against push, commit, merge and the network clients, in a layer the project's own config cannot loosen (OpenCode's is checked against the project's config at each start, and refused if loosened); a CLI with no such lock is not offered.">
+      {WORKER_ROLES.map((r) => {
+        const c = roles[r.id];
+        if (!c) return null;
+        return (
+          <SettingRow key={r.id} label={r.title}
+            hint={`${r.what}${r.readOnly ? " File edits are refused too." : ""} Default: ${r.default.provider}, ${r.default.model}.`}
+            control={<span className="flex items-center gap-1.5">
+              {/* One width for the three, so the column reads as a column
+                  rather than three controls hung from their right edge. */}
+              <Select value={c.provider} align="right"
+                className="rounded-lg px-2 py-1 text-[11px] outline-none w-[128px] justify-between"
+                options={clis.map((p) => ({ value: p.id, label: p.installed ? p.title : `${p.title} (not installed)` }))}
+                onChange={(v) => save(r.id, { provider: v, model: "" })} />
+              <input
+                value={models[r.id] ?? ""}
+                onChange={(e) => setModels((m) => ({ ...m, [r.id]: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); save(r.id, { provider: c.provider, model: models[r.id] ?? "" }); } }}
+                onBlur={() => { if ((models[r.id] ?? "") !== c.model) save(r.id, { provider: c.provider, model: models[r.id] ?? "" }); }}
+                placeholder="default model"
+                aria-label={`${r.title} model`}
+                spellCheck={false}
+                className="text-[12px] t-mono px-2 py-1 rounded outline-none bg-transparent w-[150px]"
+                style={field} />
+            </span>} />
+        );
+      })}
+      {note && <div className="text-[11px] px-1" style={{ color: "var(--text3)" }}>{note}</div>}
+    </Section>
+  );
+}
+
+/**
+ * The notification diet — what the fleet is ALLOWED to push at you, and on
+ * which channel. See shared/notifyPrefs.ts.
+ *
+ * Everything here defaults quiet on purpose: only `blocked` (an agent truly
+ * stopped on a gate or a permission prompt) and `reminders` (an alarm the
+ * person set themselves) reach for them out of the box. The rest — an agent
+ * merely idle, a stall, a tool error, the understudy needing a look, a usage
+ * limit — still show wherever they already live (the fleet card, the bell's
+ * history list); a switch here is what lets one of them additionally push.
+ *
+ * `None` sits above both groups rather than inside either: it silences every
+ * kind on every channel at once, and the "What" and "Where" rows go disabled
+ * under it so the state they represent is not lost, only overridden — turning
+ * `None` back off returns to whatever was chosen before.
+ */
+/** A switch that is one control among several in its row, so the row itself
+ *  cannot be the button (a Select inside a button is invalid HTML). */
+function SwitchButton({ on, onClick, disabled, label }: { on: boolean; onClick: () => void; disabled?: boolean; label: string }) {
+  return (
+    <button role="switch" aria-checked={on} aria-label={label} onClick={onClick} disabled={disabled}
+      className="shrink-0 disabled:opacity-50 disabled:cursor-not-allowed">
+      <Switch on={on} />
+    </button>
+  );
+}
+
+/** Voice picker plus Play, as a row's control rather than a row of its own. */
+function VoicePicker({ voices, value, onPick, label }: {
+  voices: Voice[]; value: string; onPick: (v: string) => void; label: string;
+}) {
+  const voice = findVoice(voices, value);
+  return (
+    <span className="flex items-center gap-2 shrink-0">
+      <Select value={value} onChange={onPick} title={voice.hint} style={{ minWidth: 132 }}
+        options={voices.map((v) => ({ value: v.id, label: v.label, hint: v.hint }))} />
+      <button onClick={() => playVoice(voice)} disabled={voice.id === "none"}
+        aria-label={`Play ${label}`}
+        title={voice.id === "none" ? "Nothing to play" : `Play ${voice.label}`}
+        className="text-[11px] px-2 py-1 rounded-lg shrink-0"
+        style={{
+          color: voice.id === "none" ? "var(--text4)" : "var(--text3)",
+          border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)",
+          opacity: voice.id === "none" ? 0.5 : 1,
+        }}>Play</button>
+    </span>
+  );
+}
+
+/*
+ * Four cards, in the order of the questions: what may interrupt, how it gets
+ * through, what about pull requests, and what is mirrored from other apps.
+ *
+ * Three sound gates stay three, on purpose, and none shares a key: the server
+ * channel "sound" (per kind), the session chime `sound`/`onSound` (not
+ * persisted, off at every start) and the notifications voice
+ * (`agentglass.notifyVoice`, the card behind the bell). They sit next to each
+ * other so the difference can be read, not merged.
+ *
+ * "agentglass's own notifications" is in card 1: it decides which of agentglass's
+ * own events interrupt at all, the same question as the kind rows above it.
+ */
+function NotificationsSection(p: {
+  sound: boolean; onSound: () => void;
+  quiet: boolean; mutedList: string[]; own: boolean;
+  notifyVoice: string; onNotifyVoice: (v: string) => void;
+  alarmVoice: string; onAlarmVoice: (v: string) => void;
+  ciApproved: boolean; onCiApproved: () => void;
+  talkMode: TalkNotify; onTalkMode: (v: TalkNotify) => void;
+  sysNotify: SysNotifyMode; notifyCap: NotifyCapability | null;
+}) {
+  const { quiet, mutedList, own } = p;
+  const prefs = useSyncExternalStore(subscribeNotifyPrefs, getNotifyPrefs, getNotifyPrefs);
+  const [err, setErr] = useState<string | null>(null);
+  const save = (next: typeof prefs) => {
+    setErr(null);
+    saveNotifyPrefs(next).catch(() => setErr("Could not save."));
+  };
+  const setKind = (k: NotifyKind, on: boolean) => save({ ...prefs, kinds: { ...prefs.kinds, [k]: on } });
+  const setChannel = (c: NotifyChannel, on: boolean) => save({ ...prefs, channels: { ...prefs.channels, [c]: on } });
+  const alarmPicker = (
+    <VoicePicker label="Reminder alarm" voices={ALARM_VOICES} value={p.alarmVoice} onPick={p.onAlarmVoice} />
+  );
+  return (
+    <>
+      <Section title="Interrupt me for"
+        desc="Whatever is off still shows quietly on the fleet card."
+        headerControl={<span className="flex items-center gap-2 text-[11px] t-dim">Silence all
+          <SwitchButton on={prefs.none} label="Silence all"
+            onClick={() => save({ ...prefs, none: !prefs.none })} /></span>}>
+        {err && <div className="text-[11px] px-1" style={{ color: "var(--error)" }}>{err}</div>}
+        {NOTIFY_KINDS.map((k) => k === "reminders" ? (
+          <SettingRow key={k} label={NOTIFY_KIND_LABEL[k].label}
+            hint={`${NOTIFY_KIND_LABEL[k].desc} Alarm voice: a reminder you set takes the screen and rings until it is answered.`}
+            control={<span className="flex items-center gap-3">
+              {alarmPicker}
+              <SwitchButton on={prefs.kinds[k]} disabled={prefs.none} label={NOTIFY_KIND_LABEL[k].label}
+                onClick={() => setKind(k, !prefs.kinds[k])} />
+            </span>} />
+        ) : (
+          <Toggle key={k} on={prefs.kinds[k]} disabled={prefs.none}
+            onClick={() => setKind(k, !prefs.kinds[k])}
+            label={NOTIFY_KIND_LABEL[k].label} hint={NOTIFY_KIND_LABEL[k].desc} />
+        ))}
+        <Toggle on={own} onClick={() => setAppNotify(!own)}
+          label="agentglass's own notifications"
+          hint="Chats finishing, branches falling behind, checks going red. With Quiet on, only what is stopped interrupts either way; this switch decides the rest once Quiet is off. Everything keeps landing in the bell." />
+      </Section>
+
+      <Section title="How it reaches you">
+        {NOTIFY_CHANNELS.map((c) => c === "sound" ? (
+          <Fragment key={c}>
+            <SettingRow label={NOTIFY_CHANNEL_LABEL[c].label} hint={NOTIFY_CHANNEL_LABEL[c].desc}
+              control={<span className="flex items-center gap-3">
+                <VoicePicker label="Notifications" voices={NOTIFY_VOICES} value={p.notifyVoice} onPick={p.onNotifyVoice} />
+                <SwitchButton on={prefs.channels[c]} disabled={prefs.none} label={NOTIFY_CHANNEL_LABEL[c].label}
+                  onClick={() => setChannel(c, !prefs.channels[c])} />
+              </span>} />
+            <Toggle on={p.sound} onClick={p.onSound}
+              label="Chime this session"
+              hint="A chime when a session errors or needs you. Off at every start; the speaker in the header flips it too." />
+          </Fragment>
+        ) : (
+          <Toggle key={c} on={prefs.channels[c]} disabled={prefs.none}
+            onClick={() => setChannel(c, !prefs.channels[c])}
+            label={NOTIFY_CHANNEL_LABEL[c].label} hint={NOTIFY_CHANNEL_LABEL[c].desc} />
+        ))}
+        <Fold label={`Quiet mode and muted sources (${mutedList.length} muted)`}>
+          <Toggle on={quiet} onClick={() => setNotifyQuiet(!quiet)}
+            label="Quiet — only what is stopped interrupts"
+            hint="An approval, an agent blocked on a question, a red check on a pull request about to merge: those still pop and ring. Everything else collects in the bell without a sound." />
+          {mutedList.length > 0 && (
+            <SettingRow label="Muted" align="start"
+              hint="Not collected. Mute a source from its row in the bell or from a desktop card; unmute it here or from the bell's footer."
+              control={
+                <span className="flex flex-wrap gap-1 justify-end">
+                  {mutedList.map((src) => (
+                    <button key={src} className="chip text-[11px] gap-1" onClick={() => setMuted(src, false)}
+                      title={`Unmute ${sourceLabel(src)}`} aria-label={`Unmute ${sourceLabel(src)}`}>
+                      <MuteGlyph />{sourceLabel(src)}
+                    </button>
+                  ))}
+                </span>
+              } />
+          )}
+        </Fold>
+      </Section>
+
+      <Section title="Pull requests">
+        <Toggle on={p.ciApproved} onClick={p.onCiApproved}
+          label="Checks: only when the pull request is approved"
+          hint={p.ciApproved
+            ? "A suite finishing on something half-written is a status line; on something approved it is the last thing before merging."
+            : "Every verdict, on every pull request of yours — including the ones nobody has looked at yet."} />
+        <Choice<TalkNotify>
+          label="Conversation: when somebody says something"
+          hint={p.talkMode === "everything"
+            ? "A comment from a person, and a review the moment it is submitted — named as what it is: approved, changes requested, or a remark."
+            : p.talkMode === "reviews"
+            ? "Only a review coming back. Comments on the conversation stay to be found on the board, which marks them either way."
+            : "Nothing. The board still marks what has been said since you last looked; it just will not interrupt you."}
+          value={p.talkMode}
+          options={[
+            { v: "everything", label: "Comments and reviews" },
+            { v: "reviews", label: "Reviews only" },
+            { v: "off", label: "Off" },
+          ]}
+          onPick={p.onTalkMode} />
+      </Section>
+
+      <Section title="From other apps">
+        <Toggle
+          on={p.sysNotify !== "off"}
+          // Disabled only on a verdict: "could not reach the server to ask" is
+          // not one, and greying the switch for a startup race reads as a
+          // machine that cannot do this at all.
+          disabled={p.notifyCap ? !p.notifyCap.supported && !p.notifyCap.transient : true}
+          onClick={() => setSysNotifyOn(p.sysNotify === "off")}
+          label="Mirror this machine's notifications"
+          hint={p.notifyCap && !p.notifyCap.supported
+            ? (p.notifyCap.transient
+              ? `Checking — ${p.notifyCap.reason}`
+              : `Unavailable — ${p.notifyCap.reason}`)
+            : "Slack, mail, calendar — whatever pops up behind agentglass while it is covering your screen. A copy, never an interception: your desktop still shows its own."} />
+        {p.sysNotify !== "off" && (
+          <Choice<SysNotifyMode>
+            label="How much of the message"
+            hint="Full shows the text on the card; Who shows only who it was from"
+            value={p.sysNotify}
+            onPick={setSysNotifyMode}
+            options={[
+              { v: "titles", label: "Who" },
+              { v: "full", label: "Full" },
+            ]} />
+        )}
+      </Section>
+    </>
+  );
+}
+
 function AgentsSection({ open }: { open: boolean }) {
   return (
     <Section title="Other agents on this machine">
@@ -1765,7 +2692,8 @@ function GhBudget({ open }: { open: boolean }) {
   useEffect(() => { if (open) void load(); }, [open, load]);
 
   return (
-    <Section title="GitHub API budget">
+    <Section title="GitHub">
+      <Fold label="GitHub API budget">
       <SettingRow
         label="How much of your GitHub allowance is left"
         hint="Every pull request, check and search this app shows spends one. GitHub refills them on a rolling window — 5,000 an hour for REST and GraphQL, 30 a minute for Search, which is the one that runs out first because looking up a card's pull requests is a search."
@@ -1816,6 +2744,7 @@ function GhBudget({ open }: { open: boolean }) {
           );
         })}
       </div>
+      </Fold>
     </Section>
   );
 }
@@ -1873,6 +2802,10 @@ function PrivacyPane({ open }: { open: boolean }) {
             Deleting the file above deletes all of it.
           </p>
         )}
+      </Section>
+      <Section title="Activity">
+        {/* Activity has no nav entry; this row and the palette are its ways in. */}
+        <SettingRow label="Activity log" hint="What the app itself has been doing." onClick={() => openSettings("log")} />
       </Section>
       <Section title="What does leave this machine">
         {/* The headline answer is one line and stays open, because it is the
@@ -2350,10 +3283,59 @@ const PREFIXES: { value: string; label: string }[] = [
   { value: "C-Space", label: "C-Space" },
 ];
 
-function TmuxPane({ open }: { open: boolean }) {
+/** "Terminal runs on", moved here from the tmux page: it decides what the
+ *  Terminal view does, and nobody looking for it thinks of tmux first. Same
+ *  call and same server key as before. */
+function TerminalRunsOn({ open }: { open: boolean }) {
+  const [terminal, setTerminal] = useState("engine");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const load = () => api.tmuxStatus().then((r) => { setTerminal(r.terminal || "engine"); setErr(null); })
+    .catch(() => setErr("Could not reach the server — this setting is unavailable."));
+  useEffect(() => { if (open) void load(); }, [open]);
+  const saveTerminal = (mode: string) => {
+    setTerminal(mode);
+    setBusy(true); setNote(null); setErr(null);
+    api.tmuxSettingsSave({ terminal: mode })
+      .then((r) => {
+        if (r.ok) setNote(mode === "engine"
+          ? "New terminals open on the engine. The ones already open stay where they are."
+          : "New terminals resume the tmux on this machine.");
+        else setErr(r.error ?? "Could not save that.");
+        void load();
+      })
+      .catch(() => setErr("Could not save — server unreachable."))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <Section title="Terminal runs on">
+      <SettingRow
+        label="Terminal runs on"
+        hint={<>Where the Terminal view opens a shell. "The engine" gives it the pane engine — agentglass draws the tabs and splits, the prefix set under Pane engine (tmux) applies, and Restore there can bring it back after a reboot; one session per checkout. "This machine's tmux" resumes the session you left in your own tmux, with your own <span className="t-mono text-[11px]">~/.tmux.conf</span>. They are separate servers: switching moves nothing and loses nothing, and whichever you are not using keeps running.</>}
+        control={<select value={terminal} onChange={(e) => saveTerminal(e.target.value)} disabled={busy}
+          className="text-[12px] px-2 py-1 rounded-lg justify-self-end"
+          style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--bg) 70%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
+          <option value="engine">The engine</option>
+          <option value="desk">This machine's tmux</option>
+        </select>}
+      />
+
+      {err && <div className="pt-1 pl-2 text-[12px]" style={{ color: "var(--error)" }}>{err}</div>}
+      {note && <div className="pt-1 pl-2 text-[12px]" style={{ color: "var(--success)" }}>{note}</div>}
+    </Section>
+  );
+}
+
+function TmuxPane({ open, onGoTerminal }: { open: boolean; onGoTerminal: () => void }) {
+  /* The app's own dialog, not the browser's — see no-native-dialogs.test.ts.
+     The `window.confirm` this replaces was invisible to that lint twice over:
+     its lookbehind skipped `window.`, and an apostrophe in prose forty lines
+     up had swallowed the whole region before the scan reached it. */
+  const { ask, dialog } = useDialogs();
   const [st, setSt] = useState<Awaited<ReturnType<typeof api.tmuxStatus>> | null>(null);
   const [prefix, setPrefix] = useState("");
-  const [terminal, setTerminal] = useState("engine");
   /** Sticky, so typing a custom key does not fold the box the moment the text
    *  stops matching a listed one. */
   const [prefixCustom, setPrefixCustom] = useState(false);
@@ -2379,7 +3361,6 @@ function TmuxPane({ open }: { open: boolean }) {
         setRestore(r.restoreEnabled);
         setResume(r.resumeMode);
         setPrefix(r.prefix || "");
-        setTerminal(r.terminal || "engine");
         setPrefixCustom(!!r.prefix && !PREFIXES.some((p) => p.value === r.prefix));
         setErr(null);
       })
@@ -2392,21 +3373,6 @@ function TmuxPane({ open }: { open: boolean }) {
     setBusy(true); setNote(null);
     api.tmuxSettingsSave({ source, path: source === "custom" ? path : undefined, restore, resume })
       .then((r) => { setNote(r.ok ? "Saved. The binary choice applies to new panes." : r.error ?? "Could not save."); void load(); })
-      .catch(() => setErr("Could not save — server unreachable."))
-      .finally(() => setBusy(false));
-  };
-
-  const saveTerminal = (mode: string) => {
-    setTerminal(mode);
-    setBusy(true); setNote(null); setErr(null);
-    api.tmuxSettingsSave({ terminal: mode })
-      .then((r) => {
-        if (r.ok) setNote(mode === "engine"
-          ? "New terminals open on the engine. The ones already open stay where they are."
-          : "New terminals resume the tmux on this machine.");
-        else setErr(r.error ?? "Could not save that.");
-        void load();
-      })
       .catch(() => setErr("Could not save — server unreachable."))
       .finally(() => setBusy(false));
   };
@@ -2437,8 +3403,13 @@ function TmuxPane({ open }: { open: boolean }) {
       .finally(() => setBusy(false));
   };
 
-  const resetAll = () => {
-    if (!window.confirm("Reset the tmux engine to defaults? Your override config is cleared and the engine's own tmux server restarts. Chat conversations are unaffected.")) return;
+  const resetAll = async () => {
+    if (!(await ask({
+      title: "Reset the tmux engine to defaults?",
+      body: "Your override config is cleared and the engine's own tmux server restarts.\nChat conversations are unaffected.",
+      confirmLabel: "Reset engine",
+      danger: true,
+    }))) return;
     setBusy(true); setNote(null);
     api.tmuxReset()
       .then((r) => { setNote(r.ok ? "Reset to defaults." : r.error ?? "Reset failed."); void load(); })
@@ -2510,19 +3481,17 @@ function TmuxPane({ open }: { open: boolean }) {
         </span>}
       />
 
-      {/* The choice that decides whether any of the rest is ever seen: a
-          terminal that resumes the machine's own tmux never touches the engine,
-          which is how somebody can have all of this configured and none of it
-          running. */}
+      {/* The choice itself lives under Terminal, beside the other things that
+          decide what a Terminal does; one row here so somebody who came for the
+          engine still finds where a shell opens. */}
       <SettingRow
-        label="Terminal runs on"
-        hint={<>Where the Terminal view opens a shell. "The engine" gives it this section's tmux — agentglass draws the tabs and splits, the prefix above applies, and Restore below can bring it back after a reboot; one session per checkout. "This machine's tmux" resumes the session you left in your own tmux, with your own <span className="t-mono text-[11px]">~/.tmux.conf</span>. They are separate servers: switching moves nothing and loses nothing, and whichever you are not using keeps running.</>}
-        control={<select value={terminal} onChange={(e) => saveTerminal(e.target.value)} disabled={busy}
-          className="text-[12px] px-2 py-1 rounded-lg justify-self-end"
-          style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--bg) 70%, transparent)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
-          <option value="engine">The engine</option>
-          <option value="desk">This machine's tmux</option>
-        </select>}
+        label="Where a Terminal opens a shell"
+        hint="Set under Terminal: on this engine, or on your own tmux."
+        control={<button onClick={onGoTerminal}
+          className="text-[12px] px-2.5 py-1 rounded-lg whitespace-nowrap justify-self-end"
+          style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }}>
+          Open Terminal settings
+        </button>}
       />
 
       {/* The one binding everybody changes, as a choice rather than as three
@@ -2637,16 +3606,18 @@ function TmuxPane({ open }: { open: boolean }) {
         />
       )}
       {note && <div className="pt-1 pl-2 text-[12px]" style={{ color: "var(--success)" }}>{note}</div>}
+      {dialog}
     </Section>
   );
 }
 
-export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, onOpenStats, onOpenHelp, theme, onTheme, jumpTo }: {
+export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, theme, onTheme, jump }: {
   open: boolean; onClose: () => void; sound: boolean; onSound: () => void;
-  /** A pane to land on, when Settings was opened by something asking for one. */
-  jumpTo?: string | null;
+  /** Somebody asked for a pane and maybe a row on it — see openSettings(pane,
+   *  row) in lib/openSettings.ts. `n` is a nonce: it changes on every request,
+   *  so an identical request made from inside the open modal still navigates. */
+  jump?: { pane: string | null; row: string | null; n: number } | null;
   scale: number; onZoom: (dir: 1 | -1 | 0) => void;
-  onOpenStats: () => void; onOpenHelp: () => void;
   theme: string; onTheme: (id: string) => void;
 }) {
   // Launch-at-login belongs to the installed app, so the row exists only in the
@@ -2658,10 +3629,16 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
   // about the current state would be worse than one that is merely a moment
   // stale.
   const [fullscreen, setFullscreenState] = useState(false);
+  /* Say that something is covering the app.
+     The browser's inspector is a view the SHELL floats over the window at a
+     rectangle the panel reports; it knows nothing about our DOM and sat
+     cheerfully on top of this modal. Now it gets out of the way. */
+  useEffect(() => (open ? overlayOpen("settings") : undefined), [open]);
   useEffect(() => { if (open) autostartEnabled().then(setAutostartState); }, [open]);
   useEffect(() => { if (open) void isFullscreen().then(setFullscreenState); }, [open]);
 
   const [h24, setH24] = useState<boolean>(() => clock24());
+  const [splash, setSplash] = useState<boolean>(() => splashOn());
   const [usageRefresh, setUsageRefreshState] = useState<boolean>(() => usageRefreshOn());
   const [renderer, setRenderer] = useState<RendererPref>(() => rendererPref());
   const [keys, setKeys] = useState(() => bindings());
@@ -2678,10 +3655,28 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
    * Settings is a place you come back to for the same thing twice, so it now
    * lands where you left it, defaulting to the first page on a fresh install.
    */
+  /*
+   * NO PAGE PER PLUGIN IN THIS NAV, and that is the fix rather than the gap.
+   *
+   * There was one, added at run time from the same `/plugins` read the Plugins
+   * page makes. Two things were wrong with it and both were reported by
+   * somebody using it: removing a plugin left its page in the sidebar until
+   * Settings was closed and opened again — the list is read once, and nothing
+   * told it the plugin had gone — and a person with a hundred plugins would
+   * have a hundred entries in a nav that has nineteen of its own.
+   *
+   * A plugin's settings now open inside the Plugins page, which is the one
+   * place that already knows what is installed and redraws when that changes.
+   * `openSettings("plugin:<name>")` still works: it lands on Plugins with that
+   * plugin's page open, so every link that pointed at one still points at one.
+   */
   const [pane, setPane] = useState<Pane>(() => {
     try {
       const saved = localStorage.getItem(LAST_PANE_KEY);
-      if (saved && TABS.some((t) => t.id === saved)) return saved as Pane;
+      // A plugin page is kept even before the list of plugins has loaded; if
+      // the plugin is gone its page says so rather than silently moving you.
+      const at = saved ? resolvePane(saved) : null;
+      if (at && (TABS.some((t) => t.id === at) || at.startsWith("plugin:"))) return at as Pane;
     } catch { /* private mode */ }
     return TABS[0]!.id;
   });
@@ -2689,8 +3684,10 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
   // Somebody asked for a specific pane. Overrides the remembered one for this
   // opening only — the next plain open still lands where you left it.
   useEffect(() => {
-    if (open && jumpTo && TABS.some((t) => t.id === jumpTo)) setPane(jumpTo as Pane);
-  }, [open, jumpTo]);
+    const at = jump?.pane ? resolvePane(jump.pane) : null;
+    if (open && at && (TABS.some((t) => t.id === at) || at.startsWith("plugin:"))) setPane(at as Pane);
+  }, [open, jump]);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   /*
    * What each page would tell you if you opened it.
    *
@@ -2706,18 +3703,39 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
    * the same reason.
    */
   const [badges, setBadges] = useState<{ connections?: number; remote?: "live" | null }>({});
+  const [logDigest, setLogDigest] = useState<LogDigest | "failed" | null>(null);
+  /** The three onboarding steps, read from the same state Connections and
+   *  Agents already show — this owns no state of its own, so it cannot say
+   *  "done" about something those pages would call unfinished. `null` until
+   *  the reads land, which keeps the pinned row off the nav rather than
+   *  flashing it and pulling it back a second later. */
+  const [onboarding, setOnboarding] = useState<{ hook: boolean; provider: boolean; paneEngine: boolean } | null>(null);
   useEffect(() => {
     if (!open) return;
     let live = true;
     void Promise.all([
-      api.dependencies().then((r) => r.deps.filter((d) => d.status !== "ok" && d.status !== "unsupported").length).catch(() => 0),
-      api.providers().then((r) => r.providers.filter((p) => p.state === "error" || p.state === "needs-auth").length).catch(() => 0),
+      api.dependencies().then((r) => r.deps).catch(() => [] as DepReport[]),
+      api.providers().then((r) => r.providers).catch(() => [] as ProviderStatus[]),
       api.remoteStatus().then((r) => (r.clients.liveCount > 0 ? ("live" as const) : null)).catch(() => null),
-    ]).then(([deps, provs, remote]) => {
-      if (live) setBadges({ connections: deps + provs, remote });
+      api.hooksStatus().then((r) => r.installed).catch(() => false),
+      api.logDigest().catch(() => "failed" as const),
+    ]).then(([deps, provs, remote, hookInstalled, digest]) => {
+      if (!live) return;
+      setBadges({
+        connections: deps.filter((d) => d.status !== "ok" && d.status !== "unsupported").length
+          + provs.filter((p) => p.state === "error" || p.state === "needs-auth").length,
+        remote,
+      });
+      setLogDigest(digest);
+      setOnboarding({
+        hook: hookInstalled,
+        provider: provs.some((p) => p.state === "connected"),
+        paneEngine: deps.some((d) => d.id === "tmux" && d.status === "ok"),
+      });
     });
     return () => { live = false; };
   }, [open]);
+  const onboardingDone = onboarding !== null && onboarding.hook && onboarding.provider && onboarding.paneEngine;
 
   const [q, setQ] = useState(""); // settings search — narrows the nav, then the rows
   const ql = q.trim().toLowerCase();
@@ -2739,30 +3757,199 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
   useEffect(() => { setRowHits(tally.current); });
   const filtering = ql.length > 0 && rowHits > 0;
   const filter = useMemo(() => ({ on: filtering, q: ql, seen }), [filtering, ql, seen]);
-  /* Typing into the box while standing on a page the query does not match used
-   * to leave you looking at that page, with the answer one click away in a nav
-   * you were not looking at. Now the first matching page comes to you. It only
-   * fires when the CURRENT page stops matching, so it never yanks you off a
-   * page that is still a legitimate result for what you typed. */
+  /*
+   * The pages a query answers, ranked, capped at 5.
+   *
+   * This replaces the effect that used to jump the CURRENT page to whichever
+   * one scored best the moment it stopped matching — a page silently
+   * changing under you while you are still typing was the thing that made
+   * "did I lose my place" worth asking. The results view below takes that
+   * job instead: every matching page renders in place, at once, so there is
+   * nothing to jump to.
+   */
+  const matches = useMemo(() => (
+    ql ? TABS.map((t) => ({ id: t.id, s: pageScore(t as SettingsPage, ql) }))
+      .filter((x) => x.s > 0).sort((a, b) => b.s - a.s).slice(0, 5)
+    : []
+  ), [ql]);
+  const matchIds = useMemo(() => new Set<string>(matches.map((m) => m.id)), [matches]);
+  /** Gates a page's content: the current page with no query running, or —
+   *  while searching — whichever pages the query actually answers. Plain
+   *  string identity, not `pane === id`, is what every `{show("x") && …}`
+   *  block used to test; every one of those becomes `{show("x") && …}`. */
+  const show = useCallback((id: string): boolean => (ql ? matchIds.has(id) : pane === id), [ql, matchIds, pane]);
+  const absentHit = ql ? absentFor(ql) : null;
+  const rowResults = useMemo(() => (ql ? searchSettings(ql, TABS as SettingsPage[]) : []), [ql]);
+  /** The rows actually on screen — the ones on a page that made the cap-5
+   *  cut — in the same rank order the header counts. This, not `rowResults`
+   *  itself, is what up/down cycles through: a result you cannot see is not
+   *  one you can land on with Enter. */
+  const visibleResults = useMemo(() => rowResults.filter((r) => matchIds.has(r.pane)), [rowResults, matchIds]);
+  /** Words a hit above only reached through a synonym — shown once, in the
+   *  "· also: …" clause, so typing "chime" is told it found "sound" rather
+   *  than silently substituting one word for the other. */
+  const synonymsUsed = useMemo(() => {
+    if (!ql) return [] as string[];
+    const words = ql.split(/\s+/).filter(Boolean);
+    const hitTexts = visibleResults.map((r) => (r.label + " " + r.section).toLowerCase());
+    const used = new Set<string>();
+    for (const w of words) for (const e of expandWord(w)) {
+      if (e.synonym && hitTexts.some((t) => t.includes(e.word))) used.add(e.word);
+    }
+    return [...used];
+  }, [ql, visibleResults]);
+  const [highlight, setHighlight] = useState(0);
+  useEffect(() => { setHighlight(0); }, [ql]);
+  /*
+   * The row to land on, once the page above has actually mounted.
+   *
+   * `flashRow` is armed from three places — a fresh `jump` request, Enter
+   * on a highlighted search result, and a click on a search result row
+   * itself — and disarmed by the effect below, which waits for the query to
+   * actually be empty (so it flashes the row on the settled page, not a row
+   * still standing among a stack of OTHER matching pages) before it goes
+   * looking for `[data-row=…]` in the DOM.
+   */
+  const [flashRow, setFlashRow] = useState<string | null>(null);
+  useEffect(() => { if (open && jump?.row) setFlashRow(jump.row); }, [open, jump]);
+  const filterCtx = useMemo(() => ({ ...filter, flash: flashRow }), [filter, flashRow]);
   useEffect(() => {
-    if (!ql) return;
-    const hits = (t: typeof TABS[number]) => (t.label + " " + t.kw).toLowerCase().includes(ql);
-    const here = TABS.find((t) => t.id === pane);
-    if (here && hits(here)) return;
-    const first = TABS.find(hits);
-    if (first) setPane(first.id);
-  }, [ql, pane]);
+    if (!flashRow || ql) return;
+    const id = flashRow;
+    const raf = requestAnimationFrame(() => {
+      const el = contentRef.current?.querySelector<HTMLElement>(`[data-row="${CSS.escape(id)}"]`);
+      if (el) {
+        const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+        el.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+        el.classList.add("agx-row-flash");
+        window.setTimeout(() => el.classList.remove("agx-row-flash"), 1200);
+      }
+      setFlashRow(null);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [flashRow, ql, pane]);
+  /** Enter on a highlighted result, or a click on one: land on it. Clearing
+   *  the query first is what makes `flashRow`'s effect (above) wait for the
+   *  single settled page to mount before it goes looking for the row. */
+  const landOnResult = useCallback((r: { pane: string; row: string }) => {
+    setPane(r.pane as Pane);
+    setQ("");
+    if (r.row) setFlashRow(r.row);
+  }, []);
+  /*
+   * Marks and keeps on screen the highlighted result as the arrow keys move
+   * it — a class on the row's own DOM node (a `data-row` lookup, the same
+   * one the flash uses), not the flash class itself: the flash means "this
+   * is the one you picked", and every row up/down passes through on the way
+   * there would light up the same way a landing does.
+   *
+   * `highlightedEl` is a ref, not state — the element the LAST render marked,
+   * so this can remove the class from it before adding it to (or nowhere,
+   * once the query clears) the next one, without re-scanning every row in
+   * the DOM to find whichever one happens to be wearing it.
+   */
+  const highlightedEl = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    highlightedEl.current?.classList.remove("agx-row-current");
+    highlightedEl.current = null;
+    if (!ql || !visibleResults.length) return;
+    const r = visibleResults[Math.min(highlight, visibleResults.length - 1)];
+    if (!r?.row) return;
+    const el = contentRef.current?.querySelector<HTMLElement>(`[data-row="${CSS.escape(r.row)}"]`);
+    if (!el) return;
+    el.classList.add("agx-row-current");
+    el.scrollIntoView({ block: "nearest" });
+    highlightedEl.current = el;
+  }, [highlight, ql, visibleResults]);
+  const onSearchKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!ql || !visibleResults.length) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); setHighlight((h) => Math.min(h + 1, visibleResults.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); }
+    else if (e.key === "Enter") { e.preventDefault(); landOnResult(visibleResults[Math.min(highlight, visibleResults.length - 1)]!); }
+  }, [ql, visibleResults, highlight, landOnResult]);
   const [termFont, setTermFontState] = useState(() => currentTermFont());
   const [termSize, setTermSizeState] = useState(() => currentTermSize());
   const [termLine, setTermLineState] = useState(() => currentTermLineHeight());
   const [termCursor, setTermCursorState] = useState<CursorStyle>(() => currentTermCursor());
   const [ffm, setFfm] = useState(() => focusFollowsMouse());
+  const [groupsOn, setGroupsOn] = useState(() => tabGroupsOn());
+  const [groupRules, setGroupRules] = useState(() => tabGroupRulesText());
+  const [paneActs, setPaneActs] = useState<PaneActionsMode>(() => paneActionsMode());
   const [scrollback, setScrollbackState] = useState(() => currentScrollback());
   const [wordSep, setWordSepState] = useState(() => currentWordSeparators());
   const [copySel, setCopySel] = useState(() => copyOnSelect());
   const [rcPaste, setRcPaste] = useState(() => rightClickPaste());
   const [dSplit, setDSplitState] = useState(() => diffSplit());
+  const [dTheme, setDThemeState] = useState(() => diffThemePref());
   const [dWrap, setDWrapState] = useState(() => diffWrap());
+  const [accent, setAccentState] = useState(() => currentAccent());
+  // Remounts the appearance rows after a reset: they hold their own copy of
+  // the accent and would go on showing the one that was just cleared.
+  const [appearanceNonce, setAppearanceNonce] = useState(0);
+  // The modal lives as long as the app. The diff toolbars and Ctrl +/- over a
+  // terminal write these stores behind its back, so the dot and Reset would be
+  // decided on a value from app start. Re-read them whenever it opens.
+  useEffect(() => {
+    if (!open) return;
+    setRenderer(rendererPref());
+    setTermFontState(currentTermFont());
+    setTermSizeState(currentTermSize());
+    setTermLineState(currentTermLineHeight());
+    setTermCursorState(currentTermCursor());
+    setDSplitState(diffSplit());
+    setDThemeState(diffThemePref());
+    setDWrapState(diffWrap());
+    setAccentState(currentAccent());
+  }, [open]);
+
+  /*
+   * What "modified" means, page by page, and what "Reset page" does.
+   *
+   * Each entry is a row's own comparison against the default its store
+   * already exports (DEFAULT_* or the shape of its getter), and the setter
+   * that puts it back — no key, no value and no default is new here.
+   *
+   * The ceiling: only these four pages are wired. The rest keep their state
+   * in a server or a shell (notifications, remote, hooks, tmux), or have no
+   * default to compare against (the clock follows the locale, theme mode
+   * follows the machine on a first run, fullscreen and launch-at-login are
+   * the window system's state, not a stored preference), so a dot there
+   * would be a guess.
+   *
+   * Free text the user typed is left out of Terminal on purpose (tab-group
+   * rules, word separators): "Reset page" is one unconfirmed click and there
+   * is no undo, so it only puts back settings that are a choice among
+   * defaults. The ceiling: those two rows have no dot and no reset until a
+   * confirm step exists for them.
+   */
+  const pageDirty: Partial<Record<Pane, { modified: boolean; reset: () => void }[]>> = {
+    prefs: [
+      { modified: !splash, reset: () => { setSplashOn(true); setSplash(true); } },
+      ...(IS_DESKTOP ? [{ modified: scale !== DEFAULT_SCALE, reset: () => onZoom(0) }] : []),
+    ],
+    appearance: [
+      { modified: accent !== "", reset: () => { setAccentPref(""); applyTheme(theme); setAccentState(""); setAppearanceNonce((n) => n + 1); } },
+    ],
+    terminal: [
+      { modified: renderer !== "auto", reset: () => { setRendererPref("auto"); setRenderer("auto"); } },
+      { modified: termFont !== "", reset: () => { setTermFont(""); setTermFontState(""); } },
+      { modified: termSize !== DEFAULT_SIZE, reset: () => { setTermSize(DEFAULT_SIZE); setTermSizeState(DEFAULT_SIZE); } },
+      { modified: termLine !== DEFAULT_LINE_HEIGHT, reset: () => { setTermLineHeight(DEFAULT_LINE_HEIGHT); setTermLineState(DEFAULT_LINE_HEIGHT); } },
+      { modified: termCursor !== "block", reset: () => { setTermCursor("block"); setTermCursorState("block"); } },
+      { modified: ffm, reset: () => { setFocusFollowsMouse(false); setFfm(false); } },
+      { modified: paneActs !== "hover", reset: () => { setPaneActionsMode("hover"); setPaneActs("hover"); } },
+      { modified: !copySel, reset: () => { setCopyOnSelect(true); setCopySel(true); } },
+      { modified: rcPaste, reset: () => { setRightClickPaste(false); setRcPaste(false); } },
+      { modified: !groupsOn, reset: () => { setTabGroupsOn(true); setGroupsOn(true); } },
+      { modified: scrollback !== DEFAULT_SCROLLBACK, reset: () => { setScrollback(DEFAULT_SCROLLBACK); setScrollbackState(DEFAULT_SCROLLBACK); } },
+    ],
+    diff: [
+      { modified: dSplit !== DEFAULT_SPLIT, reset: () => { setDiffSplit(DEFAULT_SPLIT); setDSplitState(DEFAULT_SPLIT); } },
+      { modified: dWrap !== DEFAULT_WRAP, reset: () => { setDiffWrap(DEFAULT_WRAP); setDWrapState(DEFAULT_WRAP); } },
+    ],
+  };
+  const pageModified = (p: Pane) => resetShown((pageDirty[p] ?? []).map((d) => d.modified));
+  const resetPage = (p: Pane) => { for (const d of pageDirty[p] ?? []) if (d.modified) d.reset(); };
   /* The source list is read straight from the store on each render; this only
      exists to ask for that render. `sourceOrder` is read the same way, so a
      move is on screen before the write has settled. */
@@ -2823,6 +4010,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
   // Read once into state rather than on every render: it lives in localStorage
   // and the row has to reflect a press immediately.
   const [ciApproved, setCiApproved] = useState(ciOnlyApproved);
+  const [talkMode, setTalkMode] = useState(talkNotify);
   /* Read once and held in state: both live in localStorage, which is not a
      store anything can subscribe to, and the row has to redraw the moment it is
      picked so the Play button previews what is now selected. */
@@ -2866,7 +4054,9 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
   // off, with a toggle whose first click did nothing visible. Measured, not
   // reasoned: the probe clicked the bell's button and this row still read false.
   const sysNotify = useSyncExternalStore(subscribeSysNotifyMode, sysNotifyMode, () => "off" as SysNotifyMode);
-  const quiet = useSyncExternalStore(subscribeNotifyQuiet, notifyQuiet, () => false);
+  const quiet = useSyncExternalStore(subscribeNotifyQuiet, notifyQuiet, () => true);
+  const muted = useSyncExternalStore(subscribeMuted, mutedSources, mutedSources);
+  const mutedList = [...muted].sort();
   const own = useSyncExternalStore(subscribeAppNotify, appNotify, () => true);
   const [notifyCap, setNotifyCap] = useState<NotifyCapability | null>(null);
   // Asked while the modal is open, and asked AGAIN while the answer is "we could
@@ -2896,111 +4086,260 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
       .catch(() => setTmuxEngine({ available: false, reason: "the agentglass server did not answer", defaultOn: false }));
   }, [open]);
 
+  /*
+   * ESCAPE ONCE SAYS SO, ESCAPE AGAIN LEAVES.
+   *
+   * One press used to close it. That is right for something hovering over your
+   * work and wrong for somewhere you went: the same key dismisses a popover, so
+   * the press meant to close a dropdown threw away the whole page and the
+   * scroll position with it. The first press arms and says what the second one
+   * does; the arming lapses on its own, so a stray Escape does not leave a
+   * loaded trigger behind for a keystroke a minute later.
+   */
+  const [escArmed, setEscArmed] = useState(false);
+  useEffect(() => { if (!open) setEscArmed(false); }, [open]);
+
+  /*
+   * The search box has the caret the moment this opens, and Ctrl+F puts it
+   * back.
+   *
+   * Twenty-four pages is past the count where reading the nav beats naming the
+   * thing you want, so typing is the primary way in and the caret should
+   * already be where typing goes. Nothing else on this screen wants the first
+   * keystroke: there is no form to fill and no destructive control to fumble.
+   *
+   * A frame late, deliberately. The panel mounts inside an AnimatePresence and
+   * focusing during the enter transition is focusing an element the compositor
+   * is still moving — Chromium scrolls the ancestor to it and the whole page
+   * jumps a few pixels on open. This is the same one-frame wait the file
+   * palette needed for the same reason.
+   *
+   * preventScroll for the belt: the nav is a scroller and a focus inside it
+   * can pull it, which on a narrow window shows as the group headings sliding
+   * up as the screen appears.
+   */
+  const searchRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const id = requestAnimationFrame(() => searchRef.current?.focus({ preventScroll: true }));
+    return () => cancelAnimationFrame(id);
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const onFind = (e: KeyboardEvent) => {
+      if (e.key !== "f" && e.key !== "F") return;
+      if (!e.ctrlKey && !e.metaKey) return;
+      /* The browser's own find is what this replaces, and on a page whose
+         rows hide themselves under a filter it is the worse of the two: it
+         highlights text inside whatever happens to be mounted and says
+         nothing about the twenty-three pages that are not. */
+      e.preventDefault();
+      searchRef.current?.focus({ preventScroll: true });
+      searchRef.current?.select();
+    };
+    window.addEventListener("keydown", onFind);
+    return () => window.removeEventListener("keydown", onFind);
+  }, [open]);
+  useEffect(() => {
+    if (!escArmed) return;
+    const t = setTimeout(() => setEscArmed(false), ESC_CONFIRM_MS);
+    return () => clearTimeout(t);
+  }, [escArmed]);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (escArmed) { setEscArmed(false); onClose(); return; }
+      setEscArmed(true);
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, onClose, escArmed]);
 
   return (
+    /* Everything this dialog opens — a confirm, a menu, a picker — is a portal
+       of its own, and a portal's floor is 9999 unless it is told otherwise.
+       Under a dialog that sits at LAYER.settings they were drawn BEHIND it:
+       measured with the plugin approval, which answered a click by showing
+       nothing at all. Inside here the floor is this dialog's own layer. */
+    <PortalFloor.Provider value={LAYER.settings + 1}>
     <Portal z={LAYER.settings} find>
       <AnimatePresence>
         {open && (
-          <>
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              className="fixed inset-0 agx-scrim" style={{ zIndex: 10000 }} onClick={onClose} />
-            <div className="fixed inset-0 flex items-center justify-center p-4 pointer-events-none" style={{ zIndex: 10001 }}>
-              <motion.div
-                initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97, y: 8 }}
-                transition={{ type: "spring", stiffness: 340, damping: 30 }}
-                className="w-[1010px] max-w-[96vw] rounded-2xl flex flex-col pointer-events-auto overflow-hidden"
-                // Fixed, not max: with tabs the pane's height would otherwise
-                // change with whichever section you picked, and a dialog that
-                // resizes under the cursor is disorienting in a way a little
-                // empty space never is.
-                //
-                // Grown from 820x620 once Remote became a page rather than a
-                // paragraph: a QR code, a list of addresses and a row per
-                // connected device do not fit a column that narrow without
-                // wrapping into something you have to scroll to read. The vh
-                // caps keep it a dialog on a laptop screen rather than a
-                // full-screen takeover.
-                                /* The dialog sits DEEPER than the app, not on top of it.
-                                   A settings screen is somewhere you go, not
-                                   something that hovers — and the deeper tone
-                                   is what lets a control that needs to be
-                                   touched (the search box, the selected page)
-                                   come forward off it. It also removes the
-                                   reason the group cards existed: the surface
-                                   is the dialog now, so nothing inside needs
-                                   one. */
-                                style={{ height: "min(92vh, 1080px)", background: "var(--bg)", border: "1px solid color-mix(in srgb, var(--border) 60%, transparent)", boxShadow: "0 30px 80px -20px rgba(0,0,0,0.8)" }}>
+          /*
+           * A PAGE, not a dialog.
+           *
+           * It was a 1010px card floating on a scrim, and the width was always
+           * a compromise: wide enough for the Remote page's QR code and list of
+           * devices, narrow enough to still read as a dialog. A settings screen
+           * is somewhere you go — so it takes the window, the scrim goes, and
+           * the width stops being a decision at all. The nav gets 280px and
+           * the content gets the rest of whatever screen he is on.
+           *
+           * Still a Portal at LAYER.settings: what is underneath must not be
+           * reachable, and a popover opened from a row still has to land above
+           * it.
+           */
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.14 }}
+            className="fixed inset-0 flex pointer-events-auto"
+            style={{ zIndex: 10000, background: "var(--bg)" }}>
 
-                <div className="flex items-center gap-3 px-5 py-3 border-b shrink-0" style={{ borderColor: "color-mix(in srgb, var(--border) 40%, transparent)" }}>
-                  <span className="text-[15px] font-semibold" style={{ color: "var(--text)" }}>Settings</span>
-                  <CloseButton onClick={onClose} className="ml-auto" />
+            {/* Three strips and a scroller, and the order is the point: the two
+                things you always want — the way out, and the way to find a
+                setting by name — sit OUTSIDE the scroll container, so neither
+                can be pushed off the top by a long nav. */}
+            {/* The nav paints its OWN tone. It shared --bg with the page, so
+                two regions that do entirely different jobs — twenty-four
+                places you can go, and the one you are in — were the same
+                surface with a 25%-alpha hairline between them, and the
+                complaint that "the sidebar and the view look like the same
+                thing" was a literal description of the colour values. The
+                border is at full --surface-line now for the same reason: a
+                seam this important is not a suggestion. */}
+            <aside className="shrink-0 w-[280px] flex flex-col border-r"
+              style={{ background: "var(--surface-nav)", borderColor: "var(--surface-line)" }}>
+              <div className="shrink-0 px-3 py-3 border-b" style={{ borderColor: "var(--surface-line)" }}>
+                {/* Leaving is a button you press, not an x you hunt for in a
+                    corner — and it says where it takes you, because after ten
+                    minutes in here that is the thing you have to be told. */}
+                <button onClick={onClose}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[13px] text-left"
+                  style={{ color: "var(--text3)" }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
+                    <path d="M19 12H5" /><path d="m12 19-7-7 7-7" />
+                  </svg>
+                  <span>Back to app</span>
+                </button>
+              </div>
+
+              <div className="shrink-0 px-3 py-3 border-b" style={{ borderColor: "var(--surface-line)" }}>
+                {/* --bg, not --bg2. The box used the raised tone, which was
+                    right when the nav under it was --bg and inverts now that
+                    the nav leans toward --bg2 itself: a field has to sit IN
+                    its surface, and painted at the surface's own tone it was
+                    a rectangle of border with nothing behind it.
+                  *
+                    Focused on open and on Ctrl+F, and the shortcut is printed
+                    on the box. Typing is what you came here to do — twenty-four
+                    pages is past the count where hunting the nav beats naming
+                    the thing — and a shortcut nobody is told about is one
+                    nobody uses. */}
+                <div className="relative">
+                  <input ref={searchRef} value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={onSearchKeyDown} placeholder="Search settings"
+                    aria-keyshortcuts="Control+F"
+                    className="w-full pl-2.5 pr-14 py-1.5 rounded-lg text-[12.5px] outline-none"
+                    style={{ background: "var(--bg)", border: "1px solid var(--surface-line)", color: "var(--text)" }} />
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-[10.5px] tabular-nums"
+                    style={{ color: "var(--text4)" }}>Ctrl F</span>
                 </div>
+              </div>
 
-                <div className="flex-1 min-h-0 flex">
-                  {/* One page per concern instead of one long scroll: four
-                      sections stacked vertically meant the shortcuts, the part
-                      you come here to change, were always below the fold. */}
-                  {/* px-2.5, not px-2, and the 2px is the point: every nav item is a
-                      button with its own px-2.5, so the container's padding plus
-                      the button's decides where the TEXT lands. At px-2 it landed
-                      at 18px while "Settings" in the header above starts at 20px
-                      — two left edges in one dialog, close enough to look like a
-                      mistake rather than a choice. */}
-                  <div className="shrink-0 w-[186px] py-2 px-2.5 flex flex-col gap-0.5 border-r agx-scroll overflow-y-auto" style={{ borderColor: "color-mix(in srgb, var(--border) 25%, transparent)" }}>
-                    <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search settings"
-                      className="mb-1 px-2.5 py-1.5 rounded-lg text-[12.5px] outline-none shrink-0"
-                      style={{ background: "var(--bg2)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)", color: "var(--text)" }} />
-                    {(() => {
-                      const hit = (t: typeof TABS[number]) => !ql || (t.label + " " + t.kw).toLowerCase().includes(ql);
-                      const groups = TAB_GROUPS
-                        .map((g) => ({ g, tabs: TABS.filter((t) => t.group === g && hit(t)) }))
-                        .filter((x) => x.tabs.length);
-                      if (!groups.length) return <div className="px-2.5 py-3 text-[12.5px]" style={{ color: "var(--text4)" }}>No settings match “{q.trim()}”.</div>;
-                      return groups.map(({ g, tabs }) => (
-                        <div key={g} className={`flex flex-col gap-0.5${g === "" ? " mt-auto pt-2" : ""}`}>
-                          {/* A group heading gets more room ABOVE it than its
-                              items get between them — measured at 42px either
-                              side before this, which is why "Agents & work"
-                              read as belonging to the row above rather than to
-                              the rows below. The rule is in tailwind.config.js
-                              beside the scale, because it is about meaning
-                              rather than size: a heading hugs what it names. */}
-                          {g !== "" && <div className="px-2.5 pt-4 pb-1 text-[11px] uppercase tracking-[0.14em]" style={{ color: "var(--text4)" }}>{g}</div>}
-                          {tabs.map((t) => (
-                            <button key={t.id} onClick={() => setPane(t.id)}
-                              className="w-full text-left px-2.5 py-1.5 rounded-lg text-[13px] flex items-center gap-2"
-                              style={pane === t.id
-                                ? { background: "color-mix(in srgb, var(--primary) 15%, transparent)", color: "var(--text)" }
-                                : { color: "var(--text3)" }}>
-                              <span className="min-w-0 truncate">{t.label}</span>
-                              {/* A count when something wants you, a dot when
-                                  something is simply happening. Different marks
-                                  because they are different facts: one is a
-                                  chore, the other is a phone on the sofa. */}
-                              {t.id === "connections" && !!badges.connections && (
-                                <span className="ml-auto shrink-0 text-[10.5px] tabular-nums px-1.5 rounded-full"
-                                  style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 16%, transparent)" }}
-                                  title={`${badges.connections} ${badges.connections === 1 ? "thing wants" : "things want"} something`}>
-                                  {badges.connections}
-                                </span>
-                              )}
-                              {t.id === "remote" && badges.remote === "live" && (
-                                <span className="ml-auto shrink-0 rounded-full" aria-label="a device is connected"
-                                  title="A device is connected right now"
-                                  style={{ width: 6, height: 6, background: "var(--success)" }} />
-                              )}
-                            </button>
-                          ))}
-                        </div>
-                      ));
-                    })()}
-                  </div>
+              {/* px-2.5, not px-2, and the 2px is the point: every nav item is a
+                  button with its own px-2.5, so the container's padding plus
+                  the button's decides where the TEXT lands. */}
+              <div className="min-h-0 flex-1 agx-scroll overflow-y-auto overflow-x-hidden py-2 px-2.5 flex flex-col gap-0.5">
+                {/* Pinned above every ring, not filed into one, and gone the
+                    moment `onboardingDone` — no "you're all set" row left
+                    behind for it to become. Held back on a search too: it
+                    answers "what's left", not "what's Terminal", so it has
+                    no business in a query for the latter. */}
+                {onboarding && !onboardingDone && !ql && (
+                  <button onClick={() => setPane("onboarding")}
+                    aria-current={pane === "onboarding" ? "page" : undefined}
+                    className="w-full text-left px-2.5 py-1.5 mb-1.5 rounded-lg text-[13px] flex items-center gap-2"
+                    style={pane === "onboarding"
+                      ? { background: "color-mix(in srgb, var(--primary) 15%, transparent)", color: "var(--text)" }
+                      : { color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)" }}>
+                    <span className="min-w-0 truncate">Get started</span>
+                    <span className="ml-auto shrink-0 text-[10.5px] tabular-nums" style={{ color: "var(--text4)" }}>
+                      {[onboarding.hook, onboarding.provider, onboarding.paneEngine].filter(Boolean).length}/3
+                    </span>
+                  </button>
+                )}
+                {(() => {
+                  const hit = (t: typeof TABS[number]) => !ql || pageScore(t as SettingsPage, ql) > 0;
+                  const groups = TAB_GROUPS
+                    .map((g) => ({ g, tabs: TABS.filter((t) => t.group === g && hit(t)) }))
+                    .filter((x) => x.tabs.length);
+                  if (!groups.length) return <div className="px-2.5 py-3 text-[12.5px]" style={{ color: "var(--text4)" }}>No settings match “{q.trim()}”.</div>;
+                  return groups.map(({ g, tabs }) => (
+                    <div key={g} className="flex flex-col gap-0.5">
+                      {/* A group heading gets more room ABOVE it than its
+                          items get between them — measured at 42px either
+                          side before this, which is why "Agents"
+                          read as belonging to the row above rather than to
+                          the rows below. The rule is in tailwind.config.js
+                          beside the scale, because it is about meaning
+                          rather than size: a heading hugs what it names. */}
+                      <div className="px-2.5 pt-4 pb-1 text-[11px] uppercase tracking-[0.14em]" style={{ color: "var(--text4)" }}>{g}</div>
+                      {tabs.map((t) => (
+                        <button key={t.id} onClick={() => setPane(t.id)}
+                          aria-current={pane === t.id ? "page" : undefined}
+                          className="w-full text-left px-2.5 py-2 rounded-lg text-[13px] flex items-center gap-2.5"
+                          style={pane === t.id
+                            ? { background: "color-mix(in srgb, var(--primary) 15%, transparent)", color: "var(--text)" }
+                            : { color: "var(--text3)" }}>
+                          {/* The icon is what turns a page of prose into a
+                              shape you can scan — a nav of twenty-four
+                              identical text rows was the thing that read as
+                              "nothing invites you in". Dimmed to `--text4`
+                              when the row isn't active so the active row's
+                              full-color icon is still the one your eye lands
+                              on first, the same job the highlight pill does. */}
+                          <span className="shrink-0 flex" style={{ color: pane === t.id ? "var(--text)" : "var(--text4)" }}>
+                            <t.icon size={ICON.md} />
+                          </span>
+                          <span className="min-w-0 truncate">{t.label}</span>
+                          {/* A count when something wants you, a dot when
+                              something is simply happening. Different marks
+                              because they are different facts: one is a
+                              chore, the other is a phone on the sofa. */}
+                          {t.id === "connections" && !!badges.connections && (
+                            <span className="ml-auto shrink-0 text-[10.5px] tabular-nums px-1.5 rounded-full"
+                              style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 16%, transparent)" }}
+                              title={`${badges.connections} ${badges.connections === 1 ? "thing wants" : "things want"} something`}>
+                              {badges.connections}
+                            </span>
+                          )}
+                          {t.id === "about" && logDigest && logDigest !== "failed" && !logDigest.quiet && (
+                            <span className="ml-auto shrink-0 text-[10.5px] tabular-nums px-1.5 rounded-full"
+                              style={{ color: "var(--warning)", background: "color-mix(in srgb, var(--warning) 16%, transparent)" }}
+                              title="The server log has a crash loop or a spike worth a look">
+                              log {logDigest.crashLoops.length + logDigest.spikes.length}
+                            </span>
+                          )}
+                          {t.id === "remote" && badges.remote === "live" && (
+                            <span className="ml-auto shrink-0 rounded-full" aria-label="a device is connected"
+                              title="A device is connected right now"
+                              style={{ width: 6, height: 6, background: "var(--success)" }} />
+                          )}
+                          {/* A word, not a 6px ring — the ring was the first
+                              draft here, and it failed its own house rule the
+                              moment it was screenshotted: a dot that needs a
+                              tooltip to explain itself is exactly the "icon
+                              too small to read" complaint this pass exists to
+                              fix. "State" says outright that the page reports
+                              rather than sets, at a size a mouse can actually
+                              land on. Held back when the page already carries
+                              its own live mark above (Tools & services' count)
+                              so nobody reads two unrelated marks on one row. */}
+                          {t.status && !(t.id === "connections" && !!badges.connections) && (
+                            <span className="ml-auto shrink-0 text-[10px] uppercase tracking-[0.08em] px-1.5 py-0.5 rounded-full"
+                              aria-label="reports state, not a setting"
+                              title="Reports what is already happening — not a switch."
+                              style={{ color: "var(--text4)", border: "1px solid color-mix(in srgb, var(--text4) 55%, transparent)" }}>
+                              State
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  ));
+                })()}
+              </div>
+            </aside>
 
                   {/* The COLUMN is capped, and everything in it ends together.
                       Capping the ROW was the first attempt and it left every
@@ -3014,41 +4353,118 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                       channel each side, two thirds of the nav's own width, and
                       moves the left reading edge every time a wide pane opts
                       out. See .agx-settings-col. */}
-                  <div className="agx-scroll flex-1 min-w-0 overflow-y-auto px-5 pt-4 pb-6">
-                  <div className="agx-settings-col">
-                  <Filter.Provider value={filter}>
-                  {filtering && (
+                  {/* The reading edge sits well clear of the nav. In the dialog this was
+                px-5 because there were only 780px to spend and every one of
+                them was measure; on a page the column is capped at 760 anyway,
+                so the slack is free and the gap is what stops the title reading
+                as an extension of the nav it sits beside. */}
+            <div ref={contentRef} className="agx-scroll flex-1 min-w-0 overflow-y-auto px-8 pt-8 pb-10">
+                  {/*
+                    A WIDER COLUMN on the panes that are BOARDS rather than
+                    reading.
+                  *
+                    760px is the measure for rows of prose and it is the wrong
+                    number for a grid of cards: two cards inside it come out at
+                    365px each, which is exactly the width that produced the
+                    359x596 letterbox nobody could look at. Set HERE and not on
+                    the pane, because a custom property inherits downward —
+                    declared by a child of this element it can never reach the
+                    `max-width` that reads it, which is why the first attempt
+                    changed nothing at all.
+                  */}
+                  <div className="agx-settings-col"
+                    style={WIDE_PANES.has(pane) ? ({ "--agx-settings-col": "1180px" } as React.CSSProperties) : undefined}>
+                  <Filter.Provider value={filterCtx}>
+                  {/*
+                   * The results header.
+                   *
+                   * Replaces the old "Showing the N settings on this page
+                   * that match…" banner, which named ONE page because there
+                   * was only ever one page on screen at a time. Now that a
+                   * query can put more than one page's content on screen at
+                   * once (see `matches`/`show` above), the count has to be
+                   * the total across all of them, and "also:" has to say
+                   * which typed word found a hit only because a synonym
+                   * carried it there — a search that quietly substitutes a
+                   * word is a search that lies about what you asked for.
+                   */}
+                  {ql && (
                     <div className="agx-settings-row mb-3 rounded-lg" style={{ background: "color-mix(in srgb, var(--primary) 9%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 25%, transparent)" }}>
                       <span className="text-[12.5px]" style={{ color: "var(--text2)" }}>
-                        Showing the <span className="tabular-nums" style={{ color: "var(--text)" }}>{rowHits}</span> setting{rowHits === 1 ? "" : "s"} on this page that match{rowHits === 1 ? "es" : ""} “{q.trim()}”.
+                        {/* visibleResults, not rowResults: the count on this line has to be
+                            the count of rows actually rendered below. rowResults holds every
+                            page's matches before the cap-5 truncation, so on a query wide
+                            enough to reach a 6th page it said "14 settings match" over a
+                            screen that showed 9 of them — a number nothing on screen backed. */}
+                        {absentHit ? absentHit.say : visibleResults.length === 0
+                          ? `No setting matches “${q.trim()}”.`
+                          : (
+                            <>
+                              <span className="tabular-nums" style={{ color: "var(--text)" }}>{visibleResults.length}</span>
+                              {" "}setting{visibleResults.length === 1 ? "" : "s"} match “{q.trim()}”
+                              {synonymsUsed.length > 0 && (
+                                <span style={{ color: "var(--text4)" }}> · also: {synonymsUsed.join(", ")}</span>
+                              )}
+                            </>
+                          )}
                       </span>
                       <button onClick={() => setQ("")} className="justify-self-end text-[12px] px-2.5 py-1 rounded-lg"
                         style={{ color: "var(--primary)", border: "1px solid color-mix(in srgb, var(--primary) 32%, transparent)" }}>Show all</button>
                     </div>
                   )}
-                  {(() => {
+                  {!ql && (() => {
                     const t = TABS.find((x) => x.id === pane);
                     return t ? (
-                      /* px-4 like every row: the page title is the top of the
-                         same line the eye runs down, not a separate one. */
-                      <div className="pb-3 px-4">
-                        <div className="text-[18px] font-medium" style={{ color: "var(--text)" }}>{t.label}</div>
-                        {t.what && <div className="text-[12.5px] mt-1.5" style={{ color: "var(--text3)" }}>{t.what}</div>}
+                      /* px-1 rather than px-4: the cards below carry their
+                         own 18px of inner padding, so a title indented to the
+                         old row padding sat a clear step to the RIGHT of every
+                         heading it governs. It leads the column now.
+                       *
+                       * 22px and a rule underneath. At 18px/medium it was two
+                       * and a half points over a row label and read as one
+                       * more line of the page rather than as its name — which
+                       * is how a settings screen ends up feeling like a book
+                       * with no chapter breaks. The rule is the chapter break;
+                       * the space under it is what stops the first card
+                       * reading as part of the heading. */
+                      <div className="pb-6 mb-6 px-1 border-b" style={{ borderColor: "var(--surface-line)" }}>
+                        <div className="flex items-baseline justify-between gap-4">
+                          <div className="text-[22px] font-semibold tracking-[-0.015em]" style={{ color: "var(--text)" }}>{t.label}</div>
+                          {pageModified(t.id) && (
+                            <button onClick={() => resetPage(t.id)}
+                              className="shrink-0 text-[12px] underline t-dim">Reset page</button>
+                          )}
+                        </div>
+                        {/* No measure cap of its own — the column is the cap. At 62ch this broke
+                            to two lines with a single word on the second while 300px of the
+                            card below it sat empty, which reads as a layout fault rather
+                            than as a sentence. */}
+                        {t.what && <div className="text-[13px] mt-2" style={{ color: "var(--text3)" }}>{t.what}</div>}
                       </div>
                     ) : null;
                   })()}
-                  {pane === "appearance" && (
-                  <Section>
+                  {ql && show("appearance") && <PageMatchHeading id="appearance" onOpen={() => { setPane("appearance" as Pane); setQ(""); }} />}
+                  {show("appearance") && (
+                  <Section title="Theme"
+                    desc="One palette for the whole cockpit.">
                     {/* The theme drives everything — app chrome, the terminal's
                         own palette, and on the desktop it is synced out to tmux
                         and nvim too. It used to live in the masthead; it belongs
                         here, where a control this heavy isn't in the way. */}
                     <p className="py-3 text-[12px] t-dim">One palette for the whole cockpit — chrome, terminal, and (on the desktop) your tmux and nvim follow it.</p>
-                    <AppearancePane current={theme} onChange={onTheme} />
+                    <AppearancePane key={appearanceNonce} current={theme} onChange={onTheme} onAccent={setAccentState} />
                   </Section>
                   )}
-                  {pane === "terminal" && (
-                  <Section>
+                  {ql && show("terminal") && <PageMatchHeading id="terminal" onOpen={() => { setPane("terminal" as Pane); setQ(""); }} />}
+                  {show("terminal") && (<>
+                  {/* THREE groups, and it was one. Eleven rows in a single
+                      unnamed box is a page you have to read end to end to find
+                      out whether the thing you came for is on it — the renderer
+                      and the word separators are not the same subject and were
+                      drawn as though they were. Named groups turn "read the
+                      page" into "read three headings". */}
+                  <Section title="How it draws"
+                    desc="The renderer, the face, and the size of a cell.">
                     {/* GPU (WebGL) is fastest but blanks white on some Linux
                         GPU/compositor stacks; Canvas is the same drawing minus
                         the GPU — fast, and no context to lose — so Auto uses GPU
@@ -3057,7 +4473,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                     <Choice<RendererPref>
                       label="Terminal renderer"
                       hint="GPU is fastest; Canvas is nearly as fast and never blanks; DOM is the slow fallback. Applies to newly opened shells."
-                      value={renderer}
+                      value={renderer} modified={renderer !== "auto"}
                       onPick={(v) => { setRenderer(v); setRendererPref(v); }}
                       options={[
                         { v: "auto", label: "Auto" },
@@ -3081,7 +4497,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                       * than a sentence saying why.
                       */}
                     <SettingRow
-                      label="Font"
+                      label="Font" modified={termFont !== ""}
                       hint={<>
                         These faces ship with agentglass — no install needed, and they render the same on
                         any machine.
@@ -3101,7 +4517,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                           .map((f) => ({ value: f.id, label: f.name }))}
                       />}
                     />
-                    <div className="pb-3">
+                    <div className="pt-3.5 pb-3">
                       <div className="panel-eyebrow pb-1" style={{ paddingLeft: 0, paddingRight: 0 }}>How it looks</div>
                       <div className="rounded-lg px-3 py-2 whitespace-pre overflow-x-auto"
                         style={{
@@ -3118,7 +4534,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                     <Stepper
                       label="Font size"
                       hint={`Applies live to every open terminal, and is remembered. ${MOD_KEY}+ / ${MOD_KEY}− with the pointer over a terminal does the same without touching the window.`}
-                      value={`${termSize}px`}
+                      value={`${termSize}px`} modified={termSize !== DEFAULT_SIZE}
                       onDec={() => { const n = Math.max(SIZE_MIN, termSize - 1); setTermSize(n); setTermSizeState(n); }}
                       onInc={() => { const n = Math.min(SIZE_MAX, termSize + 1); setTermSize(n); setTermSizeState(n); }}
                       canDec={termSize > SIZE_MIN} canInc={termSize < SIZE_MAX} />
@@ -3132,32 +4548,74 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                       hint={termLine > LINE_HEIGHT_MIN
                         ? "Above 1, box-drawing rules — the divider between tmux panes, the frames around an agent's output — are drawn with a gap on every row wherever the GPU renderer is off (the default on Linux). 1 keeps them solid."
                         : "Space between rows. 1 keeps box-drawing rules solid, which is what a terminal is normally set to."}
-                      value={termLine.toFixed(2).replace(/0$/, "")}
+                      value={termLine.toFixed(2).replace(/0$/, "")} modified={termLine !== DEFAULT_LINE_HEIGHT}
                       onDec={() => { const n = Math.max(LINE_HEIGHT_MIN, Math.round((termLine - 0.05) * 100) / 100); setTermLineHeight(n); setTermLineState(n); }}
                       onInc={() => { const n = Math.min(LINE_HEIGHT_MAX, Math.round((termLine + 0.05) * 100) / 100); setTermLineHeight(n); setTermLineState(n); }}
                       canDec={termLine > LINE_HEIGHT_MIN} canInc={termLine < LINE_HEIGHT_MAX} />
                     <Choice<CursorStyle>
                       label="Cursor"
                       hint="The shape that marks where you're typing."
-                      value={termCursor}
+                      value={termCursor} modified={termCursor !== "block"}
                       onPick={(v) => { setTermCursor(v); setTermCursorState(v); }}
                       options={CURSORS} />
+                  </Section>
+
+                  <Section title="Mouse and clipboard"
+                    desc="What pointing at a pane does, and what a selection does.">
                     {/* Off by default: focus that moves on its own is the one
                         terminal habit people either keep for life or cannot
                         stand, and a machine that has never been asked expects
                         the click. */}
-                    <Toggle on={ffm} onClick={() => { const v = !ffm; setFocusFollowsMouse(v); setFfm(v); }}
+                    <Toggle on={ffm} modified={ffm} onClick={() => { const v = !ffm; setFocusFollowsMouse(v); setFfm(v); }}
                       label="Focus follows mouse"
                       hint="Hovering a terminal pane types into it, without a click first. Only terminals — the rest of the app still waits to be clicked." />
                     {/* On by default, because it is what this terminal has
                         always done — the switch is for the machine where the
                         clipboard is shared with something that reacts to it. */}
-                    <Toggle on={copySel} onClick={() => { const v = !copySel; setCopyOnSelect(v); setCopySel(v); }}
+                    {/* The bar a pane keeps under its own bottom edge — the
+                        worktree, the changes, the pull request and the card of
+                        THAT pane. On by default: with six panes open it is how
+                        you reach the bottom one without dragging the pointer
+                        across the others, and it is not on screen until the
+                        pointer is on the seam at the pane's foot. */}
+                    <Toggle on={paneActs !== "off"} modified={paneActs !== "hover"}
+                      onClick={() => { const v = paneActs === "off" ? "hover" : "off"; setPaneActs(v); setPaneActionsMode(v); }}
+                      label="Bar on a pane"
+                      hint="Point at the seam along a pane's bottom edge and its branch, changes, pull request and card rise out of it." />
+                    <Toggle on={copySel} modified={!copySel} onClick={() => { const v = !copySel; setCopyOnSelect(v); setCopySel(v); }}
                       label="Copy on select"
                       hint="A selection is on the clipboard the instant you make it, the way tmux does it — no Ctrl+Shift+C." />
-                    <Toggle on={rcPaste} onClick={() => { const v = !rcPaste; setRightClickPaste(v); setRcPaste(v); }}
+                    <Toggle on={rcPaste} modified={rcPaste} onClick={() => { const v = !rcPaste; setRightClickPaste(v); setRcPaste(v); }}
                       label="Right-click to paste"
                       hint="Right-click pastes the clipboard into the shell instead of opening the menu. Ctrl+right-click still opens it." />
+                  </Section>
+
+                  <Section title="Tab groups"
+                    desc="With tmux, the tabs are grouped by the project each window is working in. The group you are in is open; the others fold into a chip that still shows what their agents are doing.">
+                    <Toggle on={groupsOn} modified={!groupsOn} onClick={() => { const v = !groupsOn; setTabGroupsOn(v); setGroupsOn(v); }}
+                      label="Group tabs by project"
+                      hint="Off draws every tab in one row, in tmux's order. Right-click a tab to pin it first in its group or move it to another; drag it onto a group to do the same." />
+                    {/* The tie-break for a window whose folder is not its
+                        project. None ship: a rule is a guess about how
+                        somebody names things, and the folder is right for
+                        everyone else. */}
+                    <SettingRow
+                      label="Group by name" modified={groupRules !== ""}
+                      hint={<>A window whose name starts with a prefix goes to that group, whatever folder it runs in. Pairs like <span className="t-mono text-[11px]">agx=agentglass, ops=infra</span>. {parseRules(groupRules).length
+                        ? `${parseRules(groupRules).length} ${parseRules(groupRules).length === 1 ? "rule" : "rules"} in use.`
+                        : "None yet — windows are grouped by their folder."}</>}
+                      control={
+                        <input value={groupRules} onChange={(e) => setGroupRules(e.target.value)}
+                          onBlur={() => setTabGroupRulesText(groupRules)}
+                          onKeyDown={(e) => { if (e.key === "Enter") setTabGroupRulesText(groupRules); }}
+                          placeholder="agx=agentglass" spellCheck={false} aria-label="Group-by-name rules"
+                          className="text-[12px] t-mono px-2 py-1 rounded-lg bg-transparent w-[200px] justify-self-end"
+                          style={{ color: "var(--text2)", border: "1px solid color-mix(in srgb, var(--border) 40%, transparent)" }} />
+                      } />
+                  </Section>
+
+                  <Section title="History and selection"
+                    desc="How far back a shell remembers, and what a double-click takes.">
                     {/* Sizes rather than a number box: the cost is memory PER
                         SHELL and this app holds several open at once, so the
                         step from 4k to 50k is one somebody should take on
@@ -3167,7 +4625,7 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                       hint={scrollback > DEFAULT_SCROLLBACK
                         ? `${scrollback.toLocaleString()} lines are kept per shell. Every line is cell data held in memory and reflowed on every resize — with several shells open, that is where a drag starts to stutter.`
                         : "How many lines each shell keeps. Applies live; the larger sizes cost memory per shell and make resizing slower."}
-                      value={String(scrollback)}
+                      value={String(scrollback)} modified={scrollback !== DEFAULT_SCROLLBACK}
                       onPick={(v) => { const n = Number(v); setScrollback(n); setScrollbackState(n); }}
                       options={SCROLLBACK_SIZES.map((n) => ({ v: String(n), label: n >= 1000 ? `${n / 1000}k` : String(n) }))} />
                     <div className="px-3.5 py-3">
@@ -3192,24 +4650,32 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                         style={{ fontFamily: "ui-monospace, monospace", background: "var(--bg2)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)", color: "var(--text)" }} />
                     </div>
                   </Section>
-                  )}
-                  {pane === "diff" && (
-                  <Section>
+                  <TerminalRunsOn open={open} />
+                  </>)}
+                  {ql && show("diff") && <PageMatchHeading id="diff" onOpen={() => { setPane("diff" as Pane); setQ(""); }} />}
+                  {show("diff") && (
+                  <Section title="How a diff opens"
+                    desc="The view you land on, and what happens to a long line.">
                     {/* Defaults, not the live state: the toggle in each panel
                         still wins while you are looking at that diff. Changing
                         your mind about one file is not a preference. */}
                     <Choice<"split" | "inline">
                       label="Default view"
                       hint="How file changes, source control and pull requests open a diff. The toggle in each panel still overrides it for that diff."
-                      value={dSplit ? "split" : "inline"}
+                      value={dSplit ? "split" : "inline"} modified={dSplit !== DEFAULT_SPLIT}
                       onPick={(v) => { const on = v === "split"; setDiffSplit(on); setDSplitState(on); }}
                       options={[{ v: "split", label: "Side by side" }, { v: "inline", label: "Inline" }]} />
-                    <Toggle on={dWrap} onClick={() => { const v = !dWrap; setDiffWrap(v); setDWrapState(v); }}
+                    <Toggle on={dWrap} modified={dWrap !== DEFAULT_WRAP} onClick={() => { const v = !dWrap; setDiffWrap(v); setDWrapState(v); }}
                       label="Wrap long lines"
                       hint="Wrap instead of scrolling sideways. Off keeps the columns aligned, which is what makes a code diff scannable; on is what a markdown or prose diff wants." />
+                    <SettingRow
+                      label="Diff syntax theme"
+                      hint="The colours code takes in a diff. Auto follows the app's light or dark; the toolbar in a diff changes the same setting."
+                      control={<span className="justify-self-end"><ThemePicker value={dTheme} onChange={(v) => { setDiffThemePref(v); setDThemeState(v); }} /></span>} />
                   </Section>
                   )}
-                  {pane === "tasks" && (
+                  {ql && show("tasks") && <PageMatchHeading id="tasks" onOpen={() => { setPane("tasks" as Pane); setQ(""); }} />}
+                  {show("tasks") && (
                   <>
                   <Section title="Opens on">
                     {/* There was no setting here before and no default either:
@@ -3249,18 +4715,45 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                   </Section>
                   </>
                   )}
-                  {pane === "privacy" && <PrivacyPane open={open} />}
-                  {pane === "recipes" && <RecipesPane open={open} />}
-                  {pane === "review-prompts" && <ReviewPromptsPane open={open} />}
-                  {pane === "prefs" && (
-                  <Section>
+                  {ql && show("privacy") && <PageMatchHeading id="privacy" onOpen={() => { setPane("privacy" as Pane); setQ(""); }} />}
+                  {show("privacy") && <PrivacyPane open={open} />}
+                  {show("privacy") && (
+                  <Section title="Take your data out"
+                    desc="Everything this app has recorded, in a format something else can read.">
+                    {/* Scoped like everything else: with a project open these
+                        carry that project's rows, not the whole machine's. */}
+                    <Row label="Events — CSV" hint="One row per event, for a spreadsheet"
+                      href={api.exportUrl("csv")} download="agentglass-events.csv" />
+                    <Row label="Events — JSON" hint="Full payloads, for scripting"
+                      href={api.exportUrl("json")} download="agentglass-events.json" />
+                    {/* The only export that outlives retention: it reads the
+                        daily rollup as well as the live events, so a month
+                        that has already been pruned still comes out. */}
+                    <Row label="Daily totals — CSV" hint="One row per day, back past the retention window"
+                      href={api.exportUrl("csv", "daily")} download="agentglass-daily.csv" />
+                    <Row label="Daily totals — JSON" hint="The same series, with where the retention seam falls"
+                      href={api.exportUrl("json", "daily")} download="agentglass-daily.json" />
+                    <Row label="Skills catalog — Markdown" hint="Every skill the fleet has available"
+                      href={api.skillsExportUrl()} download="agentglass-skills.md" />
+                  </Section>
+                  )}
+                  {ql && show("recipes") && <PageMatchHeading id="recipes" onOpen={() => { setPane("recipes" as Pane); setQ(""); }} />}
+                  {show("recipes") && <RecipesPane open={open} />}
+                  {ql && show("review-prompts") && <PageMatchHeading id="review-prompts" onOpen={() => { setPane("review-prompts" as Pane); setQ(""); }} />}
+                  {show("review-prompts") && <ReviewPromptsPane open={open} />}
+                  {ql && show("saved-replies") && <PageMatchHeading id="saved-replies" onOpen={() => { setPane("saved-replies" as Pane); setQ(""); }} />}
+                  {show("saved-replies") && <SavedRepliesPane open={open} />}
+                  {ql && show("prefs") && <PageMatchHeading id="prefs" onOpen={() => { setPane("prefs" as Pane); setQ(""); }} />}
+                  {show("prefs") && (
+                  <Section title="Size and startup"
+                    desc="How big the window is, and what it does when the machine boots.">
                     {/* Desktop only, like launch-at-login: in a browser tab the
                         browser's own zoom already does this, and better. */}
                     {IS_DESKTOP && (
                       <Stepper
                         label="Display size"
                         hint={`Scales the whole window, and is remembered. ${MOD_KEY}+ / ${MOD_KEY}− anywhere, ${MOD_KEY}0 to reset — except over a terminal, where the same keys size the terminal instead and leave the window alone.`}
-                        value={fmtScale(scale)}
+                        value={fmtScale(scale)} modified={scale !== DEFAULT_SCALE}
                         onDec={() => onZoom(-1)} onInc={() => onZoom(1)}
                         canDec={canZoomOut()} canInc={canZoomIn()} />
                     )}
@@ -3275,6 +4768,11 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                         label="Start at login"
                         hint="Open agentglass automatically when you log in" />
                     )}
+                    {/* Read before anything is drawn (web/index.html), so the
+                        change shows at the next launch, not this one. */}
+                    <Toggle on={splash} modified={!splash} onClick={() => { const v = !splash; setSplashOn(v); setSplash(v); }}
+                      label="Launch animation"
+                      hint="Covers the window while the terminal, sessions and git load, then the mark flies to the top bar. Off shows the plain loading screen. From the next launch" />
                     {/* Off is the default and off means nothing is watching:
                         with no client subscribed the server never starts the
                         D-Bus monitor at all. On a machine that cannot do this
@@ -3293,57 +4791,20 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                       sit under "Preferences", which is where settings go when
                       nobody has decided where they belong — a page that mixes
                       window zoom with how a CLI is spawned is a drawer. */}
-                  {pane === "chat" && (
-                  <Section>
-                    {/* Two genuinely different bargains, so the row names both
-                        rather than implying one is simply better. Panes are
-                        faster per turn and attachable from a real terminal;
-                        they also hold a live CLI (~380MB and growing) for as
-                        long as the chat is warm. Applies to new chats only —
-                        an open chat's session already lives somewhere. */}
-                    <Choice<"server" | "process" | "tmux">
-                      label="How new chats run"
-                      hint={
-                        tmuxEngine && !tmuxEngine.available
-                          // A reason on its own leaves "tmux is not installed"
-                          // as a dead end inside a settings dialog that has the
-                          // install guidance one tab away. Say where it is.
-                          ? `tmux panes unavailable: ${tmuxEngine.reason}. Chats still run, one process per turn. See Requirements for how to add tmux.`
-                          : "Panes keep a warm claude per chat: faster turns, and you can attach from your terminal. Separate takes longer per turn and leaves nothing running."
-                      }
-                      disabled={tmuxEngine ? !tmuxEngine.available : true}
-                      disabledHint={tmuxEngine ? `Unavailable: ${tmuxEngine.reason}` : "Checking…"}
-                      value={enginePref ?? "server"}
-                      onPick={(v) => {
-                        const next = v === "server" ? null : v;
-                        setChatEnginePref(next);
-                        setEnginePref(next);
-                      }}
-                      options={[
-                        { v: "server", label: tmuxEngine?.defaultOn ? "Default (panes)" : "Default (separate)" },
-                        { v: "process", label: "Separate" },
-                        { v: "tmux", label: "tmux panes" },
-                      ]} />
-                    {tmuxEngine?.available && (
-                      <div className="flex flex-col gap-1.5 pt-1">
-                        <span className="text-[10px] t-dim2 uppercase tracking-wider">Warm CLIs running now</span>
-                        <RunningPanes open={open} />
-                      </div>
-                    )}
-                  </Section>
-                  )}
-
-                  {pane === "budgets" && (
-                  <Section>
+                  {ql && show("budgets") && <PageMatchHeading id="budgets" onOpen={() => { setPane("budgets" as Pane); setQ(""); }} />}
+                  {show("budgets") && (
+                  <Section title="Spending"
+                    desc="A ceiling you set, so the insights stop firing on constants.">
                     {/* A limit you chose, so the spend insights stop firing on
                         constants — which are noise on a project that genuinely
                         costs that and silence on one where a tenth would be
                         alarming. */}
-                    {/* .panel-eyebrow, not a hand-rolled 10px uppercase span:
-                        there were three different spellings of a section
-                        heading in this file and this was the third. */}
-                    <div className="panel-eyebrow pt-1 pb-1.5">Spending budgets</div>
+                    {/* The eyebrow that used to say "Spending budgets" here is
+                        gone: the card it sits in now carries that as its own
+                        heading, and a group titled twice reads as two groups
+                        with nothing in the first. */}
                     <BudgetsPane open={open} />
+                    <PacePane />
                     {/* The consequence of the setting above, made visible.
                         Panes outlive the app, so "how new chats run" quietly
                         decides how much memory is resident on this machine an
@@ -3351,102 +4812,9 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                         place to see that was a terminal. */}
                   </Section>
                   )}
-
-                  {pane === "notifications" && (
-                  <Section>
-                    {/* Two sources, two switches. They share one surface — the
-                        bell lists both — so "stop interrupting me" has to be
-                        answerable about each separately, or turning off the
-                        chatter means turning off the fleet you are watching. */}
-                    {/* Its own group above the two sources, because it is not
-                        about a source at all — it narrows one KIND of thing
-                        agentglass raises itself. */}
-                    <Group>Pull request checks</Group>
-                    <Toggle
-                      on={ciApproved}
-                      onClick={() => { const v = !ciApproved; setCiOnlyApproved(v); setCiApproved(v); }}
-                      label="Only when the pull request is approved"
-                      hint={ciApproved
-                        ? "A suite finishing on something half-written is a status line; on something approved it is the last thing before merging."
-                        : "Every verdict, on every pull request of yours — including the ones nobody has looked at yet."} />
-
-                    {/*
-                      * The two sounds, and they are two on purpose: a
-                      * notification is somebody else's news and an alarm is a
-                      * promise you made yourself at a particular minute. One
-                      * should be brief enough to hear thirty times a day; the
-                      * other has to be heard from the next room and repeats
-                      * until it is answered.
-                      *
-                      * Every one of them is synthesised — a few oscillators and
-                      * an envelope — rather than a file: a strict CSP blocks a
-                      * remote asset, a bundled set is a few hundred kilobytes
-                      * for two seconds of audio, and every free pack arrives
-                      * with a licence to carry around.
-                      */}
-                    <Group>Sound</Group>
-                    <SoundRow
-                      label="Notifications"
-                      hint="What a card behind the bell sounds like. Quiet, below, silences the mirrored ones."
-                      voices={NOTIFY_VOICES}
-                      value={notifyVoice}
-                      onPick={(v) => { setNotifyVoice(v); setNotifyVoiceState(v); }} />
-                    <SoundRow
-                      label="Reminder alarm"
-                      hint="A reminder you set does not join the list — it takes the screen and rings until it is answered."
-                      voices={ALARM_VOICES}
-                      value={alarmVoice}
-                      onPick={(v) => { setAlarmVoice(v); setAlarmVoiceState(v); }} />
-
-                    <Group>From your desktop</Group>
-                    <Toggle
-                      on={sysNotify !== "off"}
-                      // Disabled only on a verdict. "We could not reach the
-                      // server to ask" is not one, and greying the switch out
-                      // for it makes a passing startup race look like a machine
-                      // that cannot do this at all.
-                      disabled={notifyCap ? !notifyCap.supported && !notifyCap.transient : true}
-                      onClick={() => setSysNotifyOn(sysNotify === "off")}
-                      label="Mirror this machine's notifications"
-                      hint={notifyCap && !notifyCap.supported
-                        ? (notifyCap.transient
-                          ? `Checking — ${notifyCap.reason}`
-                          : `Unavailable — ${notifyCap.reason}`)
-                        : "Slack, mail, calendar — whatever pops up behind agentglass while it is covering your screen. A copy, never an interception: your desktop still shows its own."} />
-                    {sysNotify !== "off" && (
-                      <>
-                        {/* Not the same question as the switch above. "Tell me
-                            someone wrote" and "show me what they said" differ on
-                            a shared screen, which is the one place this feature
-                            is most useful and least private. */}
-                        <Choice<SysNotifyMode>
-                          label="How much of the message"
-                          hint="Full shows the text on the card; Who shows only who it was from"
-                          value={sysNotify}
-                          onPick={setSysNotifyMode}
-                          options={[
-                            { v: "titles", label: "Who" },
-                            { v: "full", label: "Full" },
-                          ]} />
-                        {/* agentglass reads the bus rather than being the daemon,
-                            so the desktop's own Do Not Disturb cannot reach what
-                            lands here. This is the switch that can. It silences
-                            other people's messages only: a gate hold never travels
-                            this path, so quiet can't mean an agent blocked and
-                            nobody said. */}
-                        <Toggle on={quiet} onClick={() => setNotifyQuiet(!quiet)}
-                          label="Quiet — collect them without interrupting"
-                          hint="No cards; they still land in the bell, so nothing is lost" />
-                      </>
-                    )}
-
-                    <Group>From agentglass</Group>
-                    <Toggle on={own} onClick={() => setAppNotify(!own)}
-                      label="agentglass's own notifications"
-                      hint="Chats finishing, branches falling behind, checks going red. Anything held waiting on you still speaks — that one cannot be caught up on later — and everything keeps landing in the bell either way." />
-                    <Toggle on={sound} onClick={onSound}
-                      label="Alert sounds"
-                      hint="A chime when a session errors or needs you" />
+                  {show("budgets") && <GhBudget open={open} />}
+                  {show("budgets") && (
+                  <Section title="Codex quota">
                     {/* Says what it costs, because it costs something: this
                         spends a little of the quota it is measuring. */}
                     <Toggle on={usageRefresh}
@@ -3456,12 +4824,32 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                   </Section>
                   )}
 
-                  {pane === "browser" && <><BrowserPane /><AgentBrowserPane open={open} /></>}
+                  {ql && show("notifications") && <PageMatchHeading id="notifications" onOpen={() => { setPane("notifications" as Pane); setQ(""); }} />}
 
-                  {pane === "rail" && <RailPane />}
+                  {show("notifications") && (
+                  <NotificationsSection
+                    sound={sound} onSound={onSound}
+                    quiet={quiet} mutedList={mutedList} own={own}
+                    notifyVoice={notifyVoice} onNotifyVoice={(v) => { setNotifyVoice(v); setNotifyVoiceState(v); }}
+                    alarmVoice={alarmVoice} onAlarmVoice={(v) => { setAlarmVoice(v); setAlarmVoiceState(v); }}
+                    ciApproved={ciApproved} onCiApproved={() => { const v = !ciApproved; setCiOnlyApproved(v); setCiApproved(v); }}
+                    talkMode={talkMode} onTalkMode={(v) => { setTalkNotify(v); setTalkMode(v); }}
+                    sysNotify={sysNotify} notifyCap={notifyCap} />
+                  )}
 
-                  {pane === "keys" && (
-                  <Section>
+                  {ql && show("browser") && <PageMatchHeading id="browser" onOpen={() => { setPane("browser" as Pane); setQ(""); }} />}
+
+                  {show("browser") && <><BrowserPane /><Section title="Logins"><CookieImport /></Section></>}
+
+                  {ql && show("rail") && <PageMatchHeading id="rail" onOpen={() => { setPane("rail" as Pane); setQ(""); }} />}
+
+                  {show("rail") && <RailPane />}
+
+                  {ql && show("keys") && <PageMatchHeading id="keys" onOpen={() => { setPane("keys" as Pane); setQ(""); }} />}
+
+                  {show("keys") && (
+                  <Section title="Keys"
+                    desc="Every binding, grouped by where it works.">
                     {/*
                       * Grouped by WHERE the key works, not listed flat.
                       *
@@ -3581,100 +4969,117 @@ export function SettingsModal({ open, onClose, sound, onSound, scale, onZoom, on
                   </Section>
                   )}
 
-                  {pane === "open" && (
-                  <Section>
-                    <Row label="Statistics" hint="Totals, tool latency and cost breakdowns" kbd="s"
-                      onClick={() => { onOpenStats(); onClose(); }} />
-                    <Row label="Legend & shortcuts" hint="What the colours mean, and every key binding" kbd="?"
-                      onClick={() => { onOpenHelp(); onClose(); }} />
-                    <Row label="Command palette" hint="Jump to any panel, filter or session" kbd={`${MOD_KEY}K`}
-                      onClick={onClose} />
+                  {ql && show("lantern") && <PageMatchHeading id="lantern" onOpen={() => { setPane("lantern" as Pane); setQ(""); }} />}
+                  {show("lantern") && <LanternSection open={open} />}
+                  {ql && show("hooks") && <PageMatchHeading id="hooks" onOpen={() => { setPane("hooks" as Pane); setQ(""); }} />}
+
+                  {show("hooks") && <>
+                    <HooksPane open={open} />
+                    <Section title="New chats"
+                      desc="What a chat gets when it starts.">
+                      {/* Merged from a separate "Chat" page: this and the tmux
+                          binary above answer the same question — what a pane
+                          actually runs on — and a person who came here to
+                          change the prefix key is the same person who wants
+                          to know whether a new chat gets one of these. */}
+                      {/* The "Chats" eyebrow that stood here is gone — the
+                          card's own heading says it, and a group labelled
+                          twice reads as two groups with an empty first. */}
+                      <Choice<"server" | "process" | "tmux">
+                        label="How new chats run"
+                        hint={
+                          tmuxEngine && !tmuxEngine.available
+                            ? `tmux panes unavailable: ${tmuxEngine.reason}. Chats still run, one process per turn. See Requirements for how to add tmux.`
+                            : "Panes keep a warm claude per chat: faster turns, and you can attach from your terminal. Separate takes longer per turn and leaves nothing running."
+                        }
+                        disabled={tmuxEngine ? !tmuxEngine.available : true}
+                        disabledHint={tmuxEngine ? `Unavailable: ${tmuxEngine.reason}` : "Checking…"}
+                        value={enginePref ?? "server"}
+                        onPick={(v) => {
+                          const next = v === "server" ? null : v;
+                          setChatEnginePref(next);
+                          setEnginePref(next);
+                        }}
+                        options={[
+                          { v: "server", label: tmuxEngine?.defaultOn ? "Default (panes)" : "Default (separate)" },
+                          { v: "process", label: "Separate" },
+                          { v: "tmux", label: "tmux panes" },
+                        ]} />
+                      {tmuxEngine?.available && (
+                        <div className="flex flex-col gap-1.5 pt-1">
+                          <span className="text-[10px] t-dim2 uppercase tracking-wider">Warm CLIs running now</span>
+                          <RunningPanes open={open} />
+                        </div>
+                      )}
+                    </Section>
+                    {HAS_BROWSER && <AgentBrowserPane open={open} />}
+                    <AgentsSection open={open} /><WorkerRolesSection open={open} />
+                  </>}
+
+                  {ql && show("tmux") && <PageMatchHeading id="tmux" onOpen={() => { setPane("tmux" as Pane); setQ(""); }} />}
+
+                  {show("tmux") && (
+                  <>
+                    <TmuxPane open={open} onGoTerminal={() => { setPane("terminal" as Pane); setQ(""); }} />
+                  </>
+                  )}
+                  {ql && show("connections") && <PageMatchHeading id="connections" onOpen={() => { setPane("connections" as Pane); setQ(""); }} />}
+                  {show("connections") && <><RequirementsPane open={open} /><IntegrationsPane open={open} /></>}
+
+                  {ql && show("remote") && <PageMatchHeading id="remote" onOpen={() => { setPane("remote" as Pane); setQ(""); }} />}
+
+                  {show("remote") && <RemoteAccessPane open={open} />}
+                  {ql && show("plugins") && <PageMatchHeading id="plugins" onOpen={() => { setPane("plugins" as Pane); setQ(""); }} />}
+                  {show("plugins") && <PluginsPane open={open} />}
+                  {pane.startsWith("plugin:") && <PluginsPane open={open} focus={pane.slice("plugin:".length)} />}
+
+                  {ql && show("log") && <PageMatchHeading id="log" onOpen={() => { setPane("log" as Pane); setQ(""); }} />}
+
+                  {show("log") && <ActivityPane open={open} />}
+                  {ql && show("understudy") && <PageMatchHeading id="understudy" onOpen={() => { setPane("understudy" as Pane); setQ(""); }} />}
+                  {show("understudy") && <UnderstudyPane open={open} onLeave={onClose} />}
+                  {ql && show("onboarding") && <PageMatchHeading id="onboarding" onOpen={() => { setPane("onboarding" as Pane); setQ(""); }} />}
+                  {show("onboarding") && onboarding && (
+                  <Section title="What is left to set up"
+                    desc="Three things, and then this page goes away.">
+                    {/* Rows report state, they do not collect it — nothing here
+                        is a checkbox, because a box you tick yourself is a
+                        promise the app has no way to check, and this row's
+                        whole point is that it only says things it can. */}
+                    <SettingRow label="An agent is wired in"
+                      hint={onboarding.hook ? "Claude Code is hooked into this app." : "Not yet — Claude Code hasn't been wired in."}
+                      onClick={() => setPane("hooks")}
+                      control={<OnboardingMark done={onboarding.hook} />} />
+                    <SettingRow label="A provider is connected"
+                      hint={onboarding.provider ? "At least one of GitHub, GitLab, ClickUp or Taskwarrior is connected." : "Not yet — connect GitHub, GitLab, ClickUp or Taskwarrior."}
+                      onClick={() => setPane("connections")}
+                      control={<OnboardingMark done={onboarding.provider} />} />
+                    <SettingRow label="The pane engine is ready"
+                      hint={onboarding.paneEngine ? "tmux is on PATH and working." : "Not yet — tmux isn't on PATH."}
+                      onClick={() => setPane("tmux")}
+                      control={<OnboardingMark done={onboarding.paneEngine} />} />
                   </Section>
                   )}
-
-                  {pane === "export" && (
-                  <Section>
-                    {/* Scoped like everything else: with a project open these
-                        carry that project's rows, not the whole machine's. */}
-                    <Row label="Events — CSV" hint="One row per event, for a spreadsheet"
-                      href={api.exportUrl("csv")} download="agentglass-events.csv" />
-                    <Row label="Events — JSON" hint="Full payloads, for scripting"
-                      href={api.exportUrl("json")} download="agentglass-events.json" />
-                    {/* The only export that outlives retention: it reads the
-                        daily rollup as well as the live events, so a month
-                        that has already been pruned still comes out. */}
-                    <Row label="Daily totals — CSV" hint="One row per day, back past the retention window"
-                      href={api.exportUrl("csv", "daily")} download="agentglass-daily.csv" />
-                    <Row label="Daily totals — JSON" hint="The same series, with where the retention seam falls"
-                      href={api.exportUrl("json", "daily")} download="agentglass-daily.json" />
-                    <Row label="Skills catalog — Markdown" hint="Every skill the fleet has available"
-                      href={api.skillsExportUrl()} download="agentglass-skills.md" />
-                  </Section>
-                  )}
-
-                  {pane === "hooks" && <><HooksPane open={open} /><AgentsSection open={open} /></>}
-
-                  {pane === "tmux" && <TmuxPane open={open} />}
-                  {pane === "connections" && <><RequirementsPane open={open} /><IntegrationsPane open={open} /><GhBudget open={open} /></>}
-
-                  {pane === "remote" && <RemoteAccessPane open={open} />}
-
-                  {pane === "log" && <ActivityPane open={open} />}
-                  {pane === "about" && <AboutPane open={open} />}
+                  {ql && show("about") && <PageMatchHeading id="about" onOpen={() => { setPane("about" as Pane); setQ(""); }} />}
+                  {show("about") && <><AboutPane open={open} /><LogDigestSection d={logDigest} /></>}
                   </Filter.Provider>
                   </div>
                   </div>
-                </div>
-              </motion.div>
+          {escArmed && (
+            /* The hint IS the mechanism. One Escape used to throw the page
+               away, which is fine for a popover and wrong for somewhere you
+               went — so the first press says what the second one does, and
+               says it where the eye already is when it wants out. */
+            <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded-lg text-[12.5px] pointer-events-none"
+              style={{ zIndex: 10002, background: "var(--bg2)", border: "1px solid color-mix(in srgb, var(--border) 55%, transparent)", color: "var(--text2)", boxShadow: "0 10px 30px -12px rgba(0,0,0,0.7)" }}>
+              Press Escape again to leave settings
             </div>
-          </>
+          )}
+          </motion.div>
         )}
       </AnimatePresence>
     </Portal>
+    </PortalFloor.Provider>
   );
 }
 
-
-/**
- * One sound, chosen and heard.
- *
- * The preview button is the whole point of the row: five names in a list —
- * "Ping", "Drop", "Chime" — say nothing about what they sound like, and a
- * setting you have to change and then wait for an event to evaluate is a setting
- * nobody tunes. Pressing it plays the option that is selected, so choosing is
- * done by ear in the place where the choice is made.
- */
-function SoundRow({ label, hint, voices, value, onPick }: {
-  label: string;
-  hint: string;
-  voices: Voice[];
-  value: string;
-  onPick: (v: string) => void;
-}) {
-  const voice = findVoice(voices, value);
-  return (
-    <div className="px-3 py-2 flex items-center gap-3">
-      <div className="min-w-0 flex-1 flex flex-col gap-1">
-        <span className="text-[11.5px]" style={{ color: "var(--text)" }}>{label}</span>
-        <span className="text-[10.5px]" style={{ color: "var(--text4)" }}>{hint}</span>
-      </div>
-      <Select
-        value={value}
-        onChange={onPick}
-        title={voice.hint}
-        style={{ minWidth: 132 }}
-        options={voices.map((v) => ({ value: v.id, label: v.label, hint: v.hint }))} />
-      <button
-        onClick={() => playVoice(voice)}
-        disabled={voice.id === "none"}
-        title={voice.id === "none" ? "Nothing to play" : `Play ${voice.label}`}
-        className="text-[11px] px-2 py-1 rounded-lg shrink-0"
-        style={{
-          color: voice.id === "none" ? "var(--text4)" : "var(--text3)",
-          border: "1px solid color-mix(in srgb, var(--border) 45%, transparent)",
-          opacity: voice.id === "none" ? 0.5 : 1,
-        }}
-      >Play</button>
-    </div>
-  );
-}

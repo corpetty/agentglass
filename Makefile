@@ -48,13 +48,23 @@ test: ## Run the server + web test suites (the fast half — `make ci` runs ever
 ci: ## Run everything CI runs, in CI's order — plus headcheck, which only a local tree needs
 	$(MAKE) headcheck
 	bun scripts/logo.mjs --check
+	$(MAKE) lint
 	cd web && bun run typecheck
 	cd server && bun run typecheck
+	cd electron && bun run typecheck
 	cd server && bun test --timeout 20000
 	cd web && bun test
 	$(MAKE) mobile-test
 	$(MAKE) smoke
 	$(MAKE) perf
+
+# The same jobs on the runner's own image: ubuntu 24.04 (tmux 3.4, python 3.12),
+# the bun ci.yml pins, Chrome, a non-root user, no TERM, a fresh checkout of the
+# tree as it is now. `make ci` runs on this machine's tmux and python, which is
+# how a commit passed here and failed there; run this before pushing. Needs
+# Docker; logs go to ~/.cache/agentglass-ci-docker/out.
+ci-docker: ## The CI jobs in a container that is the runner (ubuntu 24.04, pinned bun) — names the step that failed
+	scripts/ci-docker/run.sh
 
 # `npm ci` and not `npm install`, because that is what the CI job runs — which
 # means it deletes and rebuilds mobile/node_modules, and regenerates
@@ -62,7 +72,7 @@ ci: ## Run everything CI runs, in CI's order — plus headcheck, which only a lo
 mobile-test: ## Install and check the phone app exactly as CI's mobile job does (npm ci wipes mobile/node_modules)
 	cd mobile && npm ci
 	cd mobile && npm run typecheck
-	cd mobile && npm test
+	scripts/tranche.sh mobile npm test
 
 # The scripts kill the server/Chrome they spawn on their own SIGINT/SIGTERM;
 # `trap 'kill 0'` here is the group-wide backstop for a SIGTERM aimed at make.
@@ -78,13 +88,93 @@ soak: ## Run the server hard for a few minutes and fail if its memory keeps clim
 loadtest: ## Hammer the server (many clients × every panel) against a copy of the REAL DB and fail if the PTY stutters (AGX_LOAD_CLIENTS=10 for heavier)
 	trap 'kill 0' INT TERM; bun scripts/loadtest.ts
 
+# The browser benchmark needs the whole desktop app, so it boots an isolated
+# instance of it first (scripts/agx-bench/instance.sh: its own port, data and
+# tmux, the window sent silently to a workspace nobody is looking at under
+# Hyprland) and stops it again however the run ends. An instance that is
+# already running is refused rather than borrowed: the trap would stop it.
+# AGX_BENCH_DIR moves the instance, AGX_BENCH_ARGS goes to the runner —
+# `--reps 5`, `--arm baseline,phase1`, `--task nav-spa`.
+agx-bench: build ## Scripted agent tasks through the browser CLI on an isolated app — success, steps, bytes, latency per arm
+	@if scripts/agx-bench/instance.sh status >/dev/null 2>&1; then echo "an agx-bench instance is already running; stop it first (scripts/agx-bench/instance.sh stop)" >&2; exit 1; fi; \
+	scripts/agx-bench/instance.sh start || exit 1; \
+	trap 'scripts/agx-bench/instance.sh stop' EXIT; \
+	bun scripts/agx-bench/run.ts --instance "$${AGX_BENCH_DIR:-/tmp/agx-bench}" $(AGX_BENCH_ARGS)
+
+# ONE command for the question `bun test` cannot answer.
+#
+# Two type errors reached this branch in a day and were found hours later, by
+# hand: `Bun.serve` types `port` as optional, and `res.json()` returns
+# `unknown`. Both suites were green throughout, because bun STRIPS types rather
+# than checking them — `bun test` says nothing at all about tsc, and neither
+# does vite build.
+#
+# The pieces already existed and this invents none of them: every package has
+# had a `typecheck` script all along. What did not exist was one thing to run
+# that fails when ANY of them does. `make typecheck` leaves mobile out, `make
+# test` leaves mobile out too, and mobile's types were only ever checked inside
+# `make mobile-test`, behind an `npm ci` that deletes and rebuilds its
+# node_modules — too slow to run before a commit, so nobody ran it.
+#
+# Types first, and the cheap ones first, because a type error is seconds and a
+# suite is minutes. Measured on this machine: the three typechecks together are
+# about 40s, the server suite alone is ~4.5min. Failing fast is the difference
+# between a check that gets run and one that gets skipped.
+#
+# MOBILE'S TYPES ARE OPTIONAL HERE, deliberately. `mobile/` is not a bun
+# workspace member (the root names server, web and electron), it installs with
+# its own `npm ci`, and its node_modules is gitignored — so a worktree a task
+# just cut has none, and mobile's own `tsc` is not there to run. Measured: `npm
+# run typecheck` exits 127, which is "command not found", not a type error.
+# Failing on that would make this command unrunnable in exactly the tree where
+# somebody is about to commit, so it says what it skipped and why, in one line
+# — the same bargain mobile's own tests already make (mobile/test/npm-deps.ts).
+# `make mobile-test` stays the one that checks mobile properly, and CI runs it.
+#
+# The binary is looked for at mobile/node_modules/.bin/tsc rather than asked
+# for by name: mobile is outside the workspaces, so npm puts its local bin
+# exactly there and nowhere else. That is a path this repo's layout guarantees,
+# unlike the path of a hoisted dependency.
+# Lint and the logo sync run first, as they do in CI: the cheapest steps of the
+# job, and two v0.20.0 reds came from them while this target stayed green.
+check: ## Lint, types AND tests for server, web and mobile — the one thing `bun test` alone cannot answer
+	@set -e; \
+	echo "── lint ──"; \
+	bun scripts/logo.mjs --check; \
+	bun run lint; \
+	echo "── types ──"; \
+	(cd web && bun run typecheck); \
+	(cd server && bun run typecheck); \
+	(cd electron && bun run typecheck); \
+	if [ -x mobile/node_modules/.bin/tsc ]; then \
+		(cd mobile && npm run --silent typecheck); \
+	else \
+		echo "skipping mobile types: no mobile/node_modules — run \`make mobile-test\`, or \`cd mobile && npm install\`"; \
+	fi; \
+	echo "── tests ──"; \
+	scripts/tranche.sh server bun test --timeout 20000; \
+	scripts/tranche.sh web bun test; \
+	scripts/tranche.sh mobile bun test
+
 # `bun run typecheck`, not `bunx tsc`: bunx downloads the newest published
 # TypeScript when the directory has none, which is how server/ ended up being
 # checked by 7.0.2 while web/ used 5.9.3. Both declare it now, and `bun run`
 # fails loudly instead of fetching. web's script covers src AND test/.
-typecheck: ## Type-check both halves, app and tests (vite build and bun both strip types without checking)
+# electron/ joined the list the day it got `// @ts-check`. It is .js, not .ts,
+# and for years that meant the file that mints the auth token and registers
+# every IPC channel was the one file here nothing checked at all — the two
+# halves this target used to name were the typed ones.
+typecheck: ## Type-check all three halves, app and tests (vite build and bun both strip types without checking)
 	cd web && bun run typecheck
 	cd server && bun run typecheck
+	cd electron && bun run typecheck
+
+# Correctness rules only, and green on the tree as it stands — .oxlintrc.json
+# says at length which rules are demoted, where, and how many findings each one
+# has today. One prebuilt binary and one dependency, which is the whole reason
+# it is oxlint and not eslint; it reads the repository in well under a second.
+lint: ## Lint every workspace for correctness mistakes (oxlint) — style is not its job
+	bun run lint
 
 # The target above reads your DESK. This one reads the COMMIT, and they are not
 # the same question on this branch: work-2026-08-05 is the trunk every session
@@ -169,5 +259,5 @@ desktop-open: ## Open the desktop app scoped to a project — make desktop-open 
 	@test -n "$(DIR)" || { echo "usage: make desktop-open DIR=/path/to/repo" >&2; exit 1; }
 	AGENTGLASS_PROJECT="$(DIR)" ~/.local/share/agentglass-desktop/agentglass
 
-.PHONY: help install dev server web build test ci mobile-test smoke perf soak loadtest typecheck headcheck start setup setup-undo connect connect-undo connect-opencode connect-opencode-undo demo-feed assets \
+.PHONY: help install dev server web build test ci ci-docker mobile-test smoke perf soak loadtest agx-bench lint typecheck headcheck start setup setup-undo connect connect-undo connect-opencode connect-opencode-undo demo-feed assets \
         desktop desktop-dev desktop-dist desktop-dist-linux desktop-install desktop-update desktop-open

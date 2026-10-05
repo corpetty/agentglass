@@ -171,6 +171,25 @@ describe("waiting", () => {
     expect(fileInLane(pr({ reviewDecision: "CHANGES_REQUESTED" }), MINE).reason).toContain("ball is with you");
     expect(fileInLane(pr({ reviewDecision: "CHANGES_REQUESTED" }), NEITHER).reason).toContain("with the author");
   });
+
+  it("says so once you've asked them to look again, instead of repeating a stale sentence", () => {
+    /*
+     * Applying the review and re-requesting used to leave this reading
+     * exactly as it had before either happened: "the ball is with you" over
+     * a pull request already back in the reviewer's court. `askedAgain`
+     * comes from the same reviewRequests GitHub's own ↻ reads.
+     */
+    const again = pr({ reviewDecision: "CHANGES_REQUESTED",
+      humanReview: { kind: "changes", who: ["okoro"], askedAgain: true } });
+    expect(fileInLane(again, MINE).reason).toContain("asked them to look again");
+    expect(fileInLane(again, MINE).reason).not.toContain("The ball is with you.");
+    expect(fileInLane(again, NEITHER).reason).toContain("asked for another look");
+
+    // No re-request yet: the original sentence still stands.
+    const notYet = pr({ reviewDecision: "CHANGES_REQUESTED",
+      humanReview: { kind: "changes", who: ["okoro"] } });
+    expect(fileInLane(notYet, MINE).reason).toBe("Changes were asked for. The ball is with you.");
+  });
 });
 
 describe("the board", () => {
@@ -231,8 +250,12 @@ describe("a conflict is not a green pull request", () => {
 
   it("caps a lane at something that fits on a screen", () => {
     // Forty cards in a column is a scroll inside a scroll — worse than the flat
-    // list the board replaced.
-    expect(LANE_CAP).toBeLessThanOrEqual(8);
+    // list the board replaced. What this holds is that a cap EXISTS and stays
+    // this side of a flat list; the number itself moved once already, when six
+    // turned out to hide seven cards there was room for and put a button in
+    // front of them.
+    expect(LANE_CAP).toBeLessThanOrEqual(25);
+    expect(LANE_CAP).toBeGreaterThanOrEqual(10);
   });
 });
 

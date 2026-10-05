@@ -1,8 +1,11 @@
 import { FacetMenu } from "./FacetMenu.tsx";
+import { ICON } from "../lib/iconSize.ts";
 import {
-  serializeQuery, toggleFacet, clearFacet, setSort, DEFAULT_SORT, SORT_OPTIONS, FACETS,
+  serializeQuery, toggleFacet, setSort, DEFAULT_SORT, SORT_OPTIONS,
   type FilterState, type FacetView, type SortTok,
 } from "../lib/prFilter.ts";
+import { SearchIcon } from "../lib/glyphIcons.tsx";
+import { CloseIcon } from "./CloseButton.tsx";
 
 /**
  * The PR list's filter bar (#pulldash-style): a query input, a wrapping row of
@@ -14,24 +17,35 @@ import {
  * state; it turns clicks into new query strings and hands them up via `onQuery`.
  */
 export function PrFilterBar({
-  query, filters, facets, onQuery, onSearch, pending, searching, checksPending, shown, total, swept,
+  query, filters, facets, onQuery, onSearch, pending, searching, shown, total, swept, unread, builder,
 }: {
   query: string;
   filters: FilterState;
   facets: FacetView[];
+  /** The rule builder, drawn after the pills. Passed in rather than built here
+   *  so this file stays what it is — a row of controls — and the rules keep
+   *  living where the rows they filter do. */
+  builder?: React.ReactNode;
   onQuery: (q: string) => void;
   /** Ask GitHub. Never called on a keystroke — see PrPanel's serverQuery. */
   onSearch: () => void;
   /** The box says something the last search did not ask for. */
   pending: boolean;
   searching?: boolean;
-  /** Second-pass check states still loading — the Checks menu says so. */
-  checksPending?: boolean;
   shown: number;
   total: number;
   /** How far the background sweep has read, while free text is filtering. A
    *  count over a partial pool has to say so. */
   swept?: { rows: number; done: boolean };
+  /**
+   * Rows with something said on them since you last looked.
+   *
+   * Not a facet: every other pill here is a GitHub search qualifier, and "since I last
+   * looked" is a timestamp in this browser that GitHub has never heard of. It sits
+   * with them because that is where somebody looks for it, and its tooltip says out
+   * loud that it counts only the rows this table has loaded.
+   */
+  unread?: { count: number; on: boolean; onToggle: () => void; onMarkAllRead: () => void };
 }) {
   const emit = (next: FilterState) => onQuery(serializeQuery(next));
 
@@ -100,48 +114,57 @@ export function PrFilterBar({
               background: "color-mix(in srgb, var(--primary) 18%, transparent)",
               border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)",
             }}>
-            {searching ? <span className="agx-spin" aria-hidden style={{ width: 8, height: 8, borderWidth: 1.5 }} /> : <span aria-hidden>⌕</span>}
+            {searching ? <span className="agx-spin" aria-hidden style={{ width: 8, height: 8, borderWidth: 1.5 }} /> : <span aria-hidden className="flex"><SearchIcon size={ICON.xs} /></span>}
             <span>{searching ? "Searching" : "Search all"}</span>
           </button>
         )}
         {query.trim() && (
           <button onClick={() => onQuery("")} title="Clear all filters" aria-label="Clear all filters"
-            className="text-[11px] px-1.5 py-0.5 rounded shrink-0 hover:bg-white/5" style={{ color: "var(--text3)", border }}>
-            ×
+            className="grid place-items-center w-[22px] h-[22px] rounded shrink-0 hover:bg-white/5" style={{ color: "var(--text3)", border }}>
+            <CloseIcon size={ICON.xs} />
           </button>
         )}
       </div>
 
       {/* Facet pills — wrap in the narrow sidebar; each menu floats via a Portal. */}
       <div className="flex flex-wrap items-center gap-1">
-        {/*
-          * The row exists before the rows do.
-          *
-          * These pills are built from the pull requests that have been loaded,
-          * so the bar used to appear a second or two after everything else and
-          * shove the board down as it landed — reported as "tarda en cargar,
-          * entonces como que salta". Drawn from the static facet table instead
-          * while there is nothing to count, dimmed and inert: same row, same
-          * height, same place, filling in rather than arriving.
-          */}
-        {facets.length === 0 && FACETS.map((f) => (
-          <span key={f.key} aria-hidden
-            className="text-[10px] px-2 py-0.5 rounded-full whitespace-nowrap select-none"
-            style={{ color: "var(--text4)", border, opacity: 0.55 }}>
-            {f.label} ▾
-          </span>
-        ))}
-        {facets.map((f) => (
-          <FacetMenu
-            key={f.key}
-            label={f.label}
-            options={f.options}
-            selected={f.selected}
-            onToggle={(v) => emit(toggleFacet(filters, f.key, v))}
-            onClear={() => emit(clearFacet(filters, f.key))}
-            note={f.key === "checks" && checksPending ? "Checks are still loading; unfinished rows are kept." : undefined}
-          />
-        ))}
+        {!!unread?.count && (
+          <button onClick={unread.onToggle} aria-pressed={unread.on}
+            title={unread.on
+              ? "Showing only the pull requests somebody has spoken on since you last looked. Press again for all of them."
+              : `${unread.count} of the loaded pull requests have something said on them since you last looked. Counted here rather than on GitHub — the mark is this browser\u2019s.`}
+            className="agx-btn inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded tabular-nums"
+            style={{
+              color: "var(--warning)",
+              border: `1px solid color-mix(in srgb, var(--warning) ${unread.on ? 70 : 40}%, transparent)`,
+              background: unread.on ? "color-mix(in srgb, var(--warning) 16%, transparent)" : "transparent",
+            }}>
+            <svg width={ICON.xs} height={ICON.xs} viewBox="0 0 24 24" fill="none" aria-hidden
+              stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+            </svg>
+            {unread.count} unread
+          </button>
+        )}
+        {/* Beside the chip it clears, not inside it: pressing this is a
+            different act from pressing the chip (one filters, one writes),
+            and a single control that did both would need a second click to
+            find out which. Only offered while there is something to mark —
+            once the count reaches zero the button would have nothing to do. */}
+        {!!unread?.count && (
+          <button onClick={unread.onMarkAllRead}
+            title={`Mark all ${unread.count} as read`}
+            className="agx-btn text-[10px] px-2 py-1 rounded"
+            style={{ color: "var(--text3)", border }}>
+            Mark all read
+          </button>
+        )}
+        {/* No row of pills: the builder is the filter, and it says everything
+            they said plus `is not`, `is set`, `is not set`, and several joined.
+            It reads the same field table (`builderFields` reads `buildFacets`),
+            so every menu they had is a field in it, and a query string still
+            fills it through `queryToRules`. */}
+        {builder}
         <div className="ml-auto">
           <FacetMenu
             label="Sort"
@@ -164,7 +187,7 @@ export function PrFilterBar({
               className="text-[9.5px] pl-2 pr-1 py-0.5 rounded-full flex items-center gap-1 hover:opacity-80"
               style={{ color: "var(--text2)", background: "color-mix(in srgb, var(--primary) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 28%, transparent)" }}>
               <span className="truncate max-w-[140px]">{c.label}</span>
-              <span aria-hidden style={{ color: "var(--text3)" }}>×</span>
+              <span aria-hidden className="flex" style={{ color: "var(--text3)" }}><CloseIcon size={ICON.xs} /></span>
             </button>
           ))}
           <button onClick={() => onQuery("")} className="text-[9.5px] px-1.5 py-0.5 rounded-full hover:bg-white/5" style={{ color: "var(--text3)" }}>

@@ -173,7 +173,27 @@ describe("what the chip should do, given what this machine has", () => {
     // rather than a convention. Out to the browser, since there is no board
     // here to land in.
     expect(chipAction(addressed, { connected: false }))
-      .toEqual({ in: "clickup", url: "https://clickup.com/t/8ab12cd34" });
+      .toEqual({ in: "away", url: "https://clickup.com/t/8ab12cd34" });
+  });
+
+  it("sends another tracker's item out, never into this board", () => {
+    /*
+     * The half this file was missing. A Jira or Linear address is certain
+     * about WHICH item, and certainly not one ClickUp can find — looking it up
+     * there returns nothing, which reads as the card having been deleted.
+     */
+    const elsewhere = cardRef({ body: "https://acme.atlassian.net/browse/WEB-1042" });
+    expect(chipAction(elsewhere, { connected: true, prefix: "ORBIT-" }))
+      .toEqual({ in: "away", url: "https://acme.atlassian.net/browse/WEB-1042" });
+    expect(looksLikeOurs(elsewhere!, "ORBIT-")).toBe(false);
+  });
+
+  it("and an issue this pull request closes is one of those", () => {
+    // The reference every public repository has and no tracker is needed for.
+    const issue = cardRef({ body: "Fixes #12", url: "https://github.com/acme/widget/pull/91" });
+    expect(issue).toMatchObject({ label: "#12", tracker: "github" });
+    expect(chipAction(issue, { connected: true, prefix: "ORBIT-" }))
+      .toEqual({ in: "away", url: "https://github.com/acme/widget/issues/12" });
   });
 
   it("opens the card here once ClickUp is connected", () => {
@@ -210,23 +230,26 @@ describe("what the chip should do, given what this machine has", () => {
  */
 const termSrc = await Bun.file(new URL("../src/components/TerminalPanel.tsx", import.meta.url)).text();
 
-describe("the card chip in the terminal's worktree bar", () => {
-  it("is a component of its own, so its ClickUp lookup is never a conditional hook", () => {
-    expect(termSrc).toContain("function WtCardChip(");
-    const body = termSrc.slice(termSrc.indexOf("function WtCardChip("), termSrc.indexOf("\n}", termSrc.indexOf("function WtCardChip(")));
-    expect(body).toContain("useClickupSetup()");
-    expect(body).toContain("cardRef({ headRefName: branch })");
+describe("the card door on the pane's block", () => {
+  /*
+   * The chip that used to carry this lived in a row above the terminal, and the
+   * row is gone — it described one pane while four were on screen. The card is
+   * a door on the block drawn in the pane itself now, but the question it asks
+   * is unchanged: read the id off the branch with `cardRef`, and let
+   * `chipAction` decide whether this machine can reach that tracker at all.
+   */
+  it("resolves the card from the focused pane's branch", () => {
+    expect(termSrc).toContain("cardRef({ headRefName: chipWt.branch })");
+    expect(termSrc).toContain("chipAction(ref, cuSetup)");
   });
 
-  it("is drawn from the branch of the worktree the bar is describing", () => {
-    expect(termSrc).toContain("<WtCardChip branch={at.branch}");
+  it("is no door at all when the branch carries no id it can resolve", () => {
+    // Rather than a dead one in permanent residence.
+    expect(termSrc).toContain("cardGoRef.current = ref && go");
+    expect(termSrc).toContain("      : null;");
   });
 
-  it("says nothing when the branch carries no id it can resolve", () => {
-    // `chipAction` is the rule — null ref or a tracker this machine cannot
-    // reach means no pill at all, rather than a dead one in permanent residence.
-    const body = termSrc.slice(termSrc.indexOf("function WtCardChip("), termSrc.indexOf("\n}", termSrc.indexOf("function WtCardChip(")));
-    expect(body).toContain("chipAction(ref, setup)");
-    expect(body).toContain("if (!ref || !go) return null;");
+  it("opens Tasks when the card lives here, and the tracker when it does not", () => {
+    expect(termSrc).toContain('if (go.in === "tasks") openCard(ref.query, ref.label); else openExternal(go.url);');
   });
 });

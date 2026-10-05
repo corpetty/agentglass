@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import type { UpdateStatus } from "../../shared/types.ts";
 
 /**
@@ -76,7 +76,7 @@ const TAG_RE = /^v\d+\.\d+\.\d+$/;
  * cannot find. AGENTGLASS_DIE_WITH_PARENT=1 rides in too, into an app that has
  * no parent to die with.
  *
- * electron/appctl.sh strips the same seven on its way out, and that is not
+ * electron/appctl.sh strips the same list on its way out, and that is not
  * redundancy: it covers `make desktop-update` run from a terminal that happens
  * to be inside agentglass, which never comes through here at all. This one
  * covers everything the script itself launches. install-stop.test.ts fails if
@@ -85,9 +85,12 @@ const TAG_RE = /^v\d+\.\d+\.\d+$/;
 export const DERIVED_ENV = [
   "AGENTGLASS_TOKEN", "AGENTGLASS_PORT", "AGENTGLASS_BIND", "AGENTGLASS_TRUST_LAN",
   "AGENTGLASS_WEB_DIR", "AGENTGLASS_DIE_WITH_PARENT", "AGENTGLASS_PTY_SIZE_FILE",
+  // Harmless in a relaunch (desk.ts reads it only under the parent it names),
+  // and still derived: an app it reaches has no pipe behind it.
+  "AGENTGLASS_DESK_FD",
 ] as const;
 
-/** This process's environment with those seven removed. */
+/** This process's environment with those removed. */
 function scriptEnv(): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   const drop = new Set<string>(DERIVED_ENV);
@@ -98,7 +101,7 @@ function scriptEnv(): NodeJS.ProcessEnv {
 // can point the clone at a fixture instead of writing into the developer's
 // real one — the mistake #144 fixed for the database.
 const SRC = process.env.AGENTGLASS_UPDATE_SRC || join(homedir(), ".cache", "agentglass", "source");
-const LOG = join(tmpdir(), "agentglass-update.log");
+const LOG = process.env.AGENTGLASS_UPDATE_LOG || join(homedir(), ".cache", "agentglass", "update.log");
 const STAMP = join(homedir(), ".cache", "agentglass", "last-update.json");
 
 function git(cwd: string, args: string[], timeout = 30_000) {
@@ -240,6 +243,48 @@ export function windowsUpdateBlock(platform: string = process.platform): string 
     : null;
 }
 
+/**
+ * The installer a Mac of this architecture updates from, named exactly as
+ * desktop-binaries.yml publishes it: electron-builder's
+ * `agentglass_${version}_${arch}.${ext}`, with `arch` as `arm64` on Apple
+ * silicon and `x64` on Intel (that job cross-builds `--x64` from the arm64
+ * runner, so both exist on every release).
+ */
+export function macDmgAsset(tag: string, arch: string = process.arch): string {
+  return `agentglass_${tag.replace(/^v/, "")}_${arch === "arm64" ? "arm64" : "x64"}.dmg`;
+}
+
+/** The release page a tag's assets hang off, from whatever spelling of the
+ *  origin this build recorded — `https://…/repo.git`, `git@github.com:o/r.git`. */
+export function releasePage(origin: string, tag: string): string {
+  const repo = origin.trim()
+    .replace(/^git@github\.com:/, "https://github.com/")
+    .replace(/^ssh:\/\/git@github\.com\//, "https://github.com/")
+    .replace(/\.git$/, "")
+    .replace(/\/+$/, "");
+  return `${repo}/releases/tag/${tag}`;
+}
+
+/**
+ * Why the Mac's About pane has no update button, said with the link instead.
+ *
+ * The updater rebuilds from source through self-update.sh → install-local.sh,
+ * and that chain is Linux end to end: it unpacks `linux-unpacked`, installs to
+ * `~/.local/share`, writes a .desktop file. Nothing in it produces an .app, so
+ * on a Mac the button would have run to the first `[ -x "$SRC/agentglass" ]`
+ * and stopped with a message about electron-builder. Rather than a button
+ * that fails in the middle, the pane says what a Mac actually does — download
+ * the .dmg for this architecture — and names the file and the page.
+ *
+ * Only when there is something to update to: with no newer tag the pane says
+ * "up to date" like everywhere else. `platform` and `arch` are parameters for
+ * the suite, which runs on Linux.
+ */
+export function macUpdateBlock(tag: string, origin: string, platform: string = process.platform, arch: string = process.arch): string | null {
+  if (platform !== "darwin") return null;
+  return `${tag} is out — on macOS the app updates from the .dmg: download ${macDmgAsset(tag, arch)} from ${releasePage(origin, tag)} and drag it over the app`;
+}
+
 export async function updateStatus(): Promise<UpdateStatus> {
   const info = buildInfo();
   const base: UpdateStatus = {
@@ -282,6 +327,11 @@ export async function updateStatus(): Promise<UpdateStatus> {
   const newer = tags.filter((t) => cmpTag(t, current) > 0);
   out.behind = newer.length;
   out.incoming = newer.map((t) => ({ sha: t, subject: "" }));
+  // After the comparison, not before like the Windows gate: a Mac that is up to
+  // date should read "up to date", and only a Mac with a release to move to is
+  // told how a Mac moves.
+  const macBlock = macUpdateBlock(latest, info.origin);
+  if (macBlock) out.blocked = macBlock;
   return out;
 }
 
@@ -346,7 +396,7 @@ export async function startUpdate(): Promise<{ ok: boolean; error?: string; log?
   if (!script) return { ok: false, error: "this build has no update script" };
 
   try { mkdirSync(dirname(STAMP), { recursive: true }); } catch { /* non-fatal */ }
-  try { writeFileSync(LOG, `updating to ${st.branch} from ${st.info.origin}\n`); } catch { /* non-fatal */ }
+  try { writeFileSync(LOG, `updating to ${st.branch} from ${st.info.origin}\n`, { mode: 0o600 }); } catch { /* non-fatal */ }
 
   running = true;
   const child = spawn("bash", [script], {
@@ -384,9 +434,20 @@ export async function startUpdate(): Promise<{ ok: boolean; error?: string; log?
   return { ok: true, log: LOG };
 }
 
-export function updateLog(): { ok: boolean; text: string } {
-  try { return { ok: true, text: readFileSync(LOG, "utf8").slice(-8000) }; }
-  catch { return { ok: true, text: "" }; }
+/**
+ * The tail of the log, and the `==> ` step lines from all of it.
+ *
+ * The tail alone is not enough to say where an update has got to: the build
+ * step prints far more than 8000 characters, and on a real update the panel
+ * went from "step 4 of 5" back to "starting" once the step lines it counts had
+ * scrolled off the front of the tail. The step lines are a handful per run.
+ */
+export function updateLog(): { ok: boolean; text: string; steps: string } {
+  try {
+    const all = readFileSync(LOG, "utf8");
+    const steps = all.split("\n").filter((l) => l.startsWith("==> ")).join("\n");
+    return { ok: true, text: all.slice(-8000), steps };
+  } catch { return { ok: true, text: "", steps: "" }; }
 }
 
 /**
@@ -434,7 +495,11 @@ export async function releaseNotes(tagIn?: string): Promise<{ ok: boolean; tag: 
   if (existsSync(join(SRC, ".git"))) {
     const r = git(SRC, ["for-each-ref", "--format=%(objecttype)%0a%(contents)", `refs/tags/${tag}`]);
     const [kind, ...rest] = (r.status === 0 ? r.stdout : "").split("\n");
-    const local = kind?.trim() === "tag" ? rest.join("\n").trim() : "";
+    // Every tag is signed now, and %(contents) includes the trailing
+    // signature armor along with the message — dropped so the panel shows
+    // the release notes a person wrote, not that plus a block of base64.
+    const withoutSignature = rest.join("\n").replace(/\n-----BEGIN (?:PGP|SSH) SIGNATURE-----[\s\S]*$/, "");
+    const local = kind?.trim() === "tag" ? withoutSignature.trim() : "";
     if (local) return keep(local, "clone");
   }
 

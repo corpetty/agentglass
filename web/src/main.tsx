@@ -1,25 +1,30 @@
-import React from "react";
+import React, { useEffect } from "react";
 import ReactDOM from "react-dom/client";
+// First among the app's own modules: it reads whether the launch cover is up
+// (web/index.html) before anything else can change the page.
+import { coverMounted } from "./lib/cover.ts";
 import App from "./App.tsx";
 import { PairScreen } from "./PairScreen.tsx";
-import { adoptServer, IS_DESKTOP } from "./lib/api.ts";
+import { LaneHost } from "./components/LaneHost.tsx";
+import { laneFromHash, laneIsEphemeral, laneProfileFromHash } from "./lib/lane.ts";
+import { adoptServer } from "./lib/api.ts";
 import { ticketFromUrl, clearTicketFromUrl } from "./lib/pairing.ts";
 import { followServerChanges } from "./lib/desktop.ts";
-import { applyTheme, initialTheme, watchThemeStorage, watchSystemTheme } from "./lib/themes.ts";
+import { applyTheme, initialTheme, watchThemeStorage, watchSystemTheme, watchDesktopPalette } from "./lib/themes.ts";
 import { restoreScale } from "./lib/uiScale.ts";
 import "./index.css";
 import "./fonts.ts"; // bundled monospace faces — see fonts.ts
 
-// Re-broadcast on boot, not only on a deliberate pick: the persisted theme IS
-// the user's last deliberate choice, and without this the machine's tmux/nvim
-// kept whatever palette was synced the last time the switcher was clicked —
-// days stale — while the cockpit itself moved on. Gated to the desktop shell so
-// a phone or a paired browser opening the cockpit never repaints the host's
-// terminals; see IS_DESKTOP.
-applyTheme(initialTheme(), { sync: IS_DESKTOP });
+// Restoring browser state paints this document only. Machine-wide theme output
+// requires a fresh picker gesture; a page load may be a smoke test or another
+// automated client and must not repaint a user's running tools.
+applyTheme(initialTheme());
 watchThemeStorage();
 // When the mode is "System", follow the OS between the two serious defaults live.
 watchSystemTheme();
+// And, on a desktop that publishes its palette, wear it in "System" and follow
+// its theme switches live. Does nothing anywhere else.
+watchDesktopPalette();
 // The webview always launches at 100%, so the saved zoom has to be re-asked for
 // on every start. Fire-and-forget: it resolves a tick later and the window
 // reflows into it, which is far less jarring than blocking the first paint.
@@ -52,7 +57,14 @@ followServerChanges();
 
 const root = ReactDOM.createRoot(document.getElementById("root")!);
 
-const mount = (tree: React.ReactNode) => root.render(<React.StrictMode>{tree}</React.StrictMode>);
+/** Tells the launch cover React has committed. An effect here runs after every
+ *  effect below it, so each panel has taken its hold on the cover by then. */
+function Mounted({ children }: { children: React.ReactNode }) {
+  useEffect(() => { coverMounted(); }, []);
+  return <>{children}</>;
+}
+
+const mount = (tree: React.ReactNode) => root.render(<React.StrictMode><Mounted>{tree}</Mounted></React.StrictMode>);
 
 /**
  * A page opened from the QR has a handshake to finish before it has an
@@ -68,7 +80,10 @@ const mount = (tree: React.ReactNode) => root.render(<React.StrictMode>{tree}</R
  * happened.
  */
 const invitation = ticketFromUrl(location.href);
-if (invitation) {
+const lane = laneFromHash(location.hash);
+if (lane) {
+  mount(<LaneHost id={lane} profile={laneProfileFromHash(location.hash)} ephemeral={laneIsEphemeral(location.hash)} />);
+} else if (invitation) {
   mount(
     <PairScreen
       ticket={invitation}

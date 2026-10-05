@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Portal } from "./Portal.tsx";
-import { THEMES, pickTheme } from "../lib/themes.ts";
+import { THEMES, chooseTheme } from "../lib/themes.ts";
 import { IS_DESKTOP } from "../lib/desktop.ts";
 import { api } from "../lib/api.ts";
+import { openSettings } from "../lib/openSettings.ts";
 
 interface Cmd {
   id: string;
@@ -22,6 +23,7 @@ export function CommandPalette({
   onWindow,
   onTheme,
   onStats,
+  onHelp,
   onSkills,
   onChanges,
   onGit,
@@ -41,6 +43,7 @@ export function CommandPalette({
   onWindow: (ms: number) => void;
   onTheme: (id: string) => void;
   onStats: () => void;
+  onHelp: () => void;
   onSkills: () => void;
   onChanges: () => void;
   onGit: () => void;
@@ -66,6 +69,10 @@ export function CommandPalette({
     list.push({ id: "terminal", group: "View", label: "Terminal — a real shell in any repo/worktree", run: () => onTerminal() });
     list.push({ id: "chat", group: "View", label: "Chat — drive a Claude session in a repo/worktree", run: () => onChat() });
     list.push({ id: "stats", group: "View", label: "Show statistics — skills, tools, apps", run: () => onStats() });
+    // Settings used to carry a page of links to these; the palette is where they live now.
+    list.push({ id: "help", group: "View", label: "Legend & shortcuts — what the colours mean, every key binding", run: () => onHelp() });
+    // Activity has no place in the settings nav; this and a row on Data & privacy open it.
+    list.push({ id: "activity-log", group: "View", label: "Activity log — what the app itself has been doing", run: () => openSettings("log") });
     list.push({ id: "clear", group: "Filter", label: "Clear all filters", run: () => onClear() });
     // Discoverability more than convenience — the keys are faster once you know
     // them, but nothing on screen would ever have told you they exist.
@@ -78,14 +85,14 @@ export function CommandPalette({
     for (const t of types) list.push({ id: "type:" + t, group: "Filter by event", label: t, run: () => onFilter({ type: t }) });
     for (const w of [["15m", 900000], ["1h", 3600000], ["6h", 21600000], ["24h", 86400000], ["7d", 604800000]] as const)
       list.push({ id: "win:" + w[0], group: "Time window", label: w[0], run: () => onWindow(w[1] as number) });
-    for (const t of THEMES) list.push({ id: "theme:" + t.id, group: "Theme", label: t.name, run: () => { pickTheme(t.id); onTheme(t.id); } });
+    for (const t of THEMES) list.push({ id: "theme:" + t.id, group: "Theme", label: t.name, run: () => { chooseTheme(t.id); onTheme(t.id); } });
     list.push({ id: "csv", group: "Export", label: "Download CSV", run: () => window.open(api.exportUrl("csv")) });
     list.push({ id: "json", group: "Export", label: "Download JSON", run: () => window.open(api.exportUrl("json")) });
     // Day totals rather than events, and the only one that reaches past the
     // retention window — see /export?kind=daily.
     list.push({ id: "daily-csv", group: "Export", label: "Download daily totals (CSV)", run: () => window.open(api.exportUrl("csv", "daily")) });
     return list;
-  }, [apps, types, onFilter, onWindow, onTheme, onStats, onSkills, onChanges, onGit, onPr, onDocker, onTerminal, onChat, onSearch, onClear, onZoom]);
+  }, [apps, types, onFilter, onWindow, onTheme, onStats, onHelp, onSkills, onChanges, onGit, onPr, onDocker, onTerminal, onChat, onSearch, onClear, onZoom]);
 
   const filtered = useMemo(
     () => (q ? cmds.filter((c) => (c.group + " " + c.label).toLowerCase().includes(q.toLowerCase())) : cmds),

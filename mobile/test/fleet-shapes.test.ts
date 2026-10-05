@@ -9,16 +9,19 @@
  *
  * The lesson is narrow and worth encoding: a TypeScript annotation on a
  * `fetch` is a claim about the server, checked by nobody. So this boots the
- * real one and reads the three routes the Now screen depends on, then runs the
- * dashboard's own `buildQueue` over the result. An empty machine is enough —
- * the mistake was about the WRAPPER, and `[]` and `{sessions: []}` differ just
- * as clearly when there is nothing in them.
+ * real one and reads the three routes the Now screen depended on. An empty
+ * machine is enough — the mistake was about the WRAPPER, and `[]` and
+ * `{sessions: []}` differ just as clearly when there is nothing in them.
+ *
+ * Now and its `buildQueue` are gone, and the phone reads only the gates of the
+ * three today. The other two stay here because the shapes are the server's,
+ * and the next screen to read `/sessions` is the one that will assume the
+ * wrapper again.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildQueue } from "../src/model/nowQueue.ts";
 
 const PORT = 4921;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -33,6 +36,18 @@ const get = async <T,>(path: string): Promise<T> => {
   return (await response.json()) as T;
 };
 
+/**
+ * Boots the sidecar and waits for it to answer.
+ *
+ * The wait below budgets twenty seconds for a cold server; the hook around it
+ * had bun's default five, so on a loaded runner the boot was still going when
+ * the hook was killed and every test in this file went with it — measured on
+ * ubuntu-latest as `(fail) (unnamed) [5000.53ms] — a beforeEach/afterEach hook
+ * timed out for this test`, with nothing in it naming the file. The same
+ * failure `pane-line.test.ts` carries a comment about, and the same fix: the
+ * hook outlasts its own wait, so a boot that really is broken fails with the
+ * sentence at the end rather than as an unnamed timeout.
+ */
 beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "agx-shapes-"));
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
@@ -61,7 +76,7 @@ beforeAll(async () => {
     await Bun.sleep(250);
   }
   throw new Error(`the server never answered ${ORIGIN}/health`);
-});
+}, 45_000);
 
 afterAll(async () => {
   server?.kill();
@@ -69,11 +84,26 @@ afterAll(async () => {
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-describe("what the Now screen reads", () => {
+/**
+ * Longer than bun's five seconds, and for the same reason the boot above is.
+ *
+ * Every test below speaks to a real server over HTTP, and one of the routes —
+ * `/docker/overview` — probes for a tool that may not be installed, which is a
+ * process spawn rather than a lookup. Measured on ubuntu-latest: that test
+ * timed out at exactly 5000ms while the two after it then failed in
+ * milliseconds against a server that was no longer answering, so the whole
+ * file reads as three defects when it is one slow probe.
+ *
+ * The number is not a guess about the route. It is "long enough that a failure
+ * here means something is wrong, rather than that the runner was busy".
+ */
+const SLOW = 30_000;
+
+describe("the shapes of the three fleet routes", () => {
   test("gates come wrapped", async () => {
     const body = await get<{ gates: unknown }>("/gate/pending");
     expect(Array.isArray(body.gates)).toBe(true);
-  });
+  }, SLOW);
 
   test("sessions come BARE — the one that was got wrong", async () => {
     const body = await get<unknown>("/sessions?limit=100");
@@ -81,36 +111,13 @@ describe("what the Now screen reads", () => {
     // Stated as its own assertion so a future wrapper shows up as this line
     // rather than as an empty queue nobody can explain.
     expect((body as { sessions?: unknown }).sessions).toBeUndefined();
-  });
+  }, SLOW);
 
   test("containers come wrapped", async () => {
     const body = await get<{ containers: unknown; available: unknown }>("/docker/overview");
     expect(Array.isArray(body.containers)).toBe(true);
     expect(typeof body.available).toBe("boolean");
-  });
-
-  test("and the queue builds from all three without throwing", async () => {
-    /*
-     * The end of the path, which is what actually broke. `buildQueue` is the
-     * dashboard's, iterating every list it is handed — so feeding it what the
-     * server really said is the check that a type annotation cannot make.
-     */
-    const [gates, sessions, docker] = await Promise.all([
-      get<{ gates: never[] }>("/gate/pending"),
-      get<never[]>("/sessions?limit=100"),
-      get<{ containers: never[] }>("/docker/overview"),
-    ]);
-
-    const queue = buildQueue({
-      gates: gates.gates,
-      sessions,
-      prs: [],
-      containers: docker.containers,
-      me: "",
-      now: Date.now(),
-    });
-    expect(Array.isArray(queue)).toBe(true);
-  });
+  }, SLOW);
 
   test("a theme is null before anybody picks one, rather than a guess", async () => {
     // The other route the app reads on every foreground. Null and a palette
@@ -118,5 +125,5 @@ describe("what the Now screen reads", () => {
     // following the computer or falling back to what it ships.
     const body = await get<{ theme: unknown }>("/theme/current");
     expect(body.theme).toBeNull();
-  });
+  }, SLOW);
 });

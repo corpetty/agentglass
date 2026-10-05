@@ -36,14 +36,11 @@ export interface Tab {
   label: string;
   /** The session it belongs to, for the second line. */
   session: string;
-  /** The directory, for when two windows share a name. */
+  /** The pane's full directory: what Source control and Files take as a root. */
   where: string;
   /** An agent is running under this pane. The reason to open it. */
   agent: boolean;
 }
-
-/** The last segment of a path, which is what a person calls a checkout. */
-const leaf = (path: string): string => path.split("/").filter(Boolean).pop() ?? "";
 
 /**
  * Windows as tabs, splits as suffixed tabs.
@@ -64,13 +61,73 @@ const leaf = (path: string): string => path.split("/").filter(Boolean).pop() ?? 
 const OURS = /^agx-phone-/;
 
 export function paneTabs(panes: readonly AgentPane[]): Tab[] {
+  /*
+   * Nothing else to show is the one case where a detached session on the
+   * app's own server is worth a tab: a shell opened from the empty state has
+   * no client and no agent, and after a relaunch it would be the only thing
+   * there and be filtered like a stray. Asked second, so a machine with real
+   * windows never lists the app's old detached sessions beside them. Ceiling:
+   * a machine with only stale detached sessions on the app's server lists them.
+   */
+  const tabs = tabsOf(panes, false);
+  return tabs.length ? tabs : tabsOf(panes, true);
+}
+
+function tabsOf(panes: readonly AgentPane[], keepOwnDetached: boolean): Tab[] {
   const windows = new Map<string, AgentPane[]>();
   for (const pane of panes) {
     if (OURS.test(pane.session)) continue;
-    // A scratchpad is not a destination: it is the thing you open over your
-    // work and dismiss, and offering it beside the windows you keep is
-    // offering to go somewhere nobody meant to be.
-    if (pane.popup) continue;
+    /*
+     * A scratchpad is not a destination — while nobody is in it.
+     *
+     * It used to be dropped outright, and the rule read well: you open it over
+     * your work and dismiss it, so offering it beside the windows you keep is
+     * offering to go somewhere nobody meant to be. What it missed is the one
+     * case the phone exists for. The popup is open on the desk, with something
+     * in it, and you are not at the desk — and the companion was the only way
+     * to read it, except this was the line that made that impossible. Reported
+     * from a phone, with the scratch up on the computer at the time.
+     *
+     * `attached` is what tells the two apart, and it is exact rather than a
+     * heuristic: the scratch is `display-popup -E "tmux attach -t scratch"`, so
+     * a client is on that session for precisely as long as the popup is up.
+     * Closed, it goes back to being a session nobody is looking at and drops
+     * out again — by this rule, not by a second one.
+     *
+     * `!== true` and not `=== false`: absent is a third answer, as it is
+     * everywhere else on this wire, and a build too old to say is one that
+     * keeps the behaviour it had.
+     */
+    if (pane.popup && pane.attached !== true) continue;
+    /*
+     * A session on somebody else's tmux server is not in this list.
+     *
+     * `listPanes` walks the socket directory and answers for every server that
+     * has a client, so a tmux the test suite left running — or another agent's
+     * — arrives beside the one you work in. On a desk that is a row you scroll
+     * past; on a phone the strip IS the screen, and half of it pointed at
+     * sessions nobody can use.
+     *
+     * Reproduced before it was fixed, on a rig with two isolated servers:
+     *
+     *     canAttach: true   panes: 2
+     *       agx-probe-9f2  win 0 sh      pane %0  attached true   <- a test's
+     *       work           win 0 editor  pane %0  attached true   <- the real one
+     *
+     * Nothing on that wire told them apart. Not `attached`, both true. Not the
+     * pane id — ids are per SERVER and both were `%0`, which is also why
+     * opening one is a coin flip between two servers. And not the name: three
+     * servers on this machine each held a session called
+     * `agentglass-understudy`, so a prefix test would have been a guess
+     * dressed as a rule.
+     *
+     * The server knows, because it has the socket, and now says so in a
+     * boolean that carries no path. `=== false` and not `!own`: absent is a
+     * third answer — a server too old to say, or one that has never attached
+     * anything and has no server of its own to compare against — and in that
+     * case this keeps what it always kept.
+     */
+    if (pane.own === false) continue;
     /*
      * Detached sessions are left out, unless an agent is running in one.
      *
@@ -80,7 +137,7 @@ export function paneTabs(panes: readonly AgentPane[]): Tab[] {
      * the one case where a session nobody is watching still matters, which is
      * an agent working in it.
      */
-    if (pane.attached === false && !pane.agentCwds.length) continue;
+    if (pane.attached === false && !pane.agentCwds.length && !(keepOwnDetached && pane.own === true)) continue;
     /*
      * Keyed on the session's NAME and the window, not on the session's id.
      *
@@ -117,7 +174,11 @@ export function paneTabs(panes: readonly AgentPane[]): Tab[] {
         // labelled `·p1` reads as "there is a p2 somewhere", and there is not.
         label: group.length > 1 ? `${name}·p${i + 1}` : name,
         session: pane.session,
-        where: leaf(pane.path),
+        // The whole directory. It used to be the last segment, which is what a
+        // person calls a checkout, and Source control and Files sent that as
+        // the root: a name is no directory, and both answered as if the
+        // checkout were empty. The screens draw the leaf themselves.
+        where: pane.path,
         agent: pane.agentCwds.length > 0,
       });
     });
@@ -136,6 +197,39 @@ export function paneTabs(panes: readonly AgentPane[]): Tab[] {
  *  them at once is not a strip anybody reads. */
 export function sessionsOf(tabs: readonly Tab[]): string[] {
   return [...new Set(tabs.map((t) => t.session))];
+}
+
+/** A pane this phone itself just asked the server to open, held until the
+ *  poll lists it for real. See `pendingTab`. */
+export interface PendingTab {
+  paneId: string;
+  session: string;
+  where: string;
+  label: string;
+}
+
+/**
+ * The tab for a pane this phone itself just opened, before the next poll
+ * lists it — bridging the gap `paneTabs` leaves ON PURPOSE two comments up:
+ * a session with no tmux client on it and no agent under it is filtered out,
+ * forever, and a plain shell this screen just asked the server to create is
+ * exactly that case until something attaches to it.
+ *
+ * Reported from a real device: the empty state's "Open a shell in <name>"
+ * button made the window on the computer — one pane, one window, zero
+ * clients — and the phone sat on "Nothing open" through repeated presses of
+ * "Look again", because nothing ever attached to make the session's `attached`
+ * true. This is the bridge: the screen renders a terminal for the pane it was
+ * just told exists, which is what makes the WebSocket attach in the first
+ * place — `TerminalView` needs only a pane id, never `strip` membership (see
+ * its own comment). Once that attach lands, the next poll lists the pane for
+ * real and `paneTabs`'s own answer takes over; this is never consulted again
+ * for a pane already found there, which is `null` FIRST and the only reason
+ * this function ever runs.
+ */
+export function pendingTab(pending: PendingTab | null, active: string | null): Tab | null {
+  if (!pending || !active || pending.paneId !== active) return null;
+  return { paneId: pending.paneId, label: pending.label, session: pending.session, where: pending.where, agent: false };
 }
 
 /** Either the strip moved, and here is the whole of it, or it did not and there

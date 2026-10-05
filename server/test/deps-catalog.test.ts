@@ -102,6 +102,25 @@ describe("the requirements catalogue matches what the app actually runs", () => 
     // Desktop-instance status only. `catch`-guarded in instances.ts: without it
     // the panel just reports nothing running, nothing else stands down.
     pgrep: "desktop-instance status falls back to 'nothing running'; nothing else stands down",
+    /*
+     * The runtime this server is already executing in.
+     *
+     * The work loop runs the person's own test command inside the worktree it
+     * cut, and that command is `bun test` — his, not a guess at one, because
+     * "compiling is not evidence" and only his suite decides whether a run
+     * actually finished. A requirements row telling somebody to install the
+     * thing currently interpreting that page would be furniture.
+     */
+    bun: "the runtime this server runs in; the work loop runs his own `bun test`",
+    // Handing a file to the desktop's own viewer. Every desktop has one of
+    // these and the finder says which it used; with none, the preview pane
+    // says so and the file simply stays where it is — nothing else changes.
+    open: "the macOS opener; the finder falls back to saying it cannot",
+    gio: "the GNOME opener, tried beside xdg-open, which has the row",
+    // Ties the notification monitor to the server with PR_SET_PDEATHSIG, for
+    // the deaths that run no exit hook. Without it the monitor is spawned bare
+    // and the exit hook still covers every clean close — nothing stands down.
+    setpriv: "the notification monitor spawns bare without it; nothing stands down",
   };
 
   test("every binary the app runs is catalogued, or exempt with a reason", () => {

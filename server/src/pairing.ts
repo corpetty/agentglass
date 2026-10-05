@@ -35,11 +35,14 @@ import { issueDevice, type Scope, type Device } from "./devices.ts";
  * public keys — and still cannot read the credential, because it never travels
  * in the clear and the key that unwraps it never leaves the phone.
  *
- * What this does **not** defend against is an active on-path attacker: someone
- * who can rewrite traffic can substitute their own public key, and no amount of
- * handshake fixes that without an authenticated channel. That is a TLS problem,
- * not a pairing problem, and the honest answer is the one the pane already
- * offers — pair over the Tailscale address, which is encrypted end to end.
+ * What this does **not** defend against, today: an active on-path attacker.
+ * The phone's public key is never bound to the six-digit code shown only at
+ * the machine, so someone who can rewrite traffic can substitute their own
+ * key and the handshake completes anyway. That code IS an out-of-band
+ * channel — comparing a fingerprint of the key against it at accept time
+ * would close this — the handshake just does not use it yet. Until it does,
+ * the honest answer is the one the pane already offers — pair over the
+ * Tailscale address, which is encrypted end to end.
  *
  * Everything here is in memory. A half-finished pairing that survives a restart
  * is a pairing nobody is watching, and the cost of losing one is scanning
@@ -54,6 +57,12 @@ export const TICKET_TTL_MS = 120_000;
  *  1-in-200,000 shot at a target that expires in two minutes; without a cap it
  *  is a million-request script and a certainty. */
 export const MAX_ATTEMPTS = 5;
+
+/** Wrong codes, from every address together, before the ticket is dead. Each
+ *  address gets MAX_ATTEMPTS of them; this is the ceiling on a guesser who
+ *  changes address, and what keeps the guess odds within a factor of two of
+ *  the 1-in-200,000 above. */
+export const MAX_ATTEMPTS_ALL = 10;
 
 /** Concurrent pairings. More than a handful is not a person adding a phone. */
 export const MAX_TICKETS = 4;
@@ -70,6 +79,8 @@ export interface Ticket {
   expiresAt: number;
   state: TicketState;
   attempts: number;
+  /** Wrong codes per claimant address. See claimTicket. */
+  misses?: Map<string, number>;
   /** What the phone called itself, once it has claimed. */
   label?: string;
   /** Its User-Agent and address, so the person accepting knows who is asking. */
@@ -181,9 +192,10 @@ export type ClaimResult =
  * still `waiting`: a claimed ticket is locked to whoever claimed it, so a
  * second scanner cannot displace the first by guessing faster.
  *
- * A wrong code costs an attempt whether or not the guess was close, and running
- * out kills the ticket outright rather than merely rejecting the guess — a
- * lockout that leaves the target alive is a rate limit, not a cap.
+ * A wrong code costs an attempt whether or not the guess was close. An address
+ * that runs out is refused from then on, and the ticket is killed outright once
+ * the addresses together have guessed MAX_ATTEMPTS_ALL times — a lockout that
+ * leaves the target alive without that ceiling is a rate limit, not a cap.
  */
 export function claimTicket(
   id: string,
@@ -199,10 +211,24 @@ export function claimTicket(
   // accepted is a pairing that fails in the one place it cannot be retried.
   if (!validPub(opts.pub)) return { ok: false, error: "shape" };
 
+  // The ticket id travels in the clear (it is in the QR and in a status query),
+  // so anybody on the network can send wrong codes for it. If the fifth wrong
+  // code from anywhere killed the ticket, knowing the id would be enough to
+  // close somebody's pairing. Wrong codes are counted per address instead: an
+  // address that has spent its guesses is refused outright, the right code
+  // included, so a refusal tells it nothing; the ticket itself dies only past
+  // MAX_ATTEMPTS_ALL, which takes several addresses.
+  const from = opts.ip || "";
+  const misses = (t.misses ??= new Map());
+  if ((misses.get(from) ?? 0) >= MAX_ATTEMPTS) return { ok: false, error: "locked" };
+
   if (!codeMatches(t.code, code)) {
+    const missed = (misses.get(from) ?? 0) + 1;
+    misses.set(from, missed);
     t.attempts++;
-    if (t.attempts >= MAX_ATTEMPTS) { tickets.delete(id); return { ok: false, error: "locked" }; }
-    return { ok: false, error: "code", left: MAX_ATTEMPTS - t.attempts };
+    if (t.attempts >= MAX_ATTEMPTS_ALL) { tickets.delete(id); return { ok: false, error: "locked" }; }
+    if (missed >= MAX_ATTEMPTS) return { ok: false, error: "locked" };
+    return { ok: false, error: "code", left: MAX_ATTEMPTS - missed };
   }
 
   const secret = randomBytes(32).toString("base64url");
