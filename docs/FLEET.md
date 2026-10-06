@@ -343,11 +343,14 @@ its cloud sessions to your hub.
 Setup, once — `bun run fleet add-cloud` prints all of it with your token filled in:
 
 1. On the hub: `AGENTGLASS_CLOUD_PORT=4010` (any free port), restart.
-2. `tailscale funnel --bg --set-path /cloud/ingest http://127.0.0.1:4010`
+2. `tailscale funnel --bg --https=8443 http://127.0.0.1:4010` — its own port.
+   Funnel publishes a whole host:port, so mounting the intake on the 443 the hub
+   is served on (`tailscale serve`) would put the hub on the internet with it.
+   `tailscale funnel status` should show 8443 public and 443 tailnet-only.
 3. In the repository: `bun run fleet cloud-hook > .claude/hooks/agentglass_cloud.py`
    and merge `bun run fleet cloud-settings` into `.claude/settings.json`.
 4. In the cloud environment's settings on claude.ai: `AGENTGLASS_CLOUD_URL`
-   (your funnel's `https://….ts.net`) and `AGENTGLASS_CLOUD_TOKEN`, and network
+   (`https://<hub>.ts.net:8443`) and `AGENTGLASS_CLOUD_TOKEN`, and network
    access set to **Custom** with that hostname allowed, or **Full** — the
    default *Trusted* level cannot reach it. Whether a `*.ts.net` host can be
    added to a Custom allowlist is not stated in Claude Code's docs; if it
