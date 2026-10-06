@@ -174,3 +174,29 @@ describe("phase 3: holds and answers", () => {
   });
 });
 
+
+describe("phase 4: what a hub may read on a node", () => {
+  test("the workspace views, read-only — and nothing else", async () => {
+    const { tunnelAllows } = await import("../src/auth.ts");
+    for (const [m, p] of [["GET", "/git/log"], ["GET", "/git/file-diff"], ["POST", "/git/status"], ["GET", "/files/tree"], ["GET", "/changes"], ["GET", "/fs/complete"]]) {
+      expect(tunnelAllows(m!, p!)).toBe(true);
+    }
+    for (const [m, p] of [
+      ["POST", "/git/stage"], ["POST", "/git/commit"], ["POST", "/git/push"],   // writes
+      ["GET", "/terminal/pty"], ["GET", "/sessions"], ["GET", "/stream"],      // outside the workspace views
+      ["POST", "/chat/send"], ["POST", "/gate/decide"], ["POST", "/fleet/proxy"],
+      ["GET", "/git/../sessions"], ["GET", "/git//x"],                          // shapes that are not a plain path
+    ]) {
+      expect(tunnelAllows(m!, p!)).toBe(false);
+    }
+  });
+
+  test("a request frame is a path, not a URL", () => {
+    const ok = { t: "req", rid: 1, method: "GET", path: "/git/log", query: "root=%2Fx" };
+    expect(parseHubFrame(JSON.stringify(ok))).toEqual(ok as any);
+    expect(parseHubFrame(JSON.stringify({ ...ok, path: "http://evil/git/log" }))).toBeNull();
+    expect(parseHubFrame(JSON.stringify({ ...ok, path: "/git/log?x=1" }))).toBeNull();
+    expect(parseHubFrame(JSON.stringify({ ...ok, method: "DELETE" }))).toBeNull();
+    expect(parseHubFrame(JSON.stringify({ ...ok, body: "x".repeat(70_000) }))).toBeNull();
+  });
+});

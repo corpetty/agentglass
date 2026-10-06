@@ -5,9 +5,9 @@ for watching several — a desk, a laptop, a headless box driven over Remote
 Control, and, as far as it can go, sessions running in Anthropic's cloud — from
 a single cockpit.
 
-Status: **phases 1–3 built** — every row knows its host, nodes forward to a
-hub, and a node's held tool calls can be answered there. Phases 4–5 are design,
-not code.
+Status: **phases 1–4 built** — every row knows its host, nodes forward to a
+hub, a node's held tool calls can be answered there, and the hub's Git panel
+reads a node's repositories. Phase 5 is design, not code.
 
 ## Setting it up
 
@@ -220,12 +220,46 @@ What phase 3 leaves open:
 
 ### 4. Remote workspace, one tier at a time
 
-- A request tunnel: the hub sends `{method, path, query, body}` down the link,
-  the node runs it against its own router under its own scope checks.
-- **The node sets the ceiling, never the hub.** Default ceiling: read + answer.
-- Order: diff and file view → git tree → chat / resume (runs `claude --resume`
-  on the owning node) → terminal last, if ever. A PTY across the link is both
-  the hardest to stream and the most dangerous thing to grant.
+Built: the **read** tier — `req`/`res` frames, `tunnelAllows` in auth.ts,
+`requestRemote` in fleethub.ts, the node's dispatcher in fleetlink.ts,
+`POST /fleet/proxy`, and `web/src/lib/remoteRoot.ts`.
+
+- **A request tunnel.** The hub sends `{method, path, query, body}` down the
+  link; the node rebuilds it from the path alone — none of the hub's headers —
+  and runs it through its own router as a call from itself, so its own scope
+  and repository checks decide. The answer comes back as itself.
+- **The node sets the ceiling, never the hub.** `tunnelAllows` is the whole
+  boundary and is checked on the node: the workspace views (`/git/*`,
+  `/files/*`, `/changes`, `/fs/complete`) and only what `scopeNeeded` calls a
+  read — exactly what a read-scope paired phone could ask of that machine. The
+  hub checks it too, so a refusal is fast and a write is never even forwarded.
+  `AGENTGLASS_UPSTREAM_TUNNEL=off`, or `"tunnel": "off"` in `upstream.json`,
+  closes it.
+- **The hub's Git panel lists every linked machine's repositories** beside its
+  own, named `proj @rooter`. Picking one reads its changes, diffs, log, graph,
+  branches, stashes and history from that machine, live. Write controls are
+  disabled and say why.
+- **How the panel does it without knowing:** a remote root is `@rooter:/path`
+  — never a local path, which always starts with `/`. The API transport is the
+  one place that notices: it strips the prefix, sends the request through
+  `/fleet/proxy`, and puts the prefix back on any path in the answer that sits
+  under the root it asked about. Panels keep passing `root` around as before.
+
+Next tiers, in order: chat / resume (runs `claude --resume` on the owning node;
+needs a streamed answer, and answers only from the hub pinned at start, as
+gates do) → terminal last, if ever. A PTY across the link is both the hardest
+to stream and the most dangerous thing to grant.
+
+What the read tier leaves open:
+
+- **Only the Git panel reads remote repositories.** Files, chat, budgets and
+  the rest list this machine's only.
+- **Views outside the tier** — the PR badge, anything under `/prs` — answer
+  "read-only over the fleet link" for a remote repository.
+- **Switching to a linked worktree** of a remote repository from inside it is
+  not mapped yet: worktrees live beside the root, not under it.
+- **Answers are capped at 3 MB** (a 413 that says so), and a node answers at
+  most 16 requests at once.
 
 ### 5. Cloud sessions (live events only)
 

@@ -156,6 +156,11 @@ async function status() {
       off: "not relayed (AGENTGLASS_UPSTREAM_GATES=0, or \"gates\": false in upstream.json)",
     }[u.gates as string] ?? u.gates;
     if (u.state === "live") console.log(`Gates:        ${gates}`);
+    if (u.state === "live") {
+      console.log(`Workspace:    ${u.tunnel === "read"
+        ? "the hub can read this machine's repositories (git, read-only)"
+        : "closed to the hub (AGENTGLASS_UPSTREAM_TUNNEL=off, or \"tunnel\": \"off\" in upstream.json)"}`);
+    }
   }
   if (s.nodes.length) {
     console.log("Nodes:");

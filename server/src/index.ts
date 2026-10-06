@@ -12,8 +12,8 @@ import { normalize, detectError, clampIngestTimestamp, externalIngestError } fro
 import { pricingProvenance, startPricingRefresh } from "./pricing.ts";
 import { db } from "./db.ts";
 import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
-import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, type FleetWsData } from "./fleethub.ts";
-import { startUplink, uplinkStatus } from "./fleetlink.ts";
+import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, requestRemote, type FleetWsData } from "./fleethub.ts";
+import { startUplink, uplinkStatus, setTunnelDispatch } from "./fleetlink.ts";
 import { HOST_ID_RE } from "./fleetwire.ts";
 import {
   insertEvent,
@@ -204,7 +204,7 @@ import { join as joinPath, resolve as resolvePath, basename } from "node:path";
 import { hostname, tmpdir } from "node:os";
 import { privateHost, resolvePeer, originOf, guardedFetch, hostsOnly } from "./net.ts";
 import { DESK_HEADER, claimDesk, deskHeld } from "./desk.ts";
-import { resolveToken, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
+import { resolveToken, tunnelAllows, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
 import {
   listPlugins, masterEnabled, setMaster, installPlugin, installFromCatalogue, updatePlugin, enablePlugin, disablePlugin, removePlugin, setPluginUnboxedConsent,
   contributesOf, isRunning, pluginSettings, setPluginSettings, resumeEnabledPlugins, stopAllPluginsSync, pluginIcon,
@@ -4997,6 +4997,35 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const { device, token } = issueDevice(`agentglass on ${host}`, "read", Date.now(), { host });
       return json({ ok: true, token, device: publicDevice(device) });
     }
+    /*
+     * Read a node's workspace from here (phase 4, docs/FLEET.md).
+     *
+     * `{ host, method, path, body? }`, where path may carry its query string.
+     * The node's answer comes back as itself — status, type, body — so a panel
+     * reading a remote repository reads exactly what it would have read there.
+     * A POST only because it carries a request; READ_POST in auth.ts says why
+     * it is a read. tunnelAllows is asked here so a refusal is fast and the
+     * hub never even forwards a write, and asked again on the node, where the
+     * answer is binding.
+     */
+    if (pathname === "/fleet/proxy" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      let b: { host?: unknown; method?: unknown; path?: unknown; body?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.host === "string" ? b.host : "";
+      const method = b.method === "POST" ? "POST" : "GET";
+      const raw = typeof b.path === "string" ? b.path : "";
+      const q = raw.indexOf("?");
+      const path = q < 0 ? raw : raw.slice(0, q);
+      const query = q < 0 ? "" : raw.slice(q + 1);
+      if (!HOST_ID_RE.test(host) || !path.startsWith("/")) return json({ ok: false, error: "host and path are required" }, 400);
+      if (!tunnelAllows(method, path)) {
+        return json({ ok: false, error: `${method} ${path} is read-only over the fleet link — do it on ${host}` }, 403);
+      }
+      const body = b.body === undefined ? undefined : JSON.stringify(b.body);
+      const a = await requestRemote(host, method, path, query, body);
+      return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
+    }
     if (pathname === "/fleet/nodes") {
       const creds = activeDevices().filter((d) => d.role === "node").map(publicDevice);
       return json({ nodes: fleetNodes(), credentials: creds });
@@ -9452,6 +9481,24 @@ whenForeignRows(({ inserted, sessions }) => {
 whenRemoteGate((host, g) => {
   const what = g.budget ? (g.summary ? `${g.budget} · ${g.summary}` : g.budget) : g.summary;
   pushGate(`${g.where || g.source_app} on ${host}`, g.tool_name, what);
+});
+
+// What runs a request the hub carried to this machine (phase 4): this server's
+// own router, as a call from this machine — over loopback, with this machine's
+// token when it has one — so its own scope and repository checks decide. The
+// node's ceiling (tunnelAllows) has already been applied in fleetlink.ts; this
+// is only the door it then walks through.
+const tunnelServer = {
+  requestIP: () => ({ address: "127.0.0.1", family: "IPv4" }),
+  port: PORT,
+  upgrade: () => false,
+} as unknown as Server<WsData>;
+setTunnelDispatch((r) => {
+  const headers = new Headers(r.headers);
+  if (AUTH_TOKEN) headers.set("Authorization", `Bearer ${AUTH_TOKEN}`);
+  const url = new URL(r.url);
+  url.port = String(PORT);
+  return handleServerRequest(new Request(url.href, { method: r.method, headers, body: r.body }), tunnelServer);
 });
 
 // Forward this machine's rows to a hub, if it has joined one. Off by default

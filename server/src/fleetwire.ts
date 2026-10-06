@@ -22,6 +22,14 @@
  *   hub  → node  decide   { t, id, decision, reason, by } a person at the hub answered one
  *   node → hub   decided  { t, id, ok, error? }           whether it took (it may have timed out)
  *
+ * Phase 4 — the hub reading a node's workspace (git, files) through it:
+ *
+ *   hub  → node  req      { t, rid, method, path, query, body? }
+ *   node → hub   res      { t, rid, status, type, body }
+ *
+ * The node decides what it will run (`tunnelAllows` in auth.ts) and runs it
+ * against its own router, under its own scope; the hub only carries it.
+ *
  * `decide` can arrive at any moment — in the middle of a batch waiting for its
  * ack — so the node handles it the moment it lands rather than queueing it
  * behind the ack it is waiting for.
@@ -85,12 +93,21 @@ export type NodeFrame =
   | { t: "hello"; v: number; host: string; version?: string }
   | { t: "rows"; upto: number; events: WireEvent[]; sessions: WireSession[] }
   | { t: "gates"; gates: WireGate[] }
-  | { t: "decided"; id: string; ok: boolean; error?: string };
+  | { t: "decided"; id: string; ok: boolean; error?: string }
+  | { t: "res"; rid: number; status: number; type: string; body: string };
 export type HubFrame =
   | { t: "welcome"; v: number; host: string; after: number }
   | { t: "ack"; upto: number }
   | { t: "refuse"; error: string }
-  | { t: "decide"; id: string; decision: "allow" | "deny"; reason: string; by: string };
+  | { t: "decide"; id: string; decision: "allow" | "deny"; reason: string; by: string }
+  | { t: "req"; rid: number; method: "GET" | "POST"; path: string; query: string; body?: string };
+
+/** A request body through the tunnel: a JSON argument, never an upload. */
+export const MAX_TUNNEL_REQUEST = 64 * 1024;
+/** A response through the tunnel — under the hub's frame ceiling with room
+ *  for the frame's own JSON. A larger answer is refused on the node with a
+ *  413 that says why, rather than truncated into something that parses. */
+export const MAX_TUNNEL_RESPONSE = 3 * 1024 * 1024;
 
 /** Same shape gate.ts accepts from a hook: a uuid, never anything else. */
 export const GATE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -255,6 +272,14 @@ export function parseNodeFrame(text: string, now = Date.now()):
     const error = typeof f.error === "string" ? f.error.slice(0, 300) : undefined;
     return { ok: true, frame: { t: "decided", id: f.id, ok: f.ok, ...(error ? { error } : {}) } };
   }
+  if (f.t === "res") {
+    if (typeof f.rid !== "number" || !Number.isSafeInteger(f.rid) || f.rid <= 0) return { ok: false, error: "bad res" };
+    if (typeof f.status !== "number" || !Number.isInteger(f.status) || f.status < 100 || f.status > 599) return { ok: false, error: "bad res" };
+    if (typeof f.type !== "string" || f.type.length > 200 || typeof f.body !== "string" || f.body.length > MAX_TUNNEL_RESPONSE) {
+      return { ok: false, error: "bad res" };
+    }
+    return { ok: true, frame: { t: "res", rid: f.rid, status: f.status, type: f.type, body: f.body } };
+  }
   if (f.t === "rows") {
     // 0 is a real cursor: a sessions-only resync from a node that has not
     // forwarded an event yet.
@@ -302,6 +327,18 @@ export function parseHubFrame(text: string): HubFrame | null {
     const by = shortStr(f.by ?? "", MAX_ACTOR);
     if (reason === null || by === null) return null;
     return { t: "decide", id: f.id, decision: f.decision, reason, by };
+  }
+  if (f.t === "req") {
+    if (typeof f.rid !== "number" || !Number.isSafeInteger(f.rid) || f.rid <= 0) return null;
+    if (f.method !== "GET" && f.method !== "POST") return null;
+    // A path, not a URL: no scheme, no host, nothing that could make the node's
+    // own Request point anywhere but itself.
+    if (typeof f.path !== "string" || !f.path.startsWith("/") || f.path.length > 512 || /[\s?#]/.test(f.path)) return null;
+    const query = typeof f.query === "string" && f.query.length <= 4096 && !f.query.includes("#") ? f.query.replace(/^\?/, "") : null;
+    if (query === null) return null;
+    const body = f.body === undefined ? undefined : shortStr(f.body, MAX_TUNNEL_REQUEST);
+    if (body === null) return null;
+    return { t: "req", rid: f.rid, method: f.method, path: f.path, query, ...(body !== undefined ? { body } : {}) };
   }
   return null;
 }

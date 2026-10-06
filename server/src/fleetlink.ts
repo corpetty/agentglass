@@ -22,11 +22,12 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostId } from "./config.ts";
 import {
-  FLEET_PROTOCOL, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_GATES, linkTransportOk, linkUrl, parseHubFrame, type HubFrame,
+  FLEET_PROTOCOL, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_GATES, MAX_TUNNEL_RESPONSE, linkTransportOk, linkUrl, parseHubFrame, type HubFrame,
 } from "./fleetwire.ts";
 import { localBatch, localSessions, recentLocalSessions } from "./fleetstore.ts";
 import { heldGates, decideGate, watchGates } from "./gate.ts";
 import { isMachineActor, MACHINE_ACTOR } from "./actions.ts";
+import { tunnelAllows } from "./auth.ts";
 
 export function upstreamPath(): string {
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "agentglass", "upstream.json");
@@ -39,7 +40,7 @@ function offLimits(p: string): boolean {
 }
 
 export type UpstreamConfig =
-  | { ok: true; url: string; token: string; insecure: boolean; stamp: string; gates: boolean }
+  | { ok: true; url: string; token: string; insecure: boolean; stamp: string; gates: boolean; tunnel: boolean }
   | { ok: false; error: string; stamp: string };
 
 function stampOf(p: string): string {
@@ -66,12 +67,14 @@ export function upstreamConfig(): UpstreamConfig | null {
   let url = process.env.AGENTGLASS_UPSTREAM_URL?.trim() || "";
   let token = process.env.AGENTGLASS_UPSTREAM_TOKEN?.trim() || "";
   let gates = process.env.AGENTGLASS_UPSTREAM_GATES !== "0";
+  let tunnel = process.env.AGENTGLASS_UPSTREAM_TUNNEL !== "off";
   if (!url && !offLimits(p) && existsSync(p)) {
     try {
-      const f = JSON.parse(readFileSync(p, "utf8")) as { url?: unknown; token?: unknown; gates?: unknown };
+      const f = JSON.parse(readFileSync(p, "utf8")) as { url?: unknown; token?: unknown; gates?: unknown; tunnel?: unknown };
       url = typeof f.url === "string" ? f.url.trim() : "";
       token = token || (typeof f.token === "string" ? f.token.trim() : "");
       if (f.gates === false) gates = false;
+      if (f.tunnel === "off" || f.tunnel === false) tunnel = false;
     } catch (e) {
       return { ok: false, error: `${p}: ${e instanceof Error ? e.message : e}`, stamp };
     }
@@ -88,7 +91,7 @@ export function upstreamConfig(): UpstreamConfig | null {
     };
   }
   if (!token) return { ok: false, error: "no token — run `bun run fleet join <hub> <token>`", stamp };
-  return { ok: true, url, token, insecure, stamp, gates };
+  return { ok: true, url, token, insecure, stamp, gates, tunnel };
 }
 
 /*
@@ -130,15 +133,62 @@ export interface UplinkStatus {
    * from it are not taken until it restarts (see `pinned`).
    */
   gates: "relayed" | "off" | "restart";
+  /** Whether the hub may read this machine's workspace (git, files) through
+   *  the link — read-only, by tunnelAllows' ceiling (phase 4). */
+  tunnel: "read" | "off";
 }
 
 const status: UplinkStatus = {
   state: "off", hub: null, hubHost: null, acked: 0, sent: 0,
-  connectedAt: null, lastAckAt: null, error: null, retryAt: null, gates: "off",
+  connectedAt: null, lastAckAt: null, error: null, retryAt: null, gates: "off", tunnel: "off",
 };
 export function uplinkStatus(): UplinkStatus { return { ...status }; }
 
 class Refused extends Error {}
+
+/*
+ * Who runs a tunnelled request: this server's own router (index.ts sets it).
+ * A hook rather than an import, because the router is index.ts and this module
+ * is one of the things index.ts imports.
+ */
+let dispatch: ((req: Request) => Promise<Response>) | null = null;
+export function setTunnelDispatch(fn: ((req: Request) => Promise<Response>) | null): void { dispatch = fn; }
+
+const tunnelAnswer = (status: number, error: string) =>
+  ({ status, type: "application/json", body: JSON.stringify({ ok: false, error }) });
+
+/**
+ * Run one request the hub carried here, and say what this machine answered.
+ *
+ * The ceiling is checked HERE, by this machine, whatever the hub decided:
+ * tunnelAllows is the boundary, and a hub that is wrong, out of date or not
+ * ours asks for nothing beyond it. The request is rebuilt from the path and
+ * nothing else — none of the hub's headers, no Origin, no credential of its
+ * own — and handed to this server's router as a call from this machine, which
+ * is what puts this machine's own scope and repository checks in charge.
+ */
+async function runTunnelled(f: Extract<HubFrame, { t: "req" }>, allowed: boolean) {
+  if (!allowed) return tunnelAnswer(403, `${hostId()} does not open its workspace to its hub`);
+  if (!tunnelAllows(f.method, f.path)) {
+    return tunnelAnswer(403, `${f.method} ${f.path} is not something ${hostId()} reads for its hub — the fleet link is read-only`);
+  }
+  if (!dispatch) return tunnelAnswer(503, "this machine's server is not ready");
+  try {
+    const url = `http://127.0.0.1${f.path}${f.query ? `?${f.query}` : ""}`;
+    const res = await dispatch(new Request(url, {
+      method: f.method,
+      headers: f.body !== undefined ? { "content-type": "application/json" } : {},
+      ...(f.body !== undefined ? { body: f.body } : {}),
+    }));
+    const body = await res.text();
+    if (body.length > MAX_TUNNEL_RESPONSE) {
+      return tunnelAnswer(413, `that answer is ${Math.round(body.length / 1024)} KB — too large to send over the fleet link`);
+    }
+    return { status: res.status, type: (res.headers.get("content-type") || "application/json").slice(0, 200), body };
+  } catch (e) {
+    return tunnelAnswer(500, `${hostId()} could not answer: ${e instanceof Error ? e.message : e}`);
+  }
+}
 
 /**
  * Why a socket closed, in words a person can act on — and whether retrying
@@ -167,13 +217,16 @@ class Inbox {
    *  is waiting for its ack, and queueing it behind the ack would read as the
    *  hub acknowledging something else. */
   onDecide: ((f: Extract<HubFrame, { t: "decide" }>) => void) | null = null;
+  /** Same for a tunnelled request: answered whenever it lands, concurrently. */
+  onRequest: ((f: Extract<HubFrame, { t: "req" }>) => void) | null = null;
   /** Set by the loop when the gate queue moved, so an idle wait ends now. */
   poke(): void { this.wake(); }
   constructor(ws: WebSocket) {
     ws.addEventListener("message", (ev) => {
       const raw = String((ev as MessageEvent).data);
-      const f = raw.includes('"decide"') ? parseHubFrame(raw) : null;
+      const f = raw.includes('"decide"') || raw.includes('"req"') ? parseHubFrame(raw) : null;
       if (f?.t === "decide") { this.onDecide?.(f); return; }
+      if (f?.t === "req") { this.onRequest?.(f); return; }
       this.queue.push(raw);
       this.wake();
     });
@@ -287,6 +340,12 @@ async function runOnce(cfg: Extract<UpstreamConfig, { ok: true }>, version: stri
       const ok = decideGate(f.id, f.decision, f.reason, by);
       answer(ok, ok ? undefined : "already resolved here — it timed out, or was answered at this machine");
     };
+    status.tunnel = cfg.tunnel ? "read" : "off";
+    inbox.onRequest = (f) => {
+      void runTunnelled(f, cfg.tunnel).then((a) => {
+        try { ws.send(JSON.stringify({ t: "res", rid: f.rid, ...a })); } catch { /* link gone; the hub times it out */ }
+      });
+    };
     try {
     for (;;) {
       if (inbox.closed) throw inbox.closed;
@@ -320,6 +379,7 @@ async function runOnce(cfg: Extract<UpstreamConfig, { ok: true }>, version: stri
     } finally {
       unwatch();
       inbox.onDecide = null;
+      inbox.onRequest = null;
     }
   } finally {
     try { ws.close(); } catch { /* already closed */ }

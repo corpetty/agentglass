@@ -212,6 +212,44 @@ describe("joining a node to a hub", () => {
       !(await body(asHub("/gate/pending"))).gates.some((x: any) => x.id === id), 5000);
   }, 60_000);
 
+  test("the hub reads a node's repository through the link, and cannot write to it", async () => {
+    // A real repository on rooter's disk, which the hub has no path to.
+    const repo = join(rooter!.dir, "proj");
+    mkdirSync(repo, { recursive: true });
+    const git = (...a: string[]) => Bun.spawnSync(["git", "-C", repo, ...a], { stdout: "pipe", stderr: "pipe" });
+    git("init", "-q"); git("config", "user.email", "t@t"); git("config", "user.name", "t");
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git("add", "-A"); git("commit", "-qm", "first on rooter");
+    writeFileSync(join(repo, "a.txt"), "one\ntwo\n");
+
+    const proxied = (method: string, path: string, b?: unknown) => asHub("/fleet/proxy", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ host: "rooter", method, path, ...(b !== undefined ? { body: b } : {}) }),
+    });
+    const log = await proxied("GET", `/git/log?root=${encodeURIComponent(repo)}`);
+    expect(log.status).toBe(200);
+    expect(JSON.stringify(await body(log))).toContain("first on rooter");
+    const st = await body(proxied("POST", "/git/status", { paths: [join(repo, "a.txt")] }));
+    expect(JSON.stringify(st)).toContain("a.txt");
+
+    // A write is refused at the hub, before it is ever forwarded …
+    const stage = await proxied("POST", "/git/stage", { root: repo, paths: ["a.txt"] });
+    expect(stage.status).toBe(403);
+    // … and so is anything outside the workspace views, read or not.
+    expect((await proxied("GET", "/sessions")).status).toBe(403);
+    expect((await proxied("GET", "/terminal/pty")).status).toBe(403);
+    // Nothing was staged on rooter.
+    expect(new TextDecoder().decode(git("diff", "--cached", "--name-only").stdout).trim()).toBe("");
+  }, 30_000);
+
+  test("a node that is not linked answers as such", async () => {
+    const r = await asHub("/fleet/proxy", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ host: "nobody", method: "GET", path: "/git/repos" }),
+    });
+    expect(r.status).toBe(502);
+  });
+
   test("an answer for a hold nobody is keeping says so", async () => {
     const r = await body(asHub("/gate/decide", {
       method: "POST", headers: { Origin: hub.base },

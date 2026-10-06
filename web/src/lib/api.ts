@@ -118,6 +118,7 @@ export type RunActivityResult = { ok: boolean; run?: Run; legs: LegActivity[]; e
 
 import { DEPS, type DepsResponse } from "../../../shared/deps.ts";
 import * as demo from "./demo.ts";
+import { remoteRoot, remoteTarget, relabel } from "./remoteRoot.ts";
 
 export const IS_DEMO = demo.IS_DEMO;
 
@@ -692,9 +693,35 @@ export function whenServerUp(): Promise<void> {
   return serverUp;
 }
 
+/**
+ * A request about a repository on another machine (docs/FLEET.md, phase 4),
+ * carried there through this server's `/fleet/proxy`. The answer is that
+ * machine's own, status and body, so the panel reads it exactly as it reads a
+ * local one. `strict` is GET's contract: a non-2xx is thrown, not returned.
+ */
+async function viaFleet<T>(t: { host: string; path: string; body?: unknown; roots?: string[] }, method: "GET" | "POST", strict: boolean): Promise<T> {
+  await whenServerUp();
+  const r = await fetch(SERVER + "/fleet/proxy", {
+    method: "POST",
+    headers: authHeaders({ "content-type": "application/json" }),
+    body: JSON.stringify({ host: t.host, method, path: t.path, ...(t.body !== undefined ? { body: t.body } : {}) }),
+  });
+  if (strict && !r.ok) {
+    const why = await r.json().then((b: { error?: string }) => b?.error).catch(() => null);
+    throw new Error(why || `${t.path} on ${t.host} → ${r.status}`);
+  }
+  return relabel(await r.json(), t.host, t.roots ?? []) as T;
+}
+
 /** A caller that can change its mind. Only the ones that ask for it get one —
  *  a request nobody is waiting on any more is the exception, not the rule. */
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  // A root on another machine goes there instead (remoteRoot.ts).
+  const remote = remoteTarget(path);
+  if (remote) {
+    if ("error" in remote) throw new Error(remote.error);
+    return viaFleet<T>(remote, "GET", true);
+  }
   await whenServerUp();
   let last: unknown;
   for (let i = 0; i <= COLD_START_WAITS.length; i++) {
@@ -724,6 +751,14 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 async function post<T>(path: string, body: unknown, headers: Record<string, string> = {}): Promise<T> {
+  // Same rule as get(). A write lands here too and is refused — at the hub and
+  // again on the node — as read-only over the link, in the `{ ok, error }`
+  // shape every write's caller already shows.
+  const remote = remoteTarget(path, body);
+  if (remote) {
+    if ("error" in remote) return { ok: false, error: remote.error } as T;
+    return viaFleet<T>(remote, "POST", false);
+  }
   // Gated like GET, and only gated: waiting for a listener changes nothing
   // about what a POST means, where asking twice would. Measured in the real
   // app, the two that still shouted after GET was gated were both POSTs —
@@ -1063,6 +1098,30 @@ const realApi = {
   // window's folders" from a whole-machine sweep. See gitNote.ts's
   // notesWorthyRepos.
   gitRepos: () => get<{ repos: GitRepoRef[]; roots?: string[] }>("/git/repos"),
+  /**
+   * The repositories here, and those on every linked machine (phase 4) —
+   * for the Git panel only, which reads a remote one through the link. The
+   * other panels that list repositories keep gitRepos(): a chat, a file or a
+   * budget in another machine's checkout is nothing this server can start.
+   * A remote root is `@host:/path` (remoteRoot.ts) and its name says where.
+   */
+  gitReposFleet: async (): Promise<{ repos: GitRepoRef[]; roots?: string[] }> => {
+    const local = await get<{ repos: GitRepoRef[]; roots?: string[] }>("/git/repos");
+    const status = await get<{ nodes?: { host: string; connected: boolean }[] }>("/fleet/status").catch(() => null);
+    const linked = (status?.nodes ?? []).filter((n) => n.connected).map((n) => n.host);
+    const remote = await Promise.all(linked.map((host) =>
+      viaFleet<{ repos?: GitRepoRef[] }>({ host, path: "/git/repos" }, "GET", true)
+        .then((r) => (r.repos ?? []).map((repo) => ({
+          ...repo,
+          root: remoteRoot(host, repo.root),
+          ...(repo.worktreeOf ? { worktreeOf: remoteRoot(host, repo.worktreeOf) } : {}),
+          name: `${repo.name} @${host}`,
+          host,
+        })))
+        // One machine that cannot answer must not take the others' repos with it.
+        .catch(() => [] as GitRepoRef[])));
+    return { ...local, repos: [...local.repos, ...remote.flat()] };
+  },
   /** Put a PNG somewhere an agent can read it, and say where. A tmux window
    *  takes text; a megabyte of base64 in a prompt is not text. */
   /** Everywhere another browser has been, for the address bar. */
@@ -2277,6 +2336,7 @@ const demoApi: typeof realApi = {
   } as DepsResponse),
   logDigest: () => D({ since: 0, total: 0, groups: [], crashLoops: [], spikes: [], quiet: true } as LogDigest),
   gitRepos: () => D(demo.gitRepos()),
+  gitReposFleet: () => D(demo.gitRepos()),
   browserPlaces: () => D({ ok: true, places: [] as ImportedPlace[] }),
   browserPlaceCount: () => D({ ok: true, total: 0, bookmarks: 0, sources: [] as string[] }),
   saveBrowserPlaces: (_s: string, _p: ImportedPlace[]) => D({ ok: false, error: "not available in the demo" }),

@@ -502,6 +502,31 @@ export function nodeAllows(method: string, pathname: string): boolean {
 }
 
 /**
+ * What a hub may ask a node to run, over the fleet link's request tunnel
+ * (docs/FLEET.md, phase 4) — the node's ceiling, decided on the node.
+ *
+ * Two tests, both required. The path has to be one of the workspace views a
+ * remote repository is read through — git, the file tree, the change list —
+ * and the request has to be what `scopeNeeded` calls a read: exactly what a
+ * paired phone at `read` may ask of this machine, by the same deny-by-default
+ * table, so a route added under `/git/` next month is in reach only if it is a
+ * GET that is not in FULL_GET. Everything else — every write, the terminal,
+ * chat, docker, pairing — is out, whatever the hub's own caller was allowed.
+ *
+ * The tunnel dispatches as this machine (fleetlink.ts), so this function is
+ * the whole of the boundary. That is deliberate: one total predicate that a
+ * test can enumerate, rather than a credential whose reach depends on how this
+ * server happens to be configured.
+ */
+const TUNNEL_PREFIXES = ["/git/", "/files/"];
+const TUNNEL_EXACT = new Set(["/changes", "/fs/complete"]);
+export function tunnelAllows(method: string, pathname: string): boolean {
+  if (pathname.includes("..") || pathname.includes("//")) return false;
+  const area = TUNNEL_EXACT.has(pathname) || TUNNEL_PREFIXES.some((p) => pathname.startsWith(p));
+  return area && scopeNeeded(method, pathname) === "read";
+}
+
+/**
  * A phone may answer what is already asked. It may not drive the machine.
  *
  * Written as *deny by default* on purpose: anything that changes state and is
@@ -516,7 +541,14 @@ export function nodeAllows(method: string, pathname: string): boolean {
 
 /** POSTs that only read. They are POSTs because their argument is a filesystem
  *  path, which has no business in a URL, not because they change anything. */
-const READ_POST = new Set(["/git/status"]);
+const READ_POST = new Set([
+  "/git/status",
+  // The hub's window onto a node's workspace (docs/FLEET.md, phase 4). A POST
+  // because it carries the request it forwards, and a read because the only
+  // requests it forwards are ones `tunnelAllows` calls reads — checked here at
+  // the hub and again, as the binding answer, on the node.
+  "/fleet/proxy",
+]);
 
 /**
  * GETs that are not reads. `/terminal/pty` is a WebSocket upgrade, and a

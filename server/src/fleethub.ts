@@ -114,6 +114,47 @@ export function decideRemote(id: string, decision: "allow" | "deny", reason: str
   });
 }
 
+/*
+ * Phase 4: requests carried to a node and not yet answered, by request id.
+ * Bounded per node — a page that opens a repository asks for a dozen things at
+ * once, and a node is somebody's desk, not a server farm.
+ */
+export interface TunnelAnswer { status: number; type: string; body: string }
+const tunnel = new Map<number, { host: string; resolve: (a: TunnelAnswer) => void; timer: ReturnType<typeof setTimeout> }>();
+let nextRid = 1;
+const TUNNEL_MS = 30_000;
+const TUNNEL_PER_NODE = 16;
+
+const answer = (status: number, error: string): TunnelAnswer =>
+  ({ status, type: "application/json", body: JSON.stringify({ ok: false, error }) });
+
+/**
+ * Ask a node to run one read against its own router, and hand back its answer.
+ *
+ * The node is the one that decides whether it will (tunnelAllows in auth.ts,
+ * on its side); the hub checks the same thing first only so a refusal is fast.
+ * A node that is not linked, too busy, or silent gets an answer in the shape
+ * every panel already reads errors in — `{ ok: false, error }` — never a hang.
+ */
+export function requestRemote(
+  host: string, method: "GET" | "POST", path: string, query: string, body?: string,
+): Promise<TunnelAnswer> {
+  const ws = live.get(host);
+  if (!ws) return Promise.resolve(answer(502, `${host} is not linked to this hub right now`));
+  let inFlight = 0;
+  for (const t of tunnel.values()) if (t.host === host) inFlight++;
+  if (inFlight >= TUNNEL_PER_NODE) return Promise.resolve(answer(503, `${host} is busy answering — try again in a moment`));
+  const rid = nextRid++;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      tunnel.delete(rid);
+      resolve(answer(504, `${host} did not answer in time`));
+    }, TUNNEL_MS);
+    tunnel.set(rid, { host, resolve, timer });
+    send(ws, { t: "req", rid, method, path, query, ...(body !== undefined ? { body } : {}) });
+  });
+}
+
 function settle(id: string, r: { ok: boolean; error?: string }): void {
   const w = awaiting.get(id);
   if (!w) return;
@@ -179,6 +220,15 @@ export function fleetMessage(ws: Ws, msg: string | Buffer): void {
     }
     return;
   }
+  if (f.t === "res") {
+    const t = tunnel.get(f.rid);
+    // Only an answer to a request sent to THIS node.
+    if (!t || t.host !== ws.data.host) return;
+    clearTimeout(t.timer);
+    tunnel.delete(f.rid);
+    t.resolve({ status: f.status, type: f.type, body: f.body });
+    return;
+  }
   if (f.t === "decided") {
     // Only an answer this hub asked this node for. A node cannot settle a
     // decision that was sent to another machine.
@@ -214,6 +264,12 @@ export function fleetClose(ws: Ws): void {
   remoteGates.delete(ws.data.host);
   for (const [id, w] of awaiting) {
     if (w.host === ws.data.host) settle(id, { ok: false, error: `${w.host} went offline before confirming — check it there` });
+  }
+  for (const [rid, t] of tunnel) {
+    if (t.host !== ws.data.host) continue;
+    clearTimeout(t.timer);
+    tunnel.delete(rid);
+    t.resolve(answer(502, `${t.host} went offline before answering`));
   }
 }
 

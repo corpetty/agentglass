@@ -2212,6 +2212,9 @@ export interface WorkingTree {
 export interface GitRepoRef {
   root: string;
   name: string;
+  /** The machine it lives on, when that is not the server you asked — set by
+   *  the client for a repository read through the fleet link (phase 4). */
+  host?: string;
   branch: string;
   dirty: number; // count of changed files
   ahead: number;
