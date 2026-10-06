@@ -1038,6 +1038,9 @@ export interface SessionDetail {
   model_name: string | null;
   /** The machine it ran on. Same contract as WatchEvent.host. */
   host?: string;
+  /** A cloud session's id on claude.ai (`cse_…`), when its hook reported one
+   *  (docs/FLEET.md, phase 5). */
+  cloud_session?: string | null;
   /** Where it ran — a resume has to start in the same directory. */
   project_path?: string | null;
   /** The linked worktree / subdir it actually ran in, if not the repo root. */

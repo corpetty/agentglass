@@ -4769,6 +4769,14 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
     // Which machine it ran on, labelled like every other read — the deep-dive
     // is where Resume lives, and Resume is exactly the button that must know.
     host: roll?.host ?? hostId(),
+    // A cloud session's own id on claude.ai, when its hook sent one (phase 5,
+    // hooks/cloud_hook.py) — what the deep-dive links to, since a cloud session
+    // can be continued there and nowhere else. Only asked of a forwarded row.
+    cloud_session: roll?.host
+      ? (db.query<{ c: string | null }, [string]>(
+          "SELECT json_extract(payload, '$.cloud_session_id') AS c FROM events WHERE session_id = ? AND json_extract(payload, '$.cloud_session_id') IS NOT NULL ORDER BY id DESC LIMIT 1",
+        ).get(sessionId)?.c ?? null)
+      : null,
     // Same rule as the list: only when there is no title to use instead.
     first_prompt: roll?.custom_title || roll?.ai_title
       ? null

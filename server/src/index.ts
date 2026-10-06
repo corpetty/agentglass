@@ -15,6 +15,7 @@ import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
 import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, requestRemote, streamRemote, type FleetWsData } from "./fleethub.ts";
 import { startUplink, uplinkStatus, setTunnelDispatch } from "./fleetlink.ts";
 import { HOST_ID_RE } from "./fleetwire.ts";
+import { startCloudIntake, cloudIntakeStatus } from "./cloudintake.ts";
 import {
   insertEvent,
   getRecent,
@@ -2653,6 +2654,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
         if (caller.principal === "node") {
           return json({ ok: false, error: `a fleet node credential opens /fleet/link and nothing else, not ${req.method} ${pathname}` }, 403);
         }
+        if (caller.principal === "cloud") {
+          return json({ ok: false, error: "a cloud session credential is only good at the cloud intake, not here" }, 403);
+        }
         if (caller.principal === "hub") {
           return json({ ok: false, error: `the hub's request was granted "${caller.scope}" here, and ${req.method} ${pathname} needs more — or is not something this machine opens to its hub` }, 403);
         }
@@ -4967,7 +4971,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // Both halves on one page: what this machine forwards to, and who forwards
     // here. A read, so a paired phone can see whether the box is linked.
     if (pathname === "/fleet/status") {
-      return json({ host: hostId(), upstream: uplinkStatus(), nodes: fleetNodes() });
+      return json({ host: hostId(), upstream: uplinkStatus(), nodes: fleetNodes(), cloud: cloudIntakeStatus() });
     }
 
     /*
@@ -4995,6 +4999,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const host = typeof b.host === "string" ? b.host.trim() : "";
       if (!HOST_ID_RE.test(host)) return json({ ok: false, error: "host must be a plain label: letters, digits, . _ -" }, 400);
       if (host === hostId()) return json({ ok: false, error: `"${host}" is this hub's own name` }, 400);
+      if (activeDevices().some((d) => d.role === "cloud" && d.host === host)) {
+        return json({ ok: false, error: `"${host}" is the name cloud sessions are stored under — pick another for this machine` }, 409);
+      }
       const existing = activeDevices().filter((d) => d.role === "node" && d.host === host);
       if (existing.length && b.replace !== true) {
         return json({ ok: false, error: `"${host}" already has a node credential — pass replace to revoke it and mint a new one` }, 409);
@@ -5062,9 +5069,38 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const a = await requestRemote(host, method, path, query, body, scope);
       return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
     }
+    /*
+     * Mint a cloud credential (phase 5): what a cloud environment's settings
+     * carry so its sessions can report to the cloud intake. At the machine, as
+     * a node credential is. It opens nothing on this server (`allowed` refuses
+     * principal "cloud" outright) and is checked only by the intake, which is
+     * why no machine token is required to mint one: there is nothing here for
+     * it to be checked against. `name` is the host its sessions are stored
+     * under — `cloud` unless you want to tell environments apart.
+     */
+    if (pathname === "/fleet/clouds" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (!atMachine()) return notHere();
+      let b: { name?: unknown; replace?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.name === "string" && b.name.trim() ? b.name.trim() : "cloud";
+      if (!HOST_ID_RE.test(host)) return json({ ok: false, error: "name must be a plain label: letters, digits, . _ -" }, 400);
+      if (host === hostId()) return json({ ok: false, error: `"${host}" is this hub's own name` }, 400);
+      if (activeDevices().some((d) => d.role === "node" && d.host === host)) {
+        return json({ ok: false, error: `"${host}" is a linked machine's name — pick another for cloud sessions` }, 409);
+      }
+      const existing = activeDevices().filter((d) => d.role === "cloud" && d.host === host);
+      if (existing.length && b.replace !== true) {
+        return json({ ok: false, error: `"${host}" already has a cloud credential — pass replace to revoke it and mint a new one` }, 409);
+      }
+      for (const d of existing) revokeDevice(d.id);
+      const { device, token } = issueDevice(`cloud sessions (${host})`, "read", Date.now(), { host, role: "cloud" });
+      return json({ ok: true, token, device: publicDevice(device), intake: cloudIntakeStatus().port });
+    }
     if (pathname === "/fleet/nodes") {
       const creds = activeDevices().filter((d) => d.role === "node").map(publicDevice);
-      return json({ nodes: fleetNodes(), credentials: creds });
+      const clouds = activeDevices().filter((d) => d.role === "cloud").map(publicDevice);
+      return json({ nodes: fleetNodes(), credentials: creds, clouds, cloud: cloudIntakeStatus() });
     }
 
     if (pathname === "/pair/ticket" && req.method === "POST") {
@@ -9494,7 +9530,7 @@ function foreignResumeRefusal(b: { resumeId?: unknown }): string | null {
 // notification on this desk, and phase 3 is where another machine's holds
 // learn to reach it deliberately rather than as a side effect.
 const FOREIGN_LIVE_MS = 10 * 60_000;
-whenForeignRows(({ inserted, sessions }) => {
+function pushForeign({ inserted, sessions }: { inserted: number[]; sessions: string[] }): void {
   for (const sid of sessions) sessionCache.delete(sid);
   const recent = Date.now() - FOREIGN_LIVE_MS;
   let toolEdge = false;
@@ -9507,7 +9543,11 @@ whenForeignRows(({ inserted, sessions }) => {
     if (s.last_seen >= recent && sessionInScope(s)) broadcast({ type: "session", data: s });
   }
   if (toolEdge) pushOpenTools();
-});
+}
+whenForeignRows(pushForeign);
+// Cloud sessions' events (phase 5) arrive through their own listener and are
+// pushed the same way — they are another machine's rows, stored under `cloud`.
+startCloudIntake(pushForeign);
 
 // A linked node started holding a tool call (phase 3). The same alert a hold
 // here raises — the desk's notification and the paired phone's — with the

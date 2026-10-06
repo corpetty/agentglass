@@ -12,6 +12,11 @@
  *                                                 how much the hub may do here (default read)
  *     bun run fleet leave                         stop forwarding
  *
+ *   Cloud sessions (Claude Code on the web) — on the hub:
+ *     bun run fleet add-cloud [name] [--replace]  mint a credential, print the setup
+ *     bun run fleet cloud-hook                    the hook script, for the repository
+ *     bun run fleet cloud-settings                the .claude/settings.json hooks block
+ *
  *   Either:
  *     bun run fleet status
  *
@@ -24,6 +29,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { readFileSync as readText } from "node:fs";
 import { HOST_ID_RE, linkTransportOk } from "../server/src/fleetwire.ts";
 
 const configDir = () => join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "agentglass");
@@ -178,6 +184,10 @@ async function status() {
       console.log(`Workspace:    ${tiers[u.tunnel] ?? u.tunnel}${u.tunnelPending ? ` — "${u.tunnelPending}" after a restart` : ""}`);
     }
   }
+  if (s.cloud?.port || s.cloud?.hosts?.length) {
+    const hosts = (s.cloud.hosts ?? []).map((h: any) => `${h.host} (last ${ago(h.last)}, ${h.events} events this run)`).join(", ");
+    console.log(`Cloud intake: ${s.cloud.port ? `listening on 127.0.0.1:${s.cloud.port}` : "not listening (AGENTGLASS_CLOUD_PORT)"}${hosts ? ` · ${hosts}` : ""}`);
+  }
   if (s.nodes.length) {
     console.log("Nodes:");
     for (const n of s.nodes) {
@@ -186,12 +196,60 @@ async function status() {
   }
 }
 
+/** Where the hook goes in the repository a cloud session works on. */
+const CLOUD_HOOK_PATH = ".claude/hooks/agentglass_cloud.py";
+const CLOUD_EVENTS = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SubagentStop", "SessionEnd"];
+
+/** The hooks block for the repository's .claude/settings.json. Every event the
+ *  dashboard draws, each running the one script, which sends nothing unless it
+ *  is in a cloud session with the hub's URL and token in its environment. */
+function cloudSettings(): string {
+  const hook = [{ type: "command", command: `python3 "$CLAUDE_PROJECT_DIR/${CLOUD_HOOK_PATH}"`, timeout: 10 }];
+  const hooks: Record<string, unknown[]> = {};
+  for (const e of CLOUD_EVENTS) {
+    hooks[e] = [e === "PreToolUse" || e === "PostToolUse" ? { matcher: "*", hooks: hook } : { hooks: hook }];
+  }
+  return JSON.stringify({ hooks }, null, 2);
+}
+
+function cloudHook(): string {
+  return readText(new URL("../hooks/cloud_hook.py", import.meta.url).pathname, "utf8");
+}
+
+async function addCloud(args: string[]) {
+  const name = args.find((a) => !a.startsWith("--")) ?? "cloud";
+  const r = await call("/fleet/clouds", { method: "POST", body: JSON.stringify({ name, replace: args.includes("--replace") }) });
+  const port: number | null = r.intake ?? null;
+  console.log(`Minted a cloud credential; sessions that use it are stored as host "${name}". Shown once — copy it now.\n`);
+  console.log(`  ${r.token}\n`);
+  console.log("Setup, once:\n");
+  console.log(`1. This hub needs its cloud intake listening: set AGENTGLASS_CLOUD_PORT (e.g. 4010) and restart.`);
+  console.log(`   ${port ? `It is listening on 127.0.0.1:${port} now.` : "It is NOT listening yet."}`);
+  console.log(`2. Put the intake — and only the intake — on the internet with Tailscale Funnel:`);
+  console.log(`     tailscale funnel --bg --set-path /cloud/ingest http://127.0.0.1:${port ?? 4010}`);
+  console.log(`   Never funnel the main server's port: it opens shells.`);
+  console.log(`3. In the repository the cloud sessions work on, commit the hook and its settings:`);
+  console.log(`     bun run fleet cloud-hook > <repo>/${CLOUD_HOOK_PATH}`);
+  console.log(`     bun run fleet cloud-settings     # merge into <repo>/.claude/settings.json`);
+  console.log(`   Safe to commit: outside a cloud session, or without the two variables below, it sends nothing.`);
+  console.log(`4. In the cloud environment's settings on claude.ai (Environments → yours):`);
+  console.log(`     AGENTGLASS_CLOUD_URL=https://<this hub's funnel name>.ts.net`);
+  console.log(`     AGENTGLASS_CLOUD_TOKEN=${r.token}`);
+  console.log(`   and set its network access to Custom with your funnel hostname allowed (or Full) —`);
+  console.log(`   the default "Trusted" level cannot reach it.\n`);
+  console.log("What arrives: live tool calls, prompts and replies; cost when a turn ends. Not available for");
+  console.log("cloud sessions: history from before the hook, holds you can approve, or the workspace panels.");
+}
+
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "add-node": await addNode(rest); break;
   case "nodes": await nodes(); break;
   case "join": await join_(rest); break;
   case "leave": await leave(); break;
+  case "add-cloud": await addCloud(rest); break;
+  case "cloud-hook": process.stdout.write(cloudHook()); break;
+  case "cloud-settings": console.log(cloudSettings()); break;
   case "status": case undefined: await status(); break;
-  default: die(`unknown command "${cmd}" — add-node, nodes, join, leave, status`);
+  default: die(`unknown command "${cmd}" — add-node, nodes, join, leave, add-cloud, cloud-hook, cloud-settings, status`);
 }

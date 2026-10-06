@@ -306,7 +306,7 @@ export interface Caller {
    * is the fence going up before the thing that needs fencing arrives, which is
    * the only order in which a fence is ever built correctly.
    */
-  principal?: "understudy" | "seat" | "node" | "hub";
+  principal?: "understudy" | "seat" | "node" | "hub" | "cloud";
   /** When `principal` is `seat`: which project's chair, and what that chair
    *  was granted. Carried on the caller rather than looked up per request so
    *  the grant is the one made at seating — changing the setting afterwards
@@ -486,6 +486,10 @@ export function callerFor(req: Request, url: URL, token: string): Caller | null 
   if (eq(provided, token)) return { kind: "machine", scope: "full" };
   const device = deviceFor(provided);
   if (device?.role === "node") return { kind: "device", scope: "read", device, principal: "node" };
+  // A cloud session's credential (docs/FLEET.md, phase 5). It is only ever
+  // checked by the cloud intake, which is a different listener; on this server
+  // it opens nothing at all — see `allowed`.
+  if (device?.role === "cloud") return { kind: "device", scope: "read", device, principal: "cloud" };
   return device ? { kind: "device", scope: device.scope, device } : null;
 }
 
@@ -778,6 +782,10 @@ export function allowed(caller: Caller, method: string, pathname: string): boole
      would hand back every write this exists to withhold. */
   if (caller.principal === "seat") return seatAllows(caller.seat?.powers ?? "speak", method, pathname);
   if (caller.principal === "node") return nodeAllows(method, pathname);
+  // Valid at the cloud intake and nowhere here. A token that sits in a cloud
+  // environment's settings is the most exposed credential this app hands out,
+  // so it buys nothing on the server that can open a shell.
+  if (caller.principal === "cloud") return false;
   // A request carried here by the hub: tunnelAllows' routes and nothing else,
   // and within them only what its scope reaches. Both, never either.
   if (caller.principal === "hub") {
@@ -840,6 +848,7 @@ export function answersFromADevice(caller: Caller | null | undefined): boolean {
   // the gate relay (fleetlink.ts), where the node checks the hold was offered;
   // this door must not be a second way in.
   if (caller?.principal === "hub") return false;
+  if (caller?.principal === "cloud") return false;
   // A plugin is spelled out too, although `kind === "device"` below already
   // excludes it, for the same reason the understudy is: this is the door, and
   // the caller that was walking through it until the kind existed (see

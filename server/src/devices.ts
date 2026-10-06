@@ -88,9 +88,10 @@ export interface Device {
    * in auth.ts. It is still a device so the one list that answers "what can
    * reach this machine" shows it, and so Forget cuts it off like anything else.
    */
-  role?: "node";
-  /** For a node: the one host name it may forward rows as. Bound when the
-   *  credential is minted, so a node cannot speak for a machine it is not. */
+  role?: "node" | "cloud";
+  /** For a node or a cloud intake: the one host name its rows are stored
+   *  under. Bound when the credential is minted, so it cannot speak for a
+   *  machine it is not. */
   host?: string;
 }
 
@@ -210,7 +211,7 @@ export function activeDevices(): Device[] {
  */
 export function issueDevice(
   label: string, scope: Scope = "answer", now = Date.now(),
-  node?: { host: string },
+  node?: { host: string; role?: "node" | "cloud" },
 ): { device: Device; token: string } {
   const token = randomBytes(32).toString("base64url");
   const device: Device = {
@@ -221,7 +222,7 @@ export function issueDevice(
     // is written as the narrowest there is rather than whatever was passed.
     scope: node ? "read" : scope,
     createdAt: now,
-    ...(node ? { role: "node" as const, host: node.host } : {}),
+    ...(node ? { role: node.role ?? "node", host: node.host } : {}),
   };
   const f = store();
   save({ ...f, devices: [...(f.devices ?? []), device] });

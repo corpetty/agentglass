@@ -5,10 +5,10 @@ for watching several — a desk, a laptop, a headless box driven over Remote
 Control, and, as far as it can go, sessions running in Anthropic's cloud — from
 a single cockpit.
 
-Status: **phases 1–4 built** — every row knows its host, nodes forward to a
-hub, a node's held tool calls can be answered there, the hub's Git panel reads
-a node's repositories, and a node's session can be resumed from the hub and run
-there. Phase 5 is design, not code.
+Status: **all five phases built** — every row knows its host, nodes forward to
+a hub, a node's held tool calls can be answered there, the hub's Git panel reads
+a node's repositories, a node's session can be resumed from the hub and run
+there, and Claude Code cloud sessions report their live events to the hub.
 
 ## Setting it up
 
@@ -307,19 +307,51 @@ What the read tier leaves open:
 
 ### 5. Cloud sessions (live events only)
 
-Repo hooks run in single-repo Claude Code cloud sessions, and `type: "http"`
-hooks can post out if the environment's network policy allows the destination.
+Built: `cloudintake.ts` (the listener), `hooks/cloud_hook.py` (the hook a
+repository commits), `POST /fleet/clouds`, and `bun run fleet add-cloud`.
 
-- The hub grows a **separate ingest-only listener**: `/ingest` and nothing else,
-  token required, exposed with Tailscale Funnel. The real server — the one that
-  opens shells — is never on the internet.
-- The repo hook fires only when `CLAUDE_CODE_REMOTE` is set *and* the token env
-  is present, so a clone of the repo posts nowhere.
-- Cloud rows are stamped host `cloud`, session id from
-  `CLAUDE_CODE_REMOTE_SESSION_ID`.
-- What you do not get: transcript history (there is no API for cloud
-  transcripts), gates, or workspace panels. Cost only if a command hook embeds
-  the transcript at `Stop`.
+Repo hooks run in single-repo Claude Code cloud sessions (Claude Code on the
+web), whose image has `python3`. So a repository can carry a hook that reports
+its cloud sessions to your hub.
+
+- **A separate listener, and the only thing on the internet.** Set
+  `AGENTGLASS_CLOUD_PORT` and the hub opens a second `Bun.serve` on loopback
+  serving exactly one route — `POST /cloud/ingest` (or `/`, for a funnel that
+  strips its mount path) — with a cloud credential. Every other path is a 404.
+  Front that port, and only that port, with Tailscale Funnel; the main server,
+  which opens shells, is never on the internet.
+- **A cloud credential** is a device with `role: "cloud"`, bound to the host
+  name its sessions are stored under (`cloud` by default; name environments
+  apart if you like). It is checked only by the intake and opens nothing on the
+  main server. Forget it in the Remote pane to stop reporting.
+- **The hook is safe to commit.** It reads its URL and token from the cloud
+  environment's settings — never the repository — and does nothing at all
+  unless `CLAUDE_CODE_REMOTE` is set, the URL is `https`, and the token is
+  present. A clone on somebody's laptop runs it and sends nothing. It never
+  prints and always exits 0, so it cannot block or alter the session (Claude
+  Code: a hook that exits 0 with no output has no effect).
+- **What arrives** is the same body the local forwarder sends, normalized by
+  the same code and stored under the credential's host — so every guard on
+  another machine's rows applies. Prompts, tool calls and replies arrive live;
+  at `Stop` the transcript rides along so the turn is priced. The session's
+  claude.ai id (`CLAUDE_CODE_REMOTE_SESSION_ID`) is kept, and its deep-dive
+  offers **Open on claude.ai** in place of Resume.
+- **What does not:** history from before the hook was committed (there is no
+  API for cloud transcripts), holds you can approve from the hub, and the
+  workspace panels — a cloud container is not a node.
+
+Setup, once — `bun run fleet add-cloud` prints all of it with your token filled in:
+
+1. On the hub: `AGENTGLASS_CLOUD_PORT=4010` (any free port), restart.
+2. `tailscale funnel --bg --set-path /cloud/ingest http://127.0.0.1:4010`
+3. In the repository: `bun run fleet cloud-hook > .claude/hooks/agentglass_cloud.py`
+   and merge `bun run fleet cloud-settings` into `.claude/settings.json`.
+4. In the cloud environment's settings on claude.ai: `AGENTGLASS_CLOUD_URL`
+   (your funnel's `https://….ts.net`) and `AGENTGLASS_CLOUD_TOKEN`, and network
+   access set to **Custom** with that hostname allowed, or **Full** — the
+   default *Trusted* level cannot reach it. Whether a `*.ts.net` host can be
+   added to a Custom allowlist is not stated in Claude Code's docs; if it
+   cannot, Full is the fallback.
 
 ---
 

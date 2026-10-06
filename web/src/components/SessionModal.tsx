@@ -9,6 +9,7 @@ import { api } from "../lib/api.ts";
 import { usePoll } from "../lib/usePoll.ts";
 import { useServerHost, ranElsewhere } from "../lib/useServerHost.ts";
 import { remoteRoot } from "../lib/remoteRoot.ts";
+import { openExternal } from "../lib/externalUrl.ts";
 import { Markdown } from "../lib/markdown.tsx";
 import { fmtUsd, fmtTokens, fmtEq, fmtAgo, fmtTime, modelLabelOf, modelColor, sessionTitle } from "../lib/format.ts";
 import { ToolRow } from "./ToolRow.tsx";
@@ -244,6 +245,16 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                             title={`Continue this conversation on ${d.host}, in ${sessionCwd(d)} — it runs there, not here`}
                             style={{ color: "var(--success)", background: "color-mix(in srgb, var(--success) 12%, transparent)", borderColor: "color-mix(in srgb, var(--success) 45%, transparent)" }}>
                             <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Resume on {d.host}
+                          </button>
+                        ) : d.cloud_session ? (
+                          // A cloud session (phase 5): it can be continued on
+                          // claude.ai and nowhere else. Its id there is the
+                          // reported `cse_…` with the prefix swapped for
+                          // `session_` — what Claude Code's own docs say the
+                          // session URL carries.
+                          <button onClick={() => openExternal(`https://claude.ai/code/${d.cloud_session!.replace(/^cse_/, "session_")}`)}
+                            className="chip cursor-pointer" title="Continue this cloud session on claude.ai">
+                            <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Open on claude.ai
                           </button>
                         ) : (
                           // Its transcript and checkout are on that machine, and
