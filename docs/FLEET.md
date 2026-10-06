@@ -6,8 +6,9 @@ Control, and, as far as it can go, sessions running in Anthropic's cloud — fro
 a single cockpit.
 
 Status: **phases 1–4 built** — every row knows its host, nodes forward to a
-hub, a node's held tool calls can be answered there, and the hub's Git panel
-reads a node's repositories. Phase 5 is design, not code.
+hub, a node's held tool calls can be answered there, the hub's Git panel reads
+a node's repositories, and a node's session can be resumed from the hub and run
+there. Phase 5 is design, not code.
 
 ## Setting it up
 
@@ -245,15 +246,58 @@ Built: the **read** tier — `req`/`res` frames, `tunnelAllows` in auth.ts,
   `/fleet/proxy`, and puts the prefix back on any path in the answer that sits
   under the root it asked about. Panels keep passing `root` around as before.
 
-Next tiers, in order: chat / resume (runs `claude --resume` on the owning node;
-needs a streamed answer, and answers only from the hub pinned at start, as
-gates do) → terminal last, if ever. A PTY across the link is both the hardest
-to stream and the most dangerous thing to grant.
+#### Second tier: chat and resume
+
+Built: the `answer` and `chat` tiers, streamed answers (`res-head`/`res-data`/
+`res-end`, `cancel`), scoped tunnel credentials, and "Resume on <host>".
+
+- **A node chooses how far the hub may go** (`TunnelTier` in auth.ts):
+
+  | tier | the hub may |
+  |---|---|
+  | `off` | nothing |
+  | `read` *(default)* | read the workspace views |
+  | `answer` | also reply to a session that is running now |
+  | `chat` | also resume an idle session or start a new chat |
+
+  Set it with `bun run fleet join … --tunnel=chat`, `"tunnel"` in
+  `upstream.json`, or `AGENTGLASS_UPSTREAM_TUNNEL`. The chat tiers open exactly
+  the chat routes (`/chat/send`, `/chat/pane/key`, `/chat/active`,
+  `/chat/panes`) — never the terminal, git writes, Codex or anything else.
+- **A turn runs with the lower of two scopes:** the hub caller's (a phone paired
+  for `answer` stays `answer`) and the node's tier (`answer` → `answer`, `chat`
+  → `full`). The node runs each tunnelled request with an in-memory credential
+  for exactly that scope — principal `hub`, fenced in `allowed` to the tunnel's
+  routes — so chat.ts's own `scopedTurn` draws the line it already draws for a
+  paired phone: `answer` replies to what is running, `full` wakes what is not.
+  The hub grades the caller against the inner route too, before forwarding.
+- **Only the hub this node started with.** `answer` and `chat` start agents at
+  the hub's word, so they take the line gate answers take: a tier set after the
+  node started stands at `read` until it restarts. `fleet status` says so.
+- **Streamed.** The node sends the answer's head, then its body as it comes,
+  then the end; the hub hands its caller a stream. Stopping the turn at the hub
+  cancels the stream, and the node stops the turn — the whole process tree —
+  exactly as a local stop does.
+- **The ask-and-approve rule holds across the link.** The device that sent a
+  remote session its turn cannot also allow that turn's held call at the hub;
+  the hub records the sender, since it is where the hold is decided.
+- **In the UI,** another machine's session offers **Resume on <host>** when
+  that node is linked at the `chat` tier. The chat opens with its directory as
+  `@host:/path`, so every turn routes there; its history replays from the
+  forwarded session, and it follows along live from the forwarded events.
+
+Last tier: the terminal, if ever. A PTY across the link is both the hardest to
+stream and the most dangerous thing to grant.
 
 What the read tier leaves open:
 
-- **Only the Git panel reads remote repositories.** Files, chat, budgets and
-  the rest list this machine's only.
+- **Only the Git panel reads remote repositories**, and only a session's own
+  Resume opens a remote chat. Files, budgets and the rest list this machine's
+  only, and the chat panel's own resume picker lists this machine's sessions.
+- **Claude only.** Codex and Antigravity chats are not carried.
+- **A remote chat's permission prompt** (the tmux engine's on-screen "allow?")
+  is answered through gates, not through `/chat/pane/key` keystrokes from the
+  hub's chat view, which address panes by this machine's session names.
 - **Views outside the tier** — the PR badge, anything under `/prs` — answer
   "read-only over the fleet link" for a remote repository.
 - **Switching to a linked worktree** of a remote repository from inside it is

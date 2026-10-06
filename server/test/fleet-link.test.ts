@@ -6,7 +6,7 @@
 // a credential taken back at the hub stops the node — so this drives both for
 // real, each with its own HOME, database and port.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { freePort } from "./freePort.ts";
@@ -20,14 +20,32 @@ let node: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string };
 let nodeToken = "";
 let rooterToken = "";
 let rooter: { base: string; proc: ReturnType<typeof Bun.spawn>; dir: string } | null = null;
+let fakeDir = "";
 
-async function boot(name: string, extra: Record<string, string>) {
+/**
+ * A stand-in for `claude` on rooter's PATH: says it started a session, says
+ * one thing, and finishes — or, when told to be slow, starts and then waits,
+ * so a test can stop it from the hub and see it die on rooter.
+ */
+function writeFakeClaude(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  const script = `#!/bin/sh
+echo "$@" > "${dir}/argv"
+echo '{"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"}'
+if [ -f "${dir}/slow" ]; then echo $$ > "${dir}/pid"; sleep 30; fi
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from rooter"}]}}'
+echo '{"type":"result","subtype":"success","result":"hello from rooter","session_id":"11111111-2222-4333-8444-555555555555"}'
+`;
+  writeFileSync(join(dir, "claude"), script, { mode: 0o755 });
+}
+
+async function boot(name: string, extra: Record<string, string>, pathFirst: string[] = []) {
   const dir = join(root, name);
   mkdirSync(dir, { recursive: true });
   const port = await freePort();
   const proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
     env: {
-      PATH: [dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
+      PATH: [...pathFirst, dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"].join(":"),
       TMUX_TMPDIR: TMUX_TEST_TMPDIR,
       HOME: dir,
       XDG_CONFIG_HOME: dir,
@@ -168,11 +186,15 @@ describe("joining a node to a hub", () => {
 
   test("a hold on a node is answered at the hub and takes effect on the node", async () => {
     // rooter starts already configured, which is the case where answers are taken.
+    fakeDir = join(root, "fake-claude");
+    writeFakeClaude(fakeDir);
     rooter = await boot("rooter", {
       AGENTGLASS_HOST_ID: "rooter",
       AGENTGLASS_UPSTREAM_URL: hub.base,
       AGENTGLASS_UPSTREAM_TOKEN: rooterToken,
-    });
+      // Configured at start, so the chat tier is in force (see tierInForce).
+      AGENTGLASS_UPSTREAM_TUNNEL: "chat",
+    }, [fakeDir]);
     const rooterBase = rooter.base;
     await until("rooter's link", async () => (await body(fetch(rooterBase + "/fleet/status"))).upstream.state === "live");
     expect((await body(fetch(rooterBase + "/fleet/status"))).upstream.gates).toBe("relayed");
@@ -240,6 +262,59 @@ describe("joining a node to a hub", () => {
     expect((await proxied("GET", "/terminal/pty")).status).toBe(403);
     // Nothing was staged on rooter.
     expect(new TextDecoder().decode(git("diff", "--cached", "--name-only").stdout).trim()).toBe("");
+  }, 30_000);
+
+  test("a node says what it opens, and the hub can tell", async () => {
+    const nodes = (await body(asHub("/fleet/nodes"))).nodes;
+    expect(nodes.find((n: any) => n.host === "rooter")?.tunnel).toBe("chat");
+    // bean joined at runtime with the default: read.
+    expect(nodes.find((n: any) => n.host === "bean")?.tunnel).toBe("read");
+  });
+
+  test("a turn sent at the hub runs on rooter and streams back", async () => {
+    const repo = join(rooter!.dir, "proj");
+    const r = await asHub("/fleet/proxy", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ host: "rooter", method: "POST", path: "/chat/send", body: { cwd: repo, message: "say hello", model: "claude-opus-5" } }),
+    });
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toContain("ndjson");
+    const text = await r.text();
+    expect(text).toContain("hello from rooter");
+    expect(text).toContain("11111111-2222-4333-8444-555555555555");
+    // It ran on rooter, as a turn: rooter's fake claude saw the arguments.
+    expect(readFileSync(join(fakeDir, "argv"), "utf8")).toContain("-p");
+  }, 30_000);
+
+  test("a node at the read tier will not take a turn", async () => {
+    const r = await asHub("/fleet/proxy", {
+      method: "POST", headers: { Origin: hub.base },
+      body: JSON.stringify({ host: "bean", method: "POST", path: "/chat/send", body: { cwd: "/tmp", message: "hi" } }),
+    });
+    expect(r.status).toBe(403);
+    expect((await body(r)).error).toContain("bean");
+  });
+
+  test("stopping a turn at the hub stops it on rooter", async () => {
+    const repo = join(rooter!.dir, "proj");
+    writeFileSync(join(fakeDir, "slow"), "1");
+    try { rmSync(join(fakeDir, "pid")); } catch { /* first run */ }
+    const ctl = new AbortController();
+    const r = await asHub("/fleet/proxy", {
+      method: "POST", headers: { Origin: hub.base }, signal: ctl.signal,
+      body: JSON.stringify({ host: "rooter", method: "POST", path: "/chat/send", body: { cwd: repo, message: "take your time", model: "claude-opus-5" } }),
+    });
+    const reader = r.body!.getReader();
+    await reader.read(); // the init line: it is running
+    const pid = Number(await until("the fake claude's pid", async () => {
+      try { return readFileSync(join(fakeDir, "pid"), "utf8").trim() || null; } catch { return null; }
+    }, 5000));
+    expect(pid).toBeGreaterThan(0);
+    ctl.abort();
+    await until("the turn to die on rooter", async () => {
+      try { process.kill(pid, 0); return false; } catch { return true; }
+    }, 10_000);
+    rmSync(join(fakeDir, "slow"));
   }, 30_000);
 
   test("a node that is not linked answers as such", async () => {

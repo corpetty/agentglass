@@ -414,11 +414,19 @@ async function turnStream(
   signal?: AbortSignal,
 ): Promise<void> {
   let res: Response;
+  // A chat in another machine's checkout (`cwd: "@rooter:/path"`) is a turn on
+  // that machine: carried there through this server's /fleet/proxy and
+  // streamed back unchanged, so everything below reads it as a local turn.
+  // That machine decides whether it takes it (docs/FLEET.md, phase 4).
+  const remote = remoteTarget(path, payload);
+  if (remote && "error" in remote) throw new ChatStreamError("refused", remote.error);
+  const url = remote ? SERVER + "/fleet/proxy" : SERVER + path;
+  const sent = remote ? { host: remote.host, method: "POST", path: remote.path, body: remote.body } : payload;
   // A fetch that throws before a response has arrived never reached the
   // server, which is a different problem from one that dies mid-turn — the
   // turn has not started, so there is nothing running to go back to.
   try {
-    res = await fetch(SERVER + path, { method: "POST", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify(payload), signal });
+    res = await fetch(url, { method: "POST", headers: authHeaders({ "content-type": "application/json" }), body: JSON.stringify(sent), signal });
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") throw e;
     throw new ChatStreamError("unreachable", "");
@@ -958,7 +966,7 @@ const realApi = {
   // clock would move spend onto a day it was never recorded on.
   usageDaily: (days = 90) => get<UsageHistory>(`/usage/daily?days=${days}`),
   /** This server's name and its place in a fleet (docs/FLEET.md). */
-  fleetStatus: () => get<{ host: string; upstream: { state: string }; nodes: { host: string; connected: boolean }[] }>(`/fleet/status`),
+  fleetStatus: () => get<{ host: string; upstream: { state: string }; nodes: { host: string; connected: boolean; tunnel?: string | null }[] }>(`/fleet/status`),
   sessions: (limit = 100, provider?: string, account?: string, host?: string) =>
     get<SessionRollup[]>(`/sessions?limit=${limit}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}${account ? `&account=${encodeURIComponent(account)}` : ""}${host ? `&host=${encodeURIComponent(host)}` : ""}`),
   // `hosts` is optional because an older server does not send it.
@@ -2277,7 +2285,7 @@ const demoApi: typeof realApi = {
   focusPane: (_p: { sessionId: string; windowId: string; paneId: string }) => D({ ok: false, error: "not in the demo" }),
   // The demo is one fabricated machine; a fleet of fake ones would be a lie
   // about a feature nobody can see working there.
-  fleetStatus: () => D({ host: "demo", upstream: { state: "off" }, nodes: [] as { host: string; connected: boolean }[] }),
+  fleetStatus: () => D({ host: "demo", upstream: { state: "off" }, nodes: [] as { host: string; connected: boolean; tunnel?: string | null }[] }),
   stats: (windowMs: number, provider?: string) => D(demo.stats(windowMs, provider)),
   usageDaily: (days = 90) => D(demo.usageDaily(days)),
   sessions: (_limit?: number, provider?: string) => D(demo.sessions(provider)),

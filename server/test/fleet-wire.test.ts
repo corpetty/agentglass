@@ -200,3 +200,62 @@ describe("phase 4: what a hub may read on a node", () => {
     expect(parseHubFrame(JSON.stringify({ ...ok, body: "x".repeat(70_000) }))).toBeNull();
   });
 });
+
+describe("phase 4, second tier: chat through the link", () => {
+  test("each tier opens what it says and no more", async () => {
+    const { tunnelAllows } = await import("../src/auth.ts");
+    // read: workspace views only
+    expect(tunnelAllows("GET", "/git/log", "read")).toBe(true);
+    expect(tunnelAllows("POST", "/chat/send", "read")).toBe(false);
+    // answer and chat: the chat routes join, and nothing else does
+    for (const tier of ["answer", "chat"] as const) {
+      expect(tunnelAllows("POST", "/chat/send", tier)).toBe(true);
+      expect(tunnelAllows("POST", "/chat/pane/key", tier)).toBe(true);
+      expect(tunnelAllows("GET", "/chat/active", tier)).toBe(true);
+      for (const [m, p] of [["POST", "/git/commit"], ["GET", "/terminal/pty"], ["POST", "/codex/send"], ["POST", "/gate/decide"], ["POST", "/chat/pane/close"]]) {
+        expect(tunnelAllows(m!, p!, tier)).toBe(false);
+      }
+    }
+    expect(tunnelAllows("GET", "/git/log", "off")).toBe(false);
+  });
+
+  test("a request runs with the lower of the hub caller's scope and the node's tier", async () => {
+    const { narrower, TIER_SCOPE } = await import("../src/auth.ts");
+    expect(narrower("full", TIER_SCOPE.answer!)).toBe("answer");   // the desk, at an answer-tier node
+    expect(narrower("answer", TIER_SCOPE.chat!)).toBe("answer");   // a phone, at a chat-tier node
+    expect(narrower("read", TIER_SCOPE.chat!)).toBe("read");
+    expect(narrower("full", TIER_SCOPE.chat!)).toBe("full");
+  });
+
+  test("the credential a tunnelled request runs with is fenced to the tunnel, whatever its scope", async () => {
+    const { tunnelTokenFor, callerFor, allowed, answersFromADevice } = await import("../src/auth.ts");
+    const as = (scope: "read" | "answer" | "full") => {
+      const req = new Request("http://127.0.0.1/x", { headers: { Authorization: `Bearer ${tunnelTokenFor(scope)}` } });
+      return callerFor(req, new URL(req.url), "machine-token")!;
+    };
+    const full = as("full");
+    expect(full.principal).toBe("hub");
+    expect(allowed(full, "POST", "/chat/send")).toBe(true);
+    expect(allowed(full, "GET", "/terminal/pty")).toBe(false);   // full, and still not the terminal
+    expect(allowed(full, "POST", "/git/commit")).toBe(false);
+    expect(answersFromADevice(full)).toBe(false);
+    const answer = as("answer");
+    expect(allowed(answer, "POST", "/chat/send")).toBe(true);    // scopedTurn then limits it to running sessions
+    const read = as("read");
+    expect(allowed(read, "POST", "/chat/send")).toBe(false);
+    expect(allowed(read, "GET", "/git/log")).toBe(true);
+    // One credential per scope, reused — not one per request.
+    expect(tunnelTokenFor("answer")).toBe(tunnelTokenFor("answer"));
+  });
+
+  test("stream frames are checked", () => {
+    expect(parseNodeFrame(JSON.stringify({ t: "res-head", rid: 3, status: 200, type: "application/x-ndjson" })).ok).toBe(true);
+    expect(parseNodeFrame(JSON.stringify({ t: "res-data", rid: 3, chunk: "{}\n" })).ok).toBe(true);
+    expect(parseNodeFrame(JSON.stringify({ t: "res-end", rid: 3 })).ok).toBe(true);
+    expect(parseNodeFrame(JSON.stringify({ t: "res-head", rid: 3, status: 99, type: "x" })).ok).toBe(false);
+    expect(parseHubFrame(JSON.stringify({ t: "cancel", rid: 3 }))).toEqual({ t: "cancel", rid: 3 });
+    // A request that does not say whose it is asks for nothing beyond read.
+    expect((parseHubFrame(JSON.stringify({ t: "req", rid: 1, method: "GET", path: "/git/log", query: "" })) as any).scope).toBeUndefined();
+    expect(parseHubFrame(JSON.stringify({ t: "req", rid: 1, method: "GET", path: "/git/log", query: "", scope: "root" }))).not.toHaveProperty("scope");
+  });
+});

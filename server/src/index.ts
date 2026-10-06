@@ -12,7 +12,7 @@ import { normalize, detectError, clampIngestTimestamp, externalIngestError } fro
 import { pricingProvenance, startPricingRefresh } from "./pricing.ts";
 import { db } from "./db.ts";
 import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
-import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, requestRemote, type FleetWsData } from "./fleethub.ts";
+import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, requestRemote, streamRemote, type FleetWsData } from "./fleethub.ts";
 import { startUplink, uplinkStatus, setTunnelDispatch } from "./fleetlink.ts";
 import { HOST_ID_RE } from "./fleetwire.ts";
 import {
@@ -173,7 +173,7 @@ import { treeAuthors, liveSessions, recentSessions, editsBy } from "./sharedtree
 import { paneStatus } from "./agentdone.ts";
 import { windowRepo } from "./windowrepo.ts";
 import { takeSpawnSlot } from "./spawncap.ts";
-import { chatSend, activeTurns, turnActive, sentTurnTo, turnSenderKey, CHAT_ENABLED, CHAT_BYPASS_ALLOWED, CHAT_ENGINE_DEFAULT } from "./chat.ts";
+import { chatSend, activeTurns, turnActive, sentTurnTo, turnSenderKey, noteTurnSender, CHAT_ENABLED, CHAT_BYPASS_ALLOWED, CHAT_ENGINE_DEFAULT } from "./chat.ts";
 import { paneEngineCapability, attachCommand, validPaneName, screenNeedsYou } from "./chatpane.ts";
 import { tmuxBinStatus, tmuxSocket, engineSocketArgs } from "./tmuxbin.ts";
 import { applyTmuxConf, resetTmuxConf, confHealth, ensureConf, sweepStaleConfs } from "./tmuxconf.ts";
@@ -204,7 +204,7 @@ import { join as joinPath, resolve as resolvePath, basename } from "node:path";
 import { hostname, tmpdir } from "node:os";
 import { privateHost, resolvePeer, originOf, guardedFetch, hostsOnly } from "./net.ts";
 import { DESK_HEADER, claimDesk, deskHeld } from "./desk.ts";
-import { resolveToken, tunnelAllows, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
+import { resolveToken, tunnelAllows, tunnelOfRequest, tunnelTokenFor, narrower, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
 import {
   listPlugins, masterEnabled, setMaster, installPlugin, installFromCatalogue, updatePlugin, enablePlugin, disablePlugin, removePlugin, setPluginUnboxedConsent,
   contributesOf, isRunning, pluginSettings, setPluginSettings, resumeEnabledPlugins, stopAllPluginsSync, pluginIcon,
@@ -1402,7 +1402,7 @@ import { bunBin, NO_BUN } from "./bunbin.ts";
 import { understudyRunEnv } from "./understudy-runenv.ts";
 import { recoverAfterRestart, startUnderstudyWatchdog, stopUnderstudyWatchdog, setResumeHook, setGitHook, setFenceHook, setAliveHook, setBunHook, setBusyHook } from "./understudy-watchdog.ts";
 import { openRequests, helpHistory, markAnswered } from "./understudy-help.ts";
-import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, issueDevice, type Scope } from "./devices.ts";
+import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, issueDevice, scopeAllows, type Scope } from "./devices.ts";
 import { credentialsPath, hasCredential } from "./credentials.ts";
 import { startCardWatch, cardForTitle } from "./clickupwatch.ts";
 import * as CardIndex from "./clickupindex.ts";
@@ -2621,7 +2621,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // plugin over the plugin socket reached a full-scope route (measured:
     // `POST /plugins/master` answered 200; with a machine token set the same
     // call is 403).
-    if ((AUTH_TOKEN || pluginOfRequest(req, url)) && !isAuthExempt(pathname, sinkFrom)) {
+    // A request the fleet hub carried here (tunnelOfRequest) gets a caller the
+    // same way, so a node with no machine token still grades it by the scope it
+    // was granted rather than waving it through as this machine.
+    if ((AUTH_TOKEN || pluginOfRequest(req, url) || tunnelOfRequest(req, url)) && !isAuthExempt(pathname, sinkFrom)) {
       caller = callerFor(req, url, AUTH_TOKEN ?? "");
       if (!caller) return json({ ok: false, error: "unauthorized — pass ?token= or Authorization: Bearer" }, 401);
       if (!allowed(caller, req.method, pathname)) {
@@ -2649,6 +2652,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
         }
         if (caller.principal === "node") {
           return json({ ok: false, error: `a fleet node credential opens /fleet/link and nothing else, not ${req.method} ${pathname}` }, 403);
+        }
+        if (caller.principal === "hub") {
+          return json({ ok: false, error: `the hub's request was granted "${caller.scope}" here, and ${req.method} ${pathname} needs more — or is not something this machine opens to its hub` }, 403);
         }
         if (caller.principal === "understudy") {
           recordFence(pathname, req.method);
@@ -3698,6 +3704,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
        * so this hub never holds the record that rule reads.
        */
       const remote = held ? null : remoteGate(String(b.id));
+      if (remote && decision === "allow" && sentTurnTo(remote.session_id, turnSenderKey(caller))) {
+        return json({ ok: false, error: "this device sent that session its turn — another device or the desk has to allow it" }, 403);
+      }
       if (remote) {
         const origin = req.headers.get("origin");
         const who = actorOf(clientIp, caller ? { ...asActor(caller)!, fromPage: !!origin && vouchedOrigin(origin) } : caller);
@@ -5019,11 +5028,38 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const path = q < 0 ? raw : raw.slice(0, q);
       const query = q < 0 ? "" : raw.slice(q + 1);
       if (!HOST_ID_RE.test(host) || !path.startsWith("/")) return json({ ok: false, error: "host and path are required" }, 400);
-      if (!tunnelAllows(method, path)) {
-        return json({ ok: false, error: `${method} ${path} is read-only over the fleet link — do it on ${host}` }, 403);
+      // The widest a node could open; the node's own tier is the real ceiling.
+      if (!tunnelAllows(method, path, "chat")) {
+        return json({ ok: false, error: `${method} ${path} is not something a linked machine opens to its hub — do it on ${host}` }, 403);
+      }
+      /*
+       * The caller's own reach, for the request it is forwarding.
+       *
+       * /fleet/proxy itself is a read (READ_POST), so the gate above only knew
+       * this caller may read. A chat turn through it needs what that turn
+       * needs here — `answer` to reply, more to start one — so it is graded
+       * again against the inner route, and the caller's scope travels with the
+       * request: the node runs it with the lower of this and its own tier. A
+       * null caller is the machine (no token configured), which is `full`.
+       */
+      const scope = caller?.scope ?? "full";
+      const needs = scopeNeeded(method, path);
+      if (!scopeAllows(scope, needs)) {
+        return json({ ok: false, error: `this device is paired for "${scope}" access, and ${method} ${path} on ${host} needs "${needs}"` }, 403);
       }
       const body = b.body === undefined ? undefined : JSON.stringify(b.body);
-      const a = await requestRemote(host, method, path, query, body);
+      if (method === "POST" && path === "/chat/send") {
+        const resumeId = typeof (b.body as { resumeId?: unknown })?.resumeId === "string" ? (b.body as { resumeId: string }).resumeId : "";
+        noteAction(clientIp, "/chat/send", { root: `${host}:${String((b.body as { cwd?: unknown })?.cwd ?? "")}`, name: String((b.body as { model?: unknown })?.model ?? "") }, { ok: true }, asActor(caller));
+        const a = await streamRemote(host, method, path, query, body, narrower(scope, "full"));
+        // The same rule a local turn keeps (chat.ts noteTurnSender): the device
+        // that sent a session its turn is not the one that allows that turn's
+        // held call. The hold arrives from the node and is decided here, so the
+        // record has to be here too — see the remote branch of /gate/decide.
+        if (a.status < 300 && scope !== "full" && resumeId) noteTurnSender(resumeId, turnSenderKey(caller));
+        return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
+      }
+      const a = await requestRemote(host, method, path, query, body, scope);
       return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
     }
     if (pathname === "/fleet/nodes") {
@@ -9484,18 +9520,21 @@ whenRemoteGate((host, g) => {
 });
 
 // What runs a request the hub carried to this machine (phase 4): this server's
-// own router, as a call from this machine — over loopback, with this machine's
-// token when it has one — so its own scope and repository checks decide. The
-// node's ceiling (tunnelAllows) has already been applied in fleetlink.ts; this
-// is only the door it then walks through.
+// own router, over loopback, carrying a credential for exactly the scope the
+// request was granted — so this machine's own scope and repository checks
+// decide, and `allowed` fences it to tunnelAllows' routes again. The node's
+// ceiling has already been applied in fleetlink.ts; this is the door it walks
+// through, and the door checks too.
 const tunnelServer = {
   requestIP: () => ({ address: "127.0.0.1", family: "IPv4" }),
   port: PORT,
   upgrade: () => false,
 } as unknown as Server<WsData>;
-setTunnelDispatch((r) => {
+setTunnelDispatch((r, scope) => {
   const headers = new Headers(r.headers);
-  if (AUTH_TOKEN) headers.set("Authorization", `Bearer ${AUTH_TOKEN}`);
+  // The credential for the scope this request was granted — never this
+  // machine's own token. See tunnelTokenFor in auth.ts.
+  headers.set("Authorization", `Bearer ${tunnelTokenFor(scope)}`);
   const url = new URL(r.url);
   url.port = String(PORT);
   return handleServerRequest(new Request(url.href, { method: r.method, headers, body: r.body }), tunnelServer);

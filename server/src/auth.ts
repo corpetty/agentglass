@@ -306,7 +306,7 @@ export interface Caller {
    * is the fence going up before the thing that needs fencing arrives, which is
    * the only order in which a fence is ever built correctly.
    */
-  principal?: "understudy" | "seat" | "node";
+  principal?: "understudy" | "seat" | "node" | "hub";
   /** When `principal` is `seat`: which project's chair, and what that chair
    *  was granted. Carried on the caller rather than looked up per request so
    *  the grant is the one made at seating — changing the setting afterwards
@@ -479,6 +479,8 @@ export function callerFor(req: Request, url: URL, token: string): Caller | null 
   }
   const seat = seatTokens.get(provided);
   if (seat) return { kind: "machine", scope: "full", principal: "seat", seat };
+  const tunnelled = tunnelTokens.get(provided);
+  if (tunnelled) return { kind: "device", scope: tunnelled, principal: "hub" };
   const plugin = pluginTokens.get(provided);
   if (plugin) return { kind: "plugin", scope: plugin.scope, plugin: plugin.name };
   if (eq(provided, token)) return { kind: "machine", scope: "full" };
@@ -520,10 +522,70 @@ export function nodeAllows(method: string, pathname: string): boolean {
  */
 const TUNNEL_PREFIXES = ["/git/", "/files/"];
 const TUNNEL_EXACT = new Set(["/changes", "/fs/complete"]);
-export function tunnelAllows(method: string, pathname: string): boolean {
+/*
+ * The chat tier's routes (phase 4, second tier): sending a turn into a session
+ * on the node — a reply, a resume, a new chat — and the two reads a chat panel
+ * makes while it waits. Exactly these and no others: a chat tier opens a
+ * conversation, never the terminal, git writes or anything else `full` buys.
+ * How far a turn may go (reply only, or wake an idle session) is not decided
+ * here but by the scope the request is run with — see TunnelTier.
+ */
+const TUNNEL_CHAT = new Set(["POST /chat/send", "POST /chat/pane/key", "GET /chat/active", "GET /chat/panes"]);
+
+/**
+ * How much of itself a node opens to its hub. Set on the node, never by the hub.
+ *
+ *   off     nothing
+ *   read    the workspace views, read-only (the default)
+ *   answer  + replying to a session that is running now
+ *   chat    + resuming an idle session or starting a new chat
+ *
+ * `answer` and `chat` differ only in the scope a tunnelled turn is run with —
+ * `answer` and `full` — and chat.ts's scopedTurn already draws exactly that
+ * line for a paired phone: answer replies to what is running, full wakes what
+ * is not. So the node's tier caps the scope, the hub caller's own scope caps it
+ * again, and the lower of the two is what the turn runs as.
+ */
+export type TunnelTier = "off" | "read" | "answer" | "chat";
+export const TIER_SCOPE: Record<TunnelTier, Scope | null> = { off: null, read: "read", answer: "answer", chat: "full" };
+
+export function tunnelAllows(method: string, pathname: string, tier: TunnelTier = "read"): boolean {
+  if (tier === "off") return false;
   if (pathname.includes("..") || pathname.includes("//")) return false;
+  if (tier !== "read" && TUNNEL_CHAT.has(`${method} ${pathname}`)) return true;
   const area = TUNNEL_EXACT.has(pathname) || TUNNEL_PREFIXES.some((p) => pathname.startsWith(p));
   return area && scopeNeeded(method, pathname) === "read";
+}
+
+/** The lower of two scopes. */
+export function narrower(a: Scope, b: Scope): Scope {
+  return scopeAllows(a, b) ? b : a;
+}
+
+/*
+ * Credentials for requests the hub carried to this node, one per scope, in
+ * memory, minted on first use and gone on restart — never written down, never
+ * in an environment. fleetlink.ts runs each tunnelled request with the one for
+ * the scope it was granted (the lower of the hub caller's and this node's
+ * tier), so a phone paired for `answer` at the hub reaches a node session as
+ * `answer` and not as this machine. The principal is `hub`, fenced in
+ * `allowed` to tunnelAllows' routes whatever its scope says.
+ */
+const tunnelTokens = new Map<string, Scope>();
+const tunnelByScope = new Map<Scope, string>();
+export function tunnelTokenFor(scope: Scope): string {
+  let t = tunnelByScope.get(scope);
+  if (!t) {
+    t = `hb_${randomBytes(24).toString("base64url")}`;
+    tunnelByScope.set(scope, t);
+    tunnelTokens.set(t, scope);
+  }
+  return t;
+}
+/** Whether this request carries a tunnel credential — the zero-config gate in
+ *  index.ts asks, so a node with no machine token still builds a caller for it. */
+export function tunnelOfRequest(req: Request, url: URL): boolean {
+  return tunnelTokens.has(presented(req, url));
 }
 
 /**
@@ -716,6 +778,11 @@ export function allowed(caller: Caller, method: string, pathname: string): boole
      would hand back every write this exists to withhold. */
   if (caller.principal === "seat") return seatAllows(caller.seat?.powers ?? "speak", method, pathname);
   if (caller.principal === "node") return nodeAllows(method, pathname);
+  // A request carried here by the hub: tunnelAllows' routes and nothing else,
+  // and within them only what its scope reaches. Both, never either.
+  if (caller.principal === "hub") {
+    return tunnelAllows(method, pathname, "chat") && scopeAllows(caller.scope, scopeNeeded(method, pathname));
+  }
   // A plugin's own channel: its panels, its settings, its event queue, its
   // notes. Open at any scope because drawing is not a power over anything
   // else — what it may draw was declared in its manifest and approved, and
@@ -769,6 +836,10 @@ export function answersFromADevice(caller: Caller | null | undefined): boolean {
   // A node is a device by kind and a machine by nature: refused by name, so a
   // future widening of the line below cannot let another box release a hold.
   if (caller?.principal === "node") return false;
+  // Nor a request the hub carried here. The hub releases a node's holds through
+  // the gate relay (fleetlink.ts), where the node checks the hold was offered;
+  // this door must not be a second way in.
+  if (caller?.principal === "hub") return false;
   // A plugin is spelled out too, although `kind === "device"` below already
   // excludes it, for the same reason the understudy is: this is the door, and
   // the caller that was walking through it until the kind existed (see

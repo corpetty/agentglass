@@ -13,6 +13,11 @@
  */
 const RE = /^@([A-Za-z0-9][A-Za-z0-9._-]{0,62}):(\/.*)$/;
 
+/** Body fields that hold what a person wrote, not a path. Never rewritten and
+ *  never consulted: a chat message or a commit message that happens to begin
+ *  `@rooter:/` is text, and must reach its destination exactly as typed. */
+const FREE_TEXT = new Set(["message", "title", "body", "reason", "text", "prompt", "summary", "description", "query", "subject"]);
+
 export function remoteRoot(host: string, path: string): string {
   return `@${host}:${path}`;
 }
@@ -57,7 +62,8 @@ export function remoteTarget(path: string, body?: unknown):
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const b: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(body as Record<string, unknown>)) {
-      b[k] = typeof v === "string" ? take(v, k)
+      b[k] = FREE_TEXT.has(k) ? v
+        : typeof v === "string" ? take(v, k)
         : Array.isArray(v) ? v.map((x) => (typeof x === "string" ? take(x) : x))
         : v;
     }

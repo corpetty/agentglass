@@ -7,7 +7,9 @@
  *     bun run fleet nodes                         who forwards here
  *
  *   On each node:
- *     bun run fleet join <hub-url> <token>        forward this machine's rows
+ *     bun run fleet join <hub-url> <token> [--tunnel=read|answer|chat|off]
+ *                                                 forward this machine's rows; --tunnel says
+ *                                                 how much the hub may do here (default read)
  *     bun run fleet leave                         stop forwarding
  *
  *   Either:
@@ -105,8 +107,12 @@ async function nodes() {
 }
 
 async function join_(args: string[]) {
-  const [hub, token] = args;
-  if (!hub || !token) die("usage: fleet join <hub-url> <token>");
+  const [hub, token] = args.filter((a) => !a.startsWith("--"));
+  if (!hub || !token) die("usage: fleet join <hub-url> <token> [--tunnel=read|answer|chat|off]");
+  const tunnelArg = args.find((a) => a.startsWith("--tunnel="))?.slice("--tunnel=".length);
+  if (tunnelArg !== undefined && !["off", "read", "answer", "chat"].includes(tunnelArg)) {
+    die("--tunnel is one of off, read, answer, chat");
+  }
   let url: URL;
   try { url = new URL(hub); } catch { die(`not a URL: ${hub}`); }
   if (!linkTransportOk(url, process.env.AGENTGLASS_UPSTREAM_INSECURE === "1")) {
@@ -126,10 +132,16 @@ async function join_(args: string[]) {
   const me = await call("/fleet/status");
   const p = upstreamFile();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify({ url: url.origin + url.pathname.replace(/\/+$/, ""), token }, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(p, JSON.stringify({
+    url: url.origin + url.pathname.replace(/\/+$/, ""), token, ...(tunnelArg ? { tunnel: tunnelArg } : {}),
+  }, null, 2) + "\n", { mode: 0o600 });
   try { chmodSync(p, 0o600); } catch { /* not every fs has modes */ }
   console.log(`Joined: "${me.host}" forwards to ${url.origin}.`);
   console.log("The running server picks this up within a few seconds — watch it with: bun run fleet status");
+  if (tunnelArg === "answer" || tunnelArg === "chat") {
+    console.log(`The hub may ${tunnelArg === "chat" ? "resume and start" : "reply to running"} sessions here once agentglass restarts:`);
+    console.log("answers and turns are only taken from the hub this machine started with.");
+  }
 }
 
 async function leave() {
@@ -157,9 +169,13 @@ async function status() {
     }[u.gates as string] ?? u.gates;
     if (u.state === "live") console.log(`Gates:        ${gates}`);
     if (u.state === "live") {
-      console.log(`Workspace:    ${u.tunnel === "read"
-        ? "the hub can read this machine's repositories (git, read-only)"
-        : "closed to the hub (AGENTGLASS_UPSTREAM_TUNNEL=off, or \"tunnel\": \"off\" in upstream.json)"}`);
+      const tiers: Record<string, string> = {
+        off: "closed to the hub",
+        read: "the hub can read this machine's repositories (git, read-only)",
+        answer: "the hub can read repositories and reply to sessions running here",
+        chat: "the hub can read repositories, and resume or start sessions here",
+      };
+      console.log(`Workspace:    ${tiers[u.tunnel] ?? u.tunnel}${u.tunnelPending ? ` — "${u.tunnelPending}" after a restart` : ""}`);
     }
   }
   if (s.nodes.length) {

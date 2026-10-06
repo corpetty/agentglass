@@ -24,8 +24,19 @@
  *
  * Phase 4 — the hub reading a node's workspace (git, files) through it:
  *
- *   hub  → node  req      { t, rid, method, path, query, body? }
+ *   hub  → node  req      { t, rid, method, path, query, body?, scope?, stream? }
  *   node → hub   res      { t, rid, status, type, body }
+ *
+ * Second tier — a chat turn, whose answer is a stream that can run for minutes:
+ *
+ *   node → hub   res-head { t, rid, status, type }
+ *   node → hub   res-data { t, rid, chunk }             zero or more, in order
+ *   node → hub   res-end  { t, rid }
+ *   hub  → node  cancel   { t, rid }                     the person stopped the turn
+ *
+ * `scope` is the hub caller's; the node runs the request with the lower of it
+ * and its own tier. `hello` says which tier the node is at, so the hub can
+ * offer Resume only where it would be taken.
  *
  * The node decides what it will run (`tunnelAllows` in auth.ts) and runs it
  * against its own router, under its own scope; the hub only carries it.
@@ -90,17 +101,28 @@ export interface WireGate {
 }
 
 export type NodeFrame =
-  | { t: "hello"; v: number; host: string; version?: string }
+  | { t: "hello"; v: number; host: string; version?: string; tunnel?: TunnelTierWire; gates?: boolean }
   | { t: "rows"; upto: number; events: WireEvent[]; sessions: WireSession[] }
   | { t: "gates"; gates: WireGate[] }
   | { t: "decided"; id: string; ok: boolean; error?: string }
-  | { t: "res"; rid: number; status: number; type: string; body: string };
+  | { t: "res"; rid: number; status: number; type: string; body: string }
+  | { t: "res-head"; rid: number; status: number; type: string }
+  | { t: "res-data"; rid: number; chunk: string }
+  | { t: "res-end"; rid: number };
 export type HubFrame =
   | { t: "welcome"; v: number; host: string; after: number }
   | { t: "ack"; upto: number }
   | { t: "refuse"; error: string }
   | { t: "decide"; id: string; decision: "allow" | "deny"; reason: string; by: string }
-  | { t: "req"; rid: number; method: "GET" | "POST"; path: string; query: string; body?: string };
+  | { t: "req"; rid: number; method: "GET" | "POST"; path: string; query: string; body?: string; scope?: ScopeWire; stream?: boolean }
+  | { t: "cancel"; rid: number };
+
+/** Kept as string unions here so this file stays free of server imports;
+ *  auth.ts's Scope and TunnelTier are the same strings. */
+export type ScopeWire = "read" | "answer" | "full";
+export type TunnelTierWire = "off" | "read" | "answer" | "chat";
+const SCOPES = new Set<string>(["read", "answer", "full"]);
+const TIERS = new Set<string>(["off", "read", "answer", "chat"]);
 
 /** A request body through the tunnel: a JSON argument, never an upload. */
 export const MAX_TUNNEL_REQUEST = 64 * 1024;
@@ -255,7 +277,12 @@ export function parseNodeFrame(text: string, now = Date.now()):
   if (f.t === "hello") {
     if (f.v !== FLEET_PROTOCOL) return { ok: false, error: `protocol ${String(f.v)} is not ${FLEET_PROTOCOL}` };
     if (typeof f.host !== "string" || !HOST_ID_RE.test(f.host)) return { ok: false, error: "bad host" };
-    return { ok: true, frame: { t: "hello", v: f.v, host: f.host, version: typeof f.version === "string" ? f.version.slice(0, 40) : undefined } };
+    return { ok: true, frame: {
+      t: "hello", v: f.v, host: f.host,
+      version: typeof f.version === "string" ? f.version.slice(0, 40) : undefined,
+      tunnel: typeof f.tunnel === "string" && TIERS.has(f.tunnel) ? f.tunnel as TunnelTierWire : undefined,
+      gates: typeof f.gates === "boolean" ? f.gates : undefined,
+    } };
   }
   if (f.t === "gates") {
     if (!Array.isArray(f.gates) || f.gates.length > MAX_GATES) return { ok: false, error: "bad gates" };
@@ -271,6 +298,17 @@ export function parseNodeFrame(text: string, now = Date.now()):
     if (typeof f.id !== "string" || !GATE_ID_RE.test(f.id) || typeof f.ok !== "boolean") return { ok: false, error: "bad decided" };
     const error = typeof f.error === "string" ? f.error.slice(0, 300) : undefined;
     return { ok: true, frame: { t: "decided", id: f.id, ok: f.ok, ...(error ? { error } : {}) } };
+  }
+  if (f.t === "res-head" || f.t === "res-data" || f.t === "res-end") {
+    if (typeof f.rid !== "number" || !Number.isSafeInteger(f.rid) || f.rid <= 0) return { ok: false, error: "bad stream frame" };
+    if (f.t === "res-end") return { ok: true, frame: { t: "res-end", rid: f.rid } };
+    if (f.t === "res-data") {
+      if (typeof f.chunk !== "string" || f.chunk.length > MAX_TUNNEL_RESPONSE) return { ok: false, error: "bad stream frame" };
+      return { ok: true, frame: { t: "res-data", rid: f.rid, chunk: f.chunk } };
+    }
+    if (typeof f.status !== "number" || !Number.isInteger(f.status) || f.status < 100 || f.status > 599) return { ok: false, error: "bad stream frame" };
+    if (typeof f.type !== "string" || f.type.length > 200) return { ok: false, error: "bad stream frame" };
+    return { ok: true, frame: { t: "res-head", rid: f.rid, status: f.status, type: f.type } };
   }
   if (f.t === "res") {
     if (typeof f.rid !== "number" || !Number.isSafeInteger(f.rid) || f.rid <= 0) return { ok: false, error: "bad res" };
@@ -338,7 +376,15 @@ export function parseHubFrame(text: string): HubFrame | null {
     if (query === null) return null;
     const body = f.body === undefined ? undefined : shortStr(f.body, MAX_TUNNEL_REQUEST);
     if (body === null) return null;
-    return { t: "req", rid: f.rid, method: f.method, path: f.path, query, ...(body !== undefined ? { body } : {}) };
+    // Absent means the narrowest: a hub too old to say whose request it is
+    // gets read access, never more.
+    const scope = typeof f.scope === "string" && SCOPES.has(f.scope) ? f.scope as ScopeWire : undefined;
+    return { t: "req", rid: f.rid, method: f.method, path: f.path, query,
+      ...(body !== undefined ? { body } : {}), ...(scope ? { scope } : {}), ...(f.stream === true ? { stream: true } : {}) };
+  }
+  if (f.t === "cancel") {
+    if (typeof f.rid !== "number" || !Number.isSafeInteger(f.rid) || f.rid <= 0) return null;
+    return { t: "cancel", rid: f.rid };
   }
   return null;
 }

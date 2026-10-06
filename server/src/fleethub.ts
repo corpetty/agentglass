@@ -17,7 +17,7 @@
 import type { ServerWebSocket } from "bun";
 import { hostId } from "./config.ts";
 import type { PendingGate } from "../../shared/types.ts";
-import { FLEET_PROTOCOL, parseNodeFrame, type HubFrame, type WireGate } from "./fleetwire.ts";
+import { FLEET_PROTOCOL, parseNodeFrame, type HubFrame, type WireGate, type ScopeWire, type TunnelTierWire } from "./fleetwire.ts";
 import { applyBatch, fleetNodeRows, nodeCursor, noteNode, type AppliedBatch } from "./fleetstore.ts";
 
 export interface FleetWsData {
@@ -32,6 +32,10 @@ export interface FleetWsData {
   lastBatchAt?: number;
   rows?: number;
   helloTimer?: ReturnType<typeof setTimeout>;
+  /** What the node said it opens to this hub (phase 4). Its own setting — the
+   *  hub only uses it to decide what to offer, never to grant anything. */
+  tunnel?: TunnelTierWire;
+  gates?: boolean;
 }
 type Ws = ServerWebSocket<FleetWsData>;
 
@@ -120,7 +124,14 @@ export function decideRemote(id: string, decision: "allow" | "deny", reason: str
  * once, and a node is somebody's desk, not a server farm.
  */
 export interface TunnelAnswer { status: number; type: string; body: string }
-const tunnel = new Map<number, { host: string; resolve: (a: TunnelAnswer) => void; timer: ReturnType<typeof setTimeout> }>();
+/** A streamed answer: status and type up front, the body as it arrives. */
+export interface TunnelStream { status: number; type: string; body: ReadableStream<Uint8Array> | string }
+type Pending =
+  | { host: string; kind: "whole"; resolve: (a: TunnelAnswer) => void; timer: ReturnType<typeof setTimeout> }
+  | { host: string; kind: "stream"; resolve: (a: TunnelStream) => void; timer: ReturnType<typeof setTimeout>;
+      ctl?: ReadableStreamDefaultController<Uint8Array>; done?: boolean };
+const tunnel = new Map<number, Pending>();
+const enc = new TextEncoder();
 let nextRid = 1;
 const TUNNEL_MS = 30_000;
 const TUNNEL_PER_NODE = 16;
@@ -136,23 +147,64 @@ const answer = (status: number, error: string): TunnelAnswer =>
  * A node that is not linked, too busy, or silent gets an answer in the shape
  * every panel already reads errors in — `{ ok: false, error }` — never a hang.
  */
-export function requestRemote(
-  host: string, method: "GET" | "POST", path: string, query: string, body?: string,
-): Promise<TunnelAnswer> {
+function slotFor(host: string): { ws: Ws; rid: number } | TunnelAnswer {
   const ws = live.get(host);
-  if (!ws) return Promise.resolve(answer(502, `${host} is not linked to this hub right now`));
+  if (!ws) return answer(502, `${host} is not linked to this hub right now`);
   let inFlight = 0;
   for (const t of tunnel.values()) if (t.host === host) inFlight++;
-  if (inFlight >= TUNNEL_PER_NODE) return Promise.resolve(answer(503, `${host} is busy answering — try again in a moment`));
-  const rid = nextRid++;
+  if (inFlight >= TUNNEL_PER_NODE) return answer(503, `${host} is busy answering — try again in a moment`);
+  return { ws, rid: nextRid++ };
+}
+
+export function requestRemote(
+  host: string, method: "GET" | "POST", path: string, query: string, body?: string, scope: ScopeWire = "read",
+): Promise<TunnelAnswer> {
+  const slot = slotFor(host);
+  if (!("rid" in slot)) return Promise.resolve(slot);
+  const { ws, rid } = slot;
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       tunnel.delete(rid);
       resolve(answer(504, `${host} did not answer in time`));
     }, TUNNEL_MS);
-    tunnel.set(rid, { host, resolve, timer });
-    send(ws, { t: "req", rid, method, path, query, ...(body !== undefined ? { body } : {}) });
+    tunnel.set(rid, { host, kind: "whole", resolve, timer });
+    send(ws, { t: "req", rid, method, path, query, scope, ...(body !== undefined ? { body } : {}) });
   });
+}
+
+/**
+ * The same, for an answer that streams — a chat turn, which can run for many
+ * minutes. Only the head has a deadline: once the node has said "200, here it
+ * comes", the body flows until the node ends it, the node goes away, or the
+ * reader on this side stops reading — which cancels the turn over there, as
+ * stopping a local turn does.
+ */
+export function streamRemote(
+  host: string, method: "GET" | "POST", path: string, query: string, body: string | undefined, scope: ScopeWire,
+): Promise<TunnelStream> {
+  const slot = slotFor(host);
+  if (!("rid" in slot)) return Promise.resolve(slot);
+  const { ws, rid } = slot;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      tunnel.delete(rid);
+      send(ws, { t: "cancel", rid });
+      resolve(answer(504, `${host} did not start answering in time`));
+    }, TUNNEL_MS);
+    tunnel.set(rid, { host, kind: "stream", resolve, timer });
+    send(ws, { t: "req", rid, method, path, query, scope, stream: true, ...(body !== undefined ? { body } : {}) });
+  });
+}
+
+/** Finish a streamed answer from this side: close the reader, forget it. */
+function endStream(rid: number, error?: string): void {
+  const t = tunnel.get(rid);
+  if (!t || t.kind !== "stream") return;
+  tunnel.delete(rid);
+  clearTimeout(t.timer);
+  if (t.done) return;
+  t.done = true;
+  try { if (error) t.ctl?.error(new Error(error)); else t.ctl?.close(); } catch { /* reader already gone */ }
 }
 
 function settle(id: string, r: { ok: boolean; error?: string }): void {
@@ -201,6 +253,8 @@ export function fleetMessage(ws: Ws, msg: string | Buffer): void {
     live.set(f.host, ws);
     ws.data.greeted = true;
     ws.data.version = f.version;
+    ws.data.tunnel = f.tunnel ?? "read";
+    ws.data.gates = f.gates;
     noteNode(f.host, f.version);
     send(ws, { t: "welcome", v: FLEET_PROTOCOL, host: hostId(), after: nodeCursor(f.host) });
     return;
@@ -220,13 +274,43 @@ export function fleetMessage(ws: Ws, msg: string | Buffer): void {
     }
     return;
   }
-  if (f.t === "res") {
+  if (f.t === "res" || f.t === "res-head" || f.t === "res-data" || f.t === "res-end") {
     const t = tunnel.get(f.rid);
     // Only an answer to a request sent to THIS node.
     if (!t || t.host !== ws.data.host) return;
-    clearTimeout(t.timer);
-    tunnel.delete(f.rid);
-    t.resolve({ status: f.status, type: f.type, body: f.body });
+    if (f.t === "res") {
+      clearTimeout(t.timer);
+      tunnel.delete(f.rid);
+      if (t.kind === "whole") t.resolve({ status: f.status, type: f.type, body: f.body });
+      else t.resolve({ status: f.status, type: f.type, body: f.body });
+      return;
+    }
+    if (t.kind !== "stream") return;
+    if (f.t === "res-head") {
+      clearTimeout(t.timer);
+      const rid = f.rid;
+      const nodeWs = ws;
+      t.resolve({
+        status: f.status, type: f.type,
+        body: new ReadableStream<Uint8Array>({
+          start(ctl) { t.ctl = ctl; },
+          // The reader on this side went away — the person stopped the turn,
+          // or closed the tab. Tell the node, which stops it as a local stop would.
+          cancel() {
+            if (t.done) return;
+            t.done = true;
+            tunnel.delete(rid);
+            send(nodeWs, { t: "cancel", rid });
+          },
+        }),
+      });
+      return;
+    }
+    if (f.t === "res-data") {
+      try { t.ctl?.enqueue(enc.encode(f.chunk)); } catch { /* reader gone; cancel() has told the node */ }
+      return;
+    }
+    endStream(f.rid);
     return;
   }
   if (f.t === "decided") {
@@ -267,6 +351,7 @@ export function fleetClose(ws: Ws): void {
   }
   for (const [rid, t] of tunnel) {
     if (t.host !== ws.data.host) continue;
+    if (t.kind === "stream" && t.ctl) { endStream(rid, `${t.host} went offline mid-answer`); continue; }
     clearTimeout(t.timer);
     tunnel.delete(rid);
     t.resolve(answer(502, `${t.host} went offline before answering`));
@@ -286,6 +371,9 @@ export interface FleetNodeStatus {
   /** Rows stored over the current connection. */
   rows: number;
   ip: string | null;
+  /** What the node opens to this hub, as it said in its hello — null when not
+   *  linked. The UI offers Resume on a node only when this is `answer` or `chat`. */
+  tunnel: TunnelTierWire | null;
 }
 
 /** Every node this hub has heard from, and whether it is linked right now. */
@@ -303,6 +391,7 @@ export function fleetNodes(): FleetNodeStatus[] {
       last_batch_at: ws?.data.lastBatchAt ?? null,
       rows: ws?.data.rows ?? 0,
       ip: ws?.data.ip ?? null,
+      tunnel: ws?.data.tunnel ?? null,
     };
   });
 }

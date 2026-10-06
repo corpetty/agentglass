@@ -50,3 +50,10 @@ describe("the other machine's answer", () => {
   });
 });
 
+describe("what a person wrote", () => {
+  test("is never taken for a path, even when it looks like one", () => {
+    const t = remoteTarget("/chat/send", { cwd: "@rooter:/home/u/proj", message: "@bean:/etc/passwd is what I mean" });
+    expect(t).toEqual({ host: "rooter", path: "/chat/send", roots: [], body: { cwd: "/home/u/proj", message: "@bean:/etc/passwd is what I mean" } });
+  });
+});
+
