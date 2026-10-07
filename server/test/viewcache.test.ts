@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * Stale-while-revalidate, which is the whole shape of this cache.
@@ -16,7 +17,7 @@ import { join } from "node:path";
  * asserting is not only what comes back but how many requests it cost. That is
  * the number that gets an integration blocked.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-swr-"));
+const dir = scratchDir(join(tmpdir(), "agx-swr-"));
 const C = await import("../src/credentials.ts");
 const V = await import("../src/clickupviews.ts");
 const CU = await import("../src/clickup.ts");
@@ -256,3 +257,5 @@ describe("pressing Refresh while a background read is in the air", () => {
     expect(b.tasks.length).toBe(1);
   });
 });
+
+afterAll(removeScratch);

@@ -11,12 +11,13 @@
 // `sessions` is the column that cannot simply be summed: it is a
 // COUNT(DISTINCT session_id) per raw id, so a session that switched model
 // version mid-run appears in both rows and would be counted twice by the fold.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-bymodel-"));
+const dir = scratchDir(join(tmpdir(), "agx-bymodel-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "bymodel.db");
@@ -115,3 +116,5 @@ describe("by_model folds raw ids into one row per label", () => {
     expect(byLabel(s, "GPT-5")[0].input_tokens).toBe(100);
   });
 });
+
+afterAll(removeScratch);

@@ -22,16 +22,17 @@
  *     from that same empty discovery — a closed loop with no way out from
  *     inside the application.
  */
-import { test, expect, beforeEach } from "bun:test";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { test, expect, beforeEach, afterAll } from "bun:test";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as U from "../src/understudy.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let store = "";
 
 beforeEach(() => {
-  store = join(mkdtempSync(join(tmpdir(), "agx-fence-restart-")), "understudy.json");
+  store = join(scratchDir(join(tmpdir(), "agx-fence-restart-")), "understudy.json");
   U.__setUnderstudyStorePath(store);
 });
 
@@ -81,3 +82,5 @@ test("a fence name that would match everything is refused on the way IN, not onl
   relaunch();
   expect(U.openProjectName()).not.toBe("/");
 });
+
+afterAll(removeScratch);

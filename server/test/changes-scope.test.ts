@@ -11,9 +11,10 @@
 // worktrees — which is the whole point of this app — hides nearly every edit it
 // should be showing, which is a far worse failure than the noise it replaced.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let repo: string;      // the scoped project
 let linked: string;    // a `git worktree add` of it, as orbit-WEB-1042 is of orbit
@@ -24,7 +25,7 @@ const git = (cwd: string, ...args: string[]) =>
   Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
 
 beforeAll(() => {
-  const box = mkdtempSync(join(tmpdir(), "agx-changes-scope-"));
+  const box = scratchDir(join(tmpdir(), "agx-changes-scope-"));
   repo = join(box, "proj");
   mkdirSync(join(repo, "src"), { recursive: true });
   git(box, "init", "-q", "proj");
@@ -40,7 +41,7 @@ beforeAll(() => {
   mkdirSync(sibling, { recursive: true });
   git(box, "init", "-q", "other");
 
-  elsewhere = mkdtempSync(join(tmpdir(), "agx-elsewhere-"));
+  elsewhere = scratchDir(join(tmpdir(), "agx-elsewhere-"));
   mkdirSync(join(elsewhere, "notes"), { recursive: true });
   writeFileSync(join(elsewhere, "notes", "worklog.md"), "- did a thing\n");
 
@@ -99,3 +100,5 @@ describe("an edit is the project's, or it is not", () => {
     expect(inScope(join(elsewhere, "notes", "worklog.md"), "")).toBe(true);
   });
 });
+
+afterAll(removeScratch);

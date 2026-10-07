@@ -19,15 +19,16 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { reapMirrorSessions } from "../src/tmuxctl.ts";
 import { recordMirrorLease, __forgetMirrorLeases, mirrorLeases } from "../src/mirrorlease.ts";
 import { TEST_TERM } from "./tmuxTerm.ts";
-import { rmSync, mkdtempSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const NAME = `agx-unzoom-${process.pid}`;
 const SOCK = ["-f", "/dev/null", "-L", NAME];
 const sh = (args: string[]) => Bun.spawnSync(["tmux", ...SOCK, ...args], { stdout: "pipe", stderr: "pipe" });
 const out = (args: string[]) => sh(args).stdout.toString().trim();
-const state = mkdtempSync(join(tmpdir(), "agx-unzoom-state-"));
+const state = scratchDir(join(tmpdir(), "agx-unzoom-state-"));
 
 beforeAll(() => {
   process.env.AGENTGLASS_STATE_DIR = state;
@@ -103,3 +104,5 @@ test("and a window the record names is only unzoomed if it is still on that pane
   expect(zoomFlag(), "a different pane is zoomed now — not ours to undo").toBe("1");
   sh(["resize-pane", "-Z", "-t", other]);
 });
+
+afterAll(removeScratch);

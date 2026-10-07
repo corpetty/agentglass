@@ -14,10 +14,11 @@
  * commit nobody meant to make.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { engineAttachArgv, engineBenchArgv, engineConsoleArgv, engineSessionName, benchSessionName } from "../src/tmuxpane.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ROOT0 = process.env.AGENTGLASS_ROOT;
 const NOTES0 = process.env.AGENTGLASS_BENCH_NOTES;
@@ -27,7 +28,7 @@ let repo: string;
 let notes: string;
 
 beforeAll(() => {
-  box = mkdtempSync(join(tmpdir(), "agx-bench-"));
+  box = scratchDir(join(tmpdir(), "agx-bench-"));
   repo = join(box, "orbit");
   rmSync(repo, { recursive: true, force: true });
   Bun.spawnSync(["mkdir", "-p", join(repo, "src")]);
@@ -137,7 +138,7 @@ describe("the note belongs to the checkout, and lives outside it", () => {
 
   it("refuses a checkout outside the open project", async () => {
     const b = await bench();
-    const outside = mkdtempSync(join(tmpdir(), "agx-elsewhere-"));
+    const outside = scratchDir(join(tmpdir(), "agx-elsewhere-"));
     try {
       expect(b.writeNote(outside, "no").ok).toBe(false);
       expect(b.readNote(outside).error).toContain("outside");
@@ -268,3 +269,5 @@ describe("one editor per checkout, and what it may open", () => {
     expect(r.live).toBe(false);
   });
 });
+
+afterAll(removeScratch);

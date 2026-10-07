@@ -21,6 +21,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { leaveCopyMode, scrollPhonePane } from "../src/tmuxctl.ts";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
 /*
  * A server per test, on a socket of its own.
@@ -85,7 +86,7 @@ const history = (): number => Number(tmux("display-message", "-p", "-t", "probe"
 beforeEach(() => {
   sock = `/tmp/agx-pscroll-${process.pid}-${++seq}.sock`;
   SOCKET = ["-f", "/dev/null", "-S", sock];
-  started.push(sock);
+  started.push(trackScratch(sock));
   // Three hundred lines to scroll through, then a process that stays put so the
   // pane does not die under the test.
   tmux("new-session", "-d", "-s", "probe", "-x", "80", "-y", "24",
@@ -190,3 +191,5 @@ describe("handing copy mode back", () => {
     expect(leaveCopyMode(SOCKET, pane)).toBe(false);
   });
 });
+
+afterAll(removeScratch);

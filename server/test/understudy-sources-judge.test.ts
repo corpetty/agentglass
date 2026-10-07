@@ -22,15 +22,16 @@
  *   still about that project. One click ticks them by hand; being asked is the
  *   entire point of the screen.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let SRC: typeof import("../src/understudy-sources.ts");
 
 beforeAll(async () => {
-  const jail = mkdtempSync(join(tmpdir(), "agx-judge-"));
+  const jail = scratchDir(join(tmpdir(), "agx-judge-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -139,3 +140,5 @@ describe("the username never votes", () => {
     }
   });
 });
+
+afterAll(removeScratch);

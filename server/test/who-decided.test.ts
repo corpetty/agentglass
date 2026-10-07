@@ -14,13 +14,13 @@
  *   - two devices with the same name. "A device" is the *default* label, so a
  *     bare label is a collision waiting to happen rather than a rare one.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { actorOf, deviceActor } from "../src/actions.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-whodecided-"));
+const dir = scratchDir(join(tmpdir(), "agx-whodecided-"));
 process.env.AGENTGLASS_DB = join(dir, "who.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -201,3 +201,5 @@ describe("the reason, as a reader sees it", () => {
     expect(gate.typedReason(row(id))).toBe("");
   });
 });
+
+afterAll(removeScratch);

@@ -11,12 +11,11 @@
  * whoever cut the worktree. The fixtures below build exactly that.
  */
 import { describe, expect, test, beforeEach, afterEach, beforeAll, afterAll } from "bun:test";
-import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, lstatSync, symlinkSync, realpathSync, readdirSync,
-} from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, lstatSync, symlinkSync, realpathSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { includeList, seedWorktree, seedSummary, gitIgnored } from "../src/worktreeseed.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // `git check-ignore` reads the global excludes file; the run must not depend
 // on what this machine ignores globally, so git sees no config at all.
@@ -35,7 +34,7 @@ function gitInit(dir: string, ignore: string): void {
   writeFileSync(join(dir, ".gitignore"), ignore);
 }
 beforeEach(() => {
-  home = realpathSync(mkdtempSync(join(tmpdir(), "agx-seed-home-")));
+  home = realpathSync(scratchDir(join(tmpdir(), "agx-seed-home-")));
   root = join(home, "repo");
   wt = join(root, ".worktrees", "x");
   mkdirSync(wt, { recursive: true });
@@ -81,7 +80,7 @@ describe("seeding", () => {
     expect(r.copied).toEqual([".env"]);
     expect(existsSync(join(wt, "README.md"))).toBe(false);
     rmSync(join(root, ".worktreeinclude"));
-    const none = seedWorktree(root, mkdtempSync(join(home, "none-")));
+    const none = seedWorktree(root, scratchDir(join(home, "none-")));
     expect(none).toEqual(EMPTY);
   });
   test("every place a worktree is cut seeds it", async () => {
@@ -163,7 +162,7 @@ describe("only what git ignores", () => {
     expect(seedSummary(r)).toBe("seeded .env · not ignored by git, not copied: notes-local");
   });
   test("a root that is not a repository at all seeds nothing — git has no word to give", () => {
-    const plain = mkdtempSync(join(home, "plain-"));
+    const plain = scratchDir(join(home, "plain-"));
     writeFileSync(join(plain, ".worktreeinclude"), ".env\n");
     writeFileSync(join(plain, ".env"), "x");
     expect(gitIgnored(plain, ".env")).toBe(false);
@@ -175,6 +174,8 @@ describe("only what git ignores", () => {
     writeFileSync(join(root, ".worktreeinclude"), "anything\n");
     writeFileSync(join(root, "anything"), "x");
     expect(seedWorktree(root, wt, () => false, () => true).copied).toEqual(["anything"]);
-    expect(seedWorktree(root, mkdtempSync(join(home, "wt2-")), () => false, () => false).unignored).toEqual(["anything"]);
+    expect(seedWorktree(root, scratchDir(join(home, "wt2-")), () => false, () => false).unignored).toEqual(["anything"]);
   });
 });
+
+afterAll(removeScratch);

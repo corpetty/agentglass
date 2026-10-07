@@ -30,11 +30,12 @@
  *     tailnet client sets those itself. The last test here is about that.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 /** Not this machine's own tailnet address, so it is a device and not "self". */
@@ -127,14 +128,14 @@ async function spawnServer(at: string, port: number, seam: boolean) {
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-serve-proxy-"));
+  dir = scratchDir(join(tmpdir(), "agx-serve-proxy-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = await spawnServer(dir, port, true);
   proxy = startProxy(base);
   via = `http://127.0.0.1:${proxy.port}`;
 
-  plainDir = mkdtempSync(join(tmpdir(), "agx-serve-plain-"));
+  plainDir = scratchDir(join(tmpdir(), "agx-serve-plain-"));
   const plainPort = await freePort();
   plain = `http://127.0.0.1:${plainPort}`;
   plainProc = await spawnServer(plainDir, plainPort, false);
@@ -305,3 +306,5 @@ test("/health proves the token to a direct loopback caller and to nobody through
   const proxied = (await (await fetch(via + "/health?challenge=abc")).json()) as { proof?: string };
   expect(proxied.proof).toBeUndefined();
 });
+
+afterAll(removeScratch);

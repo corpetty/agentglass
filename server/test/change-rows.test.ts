@@ -19,11 +19,12 @@
  * neighbour, which is unreadable as a bug and invisible as a diff.
  */
 import { describe, expect, it, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { changeRows, fileDiff, parseHunks, parseNameStatus, parseNumstat, parseStatusV2 } from "../src/changerows.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /* ── the wire formats ─────────────────────────────────────────────────────── */
 
@@ -139,7 +140,7 @@ const tmps: string[] = [];
 afterAll(() => { for (const d of tmps) rmSync(d, { recursive: true, force: true }); });
 
 function repo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "agx-rows-"));
+  const dir = scratchDir(join(tmpdir(), "agx-rows-"));
   tmps.push(dir);
   const run = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
   run("init", "-q", "-b", "work");
@@ -348,3 +349,5 @@ describe("one file's diff", () => {
     expect((await fileDiff(dir, "a.ts", "working")).sig).not.toBe(first.sig);
   });
 });
+
+afterAll(removeScratch);

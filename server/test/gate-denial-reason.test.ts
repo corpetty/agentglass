@@ -13,13 +13,13 @@
 // happened, that retrying is pointless, and what to do instead. The last two
 // pin the cases that must NOT gain a default, because a reason there changes
 // behaviour rather than wording.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-gate-reason-"));
+const dir = scratchDir(join(tmpdir(), "agx-gate-reason-"));
 process.env.AGENTGLASS_DB = join(dir, "gate.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -175,3 +175,5 @@ describe("the hook hands the reason to Claude Code", () => {
     expect(reason).toMatch(/different approach|ask/i);
   });
 });
+
+afterAll(removeScratch);

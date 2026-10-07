@@ -24,10 +24,11 @@
  * shared-tree-route.test.ts, where the sessions have a cwd to stand in.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { treeAuthors, liveSessions, physical, type TreeEdit } from "../src/sharedtree.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REPO = "/home/dev/code/orbit";
 const WT = "/home/dev/code/orbit-WEB-1042";
@@ -189,7 +190,7 @@ describe("liveSessions", () => {
 describe("physical", () => {
   // git names a checkout by its physical path; a hook names a file by the path
   // the agent used. Through a symlinked directory the two never meet as strings.
-  const box = mkdtempSync(join(tmpdir(), "agx-physical-"));
+  const box = scratchDir(join(tmpdir(), "agx-physical-"));
   const real = join(box, "real");
   mkdirSync(join(real, "src"), { recursive: true });
   symlinkSync(real, join(box, "link"));
@@ -204,3 +205,5 @@ describe("physical", () => {
     expect(physical(join(box, "deleted", "app.ts"))).toBe(join(box, "deleted", "app.ts"));
   });
 });
+
+afterAll(removeScratch);

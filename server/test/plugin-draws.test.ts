@@ -9,12 +9,13 @@
  * calls plugin-ui.ts directly, so what passes is what a plugin author gets.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, src: string, base: string, port: number, proc: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -134,7 +135,7 @@ const heading = async () => {
 };
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-plugin-draws-"));
+  dir = scratchDir(join(tmpdir(), "agx-plugin-draws-"));
   src = join(dir, "src-plugin");
   mkdirSync(src);
   writeFileSync(join(src, "plugin.json"), JSON.stringify(MANIFEST));
@@ -295,3 +296,5 @@ describe("a restart", () => {
     expect(n1.status).toBe("resolved");
   }, SERVER_BOOT_MS + 12_000);
 });
+
+afterAll(removeScratch);

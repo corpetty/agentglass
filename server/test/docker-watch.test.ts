@@ -7,16 +7,17 @@
  * into a guess names the wrong worktree — which is precisely the confusion the
  * ledger exists to end.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __setLedgerPath, ledgerFor } from "../src/dockerledger.ts";
 import { __resetBranchCacheForTest } from "../src/dockerowner.ts";
 import { exitFacts, recordExit } from "../src/dockerwatch.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const dirs: string[] = [];
-const tmp = () => { const d = mkdtempSync(join(tmpdir(), "agx-watch-")); dirs.push(d); return d; };
+const tmp = () => { const d = scratchDir(join(tmpdir(), "agx-watch-")); dirs.push(d); return d; };
 afterEach(() => {
   __setLedgerPath(null);
   __resetBranchCacheForTest();
@@ -110,3 +111,5 @@ describe("recording it", () => {
     expect(recordExit(exitFacts("nonsense"))).toBe(false);
   });
 });
+
+afterAll(removeScratch);

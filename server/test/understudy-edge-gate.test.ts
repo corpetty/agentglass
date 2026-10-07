@@ -13,10 +13,11 @@
  * is the criterion the backtest was pre-registered against before any of this
  * was measured, and the one C3 passed with +32.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let u: typeof import("../src/understudy.ts");
 
@@ -46,7 +47,7 @@ function build(cls: string, n: number, hits: number, alternating: boolean): void
 const rowFor = (cls: string) => u.scorecard().classes.find((c) => c.id === cls)!;
 
 beforeAll(async () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-edge-"));
+  const d = scratchDir(join(tmpdir(), "agx-edge-"));
   mkdirSync(join(d, "config", "git"), { recursive: true });
   writeFileSync(join(d, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(d, "t.db");
@@ -125,3 +126,5 @@ describe("an unmeasured baseline cannot promote anything", () => {
     expect(row.offered).toBe(false);
   });
 });
+
+afterAll(removeScratch);

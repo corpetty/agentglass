@@ -16,7 +16,7 @@
  * this application: it is asserted here so that the day it changes, the test
  * that tells us is the one next to the code that depends on it.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 
 /**
  * The end of the declaration that starts at `from`, for tests that read shape.
@@ -30,13 +30,14 @@ function endOfBlock(text: string, from: number): number {
   const close = text.indexOf("\n}", from);
   return close === -1 ? text.length : close;
 }
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("where a test runner puts its verdict", () => {
   test("bun writes the counts to stderr, not to stdout", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-verdict-"));
+    const dir = scratchDir(join(tmpdir(), "agx-verdict-"));
     writeFileSync(join(dir, "x.test.ts"),
       'import { expect, test } from "bun:test";\ntest("one", () => { expect(1).toBe(1); });\n');
 
@@ -109,3 +110,5 @@ describe("so the runner reads both, at the same time", () => {
     }
   });
 });
+
+afterAll(removeScratch);

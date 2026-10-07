@@ -12,12 +12,13 @@
  * what a rule does once a budget covering the call is already over.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BudgetStatus, GateRule } from "../../shared/types.ts";
 import { gateRuleVerdict } from "../src/gaterules.ts";
 import { readGateRules } from "../src/config.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const rule = (r: Partial<GateRule>): GateRule =>
   ({ root: "", allow: [], deny: [], otherwise: "hold", overBudget: "hold", ...r });
@@ -229,7 +230,7 @@ describe("reading the rules from config.json", () => {
     else process.env.XDG_CONFIG_HOME = saved;
   });
   const withConfig = (gateRules: unknown) => {
-    const d = mkdtempSync(join(tmpdir(), "agx-gaterules-"));
+    const d = scratchDir(join(tmpdir(), "agx-gaterules-"));
     mkdirSync(join(d, "agentglass"), { recursive: true });
     writeFileSync(join(d, "agentglass", "config.json"), JSON.stringify({ gateRules }));
     process.env.XDG_CONFIG_HOME = d;
@@ -280,7 +281,7 @@ describe("reading the rules from config.json", () => {
   });
 
   const withLegacy = (gateTools: unknown, gateRules?: unknown) => {
-    const d = mkdtempSync(join(tmpdir(), "agx-gatetools-"));
+    const d = scratchDir(join(tmpdir(), "agx-gatetools-"));
     mkdirSync(join(d, "agentglass"), { recursive: true });
     writeFileSync(join(d, "agentglass", "config.json"), JSON.stringify({ gateTools, gateRules }));
     process.env.XDG_CONFIG_HOME = d;
@@ -351,7 +352,7 @@ describe("reading the rules from config.json", () => {
  * run in `orbit`, whose own rule said deny.
  */
 describe.skipIf(!Bun.which("git"))("rules on checkouts of one repository", () => {
-  const base = mkdtempSync(join(tmpdir(), "agx-gaterules-wt-"));
+  const base = scratchDir(join(tmpdir(), "agx-gaterules-wt-"));
   const main = join(base, "orbit"), web = join(base, "orbit-web-1042"), api = join(base, "orbit-api-1043");
   const git = (...args: string[]) => {
     const p = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "init.defaultBranch=main", ...args],
@@ -394,3 +395,5 @@ describe.skipIf(!Bun.which("git"))("rules on checkouts of one repository", () =>
     expect(gateRuleVerdict("Bash", join(web, "src"), rules, null).kind).toBe("allow");
   });
 });
+
+afterAll(removeScratch);

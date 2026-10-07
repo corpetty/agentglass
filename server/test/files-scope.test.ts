@@ -6,9 +6,10 @@
 // is not a broken feature, it is a hole — and it would not show up in any
 // screenshot, because the panel would look exactly the same.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ROOT0 = process.env.AGENTGLASS_ROOT;
 let box: string;   // the "workspace"
@@ -16,12 +17,12 @@ let repo: string;  // a checkout inside it
 let outside: string;
 
 beforeAll(() => {
-  box = mkdtempSync(join(tmpdir(), "agx-files-"));
+  box = scratchDir(join(tmpdir(), "agx-files-"));
   repo = join(box, "repo");
   mkdirSync(join(repo, "src"), { recursive: true });
   writeFileSync(join(repo, "src", "a.ts"), "export const a = 1;\n");
   writeFileSync(join(repo, "README.md"), "# hi\n");
-  outside = mkdtempSync(join(tmpdir(), "agx-outside-"));
+  outside = scratchDir(join(tmpdir(), "agx-outside-"));
   writeFileSync(join(outside, "secret.txt"), "not yours\n");
   process.env.AGENTGLASS_ROOT = box;
 });
@@ -137,3 +138,5 @@ describe("search is held to the same boundary", () => {
     expect(r.hits).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

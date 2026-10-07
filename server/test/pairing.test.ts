@@ -8,9 +8,8 @@
  * network. Each of those is a property of this module, so this is where they
  * are pinned.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { createECDH, hkdfSync, createDecipheriv } from "node:crypto";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +18,7 @@ import {
   TICKET_TTL_MS, MAX_ATTEMPTS, MAX_ATTEMPTS_ALL, MAX_TICKETS, INFO,
 } from "../src/pairing.ts";
 import { deviceFor, activeDevices, __resetDevices } from "../src/devices.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /** A phone's keypair, and the half of the exchange only it can do. */
 function phone() {
@@ -41,7 +41,7 @@ beforeEach(() => {
   // Devices are written to disk; keep every case inside the scratch directory
   // the offLimits() guard in devices.ts allows.
   process.env.NODE_ENV = "test";
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-pair-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-pair-"));
   __resetPairing();
   __resetDevices();
 });
@@ -319,3 +319,5 @@ describe("sealTo", () => {
     expect(() => p.open(w, "another-ticket")).toThrow();
   });
 });
+
+afterAll(removeScratch);

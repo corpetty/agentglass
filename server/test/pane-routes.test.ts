@@ -16,19 +16,20 @@
  * installed, and on its own socket with a `sleep` in it — never a `claude`.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED, startSession } from "./tmuxIsolated.ts";
 import { freePort } from "./freePort.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, base: string, socket: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 const A = "6b191fd3-f71e-5010-863d-d32334eaf400";
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-panes-"));
+  dir = scratchDir(join(tmpdir(), "agx-panes-"));
   /*
    * A socket name no other run can be holding, taken from the temp directory
    * this run just made.
@@ -244,3 +245,5 @@ describe("ending one", () => {
     expect(r).toHaveProperty("killed");
   });
 });
+
+afterAll(removeScratch);

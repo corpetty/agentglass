@@ -26,12 +26,13 @@
  * `resolve()` produces, so a test that stubs either one asserts the bug away.
  * These are real directories, a real symlink and a real `git init`.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, symlinkSync, realpathSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-link-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-link-")));
 
 /** The repository, and a link that points at it. */
 const REAL = join(dir, "real-project");
@@ -84,3 +85,5 @@ describe("a scope asked for through a symlink", () => {
     expect(config.sessionInScope({ project_path: join(dir, "somewhere-else") }, scope)).toBe(false);
   });
 });
+
+afterAll(removeScratch);

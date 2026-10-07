@@ -12,7 +12,7 @@
  *     newline in it — because every one of these verbs ends up inside the page.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
   runLanes,
   withObservation,
 } from "../src/browserdrive.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /* The container ledger and the audit log are files on the operator's machine.
    Measured: without this jail the "a refused open claims no container" test
@@ -39,7 +40,7 @@ import {
 let stateScratch = "";
 let stateBefore: string | undefined;
 beforeAll(() => {
-  stateScratch = mkdtempSync(join(tmpdir(), "agx-drive-state-"));
+  stateScratch = scratchDir(join(tmpdir(), "agx-drive-state-"));
   stateBefore = process.env.AGENTGLASS_STATE_DIR;
   process.env.AGENTGLASS_STATE_DIR = stateScratch;
 });
@@ -1654,7 +1655,7 @@ describe("download: a file returned by its local path — spec §11", () => {
   });
 
   test("returns the path the download actually landed at", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agentglass-dl-test-"));
+    const dir = scratchDir(join(tmpdir(), "agentglass-dl-test-"));
     let drains = 0;
     setBrowserSink({
       send: (ask) => queueMicrotask(() => {
@@ -1692,7 +1693,7 @@ describe("download: a file returned by its local path — spec §11", () => {
   });
 
   test("a canceled download is reported, not waited out to the timeout", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agentglass-dl-test-"));
+    const dir = scratchDir(join(tmpdir(), "agentglass-dl-test-"));
     setBrowserSink({
       send: (ask) => queueMicrotask(() => {
         if (ask.op === "click") { settleBrowser(ask.id, { ok: true, value: {} }); return; }
@@ -1717,7 +1718,7 @@ describe("download: a file returned by its local path — spec §11", () => {
   });
 
   test("a completed state with no filename fails loudly rather than guessing", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agentglass-dl-test-"));
+    const dir = scratchDir(join(tmpdir(), "agentglass-dl-test-"));
     setBrowserSink({
       send: (ask) => queueMicrotask(() => {
         if (ask.op === "click") { settleBrowser(ask.id, { ok: true, value: {} }); return; }
@@ -1952,7 +1953,7 @@ describe("dragging and uploading", () => {
      * happens to be, which is not the caller's. The failure mode is a file
      * that silently is not there, which reads as "the upload did nothing".
      */
-    const dir = mkdtempSync(join(tmpdir(), "agx-upload-"));
+    const dir = scratchDir(join(tmpdir(), "agx-upload-"));
     writeFileSync(join(dir, "report.pdf"), "%PDF");
     // The scratch file is admitted through the machine-search roots, so this
     // test says the same thing whatever workspace root an earlier suite in
@@ -1998,7 +1999,7 @@ describe("what an upload may attach", () => {
 
   beforeEach(() => {
     saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
-    home = realpathSync(mkdtempSync(join(tmpdir(), "agx-upload-home-")));
+    home = realpathSync(scratchDir(join(tmpdir(), "agx-upload-home-")));
     process.env.HOME = home;
     process.env.XDG_CONFIG_HOME = join(home, ".config");
     for (const k of ENV.slice(2)) delete process.env[k];
@@ -2048,8 +2049,8 @@ describe("what an upload may attach", () => {
   });
 
   test("with a workspace root, inside it goes and outside it does not — unless the machine-search roots say so", () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "agx-upload-root-")));
-    const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), "agx-upload-elsewhere-")));
+    const root = realpathSync(scratchDir(join(tmpdir(), "agx-upload-root-")));
+    const elsewhere = realpathSync(scratchDir(join(tmpdir(), "agx-upload-elsewhere-")));
     try {
       writeFileSync(join(root, "shot.png"), "png");
       writeFileSync(join(elsewhere, "shot.png"), "png");
@@ -2609,7 +2610,7 @@ describe("§9: the audit says who asked and which tab answered", () => {
   });
 
   test("the log survives a restart — the file is the record, memory is the mirror", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-audit-"));
+    const dir = scratchDir(join(tmpdir(), "agx-audit-"));
     const log = join(dir, "browser-audit.log");
     process.env.AGENTGLASS_BROWSER_AUDIT_LOG = log;
     try {
@@ -2642,7 +2643,7 @@ describe("§9: the audit says who asked and which tab answered", () => {
   });
 
   test("the rotated half of the log is still read — one verb past the cap does not hide 2000 entries", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-audit-"));
+    const dir = scratchDir(join(tmpdir(), "agx-audit-"));
     const log = join(dir, "browser-audit.log");
     process.env.AGENTGLASS_BROWSER_AUDIT_LOG = log;
     try {
@@ -2669,7 +2670,7 @@ describe("§9: the audit says who asked and which tab answered", () => {
   });
 
   test("a torn last line does not take the rest of the log with it", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-audit-"));
+    const dir = scratchDir(join(tmpdir(), "agx-audit-"));
     const log = join(dir, "browser-audit.log");
     process.env.AGENTGLASS_BROWSER_AUDIT_LOG = log;
     try {
@@ -2798,3 +2799,5 @@ describe("§14: settings takes a tab id like every other verb", () => {
     })).toBe(true);
   });
 });
+
+afterAll(removeScratch);

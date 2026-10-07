@@ -12,12 +12,13 @@
  * the JSON-RPC over stdio.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { rmSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const MCP = new URL("../../bin/agentglass-browser-mcp", import.meta.url).pathname;
 const HAVE_PY = !!Bun.which("python3");
@@ -31,7 +32,7 @@ let askedArgs: Record<string, unknown>[] = [];
 const CLIENT = "test-window-mcp";
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-mcp-"));
+  dir = scratchDir(join(tmpdir(), "agx-mcp-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -330,7 +331,7 @@ describe.skipIf(!HAVE_PY)("browser_checkup", () => {
   test("a failure's picture comes back as a path to a private file, not an image", async () => {
     await openWindow();
     answers = { checkup: { ok: true, value: { verdict: "1 problem", url: "u", title: "t", errors: ["TypeError: x"], png: "data:image/png;base64,iVBORw0KGgo=" } } };
-    const cache = mkdtempSync(join(dir, "mcp-cache-"));
+    const cache = scratchDir(join(dir, "mcp-cache-"));
     const p = Bun.spawn(["python3", MCP], {
       env: { PATH: process.env.PATH ?? "", AGENTGLASS_SERVER: base, XDG_CACHE_HOME: cache },
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -403,7 +404,7 @@ describe.skipIf(!HAVE_PY)("the MCP surface addresses its own tab", () => {
 
   /** A fresh tab map. Two of these are two agents who have never met. */
   function freshState() {
-    const s = mkdtempSync(join(tmpdir(), "agx-mcp-tabs-"));
+    const s = scratchDir(join(tmpdir(), "agx-mcp-tabs-"));
     states.push(s);
     return s;
   }
@@ -1356,3 +1357,5 @@ print(json.dumps({b: m._parse_bind(b) for b in ["8765", "127.0.0.1:8765", "[::1]
     expect(same.err).toContain("AGENTGLASS_TOKEN");
   });
 });
+
+afterAll(removeScratch);

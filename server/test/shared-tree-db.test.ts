@@ -8,12 +8,12 @@
  * their JSON parsed at all. Timings would be the direct measure, and on a
  * loaded machine they are also the flaky one.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-process.env.AGENTGLASS_DB = join(mkdtempSync(join(tmpdir(), "agx-shared-tree-db-")), "agentglass.db");
+process.env.AGENTGLASS_DB = join(scratchDir(join(tmpdir(), "agx-shared-tree-db-")), "agentglass.db");
 
 const { db, insertEvent } = await import("../src/db.ts");
 const { normalize } = await import("../src/ingest.ts");
@@ -106,3 +106,5 @@ describe("editsBy", () => {
     expect(editsBy(["s-aging"], NOW + 120_000)).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

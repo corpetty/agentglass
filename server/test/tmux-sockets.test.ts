@@ -5,11 +5,12 @@
 // one server in the list twice. Every pane on it then came back twice, which in
 // the UI reads as two identical panes to choose between.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const base = mkdtempSync(join(tmpdir(), "agx-sock-"));
+const base = scratchDir(join(tmpdir(), "agx-sock-"));
 const dir = join(base, `tmux-${process.getuid?.() ?? 0}`);
 mkdirSync(dir, { recursive: true });
 // Listening, not just present: `tmuxSockets` only answers sockets something
@@ -149,3 +150,5 @@ describe("finding the servers", () => {
     process.env.TMUX_TMPDIR = base;
   });
 });
+
+afterAll(removeScratch);

@@ -9,13 +9,13 @@
  * below is written against the route table in index.ts rather than against a
  * handful of paths, so it keeps being true as that file grows.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { readFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { callerFor, scopeNeeded, allowed, isAuthExempt, isPairing, isIntake } from "../src/auth.ts";
 import { issueDevice, revokeDevice, deviceFor, __resetDevices, type Scope } from "../src/devices.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 
@@ -31,7 +31,7 @@ const at = (url: string, headers: Record<string, string> = {}) =>
 
 beforeEach(() => {
   process.env.NODE_ENV = "test";
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-scope-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-scope-"));
   __resetDevices();
 });
 
@@ -252,3 +252,5 @@ describe("the pairing routes themselves", () => {
     expect(isIntake("/pair/claim")).toBe(true);
   });
 });
+
+afterAll(removeScratch);

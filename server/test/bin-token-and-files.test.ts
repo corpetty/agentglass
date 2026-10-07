@@ -15,10 +15,11 @@
  * Nothing here talks to a server: the URL check runs before a request is built,
  * and the writers are exercised with `call` replaced in the loaded module.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HAVE_PY = !!Bun.which("python3");
 const BIN = (name: string) => new URL(`../../bin/${name}`, import.meta.url).pathname;
@@ -74,7 +75,7 @@ describe.skipIf(!HAVE_PY)("where the token may go", () => {
 
 describe.skipIf(!HAVE_PY)("files that may hold session material", () => {
   test("session save writes cookies and storage 0600, even over a file that was wider", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-bin-files-"));
+    const dir = scratchDir(join(tmpdir(), "agx-bin-files-"));
     try {
       const out = join(dir, "state.json");
       const r = probe(BIN("agentglass-browser"), `
@@ -152,3 +153,5 @@ print(json.dumps({"props": sorted(props), "refused": refused, "allowed_is_error"
     expect(readFileSync(BIN("agentglass-browser"), "utf8")).toContain("ignoreCertErrors");
   });
 });
+
+afterAll(removeScratch);

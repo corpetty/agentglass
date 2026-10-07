@@ -10,18 +10,19 @@
  * `Bun.which` and the last-seen lookup are injected, because what is under test
  * is the judgement, not this container's PATH.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeAgents, agentState, ROSTER } from "../src/agentprobe.ts";
 import type { AgentProbe } from "../../shared/types.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let home: string;
 let saved: Record<string, string | undefined>;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "agx-agents-"));
+  home = scratchDir(join(tmpdir(), "agx-agents-"));
   saved = { HOME: process.env.HOME, CLAUDE: process.env.CLAUDE_CONFIG_DIR };
   /*
    * `HOME`, for every agent including Claude Code.
@@ -187,3 +188,5 @@ describe("reading a config that already exists", () => {
     expect(by(probeAgents(has("codex"), never), "codex").connected).toBe(false);
   });
 });
+
+afterAll(removeScratch);

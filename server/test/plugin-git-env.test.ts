@@ -11,6 +11,7 @@ import { pluginGitEnv, PLUGIN_GIT_CONFIG } from "../src/plugins.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const PLUGINS = await Bun.file(new URL("../src/plugins.ts", import.meta.url)).text();
 const SOURCES = await Bun.file(new URL("../src/plugin-sources.ts", import.meta.url)).text();
@@ -48,10 +49,10 @@ describe("pluginGitEnv", () => {
 
   test("a header scoped to one URL in the user's gitconfig never reaches the host", async () => {
     // What a -c reset cannot clear: measured against a real git and a listener.
-    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const { writeFileSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const home = mkdtempSync(join(tmpdir(), "agx-gitenv-"));
+    const home = scratchDir(join(tmpdir(), "agx-gitenv-"));
     let seen = "";
     const srv = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch(req) { seen += req.headers.get("x-orbit-leak") ?? ""; return new Response("no", { status: 404 }); } });
     try {
@@ -92,7 +93,7 @@ describe("pluginGitEnv", () => {
     // A stub git on the child's PATH writes the environment it was given.
     // Bun.which resolves against the PATH the process started with, so the
     // stub has to be there before the child starts.
-    const root = mkdtempSync(join(tmpdir(), "agx-lsfiles-"));
+    const root = scratchDir(join(tmpdir(), "agx-lsfiles-"));
     try {
       const bin = join(root, "bin");
       const plugin = join(root, "orbit-plugin");
@@ -121,3 +122,5 @@ describe("pluginGitEnv", () => {
     expect(body).not.toContain("process.env");
   });
 });
+
+afterAll(removeScratch);

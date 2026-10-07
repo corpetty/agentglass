@@ -4,13 +4,14 @@
  * away the moment the answer was "keep it" — the row stayed on hold with
  * nothing to show for the measurement it had just made.
  */
-import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "../src/db.ts";
 import * as Work from "../src/understudy-work.ts";
 import { sweepEmptyWorktrees, setGitHook, commitsSpared } from "../src/understudy-watchdog.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REPO = "/tmp/understudy-sweep-probe";
 
@@ -18,7 +19,7 @@ let worktree: string;
 
 beforeEach(() => {
   db.exec("DELETE FROM understudy_work");
-  worktree = mkdtempSync(join(tmpdir(), "understudy-sweep-"));
+  worktree = scratchDir(join(tmpdir(), "understudy-sweep-"));
 });
 
 afterEach(() => {
@@ -171,3 +172,5 @@ test("a branch with nothing on it and nothing in it still goes", async () => {
   expect(asked.some((a) => a.startsWith("worktree remove")), "an empty leftover is the thing this sweep is for").toBe(true);
   expect(swept.length).toBe(1);
 });
+
+afterAll(removeScratch);

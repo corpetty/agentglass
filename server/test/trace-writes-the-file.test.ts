@@ -15,14 +15,15 @@
  * describes an effect nobody produced. So this drives the real function with a
  * stubbed browser and asserts the FILE.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { traceRecording, __setBrowserAsker } from "../src/browserdrive.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string | null = null;
-const scratch = () => (dir ??= mkdtempSync(join(tmpdir(), "agx-trace-")));
+const scratch = () => (dir ??= scratchDir(join(tmpdir(), "agx-trace-")));
 
 afterEach(() => {
   __setBrowserAsker(null);
@@ -119,3 +120,5 @@ describe("stopping a trace", () => {
     expect(existsSync(at)).toBe(false);
   });
 });
+
+afterAll(removeScratch);

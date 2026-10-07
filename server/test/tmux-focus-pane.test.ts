@@ -28,12 +28,13 @@
  * back to the server this process is itself sitting inside.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { focusPaneAnywhere } from "../src/tmuxctl.ts";
 import { TEST_TERM } from "./tmuxTerm.ts";
 import { startSession } from "./tmuxIsolated.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // A private socket directory, shaped exactly as tmux's own — `<TMUX_TMPDIR>/
 // tmux-<uid>/<name>` — so `tmuxSockets`, which lists that directory, discovers
@@ -41,7 +42,7 @@ import { startSession } from "./tmuxIsolated.ts";
 // discovery at it is set in beforeAll, never here, so importing this file does
 // not mutate the process for its neighbours.
 const uid = process.getuid?.() ?? 0;
-const base = mkdtempSync(join(tmpdir(), "agx-focuspane-"));
+const base = scratchDir(join(tmpdir(), "agx-focuspane-"));
 const sockDir = join(base, `tmux-${uid}`);
 mkdirSync(sockDir, { recursive: true });
 const SOCK = join(sockDir, "agx-focus");
@@ -147,3 +148,5 @@ describe("focusPaneAnywhere aims at the desk, not the phone mirror sharing its w
     expect(clientSession()).toBe(MIRROR);
   });
 });
+
+afterAll(removeScratch);

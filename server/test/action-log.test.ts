@@ -12,14 +12,14 @@
  * is asserted over the routing table rather than over the four sites that
  * exist today.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { actorOf, targetOf } from "../src/actions.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-actions-"));
+const dir = scratchDir(join(tmpdir(), "agx-actions-"));
 process.env.AGENTGLASS_DB = join(dir, "actions.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -165,3 +165,5 @@ describe("nothing writes without being recorded", () => {
     expect(index.slice(at, at + 600)).not.toContain("noteAction(");
   });
 });
+
+afterAll(removeScratch);

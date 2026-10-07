@@ -19,13 +19,13 @@
  * else entirely. It runs in its own process because RETENTION_DAYS is read once
  * at module load, which is exactly how the real server reads it.
  */
-import { beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-understudy-retention-"));
+const dir = scratchDir(join(tmpdir(), "agx-understudy-retention-"));
 process.env.AGENTGLASS_DB = join(dir, "retention.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -337,3 +337,5 @@ describe("every understudy table has a window, enumerated", () => {
     expect(src).toContain("WHERE at < ?");
   });
 });
+
+afterAll(removeScratch);

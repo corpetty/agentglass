@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync } from "node:fs";
+import { rmSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The local task list, read against a disposable Taskwarrior store.
@@ -39,7 +40,7 @@ const run = (args: string[], env: Record<string, string>) =>
   Bun.spawnSync(["task", ...args], { env: { ...process.env, TZ, ...env }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-task-"));
+  dir = scratchDir(join(tmpdir(), "agx-task-"));
   const data = join(dir, "data");
   const rc = join(dir, "taskrc");
   writeFileSync(rc, `data.location=${data}\n`);
@@ -148,7 +149,7 @@ describe("capability", () => {
     // Running `task` with rc.confirmation=no to see whether it works
     // auto-answers its first-run question and writes a ~1.5 KB taskrc. The
     // probe asks the filesystem first for exactly this reason.
-    const probe = mkdtempSync(join(tmpdir(), "agx-probe-"));
+    const probe = scratchDir(join(tmpdir(), "agx-probe-"));
     const savedRc = process.env.TASKRC, savedData = process.env.TASKDATA;
     process.env.TASKRC = join(probe, "taskrc");
     process.env.TASKDATA = join(probe, "data");
@@ -195,3 +196,5 @@ describe("the precondition has to hold still", () => {
     expect(one(), "the fingerprint drifted with nobody writing").toBe(a);
   });
 });
+
+afterAll(removeScratch);

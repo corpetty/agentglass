@@ -9,11 +9,11 @@
  * answered was allowed when the hold expired.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-gate-outward-timeout-"));
+const dir = scratchDir(join(tmpdir(), "agx-gate-outward-timeout-"));
 const saved = { db: process.env.AGENTGLASS_DB, xdg: process.env.XDG_CONFIG_HOME };
 process.env.AGENTGLASS_DB = join(dir, "gate.db");
 process.env.XDG_CONFIG_HOME = dir;
@@ -101,3 +101,5 @@ test.skipIf(process.env.AGENTGLASS_GATE_FAILCLOSED === "1")(
   },
   10_000,
 );
+
+afterAll(removeScratch);

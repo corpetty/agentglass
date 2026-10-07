@@ -23,16 +23,17 @@
  *   not ask at all: a fluent answer about nobody in particular, signed with his
  *   name, is the exact failure this feature exists to prevent.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let J: typeof import("../src/understudy-judge.ts");
 let U: typeof import("../src/understudy.ts");
 
 beforeAll(async () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-judge2-"));
+  const d = scratchDir(join(tmpdir(), "agx-judge2-"));
   mkdirSync(join(d, "config", "git"), { recursive: true });
   writeFileSync(join(d, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(d, "t.db");
@@ -203,3 +204,5 @@ describe("nothing private leaves this machine", () => {
     }
   });
 });
+
+afterAll(removeScratch);

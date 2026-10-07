@@ -15,13 +15,14 @@
  * replaced the module for the WHOLE process, which took the real ClickUp suite
  * down with it.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderTask } from "../../shared/providers.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cuwatch-"));
+const dir = scratchDir(join(tmpdir(), "agx-cuwatch-"));
 
 /** What the workspace answers with, swapped per test. Shaped like the real
  *  reader's `CallResult`, failures included: `unauthorised` used to be typed
@@ -321,3 +322,5 @@ describe("comments and mentions", () => {
 });
 
 process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* going away anyway */ } });
+
+afterAll(removeScratch);

@@ -13,11 +13,12 @@
 // own — the user names it once with repoDirs. These tests pin exactly that line:
 // a repo that is ONLY reachable by walking $HOME stays hidden, and the sources
 // that remain each surface it.
-import { describe, expect, test, afterEach, beforeEach } from "bun:test";
+import { describe, expect, test, afterEach, beforeEach, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let home = "";
 let code = "";
@@ -41,7 +42,7 @@ function makeRepo(dir: string, name: string): string {
 // A fresh HOME each time so nothing leaks between cases, and — crucially —
 // UNSCOPED (no AGENTGLASS_ROOT) so discoverRepos takes its whole-machine path.
 beforeEach(() => {
-  home = realpathSync(mkdtempSync(join(tmpdir(), "agx-wm-")));
+  home = realpathSync(scratchDir(join(tmpdir(), "agx-wm-")));
   code = join(home, "code");
   mkdirSync(code, { recursive: true });
   process.env.HOME = home;
@@ -102,3 +103,5 @@ describe("whole-machine discovery no longer walks the disk", () => {
     expect(await discover([])).toContain("elsewhere");
   });
 });
+
+afterAll(removeScratch);

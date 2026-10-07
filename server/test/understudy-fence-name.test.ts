@@ -14,10 +14,10 @@
  * Measured before the fix, on this machine, each of these made
  * `isOpenProjectPath("/home/…/code/<somebody-elses-project>")` true.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const U = await import("../src/understudy.ts");
 
@@ -30,7 +30,7 @@ const U = await import("../src/understudy.ts");
  * partitioned their material against whatever name was left behind. They
  * passed alone and failed in the suite, which is the shape that costs an hour.
  */
-U.__setUnderstudyStorePath(join(mkdtempSync(join(tmpdir(), "agx-fence-")), "understudy.json"));
+U.__setUnderstudyStorePath(join(scratchDir(join(tmpdir(), "agx-fence-")), "understudy.json"));
 
 // A machine's worth of checkouts, all under one folder — which is the shape
 // that makes the folder's name dangerous and the project names fine.
@@ -108,3 +108,5 @@ test("the folder projects live in is refused on a database that knows nothing", 
   // And a real project name still is one.
   expect(U.openProjectNameAllowed("agentglass", [])).toBe(true);
 });
+
+afterAll(removeScratch);

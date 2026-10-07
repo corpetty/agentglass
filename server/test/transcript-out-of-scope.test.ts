@@ -20,11 +20,12 @@
  * drops somebody's sessions would be worse than the cost it saves.
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-scope-"));
+const dir = scratchDir(join(tmpdir(), "agx-scope-"));
 const PROJECTS = join(dir, "projects", "-tmp-elsewhere");
 mkdirSync(PROJECTS, { recursive: true });
 process.env.AGENTGLASS_PROJECTS_DIR = join(dir, "projects");
@@ -211,3 +212,5 @@ describe("a transcript the workspace refuses", () => {
     expect(reads.get(FILE) ?? 0).toBeGreaterThan(0);
   });
 });
+
+afterAll(removeScratch);

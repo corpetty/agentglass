@@ -24,11 +24,12 @@
  * that may answer an Origin-less caller and the reason each may, and
  * KNOWN_GAPS, for the two that should have a gate and do not.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SOURCE, label, mutates, readRoutes } from "./routeTable.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * Deliberate exceptions, each with the reason it is one.
@@ -153,7 +154,7 @@ describe("every route the dispatcher can match", () => {
       + "      return json({ ok: true });\n"
       + "    }\n";
 
-    const dir = mkdtempSync(join(tmpdir(), "agx-route-guard-"));
+    const dir = scratchDir(join(tmpdir(), "agx-route-guard-"));
     const copy = join(dir, "index.ts");
     writeFileSync(
       copy,
@@ -253,3 +254,5 @@ describe("every route the dispatcher can match", () => {
     ).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

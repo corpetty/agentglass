@@ -6,10 +6,11 @@
 //
 // config.ts reads the file once at import, so each case imports a fresh copy
 // with a cache-busting query, mirroring config-root.test.ts.
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, it, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ENV0 = process.env.AGENTGLASS_TERMINAL_DISABLED;
 const XDG0 = process.env.XDG_CONFIG_HOME;
@@ -21,7 +22,7 @@ afterEach(() => {
 });
 
 function loadWith(json: string) {
-  const dir = mkdtempSync(join(tmpdir(), "agx-term-"));
+  const dir = scratchDir(join(tmpdir(), "agx-term-"));
   mkdirSync(join(dir, "agentglass"), { recursive: true });
   writeFileSync(join(dir, "agentglass", "config.json"), json);
   process.env.XDG_CONFIG_HOME = dir;
@@ -54,3 +55,5 @@ describe("terminalDisabledSource", () => {
     expect(cfg.terminalDisabledSource()).toBeNull();
   });
 });
+
+afterAll(removeScratch);

@@ -12,8 +12,8 @@
 // So this file recomputes every hash from the real bytes and reparses the
 // desktop copy out of electron/main.js. It never hard-codes a hash of its own:
 // a test that repeats the constant only proves the constant was copied twice.
-import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
@@ -22,6 +22,7 @@ import {
   SECURITY_HEADERS, DOCUMENT_SECURITY_HEADERS,
 } from "../../shared/csp.ts";
 import { injectSameOrigin } from "../src/webui.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REPO = resolve(import.meta.dir, "../..");
 
@@ -106,7 +107,7 @@ describe("what the HTTP origin actually puts on the wire", () => {
   // process is the only honest way to do that from inside a suite that has
   // already imported it.
   function headersFrom(expr: string): Record<string, string> {
-    const dist = mkdtempSync(join(tmpdir(), "agentglass-csp-"));
+    const dist = scratchDir(join(tmpdir(), "agentglass-csp-"));
     writeFileSync(join(dist, "index.html"), "<html><head></head><body></body></html>");
     writeFileSync(join(dist, "app.js"), "// js");
     try {
@@ -185,3 +186,5 @@ describe("the proxied pictures", () => {
     expect(CSP).toContain("object-src 'none'");
   });
 });
+
+afterAll(removeScratch);

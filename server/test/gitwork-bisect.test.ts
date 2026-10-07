@@ -6,12 +6,13 @@
  * bad when present, and expect the verdict to land on that commit.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-bisect-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-bisect-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { bisectStatus, bisectStart, bisectMark, bisectReset } = await import("../src/gitwork.ts");
 
@@ -120,3 +121,5 @@ describe("bisect", () => {
     expect(existsSync(join(repo, gd, "BISECT_LOG"))).toBe(true);
   });
 });
+
+afterAll(removeScratch);

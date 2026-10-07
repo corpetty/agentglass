@@ -15,12 +15,12 @@
  * liveness on, and it is the same pane whatever the session inside it is
  * called.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-process.env.AGENTGLASS_DOCTRINE = join(mkdtempSync(join(tmpdir(), "agx-self-")), "data");
+process.env.AGENTGLASS_DOCTRINE = join(scratchDir(join(tmpdir(), "agx-self-")), "data");
 const { seatPanes } = await import("../src/seatpanes.ts");
 const { db } = await import("../src/db.ts");
 
@@ -56,3 +56,5 @@ describe("which panes are a chair", () => {
     expect([...seatPanes()]).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

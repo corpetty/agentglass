@@ -5,15 +5,15 @@
 // the whole of what stands between another machine's bug and this machine's
 // tables. Each test below is a row or frame that must not get in, or a reason
 // a valid one must not be turned away.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cleanEvent, cleanGate, cleanSession, linkTransportOk, linkUrl, parseNodeFrame, parseHubFrame, FLEET_PROTOCOL, MAX_GATES,
 } from "../src/fleetwire.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-fleet-wire-"));
+process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-fleet-wire-"));
 
 const ev = (over: Record<string, unknown> = {}) => ({
   origin_id: 7, source_app: "proj", session_id: "s1", event_id: null, hook_event_type: "PostToolUse",
@@ -259,3 +259,5 @@ describe("phase 4, second tier: chat through the link", () => {
     expect(parseHubFrame(JSON.stringify({ t: "req", rid: 1, method: "GET", path: "/git/log", query: "", scope: "root" }))).not.toHaveProperty("scope");
   });
 });
+
+afterAll(removeScratch);

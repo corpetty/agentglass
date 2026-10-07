@@ -10,12 +10,13 @@
  * the original; the CLI is the copy; a case where they disagree fails this
  * test, whichever one is right.
  */
-import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { chmodSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { validateManifest } from "../src/plugins.ts";
 import { contentHash, walkPluginDir } from "../src/plugin-sources.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-plugin", import.meta.url).pathname;
 
@@ -93,7 +94,7 @@ const CASES: { what: string; manifest: unknown }[] = [
 ];
 
 function cliSays(manifest: unknown): { ok: boolean; error?: string } {
-  const dir = mkdtempSync(join(tmpdir(), "agx-plugin-cli-"));
+  const dir = scratchDir(join(tmpdir(), "agx-plugin-cli-"));
   try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "plugin.json"), JSON.stringify(manifest ?? {}));
@@ -130,7 +131,7 @@ describe("the CLI's copy of the manifest rules", () => {
   }
 
   test("says what is missing around the manifest without refusing the plugin", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-plugin-cli-"));
+    const dir = scratchDir(join(tmpdir(), "agx-plugin-cli-"));
     try {
       writeFileSync(join(dir, "plugin.json"), JSON.stringify({ ...OK, icon: "icon.svg" }));
       const r = Bun.spawnSync(["python3", CLI, "validate", dir]);
@@ -145,7 +146,7 @@ describe("the CLI's copy of the manifest rules", () => {
   });
 
   test("says what the sandbox block asks for, and flags a grant that looks like a login", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-plugin-cli-"));
+    const dir = scratchDir(join(tmpdir(), "agx-plugin-cli-"));
     try {
       writeFileSync(join(dir, "plugin.json"), JSON.stringify({ ...OK, sandbox: { network: "internet", read: ["~/.config/gh", "~/code/orbit"], write: ["~/.aws"], programs: ["gh"] } }));
       const r = Bun.spawnSync(["python3", CLI, "validate", dir]);
@@ -162,7 +163,7 @@ describe("the CLI's copy of the manifest rules", () => {
   });
 
   test("a folder with no manifest, and one that is not JSON, are both refusals with a reason", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-plugin-cli-"));
+    const dir = scratchDir(join(tmpdir(), "agx-plugin-cli-"));
     try {
       const empty = Bun.spawnSync(["python3", CLI, "validate", dir]);
       expect(empty.exitCode).toBe(1);
@@ -188,7 +189,7 @@ describe("the CLI's copy of the manifest rules", () => {
    */
   describe("and its content hash", () => {
     function tree(): string {
-      const dir = mkdtempSync(join(tmpdir(), "agx-plugin-hash-"));
+      const dir = scratchDir(join(tmpdir(), "agx-plugin-hash-"));
       writeFileSync(join(dir, "plugin.json"), JSON.stringify(OK));
       mkdirSync(join(dir, "lib", "deep"), { recursive: true });
       writeFileSync(join(dir, "lib", "deep", "b.py"), "print('b')\n");
@@ -299,7 +300,7 @@ describe("the CLI's copy of the manifest rules", () => {
      * the hash of the same commit checked out on Linux.
      */
     test("reads the bit from git's index, as the app does", () => {
-      const dir = mkdtempSync(join(tmpdir(), "agx-plugin-hash-"));
+      const dir = scratchDir(join(tmpdir(), "agx-plugin-hash-"));
       try {
         writeFileSync(join(dir, "plugin.json"), JSON.stringify(OK));
         writeFileSync(join(dir, "run.sh"), "#!/bin/sh\n");
@@ -356,3 +357,5 @@ describe("the CLI's copy of the manifest rules", () => {
     });
   });
 });
+
+afterAll(removeScratch);

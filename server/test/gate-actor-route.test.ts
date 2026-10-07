@@ -11,12 +11,13 @@
  * with no request behind it, so it is the one an audit trail loses first.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-this-test";
 let dir: string, base: string, phone = "", proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -24,7 +25,7 @@ let phoneName = "";
 const savedXdg = process.env.XDG_CONFIG_HOME;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-gateactor-"));
+  dir = scratchDir(join(tmpdir(), "agx-gateactor-"));
   // Mint the credential into the same store the server will read. The server
   // loads it once, when it starts, so it is written before the spawn below.
   process.env.XDG_CONFIG_HOME = dir;
@@ -222,3 +223,5 @@ describe("what nobody answered", () => {
     expect(String(r.error)).toContain("not one this server is holding");
   });
 });
+
+afterAll(removeScratch);

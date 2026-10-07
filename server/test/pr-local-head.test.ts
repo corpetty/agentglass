@@ -13,13 +13,14 @@
 //   ff        it can be fast-forwarded (checked out or not)
 //   diverged  it has commits the remote does not, so no fast-forward exists
 //   dirty     checked out with uncommitted work — someone is standing in it
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, writeFileSync, realpathSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { writeFileSync, realpathSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localHead, fastForwardLocal } from "../src/prs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-localhead-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-localhead-")));
 const ORIGIN = join(dir, "origin.git");
 const REPO = join(dir, "repo");
 
@@ -176,3 +177,5 @@ describe("the local copy of a branch", () => {
     expect(st.sync).toBe("ff");
   });
 });
+
+afterAll(removeScratch);

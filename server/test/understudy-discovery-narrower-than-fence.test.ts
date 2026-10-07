@@ -16,11 +16,11 @@
  * worktrees of the same repository (`agentglass`, `agentglass-unread`, and
  * this very checkout) sat inside the fence and outside discovery.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let U: typeof import("../src/understudy.ts");
 let G: typeof import("../src/gitwork.ts");
@@ -35,9 +35,9 @@ function git(cwd: string, args: string[]): string {
 beforeAll(async () => {
   U = await import("../src/understudy.ts");
   G = await import("../src/gitwork.ts");
-  U.__setUnderstudyStorePath(join(mkdtempSync(join(tmpdir(), "agx-disc-")), "understudy.json"));
+  U.__setUnderstudyStorePath(join(scratchDir(join(tmpdir(), "agx-disc-")), "understudy.json"));
 
-  const base = mkdtempSync(join(tmpdir(), "agx-disc-proj-"));
+  const base = scratchDir(join(tmpdir(), "agx-disc-proj-"));
   root = join(base, "widget");
   execFileSync("git", ["init", "-q", root]);
   git(root, ["config", "user.email", "t@example.com"]);
@@ -97,3 +97,5 @@ describe("discovery must reach everything the fence already allows", () => {
     expect(code).not.toContain("workspaceRoot()");
   });
 });
+
+afterAll(removeScratch);

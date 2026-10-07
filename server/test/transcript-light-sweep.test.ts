@@ -5,11 +5,12 @@
 // file that is still being written, both turn up on the very next light sweep.
 // Only a cold file that comes back to life waits for the full one.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-light-"));
+const dir = scratchDir(join(tmpdir(), "agx-light-"));
 const PROJECTS = join(dir, "projects", "-tmp-lightproj");
 mkdirSync(PROJECTS, { recursive: true });
 process.env.AGENTGLASS_PROJECTS_DIR = join(dir, "projects");
@@ -78,3 +79,5 @@ describe("light transcript sweep", () => {
     expect(count("l-cold")).toBe(2);
   });
 });
+
+afterAll(removeScratch);

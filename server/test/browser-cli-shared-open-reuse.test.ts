@@ -17,13 +17,14 @@
  * the CLI's half of that: the wire body for a page-addressed `open --shared`
  * never carries `as`.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-browser", import.meta.url).pathname;
 const HAVE_PY = !!Bun.which("python3");
@@ -35,7 +36,7 @@ let askedArgs: Record<string, unknown>[] = [];
 const CLIENT = "test-window-shared-reuse";
 
 async function setup() {
-  dir = mkdtempSync(join(tmpdir(), "agx-shared-reuse-"));
+  dir = scratchDir(join(tmpdir(), "agx-shared-reuse-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -132,3 +133,5 @@ describe.skipIf(!HAVE_PY)("open --shared, called twice", () => {
     }
   }, SERVER_BOOT_MS);
 });
+
+afterAll(removeScratch);

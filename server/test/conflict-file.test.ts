@@ -18,11 +18,12 @@
  *     number of conflicts the same.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-cfile-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-cfile-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { conflictFile, resolveBlocks, contentStamp } = await import("../src/gitwork.ts");
 
@@ -296,3 +297,5 @@ describe("what it refuses", () => {
     expect(r.segments).toHaveLength(1);
   });
 });
+
+afterAll(removeScratch);

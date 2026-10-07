@@ -9,13 +9,14 @@
 // it survives being wrapped, it comes back byte-identical on uninstall, and the
 // two installers (this one and hooks/install_hooks.py) write the same string —
 // otherwise the Python side cannot undo what the button did.
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { _internal } from "../src/hooksetup.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { installStatusLine, uninstallStatusLine, chainedFrom, shQuote } = _internal as any;
 
@@ -105,7 +106,7 @@ describe("the two installers agree on quoting", () => {
   });
 
   test.if(havePython)("the Python installer can undo what this one wrote", () => {
-    const home = mkdtempSync(join(tmpdir(), "agx-sl-"));
+    const home = scratchDir(join(tmpdir(), "agx-sl-"));
     mkdirSync(join(home, ".claude"), { recursive: true });
     const path = join(home, ".claude", "settings.json");
     const repoHooks = join(import.meta.dir, "..", "..", "hooks");
@@ -152,7 +153,7 @@ describe("the forwarder script", () => {
     } });
     url = `http://127.0.0.1:${server.port}`;
     // Its own TMPDIR, so the throttle stamp is this test's and not the machine's.
-    stampDir = mkdtempSync(join(tmpdir(), "agx-sl-stamp-"));
+    stampDir = scratchDir(join(tmpdir(), "agx-sl-stamp-"));
   });
 
   async function run(payload: string, chained: string) {
@@ -219,3 +220,5 @@ describe("the forwarder script", () => {
     expect(p.exitCode).toBe(0);
   });
 });
+
+afterAll(removeScratch);

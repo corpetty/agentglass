@@ -12,17 +12,18 @@
  * environment, a scratch config dir, a scratch database, no scanner.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-lantern-route-"));
+  dir = scratchDir(join(tmpdir(), "agx-lantern-route-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -254,3 +255,5 @@ test("a person can clear a line whoever posted it — through the authenticated 
   const again = await post("/agents/forget", { name: "orbit-2001-migration" });
   expect(again.status, "nothing left by that name").toBe(404);
 });
+
+afterAll(removeScratch);

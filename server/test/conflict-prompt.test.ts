@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickConflictModel, resolveConflictModel } from "../../shared/conflictModel.ts";
@@ -7,6 +7,7 @@ import { conflictRecipe, saveReviewRecipe, removeReviewRecipe, resetReviewRecipe
 import { conflictPrompt, countHunks } from "../src/conflictPrompt.ts";
 import { modelFlags } from "../src/terminal.ts";
 import { CONFLICT_ASK } from "../../shared/conflictAsk.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The conflict button's prompt lives in the review-prompts store, so what needs
@@ -17,7 +18,7 @@ import { CONFLICT_ASK } from "../../shared/conflictAsk.ts";
  */
 let dir = "";
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-conflict-prompt-"));
+  dir = scratchDir(join(tmpdir(), "agx-conflict-prompt-"));
   __setReviewPromptsPath(join(dir, "review-prompts.json"));
 });
 afterAll(() => {
@@ -193,3 +194,5 @@ test("the conflict route is matched before the /pr-prompts/ family, whose prefix
   expect(mine).toBeGreaterThan(0);
   expect(family).toBeGreaterThan(mine);
 });
+
+afterAll(removeScratch);

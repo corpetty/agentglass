@@ -186,6 +186,8 @@ export function isRealAgentglassPath(p: string): boolean {
 
 /** The scratch home this process made, and removes at the end; none on a re-entry. */
 let madeHome: string | null = null;
+/** For tmpsweep.ts, which loads after this file and so never saw it being made. */
+export const madeScratchHome = (): string | null => madeHome;
 if (!scratch(process.env.HOME)) {
   for (const k of Object.keys(process.env)) if (k.startsWith("AGENTGLASS_")) delete process.env[k];
   madeHome = fs.mkdtempSync(join(TMP, "agx-test-home-"));

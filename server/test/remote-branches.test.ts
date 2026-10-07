@@ -7,9 +7,10 @@
 // job is to keep those two facts apart on every row.
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, origin: string, clone: string, gw: typeof import("../src/gitwork.ts");
 
@@ -18,7 +19,7 @@ const run = (cwd: string, ...args: string[]) => spawnSync("git", ["-C", cwd, ...
 beforeAll(async () => {
   // realpath: git records the resolved path in a worktree's .git file, and the
   // worktree assertions below compare paths.
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-remote-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-remote-")));
   origin = join(dir, "origin.git");
   clone = join(dir, "clone");
   // The scope guard reads the running machine's real config; point it at the
@@ -271,3 +272,5 @@ describe("worktreesWithState", () => {
     expect(r.error).toContain("commit or stash");
   });
 });
+
+afterAll(removeScratch);

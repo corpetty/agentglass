@@ -11,12 +11,13 @@
  * rather than failing silently.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, src: string, base: string, port: number, sockPath: string, pluginToken: string;
 let proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -63,7 +64,7 @@ async function until<T>(read: () => Promise<T> | T, ok: (v: T) => boolean, ms = 
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-plugin-socket-"));
+  dir = scratchDir(join(tmpdir(), "agx-plugin-socket-"));
   src = join(dir, "src-plugin");
   mkdirSync(src);
   writeFileSync(join(src, "plugin.json"), JSON.stringify(MANIFEST));
@@ -175,3 +176,5 @@ describe("the plugin socket's own gate", () => {
     expect(b.ok).toBe(true);
   }, 20000);
 });
+
+afterAll(removeScratch);

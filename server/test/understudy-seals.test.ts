@@ -27,7 +27,7 @@
  *   expensive lie a safety panel can tell, and a skipped assertion dressed up
  *   as a pass is the same lie in quieter clothes.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 
 /**
  * The end of the declaration that starts at `from`, for tests that read shape.
@@ -41,14 +41,15 @@ function endOfBlock(text: string, from: number): number {
   const close = text.indexOf("\n}", from);
   return close === -1 ? text.length : close;
 }
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let AUTH: typeof import("../src/auth.ts");
 
 beforeAll(async () => {
-  const jail = mkdtempSync(join(tmpdir(), "agx-seals-"));
+  const jail = scratchDir(join(tmpdir(), "agx-seals-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -348,3 +349,5 @@ describe("seal: the only claim still unproven", () => {
    * can tell.
    */
 });
+
+afterAll(removeScratch);

@@ -1,12 +1,13 @@
 // Regressions from the review of plan pace: each case is a measured wrong
 // answer, and each was watched going red against the code before the fix.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   DEFAULT_PACE_CONFIG, GAP_MS, alertDue, pace, type PaceConfig, type PaceSample,
 } from "../../shared/pace.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TZ = "Europe/Madrid";
 const cfg = (over: Partial<PaceConfig> = {}): PaceConfig => ({ ...DEFAULT_PACE_CONFIG, timeZone: TZ, ...over });
@@ -118,7 +119,7 @@ describe("claimPaceAlerts: one decision for every client", () => {
   const usageOff = () => prefs.writeNotifyPrefs({});
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-pace-claim-"));
+    dir = scratchDir(join(tmpdir(), "agx-pace-claim-"));
     process.env.XDG_CONFIG_HOME = dir;
     claim = await import("../src/paceAlert.ts");
     prefs = await import("../src/notifyPrefs.ts");
@@ -170,3 +171,5 @@ describe("claimPaceAlerts: one decision for every client", () => {
     expect([claim.coerceAlertAt(80), claim.coerceAlertAt(10), claim.coerceAlertAt("x"), claim.coerceAlertAt(90.5)]).toEqual([80, 90, 90, 90]);
   });
 });
+
+afterAll(removeScratch);

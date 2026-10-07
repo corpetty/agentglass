@@ -9,13 +9,14 @@
  * one repository is one group" is a claim about `--git-common-dir`.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { FRAME_ARGV, parseWindows, runAction, sanitizeGroupName, type TmuxTarget } from "../src/tmuxctl.ts";
 import { __resetWindowRepo, windowRepo } from "../src/windowrepo.ts";
 import { projectRootOfAsync } from "../src/git.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCK = [...TMUX_ISOLATED, "-L", `agx-tabgroups-${process.pid}`];
 const TMPDIR = `/tmp/agx-tmux-tabgroups-${process.pid}`;
@@ -146,7 +147,7 @@ describe("the project a directory belongs to", () => {
   });
 
   test("a linked worktree beside the main checkout is the same project", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "agx-tabgroups-git-")));
+    const root = realpathSync(scratchDir(join(tmpdir(), "agx-tabgroups-git-")));
     const main = join(root, "orbit");
     const git = (cwd: string, ...a: string[]) => Bun.spawnSync(["git", "-C", cwd, ...a], {
       stdout: "pipe", stderr: "pipe",
@@ -165,3 +166,5 @@ describe("the project a directory belongs to", () => {
     }
   });
 });
+
+afterAll(removeScratch);

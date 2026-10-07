@@ -3,16 +3,16 @@
 // `LOOPBACK_ONLY && !TRUST_LAN`, so enabling TRUST_LAN (which widens the origin
 // gate to trust private-IP pages) makes this false and a token mandatory — a
 // LAN-origin page then can't drive token-less writes through a loopback server.
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveToken } from "../src/auth.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 beforeEach(() => {
   // A fresh config home per assertion so a persisted token from one doesn't
   // decide the next, and no ambient env token.
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-auth-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-auth-"));
   delete process.env.AGENTGLASS_TOKEN;
 });
 
@@ -32,3 +32,5 @@ describe("resolveToken", () => {
     expect(resolveToken(true).token).toBe("sekret-token-value");
   });
 });
+
+afterAll(removeScratch);

@@ -12,12 +12,12 @@
  * Pure: the tokens are minted straight through auth.ts, no plugin is installed
  * and no directory outside the scratch XDG home is touched.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allowed, answersFromADevice, callerFor, mintPluginToken, revokePluginToken } from "../src/auth.ts";
 import { __resetDevices, issueDevice } from "../src/devices.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const at = (token: string) => {
   const url = new URL("http://x/gate/decide");
@@ -26,7 +26,7 @@ const at = (token: string) => {
 
 beforeEach(() => {
   process.env.NODE_ENV = "test";
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-plugin-hand-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-plugin-hand-"));
   __resetDevices();
 });
 
@@ -69,3 +69,5 @@ describe("who a plugin token is", () => {
     revokePluginToken(t);
   });
 });
+
+afterAll(removeScratch);

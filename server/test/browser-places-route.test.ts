@@ -17,12 +17,13 @@
  * places.db under it, and a test must never touch the developer's own history.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir: string, data: string, base: string;
@@ -37,8 +38,8 @@ const post = (path: string, body: unknown, headers: Record<string, string> = {})
   fetch(base + path, { method: "POST", headers: auth(headers), body: JSON.stringify(body) });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-places-route-"));
-  data = mkdtempSync(join(tmpdir(), "agx-places-data-"));
+  dir = scratchDir(join(tmpdir(), "agx-places-route-"));
+  data = scratchDir(join(tmpdir(), "agx-places-data-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   const src = new URL("../src/index.ts", import.meta.url).pathname;
@@ -111,3 +112,5 @@ test("a genuinely unknown /browser/ verb still bounces off the relay", async () 
   const body = await r.json() as { error?: string };
   expect(body.error).toBe("unknown browser operation");
 });
+
+afterAll(removeScratch);

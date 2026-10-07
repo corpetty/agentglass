@@ -5,13 +5,13 @@
 // invalidates it so the card updates on the very next read. These tests assert
 // that contract by reference identity, so they say nothing about timing and
 // cannot go flaky.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Set before the dynamic import: db.ts opens its Database at module load.
-const dir = mkdtempSync(join(tmpdir(), "agx-opentool-"));
+const dir = scratchDir(join(tmpdir(), "agx-opentool-"));
 process.env.AGENTGLASS_DB = join(dir, "opentool.db");
 process.env.XDG_CONFIG_HOME = dir;
 // Unscoped on purpose: the memo's behaviour is what's under test, not scoping.
@@ -101,3 +101,5 @@ describe("sessions memo", () => {
     expect(db.getSessions(50)).toBe(a); // same (limit, provider, scope) within the TTL
   });
 });
+
+afterAll(removeScratch);

@@ -16,12 +16,13 @@
 // The other direction is asserted too, because a grouping that over-collects is
 // worse than one that under-collects: a directory that is not a leg of this run
 // must not appear in its totals, however busy it is.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, realpathSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-run-group-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-run-group-")));
 const REPO = join(dir, "repo");
 /** Two checkouts cut by hand, long before the run. */
 const OLD_A = join(dir, "repo-old-a");
@@ -175,3 +176,5 @@ describe("the column this leans on", () => {
     expect(sql).toContain("GENERATED ALWAYS AS");
   });
 });
+
+afterAll(removeScratch);

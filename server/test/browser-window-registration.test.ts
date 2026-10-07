@@ -14,13 +14,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import type { Writable } from "node:stream";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { DESK_HEADER } from "../src/desk.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SERVER_SRC = new URL("../src/index.ts", import.meta.url).pathname;
 const KEY = "k".repeat(64);
@@ -38,7 +39,7 @@ afterAll(() => {
 
 /** A server on its own port and data dir; `desk` starts it the way the app does. */
 async function boot(desk: boolean): Promise<string> {
-  const dir = mkdtempSync(join(tmpdir(), "agx-winreg-"));
+  const dir = scratchDir(join(tmpdir(), "agx-winreg-"));
   dirs.push(dir);
   const port = await freePort();
   const env: Record<string, string> = {
@@ -178,3 +179,5 @@ describe("the parts a test server cannot show (read as source)", () => {
     expect(index.slice(at, end)).toContain("!ws.data?.deviceId");
   });
 });
+
+afterAll(removeScratch);

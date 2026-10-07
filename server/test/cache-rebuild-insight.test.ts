@@ -4,12 +4,12 @@
  * pin both sides of that inference so the insight cannot price a model switch,
  * another subagent's work, or normal within-window churn as avoidable spend.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cache-rebuild-"));
+const dir = scratchDir(join(tmpdir(), "agx-cache-rebuild-"));
 process.env.AGENTGLASS_DB = join(dir, "cache-rebuild.db");
 delete process.env.AGENTGLASS_ROOT;
 process.env.XDG_CONFIG_HOME = dir;
@@ -156,3 +156,5 @@ describe("the block stops itself, dearest first", () => {
     expect(insights.topRebuilds(new Map())).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

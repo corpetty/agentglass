@@ -6,12 +6,12 @@
  * it beat two agents, a row left claimed by an agent that no longer exists,
  * and two takers of one item.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-seatq-"));
+const dir = scratchDir(join(tmpdir(), "agx-seatq-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 
 const Q = await import("../src/seatqueue.ts");
@@ -184,3 +184,5 @@ describe("what would prove it done travels with the work", () => {
     if (r.ok) expect(r.task.proof).toBe("");
   });
 });
+
+afterAll(removeScratch);

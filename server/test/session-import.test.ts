@@ -11,11 +11,12 @@
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseAsk, redactAskForTest, type BrowserOp } from "../src/browserdrive.ts";
 import { startBrowserStub, runCli, runMcpTool } from "./fixtures/browser-stub.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HAVE_PY = !!Bun.which("python3");
 const DAY = 86_400_000;
@@ -62,7 +63,7 @@ function audited(calls: { op: string; body: Record<string, unknown> }[]): string
 let stub: ReturnType<typeof startBrowserStub>, profile = "";
 beforeAll(() => {
   stub = startBrowserStub(() => ({ ok: true, value: {} }));
-  profile = fakeProfile(mkdtempSync(join(tmpdir(), "agx-ffprofile-")));
+  profile = fakeProfile(scratchDir(join(tmpdir(), "agx-ffprofile-")));
 });
 afterAll(() => { stub.stop(); rmSync(profile, { recursive: true, force: true }); });
 
@@ -132,7 +133,7 @@ function withLocalStorage(dir: string, originDir: string): void {
 }
 
 test.skipIf(!HAVE_PY)("localStorage for the origin the tab is on is written; a compressed value is skipped, another origin is deferred", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-ffls-"));
+  const dir = scratchDir(join(tmpdir(), "agx-ffls-"));
   fakeProfile(dir);
   withLocalStorage(dir, "https+++www.orbit.example");
   withLocalStorage(dir, "https+++app.orbit.example");
@@ -164,7 +165,7 @@ test.skipIf(!HAVE_PY)("no imported value reaches the audit log, a stored one inc
    * token-SHAPED went into the log verbatim. Every call the import makes is
    * put through the audit's own redaction here, not only its stdout.
    */
-  const dir = mkdtempSync(join(tmpdir(), "agx-ffls-"));
+  const dir = scratchDir(join(tmpdir(), "agx-ffls-"));
   fakeProfile(dir);
   withLocalStorage(dir, "https+++www.orbit.example");
   const s = startBrowserStub((op, body) => {
@@ -183,7 +184,7 @@ test.skipIf(!HAVE_PY)("no imported value reaches the audit log, a stored one inc
 });
 
 test.skipIf(!HAVE_PY)("session load writes storage through the same redacted path", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-sessload-"));
+  const dir = scratchDir(join(tmpdir(), "agx-sessload-"));
   const file = join(dir, "state.json");
   writeFileSync(file, JSON.stringify({
     cookies: [{ name: "orbit_sid", value: "cookie-not-in-audit", domain: ".orbit.example", path: "/", secure: true }],
@@ -214,7 +215,7 @@ test.skipIf(!HAVE_PY)("the MCP's set_storage_state writes storage through the sa
    * lock covers both clients, and the origin check that stays an `eval` must
    * carry no value at all.
    */
-  const dir = mkdtempSync(join(tmpdir(), "agx-mcpload-"));
+  const dir = scratchDir(join(tmpdir(), "agx-mcpload-"));
   const s = startBrowserStub((op, body) => {
     if (op === "eval" && body.js === "location.origin") return { ok: true, value: { value: "https://www.orbit.example" } };
     // What the old one-script write answered, so the leak is what fails, not the count.
@@ -306,8 +307,8 @@ test.skipIf(!HAVE_PY)("the private copy of the profile is gone afterwards, when 
      halfway left its directory behind, because the caller's cleanup only
      starts once the copy has returned. A directory where cookies.sqlite
      should be makes the copy fail the same way on any machine, root included. */
-  const tmp = mkdtempSync(join(tmpdir(), "agx-importtmp-"));
-  const broken = mkdtempSync(join(tmpdir(), "agx-ffbroken-"));
+  const tmp = scratchDir(join(tmpdir(), "agx-importtmp-"));
+  const broken = scratchDir(join(tmpdir(), "agx-ffbroken-"));
   mkdirSync(join(broken, "cookies.sqlite"));
   const left = () => readdirSync(tmp).filter((n) => n.startsWith("agx-import-"));
   try {
@@ -328,7 +329,7 @@ test.skipIf(!HAVE_PY)("a stored key the tab refuses is named, the rest still lan
      silently drop every key after it, and the summary must not count a key
      that never landed. A non-string value is written as the browser's own
      setItem would have made it a string, not refused. */
-  const dir = mkdtempSync(join(tmpdir(), "agx-sessload-"));
+  const dir = scratchDir(join(tmpdir(), "agx-sessload-"));
   const file = join(dir, "state.json");
   writeFileSync(file, JSON.stringify({
     cookies: [],
@@ -351,7 +352,7 @@ test.skipIf(!HAVE_PY)("a stored key the tab refuses is named, the rest still lan
 });
 
 test.skipIf(!HAVE_PY)("an origin whose localStorage cannot be read is named and skipped, not a traceback after the cookies landed", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-ffls-"));
+  const dir = scratchDir(join(tmpdir(), "agx-ffls-"));
   fakeProfile(dir);
   // A directory where the database should be: the copy fails on any machine.
   mkdirSync(join(dir, "storage", "default", "https+++www.orbit.example", "ls", "data.sqlite"), { recursive: true });
@@ -363,3 +364,5 @@ test.skipIf(!HAVE_PY)("an origin whose localStorage cannot be read is named and 
     expect(r.stderr).toContain("localStorage for https://www.orbit.example: could not read");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+afterAll(removeScratch);

@@ -11,11 +11,11 @@
  * write actually reached the module the gate reads from).
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AlertNote } from "../../shared/types.ts";
 import { DEFAULT_NOTIFY_PREFS } from "../../shared/notifyPrefs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REAL_XDG = process.env.XDG_CONFIG_HOME;
 const REAL_NOTIFY = process.env.AGENTGLASS_NOTIFY;
@@ -30,7 +30,7 @@ const CENSUS_NO_CLIENT = { attached: 0, live: 0 };
 
 beforeAll(async () => {
   process.env.NODE_ENV = "test";
-  dir = mkdtempSync(join(tmpdir(), "agx-notify-gate-"));
+  dir = scratchDir(join(tmpdir(), "agx-notify-gate-"));
   process.env.XDG_CONFIG_HOME = dir;
   // alerts.ts is cache-busted, the same way alerts-sink.test.ts busts it, so
   // its module-level `DESKTOP` is read with AGENTGLASS_NOTIFY set above.
@@ -128,7 +128,7 @@ describe("GET/POST /notify/prefs", () => {
     const { TMUX_TEST_TMPDIR } = await import("./tmuxTmp.ts");
     const port = await freePort();
     const base = `http://127.0.0.1:${port}`;
-    const routeDir = mkdtempSync(join(tmpdir(), "agx-notify-route-"));
+    const routeDir = scratchDir(join(tmpdir(), "agx-notify-route-"));
     const proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
       env: {
         PATH: process.env.PATH ?? "",
@@ -172,3 +172,5 @@ describe("GET/POST /notify/prefs", () => {
     }
   }, 30_000);
 });
+
+afterAll(removeScratch);

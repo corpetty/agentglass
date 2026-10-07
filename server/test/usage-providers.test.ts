@@ -7,7 +7,7 @@
  * exist", and the second reads as our bug rather than theirs.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { anthropicUsage, installedProviders, allProviderUsage } from "../src/providerusage.ts";
@@ -16,11 +16,12 @@ import type { UsagePayload } from "../src/usage.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-usage-providers-"));
+  dir = scratchDir(join(tmpdir(), "agx-usage-providers-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -279,3 +280,5 @@ describe("allProviderUsage() with injected probes", () => {
     expect(agy!.note).toMatch(/\./);
   });
 });
+
+afterAll(removeScratch);

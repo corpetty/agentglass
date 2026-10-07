@@ -7,13 +7,14 @@
  * it refuses outright when Codex is not available to run.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { usageRefreshModel } from "../src/codexusage.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("usageRefreshModel", () => {
   test("takes the last entry — parseModels sorts by Codex's own priority", () => {
@@ -40,7 +41,7 @@ describe("the route, with Codex switched off", () => {
   let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-refresh-off-"));
+    dir = scratchDir(join(tmpdir(), "agx-refresh-off-"));
     const port = await freePort();
     base = `http://127.0.0.1:${port}`;
     proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -87,3 +88,5 @@ describe("the route, with Codex switched off", () => {
     expect(j.error ?? "").toMatch(/codex/i);
   });
 });
+
+afterAll(removeScratch);

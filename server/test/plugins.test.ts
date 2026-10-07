@@ -7,7 +7,7 @@
  * failing.
  */
 import { beforeAll, afterAll, beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import {
 import { callerFor, pluginTokenCount } from "../src/auth.ts";
 import { __resetSandboxProbe } from "../src/plugin-sandbox.ts";
 import { blocklistPath } from "../src/plugin-blocklist.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const okManifest = {
   name: "watcher", publisher: "someone in the community",
@@ -30,7 +31,7 @@ const okManifest = {
  *  install copied and parsed the manifest. Tests that care about the
  *  process itself pass a body that keeps running. */
 function fixture(manifest: Record<string, unknown> = okManifest, run = "true"): string {
-  const dir = mkdtempSync(join(tmpdir(), "agx-plugin-src-"));
+  const dir = scratchDir(join(tmpdir(), "agx-plugin-src-"));
   writeFileSync(join(dir, MANIFEST_NAME), JSON.stringify(manifest));
   writeFileSync(join(dir, "run.sh"), `#!/bin/bash\n${run}\n`);
   chmodSync(join(dir, "run.sh"), 0o755);
@@ -56,7 +57,7 @@ beforeEach(async () => {
   process.env.AGENTGLASS_BWRAP = "/nonexistent/bwrap";
   process.env.AGENTGLASS_PLUGINS_UNBOXED = "1";
   __resetSandboxProbe();
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-plugins-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-plugins-"));
   await __resetPlugins();
 });
 
@@ -135,7 +136,7 @@ describe("install = copy, no code runs", () => {
   });
 
   test("no manifest at the root is refused", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-plugin-src-"));
+    const dir = scratchDir(join(tmpdir(), "agx-plugin-src-"));
     const r = await installPlugin(dir);
     expect(r.ok).toBe(false);
   });
@@ -292,7 +293,7 @@ describe("consent does not survive an update", () => {
 
 describe("enable = scoped token + separate process; disable actually stops it", () => {
   test("enabling starts a real process and mints a token scoped as declared", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-plugin-src-"));
+    const dir = scratchDir(join(tmpdir(), "agx-plugin-src-"));
     const marker = join(dir, "marker");
     writeFileSync(join(dir, MANIFEST_NAME), JSON.stringify({ ...okManifest, scope: "answer" }));
     writeFileSync(join(dir, "run.sh"), `#!/bin/bash\necho -n "$AGENTGLASS_READ_TOKEN" > "${marker}"\nsleep 5\n`);
@@ -441,7 +442,7 @@ describe("remove", () => {
   // `plugins.json` is a file on disk; a record whose `installDir` points
   // outside the plugins folder is dropped without deleting anything.
   test("a tampered record pointing outside the plugins folder is dropped, the folder is not deleted", async () => {
-    const outside = mkdtempSync(join(tmpdir(), "agx-not-a-plugin-"));
+    const outside = scratchDir(join(tmpdir(), "agx-not-a-plugin-"));
     writeFileSync(join(outside, "keep.txt"), "still here");
     const store = JSON.parse(readFileSync(pluginsPath(), "utf8"));
     store.plugins = [{
@@ -591,7 +592,7 @@ describe("a pinned catalogue entry installs its commit or nothing", () => {
   // Its own hooks, because the file's beforeEach resets the in-process store
   // and these touch none of it.
   beforeAll(async () => {
-    root = mkdtempSync(join(tmpdir(), "agx-pinned-"));
+    root = scratchDir(join(tmpdir(), "agx-pinned-"));
     const repo = join(root, "fixtures", "acme", "orbit-clock");
     mkdirSync(repo, { recursive: true });
     run(repo, "init", "-q", "-b", "main");
@@ -621,7 +622,7 @@ describe("a pinned catalogue entry installs its commit or nothing", () => {
    *  `gitconfig` is the user's global git config for that child, and
    *  `onlyGit` leaves the stub git as the one program on its PATH. */
   async function install(op: Record<string, unknown>, how: { gitconfig?: string; onlyGit?: boolean } = {}): Promise<Out> {
-    const at = mkdtempSync(join(root, "child-"));
+    const at = scratchDir(join(root, "child-"));
     writeFileSync(join(root, "git.log"), "");
     const globalConfig = how.gitconfig === undefined ? "/dev/null" : join(at, "gitconfig");
     if (how.gitconfig !== undefined) writeFileSync(globalConfig, how.gitconfig);
@@ -773,7 +774,7 @@ describe("a pinned catalogue entry installs its commit or nothing", () => {
   // A folder in use can hold a socket or a pipe; `cp -R` copied them and the
   // walk ignores them, so they do not stop an install.
   test("a folder holding a pipe still installs from its path", async () => {
-    const folder = mkdtempSync(join(root, "fifo-"));
+    const folder = scratchDir(join(root, "fifo-"));
     writeFileSync(join(folder, MANIFEST_NAME), JSON.stringify({ ...okManifest, name: "orbit-clock", entrypoint: "sh run.sh" }));
     writeFileSync(join(folder, "run.sh"), "echo local\n");
     expect(Bun.spawnSync(["mkfifo", join(folder, "dev.pipe")]).exitCode).toBe(0);
@@ -789,7 +790,7 @@ describe("a pinned catalogue entry installs its commit or nothing", () => {
     expect(pinnedInstall.result.error ?? "").toBe("");
     expect(pinnedInstall.runSh).toBe("echo listed\n");
 
-    const folder = mkdtempSync(join(root, "folder-"));
+    const folder = scratchDir(join(root, "folder-"));
     writeFileSync(join(folder, MANIFEST_NAME), JSON.stringify({ ...okManifest, name: "orbit-clock", entrypoint: "sh run.sh" }));
     writeFileSync(join(folder, "listed.sh"), "echo local\n");
     symlinkSync("listed.sh", join(folder, "run.sh"));
@@ -806,3 +807,5 @@ describe("a pinned catalogue entry installs its commit or nothing", () => {
     expect(r.log).toContain("clone");
   }, 30_000);
 });
+
+afterAll(removeScratch);

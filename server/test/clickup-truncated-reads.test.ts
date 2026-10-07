@@ -36,11 +36,12 @@
  * These bite by EFFECT — what is stored, and what the caller is told.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-trunc-"));
+const dir = scratchDir(join(tmpdir(), "agx-trunc-"));
 const C = await import("../src/credentials.ts");
 const CU = await import("../src/clickup.ts");
 const W = await import("../src/clickupwatch.ts");
@@ -286,3 +287,5 @@ describe("the list of matches", () => {
     expect(r.data && "more" in r.data).toBe(false);
   });
 });
+
+afterAll(removeScratch);

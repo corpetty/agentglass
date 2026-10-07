@@ -12,14 +12,15 @@
  */
 import { describe, test, expect, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultDbRefusal, SCHEMA_GENERATION } from "../src/db.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SRC = resolve(import.meta.dir, "../src");
 const DB_TS = join(SRC, "db.ts");
-const scratch = mkdtempSync(join(tmpdir(), "agx-realdb-guard-"));
+const scratch = scratchDir(join(tmpdir(), "agx-realdb-guard-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe("defaultDbRefusal", () => {
@@ -205,3 +206,5 @@ describe("backward compatible schema", () => {
     expect(sneaked).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

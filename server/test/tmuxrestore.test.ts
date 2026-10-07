@@ -3,14 +3,16 @@
 // our own state dir. Nothing reaches the developer's tmux or their resurrect
 // saves, and the whole sandbox is removed afterwards.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { killRunTmux, removeScratch, trackScratch } from "./scratch.ts";
 
 const SOCKET = `agx-restore-test-${process.pid}`;
 process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
-const TMPDIR = join(tmpdir(), `agx-tmux-restore-${process.pid}`);
-process.env.AGENTGLASS_STATE_DIR = join(tmpdir(), `agx-restore-state-${process.pid}`);
+// Both removed by removeScratch, after every server in them has been stopped.
+const TMPDIR = trackScratch(join(tmpdir(), `agx-tmux-restore-${process.pid}`));
+process.env.AGENTGLASS_STATE_DIR = trackScratch(join(tmpdir(), `agx-restore-state-${process.pid}`));
 const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 
 let restore: typeof import("../src/tmuxrestore.ts");
@@ -39,12 +41,17 @@ afterAll(async () => {
    * worktrees open, the oldest 23 hours old. Removing TMPDIR does not help —
    * deleting a socket file does not stop the process listening on it, which is
    * exactly what those 216 were: live servers with a deleted socket.
+   *
+   * And `tmux()` does not throw when the kill fails, it answers `ok: false` —
+   * so the catch below never saw the one that mattered: a `kill-server` cut off
+   * by the 5 s timeout on a machine deep in swap, after which the directory was
+   * removed under a live server. One that did not answer is killed by pid
+   * (scratch.ts), before removeScratch takes the directory.
    */
-  try { await pane.tmux(["kill-server"]); } catch { /* already gone */ }
+  const killed = await pane.tmux(["kill-server"]).catch(() => null);
+  if (!killed?.ok) killRunTmux();
   if (REAL_TMPDIR === undefined) delete process.env.TMUX_TMPDIR;
   else process.env.TMUX_TMPDIR = REAL_TMPDIR;
-  try { rmSync(TMPDIR, { recursive: true, force: true }); } catch { /* never made */ }
-  try { rmSync(process.env.AGENTGLASS_STATE_DIR!, { recursive: true, force: true }); } catch { /* never made */ }
 });
 
 test("captureLayout writes the tree of a live session", async () => {
@@ -103,3 +110,5 @@ test("the captured layout is readable back from disk without tmux", async () => 
   expect(state).not.toBeNull();
   expect(state!.sessions.length).toBeGreaterThan(0);
 });
+
+afterAll(removeScratch);

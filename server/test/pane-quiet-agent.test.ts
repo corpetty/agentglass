@@ -14,12 +14,13 @@
  * working (the transcript keeps growing — never stopped for quiet).
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { screenSignature } from "../src/understudy-pane.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCKET = `agx-quiet-${process.pid}`;
 const have = !!Bun.which("tmux") && !!Bun.which("python3");
@@ -94,7 +95,7 @@ let jail = "", out = "", code = -1;
 
 beforeAll(async () => {
   if (!have) return;
-  jail = mkdtempSync(join(tmpdir(), "agx-quiet-"));
+  jail = scratchDir(join(tmpdir(), "agx-quiet-"));
   mkdirSync(join(jail, "bin"), { recursive: true });
   mkdirSync(join(jail, "repo"), { recursive: true });
   writeFileSync(join(jail, "bin", "claude"), STUB);
@@ -109,6 +110,12 @@ beforeAll(async () => {
       AGENTGLASS_TMUX_SOCKET: SOCKET,
       TMUX_TMPDIR: TMUX_TEST_TMPDIR,
       AGENTGLASS_CLAUDE_HOME: join(jail, "clone-claude"),
+      /* The child runs from the jail, where there is no bunfig and so no
+         preload: without these it opened a database of its own in /tmp, which
+         nothing removed. It used to inherit one only because an earlier file
+         had left AGENTGLASS_DB pointing at its own scratch directory. */
+      AGENTGLASS_DB: join(jail, "agentglass.db"),
+      AGENTGLASS_STATE_DIR: join(jail, "state"),
       /*
        * Seconds, not minutes: the behaviour under test is the SHAPE — warn,
        * then stop, both well under the budget — not the length.
@@ -195,3 +202,5 @@ describe.skipIf(!have)("a live agent that goes quiet", () => {
     expect(code, out.slice(-1500)).toBe(0);
   });
 });
+
+afterAll(removeScratch);

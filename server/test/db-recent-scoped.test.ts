@@ -13,12 +13,13 @@
  * the rewrite could plausibly get wrong: two events sharing a timestamp, where
  * the tiebreak on id is what decides.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-recent-"));
+const dir = scratchDir(join(tmpdir(), "agx-recent-"));
 const SCOPE = join(dir, "project");
 const OUTSIDE = join(dir, "elsewhere");
 mkdirSync(SCOPE, { recursive: true });
@@ -94,3 +95,5 @@ describe("getRecent under a workspace scope", () => {
     expect(mod.getRecent(0)).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

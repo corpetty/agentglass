@@ -6,12 +6,13 @@
  * `bun test` — a refusal fails the run it happens in, on purpose, so it can
  * only be watched from outside that run.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { childTargets, isRealAgentglassPath } from "./isolation";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TMP = resolve(tmpdir());
 const REAL = process.env.AGX_TEST_REAL_HOME!;
@@ -56,12 +57,27 @@ test("every suite in the repository loads it, and loads it first", async () => {
   /* First because bun freezes a builtin's exports the first time anything
      imports it, and the homedir patch has to land before that. Every suite,
      because each of them spawns or imports something that resolves a home. */
-  for (const f of ["../../bunfig.toml", "../bunfig.toml", "../../web/bunfig.toml", "../../mobile/bunfig.toml"]) {
-    const text = await Bun.file(new URL(f, import.meta.url).pathname).text();
+  for (const f of ["../../bunfig.toml", "../bunfig.toml", "./bunfig.toml", "../../web/bunfig.toml", "../../mobile/bunfig.toml"]) {
+    const url = new URL(f, import.meta.url);
+    const text = await Bun.file(url.pathname).text();
     const first = text.match(/^preload = \["([^"]+)"/m);
     expect(first, `${f} has no preload`).not.toBeNull();
-    expect(first![1]!.endsWith("/test/isolation.ts"), `${f} loads ${first![1]} first`).toBe(true);
+    // Resolved against the bunfig, so test/'s own `./isolation.ts` counts.
+    expect(new URL(first![1]!, url).pathname, `${f} loads ${first![1]} first`).toBe(new URL("./isolation.ts", import.meta.url).pathname);
   }
+});
+
+test("a run started in server/test loads the same preloads as one started in server", async () => {
+  /* bun reads the bunfig of the directory it was started in, so the one in
+     test/ is a second copy of the list, and a second copy is the one that
+     drifts. Compared as the files they name, not as text. */
+  const preloads = async (f: string) => {
+    const url = new URL(f, import.meta.url);
+    const text = await Bun.file(url.pathname).text();
+    const list = JSON.parse(/^preload = (\[.*\])$/m.exec(text)![1]!) as string[];
+    return list.map((p) => new URL(p, url).pathname);
+  };
+  expect(await preloads("./bunfig.toml")).toEqual(await preloads("../bunfig.toml"));
 });
 
 describe("what counts as real", () => {
@@ -90,7 +106,7 @@ describe("what counts as real", () => {
 
 /** The fixture in a child `bun test`, and what it wrote down. */
 function runFixture(env: Record<string, string>) {
-  const report = join(mkdtempSync(join(tmpdir(), "agx-isolation-check-")), "report.json");
+  const report = join(scratchDir(join(tmpdir(), "agx-isolation-check-")), "report.json");
   const child = Bun.spawnSync(["bun", "test", "./test/fixtures/isolation-fixture.ts"], {
     cwd: new URL("..", import.meta.url).pathname,
     env: { ...process.env, ...env, ISOLATION_REPORT: report },
@@ -137,3 +153,5 @@ describe("the guard, watched from outside the run it fails", () => {
     expect(r.filledHome).toBe(process.env.HOME!);
   });
 });
+
+afterAll(removeScratch);

@@ -6,12 +6,12 @@
 // requests because the third was on another page. Every case here is a
 // difference between the two grammars, or a way a body of free text could
 // change the query's meaning.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-search-"));
+const dir = scratchDir(join(tmpdir(), "agx-search-"));
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_DB = join(dir, "s.db");
 
@@ -114,3 +114,5 @@ describe("free text", () => {
     expect(expr("author:")).toBe(expr());
   });
 });
+
+afterAll(removeScratch);

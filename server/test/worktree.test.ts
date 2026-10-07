@@ -7,15 +7,16 @@
 // terminal, git writes and chat all refused to run in it as "outside the open
 // project". These pin both halves: the worktree is inside the scope, and the
 // things that merely *look* like it still aren't.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // realpath, because git writes the resolved path into the worktree's `.git`
 // file: on macOS `tmpdir()` is the symlink /var/folders/… and git records
 // /private/var/folders/…, so every path comparison below would fail.
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-worktree-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-worktree-")));
 const PROJECT = join(dir, "orbit");
 const WORKTREE = join(dir, "orbit-WEB-1042");
 const SIBLING = join(dir, "orbit-backup"); // a plain directory that shares the prefix
@@ -144,3 +145,5 @@ describe("inScope with worktrees", () => {
     expect(cfg.inScope(dir, PROJECT)).toBe(false);
   });
 });
+
+afterAll(removeScratch);

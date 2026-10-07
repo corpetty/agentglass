@@ -17,11 +17,12 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const home = mkdtempSync(join(tmpdir(), "agx-cookiepipe-"));
+const home = scratchDir(join(tmpdir(), "agx-cookiepipe-"));
 const profile = join(home, ".mozilla", "firefox", "abcd1234.default-release");
 const SITES = Array.from({ length: 120 }, (_, i) => `site${i}.test`);
 
@@ -116,3 +117,5 @@ describe("how the reader writes", () => {
     expect(unawaited.map((m) => m[0])).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

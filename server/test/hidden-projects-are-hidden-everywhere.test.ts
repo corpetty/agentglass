@@ -16,9 +16,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", cfg = "", gw: typeof import("../src/gitwork.ts"), cf: typeof import("../src/config.ts");
 const ENV0 = { xdg: process.env.XDG_CONFIG_HOME, root: process.env.AGENTGLASS_ROOT, dirs: process.env.AGENTGLASS_REPO_DIRS };
@@ -50,7 +51,7 @@ const names = async (opts: { ignoreScope?: boolean } = {}) =>
   (await gw.discoverRepos([], [], opts)).map((r) => r.name).sort();
 
 beforeAll(async () => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-hidden-everywhere-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-hidden-everywhere-")));
   process.env.XDG_CONFIG_HOME = join(dir, "xdg");
   cfg = join(dir, "xdg", "agentglass", "config.json");
   mkdirSync(join(dir, "xdg", "agentglass"), { recursive: true });
@@ -116,3 +117,5 @@ describe("a removed project", () => {
     }
   });
 });
+
+afterAll(removeScratch);

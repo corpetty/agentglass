@@ -29,11 +29,12 @@
  * can be asserted without racing the other sessions running this on the same
  * machine.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REPO = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 const HEADCHECK = join(REPO, "scripts", "headcheck.ts");
@@ -63,7 +64,7 @@ function write(dir: string, rel: string, body: string) {
  * rather than installing.
  */
 function fixture(): { repo: string; tmp: string } {
-  const base = mkdtempSync(join(tmpdir(), "agx-headcheck-test-"));
+  const base = scratchDir(join(tmpdir(), "agx-headcheck-test-"));
   trash.push(base);
   const repo = join(base, "repo");
   const tmp = join(base, "tmp");
@@ -183,3 +184,5 @@ describe("headcheck — the commit answers for itself", () => {
     expect(out).toContain("nothing was checked");
   }, 30000);
 });
+
+afterAll(removeScratch);

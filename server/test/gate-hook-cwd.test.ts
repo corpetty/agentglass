@@ -9,9 +9,10 @@
  * hook passes it on, by running the real hook against a stand-in server.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const PY = Bun.which("python3");
 const HOOK = new URL("../../hooks/gate_event.py", import.meta.url).pathname;
@@ -20,7 +21,7 @@ let server: ReturnType<typeof Bun.serve> | null = null;
 let seen: Record<string, unknown> | null = null;
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-gate-hook-cwd-"));
+  dir = scratchDir(join(tmpdir(), "agx-gate-hook-cwd-"));
   server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -60,3 +61,5 @@ test.skipIf(!PY)("a payload without one sends none, and the server falls back to
   expect(seen).not.toBeNull();
   expect(seen!.cwd ?? "").toBe("");
 });
+
+afterAll(removeScratch);

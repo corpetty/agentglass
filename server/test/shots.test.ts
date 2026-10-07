@@ -7,12 +7,13 @@
  * something to trust with a path.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, utimesSync, existsSync } from "node:fs";
+import { rmSync, readdirSync, readFileSync, writeFileSync, utimesSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { saveShot, __setShotDir } from "../src/shots.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-shots-"));
+const dir = scratchDir(join(tmpdir(), "agx-shots-"));
 let here = "";
 
 /** A real one-pixel PNG, so the magic-number check is exercised rather than
@@ -118,3 +119,5 @@ describe("not accumulating", () => {
     expect(saveShot(url(), "b").ok).toBe(true);
   });
 });
+
+afterAll(removeScratch);

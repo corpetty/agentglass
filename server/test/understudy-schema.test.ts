@@ -19,13 +19,13 @@
  * throw — a CREATE that only works on an empty file would break the app on its
  * second launch and pass here for ever.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-understudy-schema-"));
+const dir = scratchDir(join(tmpdir(), "agx-understudy-schema-"));
 const dbPath = join(dir, "understudy.db");
 process.env.AGENTGLASS_DB = dbPath;
 process.env.XDG_CONFIG_HOME = dir;
@@ -256,3 +256,5 @@ describe("opening a database that already has all of this in it", () => {
     });
   });
 });
+
+afterAll(removeScratch);

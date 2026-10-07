@@ -11,17 +11,18 @@
  * Collapsing them gives one wrong instruction for two states.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { cliState, installSkill, refreshSkill, shippedSkill, skillDest, skillState } from "../src/browseruse.ts";
 import { createHash } from "node:crypto";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 const HOME0 = process.env.HOME;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-bu-"));
+  dir = scratchDir(join(tmpdir(), "agx-bu-"));
   process.env.HOME = dir;
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
@@ -162,7 +163,7 @@ describe("refreshing the skill when the app ships a newer one", () => {
 describe("the refresh reads the app's own copy only", () => {
   test("a skills directory in the launch cwd is not a source", () => {
     const cwd = process.cwd();
-    const there = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const there = scratchDir(join(tmpdir(), "agx-cwd-"));
     mkdirSync(join(there, "skills", "browser-use"), { recursive: true });
     writeFileSync(join(there, "skills", "browser-use", "SKILL.md"), "somebody else's skill");
     mkdirSync(join(dir, ".claude", "skills", "browser-use"), { recursive: true });
@@ -179,3 +180,5 @@ describe("the refresh reads the app's own copy only", () => {
     }
   });
 });
+
+afterAll(removeScratch);

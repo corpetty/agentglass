@@ -2,14 +2,15 @@
  * The URL rules and the containment walk plugins.ts hands the copied tree
  * to before trusting any of it.
  */
-import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
   pluginGitUrlError, catalogueUrlError, pluginRefError, walkPluginDir, contentHash, hashPath, linkText,
   MAX_FILES,
 } from "../src/plugin-sources.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOURCES = await Bun.file(new URL("../src/plugin-sources.ts", import.meta.url)).text();
 
@@ -67,7 +68,7 @@ describe("pluginRefError", () => {
 
 describe("walkPluginDir", () => {
   function dir(): string {
-    return mkdtempSync(join(tmpdir(), "agx-walk-"));
+    return scratchDir(join(tmpdir(), "agx-walk-"));
   }
 
   test("an ordinary small tree walks fine", () => {
@@ -92,7 +93,7 @@ describe("walkPluginDir", () => {
 
   test("a symlink that escapes the plugin directory is refused", () => {
     const d = dir();
-    const outside = mkdtempSync(join(tmpdir(), "agx-outside-"));
+    const outside = scratchDir(join(tmpdir(), "agx-outside-"));
     writeFileSync(join(outside, "secret"), "not yours");
     symlinkSync(join(outside, "secret"), join(d, "link"));
     const r = walkPluginDir(d);
@@ -145,7 +146,7 @@ describe("walkPluginDir", () => {
 
 describe("contentHash", () => {
   test("deterministic regardless of the order files are listed in", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "a.txt"), "one");
     writeFileSync(join(d, "b.txt"), "two");
     const h1 = contentHash(d, ["a.txt", "b.txt"]);
@@ -154,7 +155,7 @@ describe("contentHash", () => {
   });
 
   test("changes when a file's bytes change", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "a.txt"), "one");
     const before = contentHash(d, ["a.txt"]);
     writeFileSync(join(d, "a.txt"), "changed");
@@ -169,7 +170,7 @@ describe("contentHash", () => {
    * same, keep its approval, and run something nobody had agreed to.
    */
   test("changes when a link inside the folder is pointed at another file", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "good.sh"), "echo good\n");
     writeFileSync(join(d, "evil.sh"), "echo evil\n");
     symlinkSync("good.sh", join(d, "run.sh"));
@@ -181,7 +182,7 @@ describe("contentHash", () => {
   });
 
   test("a link is not a file that holds its target's name", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "good.sh"), "echo good\n");
     symlinkSync("good.sh", join(d, "run.sh"));
     const linked = contentHash(d, walkPluginDir(d).files);
@@ -196,9 +197,9 @@ describe("contentHash", () => {
    * it hashed exactly like the two files it spelled out.
    */
   test("one file cannot pass for two", () => {
-    const one = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const one = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(one, "a.txt"), "x\0run.sh\0echo pwned\n");
-    const two = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const two = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(two, "a.txt"), "x");
     writeFileSync(join(two, "run.sh"), "echo pwned\n");
     expect(contentHash(one, ["a.txt"])).not.toBe(contentHash(two, ["a.txt", "run.sh"]));
@@ -222,7 +223,7 @@ describe("contentHash and the executable bit", () => {
   };
   /** A checkout of one commit holding `run.sh` as 100755, with the file on disk made `mode`. */
   function checkout(mode: number): string {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-x-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-x-"));
     writeFileSync(join(d, "run.sh"), "echo hi\n");
     writeFileSync(join(d, "notes.txt"), "plain\n");
     chmodSync(join(d, "run.sh"), 0o755);
@@ -235,7 +236,7 @@ describe("contentHash and the executable bit", () => {
   const hashOf = (d: string, platform?: NodeJS.Platform) => contentHash(d, walkPluginDir(d).files, platform);
 
   test("changes when only a file's executable bit changes", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "run.sh"), "echo hi\n");
     chmodSync(join(d, "run.sh"), 0o644);
     const before = hashOf(d);
@@ -248,7 +249,7 @@ describe("contentHash and the executable bit", () => {
     const windows = checkout(0o644);
     expect(hashOf(windows, "win32")).toBe(hashOf(linux, "linux"));
     // …and that is the bit and not the history: the same bytes with no bit hash otherwise.
-    const plain = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const plain = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(plain, "run.sh"), "echo hi\n");
     writeFileSync(join(plain, "notes.txt"), "plain\n");
     chmodSync(join(plain, "run.sh"), 0o644);
@@ -256,7 +257,7 @@ describe("contentHash and the executable bit", () => {
   });
 
   test("on Windows the disk says nothing about the bit, and elsewhere a folder that is no checkout says it", () => {
-    const d = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const d = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(d, "run.sh"), "echo hi\n");
     chmodSync(join(d, "run.sh"), 0o755);
     const onWindows = hashOf(d, "win32");
@@ -266,7 +267,7 @@ describe("contentHash and the executable bit", () => {
   });
 
   test("a .git that is not a repository is not read, and neither is a repository above the folder", () => {
-    const broken = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const broken = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(broken, "run.sh"), "echo hi\n");
     mkdirSync(join(broken, ".git"));
     writeFileSync(join(broken, ".git", "HEAD"), "ref: refs/heads/main\n");
@@ -278,7 +279,7 @@ describe("contentHash and the executable bit", () => {
     writeFileSync(join(repo, "sub", "run.sh"), "echo hi\n");
     git(repo, "add", "sub/run.sh");
     git(repo, "update-index", "--chmod=+x", "sub/run.sh");
-    const alone = mkdtempSync(join(tmpdir(), "agx-hash-"));
+    const alone = scratchDir(join(tmpdir(), "agx-hash-"));
     writeFileSync(join(alone, "run.sh"), "echo hi\n");
     expect(hashOf(join(repo, "sub"), "win32")).toBe(hashOf(alone, "win32"));
   });
@@ -338,3 +339,5 @@ describe("a path and a link read the same on Windows", () => {
     expect(body("contentHash")).toContain("linkText(readlinkSync(");
   });
 });
+
+afterAll(removeScratch);

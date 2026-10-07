@@ -4,12 +4,13 @@
 // registration inside the in-scope repo's .git — so the path must be verified as
 // a worktree of this repo first, exactly like its siblings do.
 import { afterAll, describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const base = mkdtempSync(join(tmpdir(), "agx-rmwt-"));
+const base = scratchDir(join(tmpdir(), "agx-rmwt-"));
 // Restored in afterAll: process.env is shared across every test file in one
 // `bun test` run, so leaking a scope root here would silently rescope an
 // order-dependent suite that loads after this one.
@@ -49,3 +50,5 @@ describe("removeWorktree membership", () => {
     expect(r.ok).toBe(true);
   });
 });
+
+afterAll(removeScratch);

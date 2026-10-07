@@ -17,14 +17,15 @@
  *     branch.
  */
 import { afterAll, beforeEach, afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Static, and it has no side effects — the dynamic imports below are ordered
 // after AGENTGLASS_ROOT is set and this one must not disturb that.
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-msess-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-msess-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { mergeSession, reopenConflict, mergeContinue, resolveBlocks, resolveWith, markersLeft, sessionOp, mergeInfo, stoppedRefusal } =
   await import("../src/gitwork.ts");
@@ -373,3 +374,5 @@ describe("committing a merge that still has markers in it", () => {
     expect(mergeSession(repo).op).toBe("");
   });
 });
+
+afterAll(removeScratch);

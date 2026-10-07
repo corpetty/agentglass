@@ -14,19 +14,20 @@
  * accidentally halts somebody's agents is a worse product than one that only
  * reports, so "does not hold" is pinned harder here than "holds".
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Budget, BudgetStatus } from "../../shared/types.ts";
 import type { budgetHoldFor as BudgetHoldFor } from "../src/budget.ts";
 import { budgetStatus, overBudgetFor, budgetHoldReason, emptyBudget } from "../src/budget.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Config homes, one per budget arrangement. config.ts caches per resolved path
 // and reloads when the path changes, so flipping XDG_CONFIG_HOME between tests
 // is how a suite in one process gets to try more than one settings file.
 const home = (name: string, budgets?: unknown): string => {
-  const d = mkdtempSync(join(tmpdir(), `agx-gatebudget-${name}-`));
+  const d = scratchDir(join(tmpdir(), `agx-gatebudget-${name}-`));
   if (budgets !== undefined) {
     mkdirSync(join(d, "agentglass"), { recursive: true });
     writeFileSync(join(d, "agentglass", "config.json"), JSON.stringify({ budgets }));
@@ -282,3 +283,5 @@ describe("AGENTGLASS_GATE_FAILCLOSED", () => {
     }
   }, 10_000);
 });
+
+afterAll(removeScratch);

@@ -13,12 +13,13 @@
  * root and is not gated fails here rather than shipping.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOURCE = await Bun.file(new URL("../src/index.ts", import.meta.url).pathname).text();
 
@@ -91,7 +92,7 @@ async function boot(env: Record<string, string>): Promise<string> {
 let scoped = "", unscoped = "", noBrowse = "";
 
 beforeAll(async () => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-gitscope-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-gitscope-")));
   // Refuse to go on anywhere but a fresh temp directory: every path below is
   // handed to a server as HOME and XDG_CONFIG_HOME.
   if (!dir.startsWith(realpathSync(tmpdir()))) throw new Error(`not a temp dir: ${dir}`);
@@ -266,7 +267,7 @@ describe("the git wrapper", () => {
   const saved = { g: process.env.GIT_CONFIG_GLOBAL, s: process.env.GIT_CONFIG_NOSYSTEM };
   let w = "";
   beforeAll(() => {
-    w = realpathSync(mkdtempSync(join(tmpdir(), "agx-gitsafe-")));
+    w = realpathSync(scratchDir(join(tmpdir(), "agx-gitsafe-")));
     // The developer's own global config may set core.hooksPath or fsmonitor,
     // and either would decide these tests for them.
     writeFileSync(join(w, "gitconfig"), "");
@@ -326,3 +327,5 @@ describe("the git wrapper", () => {
     expect(existsSync(`${mark}-commit`)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

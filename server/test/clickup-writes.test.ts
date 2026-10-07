@@ -10,14 +10,15 @@
  * never removes from the old, a comment edited into plain text.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as CU from "../src/clickup.ts";
 import * as C from "../src/credentials.ts";
 import * as CV from "../src/clickupviews.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cu-writes-"));
+const dir = scratchDir(join(tmpdir(), "agx-cu-writes-"));
 
 let seen: { method: string; path: string; body: unknown }[] = [];
 let reply: (req: Request) => Response | Promise<Response> = () => new Response("{}", { headers: { "content-type": "application/json" } });
@@ -277,3 +278,5 @@ describe("the switch that has to hold for all of them", () => {
     expect(seen).toHaveLength(0);
   });
 });
+
+afterAll(removeScratch);

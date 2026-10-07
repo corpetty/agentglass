@@ -11,12 +11,12 @@
 //  - the CI notification fires once at the end, not once per check;
 //  - the asset proxy is a URL taken from a pull request body, which is a string
 //    a stranger wrote.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-prs-"));
+const dir = scratchDir(join(tmpdir(), "agx-prs-"));
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_DB = join(dir, "p.db");
 
@@ -499,3 +499,5 @@ describe("what the image proxy relays", () => {
     }
   });
 });
+
+afterAll(removeScratch);

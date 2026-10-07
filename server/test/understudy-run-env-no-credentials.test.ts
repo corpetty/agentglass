@@ -17,10 +17,11 @@
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { understudyRunEnv, secretsBlanked, SECRET_NAME } from "../src/understudy-runenv.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 let env: Record<string, string> = {};
@@ -35,7 +36,7 @@ function git(args: string[]) {
 }
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-fence-"));
+  dir = scratchDir(join(tmpdir(), "agx-fence-"));
   execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir });
   /* A remote of the shape this project actually uses. Nothing is ever sent to
      it: every assertion below is about the request never leaving. */
@@ -205,7 +206,7 @@ describe("and what a run still needs, it keeps", () => {
   });
 
   test("two runs never share the empty gh config", () => {
-    const other = mkdtempSync(join(tmpdir(), "agx-fence-2-"));
+    const other = scratchDir(join(tmpdir(), "agx-fence-2-"));
     try {
       expect(understudyRunEnv(other).GH_CONFIG_DIR).not.toBe(env.GH_CONFIG_DIR);
     } finally {
@@ -213,3 +214,5 @@ describe("and what a run still needs, it keeps", () => {
     }
   });
 });
+
+afterAll(removeScratch);

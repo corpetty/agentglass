@@ -3,12 +3,13 @@
 // Project scope was already applied; the time window and provider chip were not,
 // so Search returned hits from outside the header filters while every other pane
 // respected them. These drive the real query layer against a throwaway DB.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-search-scope-"));
+const dir = scratchDir(join(tmpdir(), "agx-search-scope-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "search-scope.db");
@@ -100,3 +101,5 @@ describe("ftsQuery rewrite is preserved alongside the new filters", () => {
     expect(db.ftsQuery("foo-bar")).toBe('"foo-bar"*');
   });
 });
+
+afterAll(removeScratch);

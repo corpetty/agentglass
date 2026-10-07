@@ -14,16 +14,16 @@
  * Clamping is not validating. A number that is not a number has to be replaced
  * before it reaches arithmetic that assumes it is one.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let S: typeof import("../src/understudy-shift.ts");
 let U: typeof import("../src/understudy.ts");
 
 beforeAll(async () => {
-  process.env.AGENTGLASS_DB = join(mkdtempSync(join(tmpdir(), "agx-shift-")), "t.db");
+  process.env.AGENTGLASS_DB = join(scratchDir(join(tmpdir(), "agx-shift-")), "t.db");
   S = await import("../src/understudy-shift.ts");
   U = await import("../src/understudy.ts");
   U.setEnabled(true);
@@ -112,3 +112,5 @@ describe("an expired shift does not block the next one for ever", () => {
     expect(again.ok === false && again.error).toContain("already running");
   });
 });
+
+afterAll(removeScratch);

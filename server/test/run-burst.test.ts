@@ -17,12 +17,13 @@
 //
 // The second half is the replacement: one call, one loop, every leg awaited,
 // and the count that comes back is the count that was asked for.
-import { describe, expect, test, beforeAll, afterEach } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterEach, afterAll } from "bun:test";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-run-burst-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-run-burst-")));
 const ROOT = join(dir, "repo");
 
 process.env.XDG_CONFIG_HOME = dir;
@@ -172,3 +173,5 @@ describe("a run started on the server", () => {
     expect(r.error).toContain("outside the open project");
   });
 });
+
+afterAll(removeScratch);

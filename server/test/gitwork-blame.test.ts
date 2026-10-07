@@ -1,14 +1,15 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // All gitwork tests share one skeleton: a scratch repo outside the real tree,
 // a GIT_CONFIG_GLOBAL pointing at a temp config so nothing on this machine can
 // leak in, and guard() resolved against the scratch root via AGENTGLASS_ROOT.
 async function makeRepo() {
-  const dir = mkdtempSync(join(tmpdir(), "agx-blame-"));
+  const dir = scratchDir(join(tmpdir(), "agx-blame-"));
   process.env.AGENTGLASS_ROOT = dir;
   const config = join(dir, ".gitconfig");
   writeFileSync(config, `[user]\n\temail = t@t\n\tname = T\n[init]\n\tdefaultBranch = main\n`);
@@ -137,3 +138,5 @@ describe("blame", () => {
     expect(readFileSync(join(process.env.AGENTGLASS_ROOT!, "setup.sh"), "utf8")).toBe("touch");
   });
 });
+
+afterAll(removeScratch);

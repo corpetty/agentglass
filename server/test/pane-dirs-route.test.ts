@@ -17,12 +17,13 @@
  * listed first.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { freePort } from "./freePort.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", base = "", socket = "", window = "", proc: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -44,7 +45,7 @@ const tmux = (...args: string[]) =>
   });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-panedirs-"));
+  dir = scratchDir(join(tmpdir(), "agx-panedirs-"));
   WT = join(dir, "orbit-WEB-1042");
   socket = `agx-pd-${dir.slice(dir.lastIndexOf("-") + 1)}`;
   if (HAVE_TMUX) {
@@ -144,3 +145,5 @@ describe("/terminal/pane-dirs", () => {
     expect(r.dirs).not.toContain(OUTSIDE);
   });
 });
+
+afterAll(removeScratch);

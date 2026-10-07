@@ -1,8 +1,9 @@
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { test, expect, describe, beforeEach, afterEach, afterAll } from "bun:test";
+import { writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parseCatalog, isOffered, todayStamp, claudeModels, catalogPaths } from "../src/claudemodels.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Claude Code publishes no model list — no `models` subcommand, no
 // `--list-models`, no cache on disk — so unlike Codex and Antigravity this one
@@ -87,7 +88,7 @@ describe("reading the file", () => {
 describe("where it is read from", () => {
   let dir = "";
   const saved = process.env.AGENTGLASS_CLAUDE_MODELS;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "agx-models-")); });
+  beforeEach(() => { dir = scratchDir(join(tmpdir(), "agx-models-")); });
   afterEach(() => {
     if (saved === undefined) delete process.env.AGENTGLASS_CLAUDE_MODELS;
     else process.env.AGENTGLASS_CLAUDE_MODELS = saved;
@@ -141,3 +142,5 @@ describe("the catalogue this repo ships", () => {
     expect(todayStamp(new Date(2026, 0, 5))).toBe("2026-01-05");
   });
 });
+
+afterAll(removeScratch);

@@ -17,12 +17,13 @@
  * what tmux does and a mock would only repeat what I believed.
  */
 import { describe, expect, it, beforeEach, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startSession } from "./tmuxIsolated.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const DIR = mkdtempSync(join(tmpdir(), "agx-move-"));
+const DIR = scratchDir(join(tmpdir(), "agx-move-"));
 const SOCKET = `agx-move-${process.pid}`;
 const BIN = Bun.which("tmux") ?? "tmux";
 
@@ -117,3 +118,5 @@ describe("what tmux does on its own, and does not", () => {
     expect(strip().startsWith("1:w2")).toBe(true);
   });
 });
+
+afterAll(removeScratch);

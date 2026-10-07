@@ -9,13 +9,14 @@
 // requires nothing from Electron, so it is imported here directly.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { healthProof } from "../src/auth.ts";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const require = createRequire(import.meta.url);
 const shell = require("../../electron/server-probe.js") as {
@@ -106,7 +107,7 @@ describe("a real server", () => {
   let proc: ReturnType<typeof Bun.spawn> | null = null;
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-adopt-"));
+    dir = scratchDir(join(tmpdir(), "agx-adopt-"));
     port = await freePort();
     proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
       env: {
@@ -189,3 +190,5 @@ describe("the shell after a failed start", () => {
     expect(body("async function restartSidecar(")).toContain("token: sidecarUp ? currentToken() : null");
   });
 });
+
+afterAll(removeScratch);

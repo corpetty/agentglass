@@ -16,10 +16,11 @@
  * windows there is a test that opens windows in somebody's work.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCKET = `agx-enginewin-${process.pid}`;
 const REAL_SOCKET = process.env.AGENTGLASS_TMUX_SOCKET;
@@ -32,7 +33,7 @@ const { engineWindowRunning, tmux, tmuxCapability } = await import("../src/tmuxp
 let dir = "";
 const have = tmuxCapability().available;
 
-beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "agx-enginewin-")); });
+beforeAll(() => { dir = scratchDir(join(tmpdir(), "agx-enginewin-")); });
 afterAll(async () => {
   if (have) await tmux(["kill-server"]);
   if (dir) rmSync(dir, { recursive: true, force: true });
@@ -83,3 +84,5 @@ describe("opening windows on the engine", () => {
     expect(ls.stdout).toContain("app-v2");
   });
 });
+
+afterAll(removeScratch);

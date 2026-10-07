@@ -13,13 +13,14 @@
  * the same rule that keeps a suite run from reading or clobbering a
  * developer's real prefs.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_NOTIFY_PREFS, coerceNotifyPrefs, notifies, kindOfNotification, NOTIFY_KINDS, NOTIFY_CHANNELS,
 } from "../../shared/notifyPrefs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("DEFAULT_NOTIFY_PREFS", () => {
   test("only blocked and reminders interrupt out of the box", () => {
@@ -102,7 +103,7 @@ describe("persistence — server/src/notifyPrefs.ts", () => {
 
   beforeEach(async () => {
     process.env.NODE_ENV = "test";
-    dir = mkdtempSync(join(tmpdir(), "agx-notify-prefs-"));
+    dir = scratchDir(join(tmpdir(), "agx-notify-prefs-"));
     process.env.XDG_CONFIG_HOME = dir;
     // A fresh module instance per test: readNotifyPrefs() caches, and the
     // cache is what a stale XDG_CONFIG_HOME from a previous test would leak
@@ -134,3 +135,5 @@ describe("persistence — server/src/notifyPrefs.ts", () => {
     expect(mod.readNotifyPrefs()).toEqual(DEFAULT_NOTIFY_PREFS);
   });
 });
+
+afterAll(removeScratch);

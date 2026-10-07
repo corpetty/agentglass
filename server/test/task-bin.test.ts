@@ -6,11 +6,12 @@
  * on a machine with no tmux. A bundled binary has to be FOUND before it can be
  * shipped, and this is the half that finds it.
  */
-import { afterEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, it, afterAll } from "bun:test";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { taskBin, __resetTaskBin } from "../src/tasks.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const dirs: string[] = [];
 const saved = { path: process.env.AGENTGLASS_TASK_PATH, dir: process.env.AGENTGLASS_TASK_DIR };
@@ -26,7 +27,7 @@ afterEach(() => {
 
 /** A directory holding an executable called `task`. */
 function withBinary(): string {
-  const dir = mkdtempSync(join(tmpdir(), "agx-task-"));
+  const dir = scratchDir(join(tmpdir(), "agx-task-"));
   dirs.push(dir);
   const p = join(dir, "task");
   writeFileSync(p, "#!/bin/sh\nexit 0\n");
@@ -53,7 +54,7 @@ describe("finding taskwarrior", () => {
   it("ignores an override that is not runnable, rather than failing outright", () => {
     /* A stale path in a config file must not take local tasks away from a
        machine that has a perfectly good `task` on PATH. */
-    const dir = mkdtempSync(join(tmpdir(), "agx-task-"));
+    const dir = scratchDir(join(tmpdir(), "agx-task-"));
     dirs.push(dir);
     writeFileSync(join(dir, "task"), "not executable\n");
     process.env.AGENTGLASS_TASK_PATH = join(dir, "task");
@@ -65,7 +66,7 @@ describe("finding taskwarrior", () => {
   });
 
   it("says nothing rather than guessing when there is none anywhere", () => {
-    const empty = mkdtempSync(join(tmpdir(), "agx-task-"));
+    const empty = scratchDir(join(tmpdir(), "agx-task-"));
     dirs.push(empty);
     process.env.AGENTGLASS_TASK_DIR = empty;
     delete process.env.AGENTGLASS_TASK_PATH;
@@ -75,3 +76,5 @@ describe("finding taskwarrior", () => {
     try { expect(taskBin()).toBeNull(); } finally { process.env.PATH = path; }
   });
 });
+
+afterAll(removeScratch);

@@ -10,12 +10,13 @@
 //
 // The bucket only ever contains Skill-tool invocations, so where a skill of
 // that name exists it is the one that ran.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-skillkind-"));
+const dir = scratchDir(join(tmpdir(), "agx-skillkind-"));
 const CODE = join(dir, "code");
 const PROJ = join(CODE, "proj");
 const CLAUDE = join(PROJ, ".claude");
@@ -141,3 +142,5 @@ describe("the usage window is bounded and declared", () => {
     expect(find(all, "skill", "deploy").calls).toBe(0);
   });
 });
+
+afterAll(removeScratch);

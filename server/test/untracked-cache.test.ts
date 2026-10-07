@@ -14,9 +14,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let repo: string;
 let gw: typeof import("../src/gitwork.ts");
@@ -24,7 +25,7 @@ let gw: typeof import("../src/gitwork.ts");
 const run = (dir: string, ...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
 
 beforeAll(async () => {
-  repo = mkdtempSync(join(tmpdir(), "agx-untracked-cache-"));
+  repo = scratchDir(join(tmpdir(), "agx-untracked-cache-"));
   run(repo, "init", "-q", "-b", "main");
   run(repo, "config", "user.email", "t@example.com");
   run(repo, "config", "user.name", "t");
@@ -68,3 +69,5 @@ describe("untracked file listing", () => {
     expect(afterStage.unstaged.find((c) => c.file_path.endsWith("third.txt"))).toBeTruthy();
   });
 });
+
+afterAll(removeScratch);

@@ -21,19 +21,19 @@
  * that device-scope.test.ts already covers. The fence goes up before the thing
  * it fences arrives; that is the only order that works.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allowed, answersFromADevice, callerFor, scopeNeeded, type Caller } from "../src/auth.ts";
 import { issueDevice, __resetDevices, type Scope } from "../src/devices.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const MACHINE = "machine-token-for-this-test";
 
 beforeEach(() => {
   process.env.NODE_ENV = "test";
   // Never the developer's real devices file. See offLimits in devices.ts.
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-understudy-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-understudy-"));
   __resetDevices();
 });
 
@@ -142,3 +142,5 @@ describe("and nobody else moved", () => {
     expect(answersFromADevice(machine)).toBe(false); // still not a device; unchanged
   });
 });
+
+afterAll(removeScratch);

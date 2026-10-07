@@ -10,12 +10,13 @@
  * preserved, and refuses anything that is not contiguous.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-history-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-history-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { revertCommit, amendCommit, squashCommits, stage, conflicts, resolveWith, mergeContinue, mergeAbort } =
   await import("../src/gitwork.ts");
@@ -151,3 +152,5 @@ describe("squash", () => {
     expect(r.error).toContain("not in this branch's history");
   });
 });
+
+afterAll(removeScratch);

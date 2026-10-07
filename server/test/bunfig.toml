@@ -1,0 +1,10 @@
+# The same preloads as server/bunfig.toml, for a run started in this directory.
+#
+# bun reads a bunfig.toml only from the directory it was STARTED in, so
+# `cd server/test && bun test ./foo.test.ts` loaded none of them: no scratch
+# HOME, no guard on the real agentglass directories, and no sweep. Measured: a
+# probe directory made from here survived the run. See test/isolation.ts and
+# test/tmpsweep.ts; isolation.ts has to come first, and tmuxleak.ts before
+# tmpsweep.ts, which removes the directory its servers are in.
+[test]
+preload = ["./isolation.ts", "./tmuxleak.ts", "./tmpsweep.ts"]

@@ -31,16 +31,17 @@
  * the machines that had been using it.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { containerRecord, resetContainerLedger } from "../src/browserdrive.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let scratch = "";
 let previous: string | undefined;
 
 beforeAll(() => {
-  scratch = mkdtempSync(join(tmpdir(), "agx-ledgerpath-"));
+  scratch = scratchDir(join(tmpdir(), "agx-ledgerpath-"));
   previous = process.env.AGENTGLASS_STATE_DIR;
   process.env.AGENTGLASS_STATE_DIR = scratch;
 });
@@ -106,7 +107,7 @@ describe("with no AGENTGLASS_STATE_DIR at all", () => {
   let home = "";
 
   beforeAll(() => {
-    home = mkdtempSync(join(tmpdir(), "agx-ledgerhome-"));
+    home = scratchDir(join(tmpdir(), "agx-ledgerhome-"));
     keptState = process.env.AGENTGLASS_STATE_DIR;
     keptCfg = process.env.XDG_CONFIG_HOME;
     keptHome = process.env.XDG_STATE_HOME;
@@ -151,3 +152,5 @@ describe("with no AGENTGLASS_STATE_DIR at all", () => {
     expect(containerRecord("some-container")?.creator).toBe("orbit-state");
   });
 });
+
+afterAll(removeScratch);

@@ -13,11 +13,12 @@
  * off that list rather than inferred from an error string.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { guardedFetch, hostsOnly, pinnedFetch, privateAddress, unfetchableHost } from "../src/net.ts";
 import { fetchCatalogue } from "../src/plugin-catalogue.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("a private address, judged without a resolver", () => {
   test("loopback, RFC1918, CGNAT, link-local, unspecified, and their IPv6 spellings", () => {
@@ -241,7 +242,7 @@ describe("the address that was checked is the address that is connected to", () 
 
 describe("pinnedFetch over https", () => {
   /** A connection to an address must still check the certificate against the NAME. */
-  const dir = mkdtempSync(join(tmpdir(), "agx-pin-"));
+  const dir = scratchDir(join(tmpdir(), "agx-pin-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
   const cert = (cn: string) => {
     const key = join(dir, `${cn}.key`), crt = join(dir, `${cn}.crt`);
@@ -262,3 +263,5 @@ describe("pinnedFetch over https", () => {
     } finally { srv.stop(true); }
   });
 });
+
+afterAll(removeScratch);

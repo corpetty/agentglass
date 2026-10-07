@@ -14,12 +14,13 @@
  *     machinery finishes or abandons it, exactly as it does for cherry-picks.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-rebase-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-rebase-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { rebaseSteps, runRebase, conflicts, resolveWith, mergeContinue, mergeAbort } =
   await import("../src/gitwork.ts");
@@ -180,3 +181,5 @@ describe("runRebase", () => {
     expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("two\n");
   });
 });
+
+afterAll(removeScratch);

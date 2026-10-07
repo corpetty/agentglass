@@ -22,14 +22,15 @@
  * mid-series — the case a `cherry-pick c1 c2 c3` run is actually for.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Static, and it has no side effects — the dynamic imports below are ordered
 // after AGENTGLASS_ROOT is set and this one must not disturb that.
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-cherry-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-cherry-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { cherryPick, cherryPickContinue, cherryPickAbort, conflicts, resolveWith, mergeContinue } =
   await import("../src/gitwork.ts");
@@ -141,3 +142,5 @@ describe("cherry-pick engine", () => {
     expect(r.error).toContain("nothing to continue");
   });
 });
+
+afterAll(removeScratch);

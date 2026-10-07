@@ -12,12 +12,13 @@
 // DB. It is scoped to a private project root so the counts are exactly this
 // test's events even though bun shares one DB across the suite, and the session
 // assertions are restricted to this test's ids as a second guard.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-provider-"));
+const dir = scratchDir(join(tmpdir(), "agx-provider-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "provider.db");
@@ -110,3 +111,5 @@ describe("a multi-provider session is attributed per event, not latched to one",
     expect(events("OpenAI")).toBe(2);
   });
 });
+
+afterAll(removeScratch);

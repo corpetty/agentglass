@@ -3,16 +3,17 @@
 // of real directories, it must not burn a display slot a real directory never
 // gets to fill — that silently dropped openable directories off the end.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { completePath } from "../src/fsbrowse.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const MAX_ENTRIES = 60; // must match fsbrowse.ts
 let base = "";
 
 beforeAll(() => {
-  base = mkdtempSync(join(tmpdir(), "agx-fscap-"));
+  base = scratchDir(join(tmpdir(), "agx-fscap-"));
   // Symlinks-to-files that sort first (leading "0"): under the old code they
   // took the first slots and pushed real directories past the cap.
   for (let i = 0; i < 5; i++) {
@@ -37,3 +38,5 @@ describe("completePath cap", () => {
     expect(names.filter((n) => n.startsWith("dir")).length).toBe(MAX_ENTRIES);
   });
 });
+
+afterAll(removeScratch);

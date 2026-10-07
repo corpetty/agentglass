@@ -17,12 +17,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-the-dupe-test";
 
@@ -35,7 +36,7 @@ function git(cwd: string, args: string[]): string {
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-ask-dupe-"));
+  dir = scratchDir(join(tmpdir(), "agx-ask-dupe-"));
   dbFile = join(dir, "dupe.db");
 
   // A real checkout, and a real sibling worktree of it — the fence
@@ -141,3 +142,5 @@ describe("the queue refuses a task it already has", () => {
     expect(again.body.id).not.toBe(first.body.id);
   });
 });
+
+afterAll(removeScratch);

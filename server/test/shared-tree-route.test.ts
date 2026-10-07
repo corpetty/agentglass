@@ -10,12 +10,13 @@
  * and that file as their overlap, and the worktree with the third alone.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
 import type { ChangeRowsResult } from "../../shared/types.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", repo = "", linked = "", base = "";
 let proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -33,7 +34,7 @@ const edit = (session_id: string, file_path: string) =>
   hook(session_id, "PostToolUse", { tool_name: "Edit", tool_input: { file_path, old_string: "1", new_string: "2" } });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-shared-tree-"));
+  dir = scratchDir(join(tmpdir(), "agx-shared-tree-"));
   repo = join(dir, "orbit");
   mkdirSync(join(repo, "src"), { recursive: true });
   git(dir, "init", "-q", "-b", "main", "orbit");
@@ -112,3 +113,5 @@ test("committed mode is history and carries no flag", async () => {
   const r = (await (await fetch(base + "/git/changes-v2?mode=committed")).json()) as ChangeRowsResult;
   expect(r.authors).toBeUndefined();
 });
+
+afterAll(removeScratch);

@@ -21,13 +21,13 @@
  * on every route and in both surfaces. A log that relabels the human as a
  * machine is wrong on nearly every row; the bug above is wrong on the rare one.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { actorOf, deviceActor, isMachineActor, MACHINE_ACTOR } from "../src/actions.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-principal-"));
+const dir = scratchDir(join(tmpdir(), "agx-principal-"));
 process.env.AGENTGLASS_DB = join(dir, "principal.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -194,3 +194,5 @@ describe("the row and the message, which have to agree", () => {
     }
   });
 });
+
+afterAll(removeScratch);

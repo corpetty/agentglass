@@ -12,11 +12,12 @@
  * checkout that had been removed from under the run, and each one sent
  * somebody to check a binary that was on the machine the whole time.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { whyItDied } from "../src/understudy-loop.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("the two ENOENTs", () => {
   test("a good program with a gone directory says the same as a missing program", () => {
@@ -26,7 +27,7 @@ describe("the two ENOENTs", () => {
     let badCwd = "";
     try { Bun.spawnSync({ cmd: [bun, "--version"], cwd: gone }); } catch (e) { badCwd = String((e as Error).message); }
     let badProgram = "";
-    const dir = mkdtempSync(join(tmpdir(), "understudy-cwd-"));
+    const dir = scratchDir(join(tmpdir(), "understudy-cwd-"));
     try { Bun.spawnSync({ cmd: [`${bun}-does-not-exist`, "--version"], cwd: dir }); } catch (e) { badProgram = String((e as Error).message); }
     rmSync(dir, { recursive: true, force: true });
 
@@ -53,3 +54,5 @@ describe("the two ENOENTs", () => {
       .toBe("the agent never wrote a word");
   });
 });
+
+afterAll(removeScratch);

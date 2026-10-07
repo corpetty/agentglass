@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * A recipe is text that becomes a process with the user's permissions.
@@ -12,7 +13,7 @@ import { join } from "node:path";
  * line — and the failure mode is not a wrong answer, it is somebody's home
  * directory.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-rec-"));
+const dir = scratchDir(join(tmpdir(), "agx-rec-"));
 const R = await import("../src/recipes.ts");
 
 const base = {
@@ -203,3 +204,5 @@ describe("a flag the author wants on by default", () => {
     expect(R.renderSteps(r, { fe: "0" }).steps[0]).toBe("make build ");
   });
 });
+
+afterAll(removeScratch);

@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { rmSync, statSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The file that holds a token.
@@ -14,7 +15,7 @@ import { join } from "node:path";
  * Its own directory, always. A suite that read the developer's real
  * credentials would pass, which is the failure this fixture removes.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-cred-"));
+const dir = scratchDir(join(tmpdir(), "agx-cred-"));
 const file = join(dir, "credentials.json");
 const C = await import("../src/credentials.ts");
 
@@ -112,3 +113,5 @@ describe("a store that got damaged", () => {
     expect(JSON.parse(readFileSync(file, "utf8")).clickup.token).toBe("pk_1_X");
   });
 });
+
+afterAll(removeScratch);

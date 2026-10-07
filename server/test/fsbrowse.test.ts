@@ -4,14 +4,15 @@
 // resolve against whatever directory the server was launched from, and the
 // promise that only directory names ever come back.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { completePath, splitPrefix } from "../src/fsbrowse.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let base = "";
 beforeAll(() => {
-  base = mkdtempSync(join(tmpdir(), "agx-fsbrowse-"));
+  base = scratchDir(join(tmpdir(), "agx-fsbrowse-"));
   for (const d of ["alpha", "alavera_app", "alavera_api", "beta", ".hidden", "node_modules"]) {
     mkdirSync(join(base, d));
   }
@@ -106,3 +107,5 @@ describe("completePath", () => {
     expect(e.path).toBe(join(base, "alpha"));
   });
 });
+
+afterAll(removeScratch);

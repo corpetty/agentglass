@@ -18,11 +18,12 @@
  * into the real one.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", state = "", base = "";
 let port = 0;
@@ -81,8 +82,8 @@ async function openWindow(reply: (op: string) => { ok: boolean; value?: unknown;
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-audit-route-"));
-  state = mkdtempSync(join(tmpdir(), "agx-audit-state-"));
+  dir = scratchDir(join(tmpdir(), "agx-audit-route-"));
+  state = scratchDir(join(tmpdir(), "agx-audit-state-"));
   port = await freePort();
   base = `http://127.0.0.1:${port}`;
   await startServer();
@@ -175,3 +176,5 @@ test("and the log is still there after the app restarts", async () => {
   expect(click!.how).toBe("explicit-page");
   expect((await readAudit({ tab: "t-b" })).entries.some((e) => e.op === "click")).toBe(true);
 });
+
+afterAll(removeScratch);

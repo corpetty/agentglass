@@ -9,12 +9,12 @@
 // column is NULL), the web returns "unknown" (the label). #246 depends on that
 // exact correspondence (the web's "unknown" round-trips to the server's NULL
 // bucket), so it is normalised here rather than treated as a divergence.
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-process.env.AGENTGLASS_DB = join(mkdtempSync(join(tmpdir(), "agx-prov-")), "p.db");
+process.env.AGENTGLASS_DB = join(scratchDir(join(tmpdir(), "agx-prov-")), "p.db");
 
 let serverProviderOf: (m: string | null | undefined) => string | null;
 let webProviderOf: (m: string | null | undefined) => string;
@@ -175,3 +175,5 @@ describe("modelLabel agrees between the server and the web copy", () => {
     }
   });
 });
+
+afterAll(removeScratch);

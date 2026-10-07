@@ -23,12 +23,12 @@
  * in this file's own beforeAll for the same reason: whichever file ran before
  * left them pointing somewhere else.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-understudy-seal-"));
+const dir = scratchDir(join(tmpdir(), "agx-understudy-seal-"));
 process.env.AGENTGLASS_DB = join(dir, "seal.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -269,3 +269,5 @@ describe("off means no rows", () => {
     expect(u.CLASSES).toHaveLength(13);
   });
 });
+
+afterAll(removeScratch);

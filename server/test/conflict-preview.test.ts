@@ -11,11 +11,12 @@
  * working tree is untouched and HEAD has not moved.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-preview-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-preview-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { conflictPreview } = await import("../src/gitwork.ts");
 
@@ -159,3 +160,5 @@ describe("when the fetch cannot happen", () => {
     expect(r.conflicts.length).toBe(7);
   });
 });
+
+afterAll(removeScratch);

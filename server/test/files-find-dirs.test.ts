@@ -12,10 +12,11 @@
  * prefixes of the paths it does track, which finds an empty one not at all.
  * That last part is a real limit and it is asserted rather than hidden.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { findFiles } = await import("../src/files.ts");
 
@@ -23,7 +24,7 @@ let dir = "";
 let hadRoot: string | undefined;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-find-"));
+  dir = scratchDir(join(tmpdir(), "agx-find-"));
   /*
    * The scope, set explicitly rather than inherited.
    *
@@ -102,3 +103,5 @@ describe("what a name search answers with", () => {
     expect(r.dirs).toContain("docs/projects");
   });
 });
+
+afterAll(removeScratch);

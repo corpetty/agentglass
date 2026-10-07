@@ -6,11 +6,12 @@
  * sizes, dates, dimensions, the picture itself — and it must not become a way
  * to read `~/.ssh/id_rsa` from a browser tab.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { browseDir, browseReal, fileBytes, fileFacts, imageSize, kindOf, openInDesktop } from "../src/browse.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const made: string[] = [];
 const wasRoots = process.env.AGENTGLASS_DISK_ROOTS;
@@ -22,7 +23,7 @@ const wasRoots = process.env.AGENTGLASS_DISK_ROOTS;
  * the operator's own way of adding a root, and using it here means the suite
  * tests the real rule instead of a relaxed one. */
 const tmp = () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-browse-"));
+  const d = scratchDir(join(tmpdir(), "agx-browse-"));
   made.push(d);
   process.env.AGENTGLASS_DISK_ROOTS = made.join(":");
   return d;
@@ -133,7 +134,7 @@ describe("the boundary", () => {
      `xdg-open` followed the link. The judgement is now on the real path. */
   test("a link whose target leaves both worlds is refused — the real path is judged, and served", async () => {
     const d = tmp();
-    const outside = mkdtempSync(join(tmpdir(), "agx-browse-outside-"));
+    const outside = scratchDir(join(tmpdir(), "agx-browse-outside-"));
     try {
       writeFileSync(join(outside, "id_key"), "PRIVATE");
       symlinkSync(join(outside, "id_key"), join(d, "notes.txt"));
@@ -161,7 +162,7 @@ describe("the boundary", () => {
 describe("the picture the viewer asks for stays inside the finder's places", () => {
   test("a link to a picture outside them is refused, and one inside is served", async () => {
     const d = tmp();
-    const outside = mkdtempSync(join(tmpdir(), "agx-browse-outside-"));
+    const outside = scratchDir(join(tmpdir(), "agx-browse-outside-"));
     try {
       writeFileSync(join(outside, "shot.png"), png(4, 4));
       symlinkSync(join(outside, "shot.png"), join(d, "shot.png"));
@@ -179,7 +180,7 @@ describe("the picture the viewer asks for stays inside the finder's places", () 
 
   test("`..` out of an allowed folder is judged where it lands", async () => {
     const d = tmp();
-    const outside = mkdtempSync(join(tmpdir(), "agx-browse-outside-"));
+    const outside = scratchDir(join(tmpdir(), "agx-browse-outside-"));
     try {
       writeFileSync(join(outside, "shot.png"), png(4, 4));
       mkdirSync(join(d, "inner"));
@@ -323,3 +324,5 @@ describe("handing a file to the desktop", () => {
   });
 });
 function noRootsForOpen() { delete process.env.AGENTGLASS_DISK_ROOTS; }
+
+afterAll(removeScratch);

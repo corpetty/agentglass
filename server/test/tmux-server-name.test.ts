@@ -9,17 +9,18 @@
  * and the only proof that it does is a real `$TMUX` from inside a real pane.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tmuxServerName, withTmuxServer } from "../src/tmuxctl.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const have = !!Bun.which("tmux");
 const INDEX = await Bun.file(new URL("../src/index.ts", import.meta.url)).text();
 const NAME = `agx-servername-${process.pid}`;
 const SOCK = ["-L", NAME];
-const dir = mkdtempSync(join(tmpdir(), "agx-servername-"));
+const dir = scratchDir(join(tmpdir(), "agx-servername-"));
 const seen = join(dir, "tmux-env");
 const savedTmpdir = process.env.TMUX_TMPDIR;
 const env = (): Record<string, string> => {
@@ -68,3 +69,5 @@ test("the Diff view's pane liveness reads each pane's own server", () => {
   expect(INDEX).toContain("paneHeldSessions(withTmuxServer(await listPanes(");
   expect(INDEX).not.toMatch(/paneHeldSessions\((await )?listPanes\(/);
 });
+
+afterAll(removeScratch);

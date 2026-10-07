@@ -1,12 +1,12 @@
 // Applying a suggested change rewrites somebody's file, so the line arithmetic
 // is worth pinning. GitHub has no "apply suggestion" API — the commit is
 // written here — and an off-by-one silently eats a line rather than failing.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-sug-"));
+const dir = scratchDir(join(tmpdir(), "agx-sug-"));
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_DB = join(dir, "s.db");
 
@@ -42,3 +42,5 @@ describe("spliceLines", () => {
     expect(prs.spliceLines(withTrailing, 1, 1, "A")).toBe("A\nb\n");
   });
 });
+
+afterAll(removeScratch);

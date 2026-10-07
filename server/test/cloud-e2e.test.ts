@@ -7,12 +7,13 @@
 // cloud intake, which stores the event under `cloud` on a hub that can then be
 // asked about it like any other machine's session.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "hub-secret-for-cloud-e2e";
 let root: string;
@@ -29,7 +30,7 @@ const asHub = (path: string, init: RequestInit = {}) =>
 const body = async (r: Promise<Response> | Response): Promise<any> => (await r).json();
 
 beforeAll(async () => {
-  root = mkdtempSync(join(tmpdir(), "agx-cloud-e2e-"));
+  root = scratchDir(join(tmpdir(), "agx-cloud-e2e-"));
   const dir = join(root, "hub");
   mkdirSync(dir, { recursive: true });
   const [port, intake] = [await freePort(), await freePort()];
@@ -156,3 +157,5 @@ describe("a cloud session reporting to the hub", () => {
     expect(after).toBe(before);
   }, 15_000);
 });
+
+afterAll(removeScratch);

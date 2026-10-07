@@ -1,18 +1,19 @@
 // Committing a renamed file used to record only the new path's addition, not the
 // old path's deletion: HEAD ended up with both files plus an orphaned staged
 // deletion. A rename must land whole.
-import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, it, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { commit } from "../src/git.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 const git = (...a: string[]) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" });
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-commitrename-"));
+  dir = scratchDir(join(tmpdir(), "agx-commitrename-"));
   process.env.AGENTGLASS_ROOT = dir; // the commit path is scope-guarded
   delete process.env.AGENTGLASS_COMMIT_DISABLED;
   git("init", "-q", "-b", "main");
@@ -49,3 +50,5 @@ describe("commit() of a rename", () => {
     expect(tree).toContain("orig.txt");
   });
 });
+
+afterAll(removeScratch);

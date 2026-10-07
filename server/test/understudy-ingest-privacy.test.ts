@@ -18,17 +18,18 @@
  * Both tests use a jail with its own terms file, so the suite never reads the
  * developer's real one and never writes near their real policy.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let jail: string;
 let U: typeof import("../src/understudy.ts");
 let ING: typeof import("../src/understudy-ingest.ts");
 
 beforeAll(async () => {
-  jail = mkdtempSync(join(tmpdir(), "agx-ingest-privacy-"));
+  jail = scratchDir(join(tmpdir(), "agx-ingest-privacy-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   mkdirSync(join(jail, "notes"), { recursive: true });
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -139,3 +140,5 @@ describe("provenance never carries a path", () => {
     U.setNever([]);
   });
 });
+
+afterAll(removeScratch);

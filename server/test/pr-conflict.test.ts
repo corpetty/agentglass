@@ -11,18 +11,19 @@
  * which two branches a pull request is between is somebody else's job.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 // Static, and it has no side effects — the dynamic imports below are ordered
 // after AGENTGLASS_ROOT is set and this one must not disturb that.
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // realpath, because git records the resolved path in a worktree's .git file and
 // these assertions compare paths. The scope guard reads the machine's real
 // config, so it is pointed at the fixture BEFORE gitwork is imported — the same
 // dance remote-branches.test.ts does.
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-prconf-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-prconf-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { prepareConflictMerge } = await import("../src/gitwork.ts");
 
@@ -144,3 +145,5 @@ describe("preparing a conflict", () => {
     expect(prepareConflictMerge(repo, "feature", "--upload-pack=evil").ok).toBe(false);
   });
 });
+
+afterAll(removeScratch);

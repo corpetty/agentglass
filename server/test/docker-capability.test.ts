@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, it, afterAll } from "bun:test";
+import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dockerCapability, dockerBin, __resetDockerCapForTest, __expireDockerVersionForTest } from "../src/docker.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Whether docker is on this machine, told apart from "the daemon is down".
@@ -48,7 +49,7 @@ describe("docker capability", () => {
     // whose answer we flip lets us cache a version, kill the daemon, and confirm
     // the next probe (past the liveness window) drops the version and reports it
     // down instead of vouching for a server that no longer answers.
-    const bin = mkdtempSync(join(tmpdir(), "agx-fakedocker-"));
+    const bin = scratchDir(join(tmpdir(), "agx-fakedocker-"));
     writeFileSync(
       join(bin, "docker"),
       `#!/bin/sh\nif [ -f "${bin}/down" ]; then\n`
@@ -89,3 +90,5 @@ describe("docker capability", () => {
     else expect(typeof cap.reason).toBe("string");            // (b) daemon down
   });
 });
+
+afterAll(removeScratch);

@@ -8,12 +8,13 @@
 //
 // Not theoretical: remote access and the phone companion exist precisely so
 // the viewer is not sitting at the server.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-heatmaptz-"));
+const dir = scratchDir(join(tmpdir(), "agx-heatmaptz-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "heat.db");
@@ -96,3 +97,5 @@ describe("the heatmap buckets in the zone it is asked for", () => {
     expect(la).not.toEqual(tokyo);
   });
 });
+
+afterAll(removeScratch);

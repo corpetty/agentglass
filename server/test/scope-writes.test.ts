@@ -8,12 +8,13 @@
 // The rule is deliberately shared by every write path (git mutations, the PTY,
 // chat) rather than re-implemented per call site, because the original scoping
 // bug was exactly that: each endpoint had to remember, and most didn't.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-scopewrite-"));
+const dir = scratchDir(join(tmpdir(), "agx-scopewrite-"));
 const PROJECT = join(dir, "project");
 const SIBLING = join(dir, "project-backup");
 for (const p of [PROJECT, SIBLING, join(PROJECT, "packages", "api")]) mkdirSync(p, { recursive: true });
@@ -68,3 +69,5 @@ describe("inScope", () => {
     expect(cfg.inScope(null, null)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

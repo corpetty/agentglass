@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Whether a branch's upstream is its own remote copy or the base branch itself.
@@ -19,7 +20,7 @@ let origin: string, work: string, other: string, gw: typeof import("../src/gitwo
 const run = (dir: string, ...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
 
 beforeAll(async () => {
-  const base = mkdtempSync(join(tmpdir(), "agx-guard-"));
+  const base = scratchDir(join(tmpdir(), "agx-guard-"));
   origin = join(base, "origin.git");
   work = join(base, "work");
   other = join(base, "other");
@@ -124,3 +125,5 @@ describe("upstream is the base", () => {
     expect(b.upstreamIsBase).toBe(true);
   });
 });
+
+afterAll(removeScratch);

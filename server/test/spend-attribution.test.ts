@@ -22,8 +22,8 @@
  * Each of those has one right answer, and none of them is obvious enough to
  * survive a refactor on its own.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 /*
@@ -41,8 +41,9 @@ import { join } from "node:path";
  * db and spend are loaded that way rather than named up here.
  */
 import type { SpendRow } from "../src/spend.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-spend-"));
+const dir = scratchDir(join(tmpdir(), "agx-spend-"));
 const REPO = join(dir, "orbit");
 const OTHER = join(dir, "other");
 /*
@@ -265,3 +266,5 @@ describe("over a seeded database", () => {
     expect(after.seamDay).toBeTruthy();
   });
 });
+
+afterAll(removeScratch);

@@ -4,12 +4,13 @@
 // cockpit was never opened for. safeAbs confines nothing to the workspace; only
 // inScope does.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-termscope-"));
+const dir = scratchDir(join(tmpdir(), "agx-termscope-"));
 const SCOPED = join(dir, "scoped");
 const OTHER = join(dir, "other");
 // A real repo each: projectCommands resolves the git root and walks for a
@@ -42,3 +43,5 @@ describe("projectCommands scoping", () => {
     expect(cmds.scripts).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

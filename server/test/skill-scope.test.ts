@@ -1,12 +1,13 @@
 // top_skills is a scoped read, like every other stat. skillUsageDetail forgot
 // the project filter, so a cockpit opened for one project listed skills — and
 // charged their cost — from every other project on the machine.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-skillscope-"));
+const dir = scratchDir(join(tmpdir(), "agx-skillscope-"));
 const SCOPED = join(dir, "scoped");
 const OTHER = join(dir, "other");
 for (const p of [SCOPED, OTHER]) mkdirSync(p, { recursive: true });
@@ -48,3 +49,5 @@ describe("skillUsageDetail scoping", () => {
     expect(skills).not.toContain("beta"); // the other project's skill must not leak in
   });
 });
+
+afterAll(removeScratch);

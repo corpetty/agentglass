@@ -7,18 +7,19 @@
  * makes the rest true — a lookup that does not leak how much of a guess was
  * right.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { beforeEach, describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   issueDevice, deviceFor, devices, activeDevices, revokeDevice, markSeen,
   scopeAllows, hashToken, devicesPath, publicDevice, __resetDevices,
 } from "../src/devices.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 beforeEach(() => {
   process.env.NODE_ENV = "test";
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-dev-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-dev-"));
   __resetDevices();
 });
 
@@ -161,3 +162,5 @@ describe("scope", () => {
     expect(issueDevice("iPhone").device.scope).toBe("answer");
   });
 });
+
+afterAll(removeScratch);

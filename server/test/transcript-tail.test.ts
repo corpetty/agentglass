@@ -13,11 +13,12 @@
 // file and with a line the writer has only half-flushed is the part that breaks.
 // Each test below is one of those.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-tail-"));
+const dir = scratchDir(join(tmpdir(), "agx-tail-"));
 const PROJECTS = join(dir, "projects", "-tmp-tailproj");
 mkdirSync(PROJECTS, { recursive: true });
 // Sweep this fixture, never ~/.claude/projects. Read per sweep by the scanner,
@@ -267,3 +268,5 @@ describe("incremental transcript sweep", () => {
     expect(prompts(sid)).toEqual(["c1", "c2", "c3"]);
   });
 });
+
+afterAll(removeScratch);

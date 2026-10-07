@@ -12,16 +12,17 @@
  * policy that can be reasoned around by whatever writes the next version of the
  * reasoning; an end time in a column cannot be.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let S: typeof import("../src/understudy-shift.ts");
 let W: typeof import("../src/understudy-work.ts");
 
 beforeAll(async () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-shift-"));
+  const d = scratchDir(join(tmpdir(), "agx-shift-"));
   mkdirSync(join(d, "config", "git"), { recursive: true });
   writeFileSync(join(d, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(d, "t.db");
@@ -103,7 +104,7 @@ describe("when it must stop and wait", () => {
     // removed. The old rule counted the row and never let go; it should not
     // fire here at all.
     for (let i = 0; i < 3; i++) {
-      const dir = mkdtempSync(join(tmpdir(), "agx-shift-wt-"));
+      const dir = scratchDir(join(tmpdir(), "agx-shift-wt-"));
       const id = W.beginRun({
         shiftId: r.shift.id,
         item: { id: `read-${i}`, source: "test", title: "x", detail: "", repo: "r", weight: 1 },
@@ -154,3 +155,5 @@ describe("there is no way to extend a shift", () => {
     expect(Object.keys(S)).not.toContain("renew");
   });
 });
+
+afterAll(removeScratch);

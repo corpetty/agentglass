@@ -15,14 +15,15 @@
  * The transcript is fed as text so all of that is testable without a CLI
  * writing one, which is the same reason paneloc.ts splits its parser out.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   dirsFromTranscript, ensurePaneNoteTable, noteForSession, notePaneAgent, notePaneFromHook, paneAgentNote, paneDirs, paneHeldSessions, readTail, resetTailCache,
 } from "../src/panewt.ts";
 import { Database } from "bun:sqlite";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const WT = "/home/dev/code/orbit-WEB-1042";
 const REPO = "/home/dev/code/orbit";
@@ -90,7 +91,7 @@ describe("dirsFromTranscript", () => {
 
 describe("readTail", () => {
   let dir = "";
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "agx-panewt-")); });
+  beforeEach(() => { dir = scratchDir(join(tmpdir(), "agx-panewt-")); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
   test("reads the end of a file, not the start", () => {
@@ -266,7 +267,7 @@ describe("the pane note", () => {
   });
 
   test("a read-only database is opened as it is, the sync that runs at every start included", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-panenote-ro-"));
+    const dir = scratchDir(join(tmpdir(), "agx-panenote-ro-"));
     try {
       const file = join(dir, "notes.db");
       const w = new Database(file);
@@ -304,7 +305,7 @@ describe("paneDirs", () => {
   const PANE = "%9911";
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "agx-panedirs-"));
+    dir = scratchDir(join(tmpdir(), "agx-panedirs-"));
     transcript = join(dir, "session.jsonl");
     writeFileSync(transcript, toolUse("Bash", { command: `git -C ${WT} diff` }) + "\n");
     resetTailCache();
@@ -369,3 +370,5 @@ describe("paneHeldSessions", () => {
     expect([...paneHeldSessions([{ paneId: "%9941", agentCwds: [REPO], server: s2 }])]).toEqual(["busy-on-s2"]);
   });
 });
+
+afterAll(removeScratch);

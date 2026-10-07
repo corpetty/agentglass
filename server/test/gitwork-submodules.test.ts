@@ -5,12 +5,13 @@
  * which the fixture sets on every git call that touches a submodule URL.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-submod-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-submod-")));
 process.env.AGENTGLASS_ROOT = dir;
 // protocol.file.allow is only honored from system/global config — never write
 // that into the real user's ~/.gitconfig, so give the test run its own.
@@ -133,3 +134,5 @@ describe("submodules", () => {
     expect(commitStaged(repo, "third", "").ok).toBe(true);
   });
 });
+
+afterAll(removeScratch);

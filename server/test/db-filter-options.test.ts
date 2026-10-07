@@ -10,12 +10,13 @@
  * one matters more. A new agent or model now appears in the dropdown on its
  * FIRST event instead of up to thirty seconds later.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-filter-"));
+const dir = scratchDir(join(tmpdir(), "agx-filter-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "filter.db");
@@ -88,3 +89,5 @@ describe("the filter dropdowns", () => {
     expect(value.hook_event_types).toContain("ProbeNewHook");
   });
 });
+
+afterAll(removeScratch);

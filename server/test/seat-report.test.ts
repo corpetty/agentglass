@@ -11,12 +11,12 @@
  * does not use the labels is still a report, and a parser that turns a status
  * into an argument about formatting has lost the thing that mattered.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-report-"));
+const dir = scratchDir(join(tmpdir(), "agx-report-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 
 const R = await import("../src/seatreport.ts");
@@ -239,3 +239,5 @@ describe("what counts as blocked", () => {
     expect(R.unreadWorthWaking(ROOT)).toBe(1);
   });
 });
+
+afterAll(removeScratch);

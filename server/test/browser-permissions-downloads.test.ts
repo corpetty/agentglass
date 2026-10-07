@@ -12,11 +12,12 @@
  * The decisions live in electron/guest-guard.js, which requires nothing, so
  * they are asserted there. What main.js does with them is a rule about source.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import { createRequire } from "node:module";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const require = createRequire(import.meta.url);
 const guard = require("../../electron/guest-guard.js") as {
@@ -105,7 +106,7 @@ describe("permissionVerdict", () => {
 });
 
 describe("uniqueSavePath", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-f2-dl-"));
+  const dir = scratchDir(join(tmpdir(), "agx-f2-dl-"));
   const exists = (p: string) => existsSync(p);
 
   test("a free name is used as it is", () => {
@@ -210,3 +211,5 @@ describe("downloadFile passes the caller's tab through", () => {
     expect(/finally\s*\{[\s\S]*behavior: "default"/.test(body)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

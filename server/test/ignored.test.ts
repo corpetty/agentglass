@@ -1,9 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { markIgnored } from "../src/ignored.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Against a real repository, because the whole point of asking git is that
@@ -13,7 +14,7 @@ import { markIgnored } from "../src/ignored.ts";
 let repo: string;
 
 beforeAll(() => {
-  repo = mkdtempSync(join(tmpdir(), "agx-ignored-"));
+  repo = scratchDir(join(tmpdir(), "agx-ignored-"));
   const git = (...args: string[]) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
   git("init", "-q");
   git("config", "user.email", "t@example.com");
@@ -58,3 +59,5 @@ describe("markIgnored", () => {
     for (const p of paths) expect(m.has(p)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

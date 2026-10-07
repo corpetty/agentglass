@@ -16,12 +16,13 @@
 // A third pair guards the id itself. `agentglass:web` in session `s1` and
 // `agentglass` in session `web:s1` are two rows that a plain join writes as one
 // string, so the id has to encode the pair rather than concatenate it.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-insights-group-"));
+const dir = scratchDir(join(tmpdir(), "agx-insights-group-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "insights-grp.db");
@@ -114,3 +115,5 @@ describe("two apps sharing one session id are two fleets, not one", () => {
     expect(new Set(rows.map((r) => r.id)).size).toBe(2);
   });
 });
+
+afterAll(removeScratch);

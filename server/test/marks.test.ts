@@ -7,7 +7,7 @@
  * a real socket can show an absence.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
@@ -18,6 +18,7 @@ import { db } from "../src/db.ts";
 import { scopeNeeded } from "../src/auth.ts";
 import { issueDevice } from "../src/devices.ts";
 import type { MarkOp } from "../../shared/types.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const NOW = 1_780_000_000_000;
 const PR = "acme/orbit#42";
@@ -177,7 +178,7 @@ describe("live: the route and the socket", () => {
   const machine = { authorization: `Bearer ${TOKEN}` };
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-marks-"));
+    dir = scratchDir(join(tmpdir(), "agx-marks-"));
     // The device store is read from XDG_CONFIG_HOME at call time, so the
     // credential is minted into the directory the server is about to use.
     process.env.XDG_CONFIG_HOME = dir;
@@ -278,3 +279,5 @@ describe("live: the route and the socket", () => {
     expect(got.marks.map((m: any) => m.key)).not.toContain("acme/orbit#43");
   });
 });
+
+afterAll(removeScratch);

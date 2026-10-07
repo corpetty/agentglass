@@ -1,15 +1,15 @@
 // The pricing baseline was added after sessions already existed in the wild.
 // Start a fresh Bun process on the old schema so this test exercises module-load
 // migration exactly as an upgraded installation does.
-import { expect, test } from "bun:test";
+import { expect, test, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 test("backfills an existing session's pricing baseline during migration", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-pricing-migration-"));
+  const dir = scratchDir(join(tmpdir(), "agx-pricing-migration-"));
   const dbPath = join(dir, "legacy.db");
   const legacy = new Database(dbPath, { create: true });
   legacy.exec(`
@@ -59,3 +59,5 @@ test("backfills an existing session's pricing baseline during migration", () => 
     pricing_baseline_usd: 1.2345,
   });
 });
+
+afterAll(removeScratch);

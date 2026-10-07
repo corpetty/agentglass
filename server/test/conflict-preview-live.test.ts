@@ -18,10 +18,11 @@
  *
  * Real repositories throughout: a merge conflict is not a thing to mock.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { conflictPreview } = await import("../src/gitwork.ts");
 
@@ -47,7 +48,7 @@ const write = (repo: string, name: string, body: string) => {
 };
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-cpl-"));
+  dir = scratchDir(join(tmpdir(), "agx-cpl-"));
   origin = join(dir, "origin.git");
   clone = join(dir, "work");
 
@@ -145,3 +146,5 @@ describe("how quickly it notices", () => {
     expect(b).toBe(a);
   });
 });
+
+afterAll(removeScratch);

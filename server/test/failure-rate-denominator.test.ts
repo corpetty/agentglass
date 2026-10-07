@@ -15,12 +15,13 @@
 // The fix keeps both counts. `errors` still means "how much went wrong", which
 // is what the Failed tile and the timeline series want; `tool_errors` is the
 // one a tool-call denominator may be paired with.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-failrate-"));
+const dir = scratchDir(join(tmpdir(), "agx-failrate-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "failrate.db");
@@ -99,3 +100,5 @@ describe("insights does not report a failure rate for tools that did not fail", 
     expect(card!.detail).toBe("3 of 5 tool calls failed");
   });
 });
+
+afterAll(removeScratch);

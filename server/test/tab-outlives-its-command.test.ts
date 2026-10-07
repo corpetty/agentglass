@@ -31,11 +31,12 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
 const SOCKET = `agx-tabdies-${process.pid}`;
 process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
-const TMPDIR = join(tmpdir(), `agx-tabdies-tmp-${process.pid}`);
-process.env.AGENTGLASS_STATE_DIR = join(tmpdir(), `agx-tabdies-state-${process.pid}`);
+const TMPDIR = trackScratch(join(tmpdir(), `agx-tabdies-tmp-${process.pid}`));
+process.env.AGENTGLASS_STATE_DIR = trackScratch(join(tmpdir(), `agx-tabdies-state-${process.pid}`));
 process.env.AGENTGLASS_RESTORE_SETTLE_MS = "400";
 const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 const REAL_XDG = process.env.XDG_CONFIG_HOME;
@@ -178,3 +179,5 @@ describe("a restore on that engine", () => {
     expect(await windowsOf(name)).toEqual(["keeps"]);
   }, 20_000);
 });
+
+afterAll(removeScratch);

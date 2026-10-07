@@ -9,12 +9,13 @@
 //
 // Driven against a throwaway DB, same as scope.test.ts: the bugs here are a
 // missing WHERE clause, which a test on SQL fragments would never notice.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-fleet-host-"));
+const dir = scratchDir(join(tmpdir(), "agx-fleet-host-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "fleet.db");
@@ -224,3 +225,5 @@ describe("another machine's paths are not ours to resolve", () => {
     expect(foreign.evidenceKind).toBe("none");
   });
 });
+
+afterAll(removeScratch);

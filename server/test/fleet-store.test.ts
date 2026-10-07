@@ -5,12 +5,12 @@
 // retried batch lands once, the cursor never runs ahead of what was stored, a
 // mirrored session is the node's numbers exactly, and nothing forwarded can
 // overwrite a session this machine — or a third one — recorded.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-fleet-store-"));
+const dir = scratchDir(join(tmpdir(), "agx-fleet-store-"));
 process.env.AGENTGLASS_DB ||= join(dir, "fleet.db");
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_HOST_ID = "hub";
@@ -127,3 +127,5 @@ describe("knowing a session is somewhere else", () => {
     expect(db.foreignHostOf("")).toBeNull();
   });
 });
+
+afterAll(removeScratch);

@@ -8,12 +8,13 @@
  * allow list, and a project rule follows the directory the hook reports.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-this-test";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -24,7 +25,7 @@ const ORBIT = "/nonexistent/code/orbit";
 const OTHER = "/nonexistent/code/other";
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-gaterules-route-"));
+  dir = scratchDir(join(tmpdir(), "agx-gaterules-route-"));
   mkdirSync(join(dir, "agentglass"), { recursive: true });
   writeFileSync(join(dir, "agentglass", "config.json"), JSON.stringify({
     gateRules: [
@@ -216,3 +217,5 @@ describe("a local tool whose name reads as outward", () => {
     expect((await pending()).some((g) => g.id === id)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

@@ -7,12 +7,13 @@
  * plugin-sandbox.test.ts, gated on `sandboxProbe().ok` like every other real
  * box test.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parsePluginBridgeArgs, runPluginBridge } from "../src/plugin-bridge.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("parsePluginBridgeArgs", () => {
   test("the ordinary shape", () => {
@@ -38,7 +39,7 @@ describe("parsePluginBridgeArgs", () => {
 
 const dirs: string[] = [];
 function scratch(): string {
-  const d = mkdtempSync(join(tmpdir(), "agx-bridge-"));
+  const d = scratchDir(join(tmpdir(), "agx-bridge-"));
   dirs.push(d);
   return d;
 }
@@ -132,3 +133,5 @@ describe("the proxy carries bytes both ways", () => {
     expect(await runPluginBridge(["--nonsense"])).toBe(2);
   });
 });
+
+afterAll(removeScratch);

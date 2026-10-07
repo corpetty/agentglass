@@ -20,10 +20,11 @@
  *
  * One minted credential answers both: every view readable, every write refused.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let AUTH: typeof import("../src/auth.ts");
 
@@ -32,7 +33,7 @@ const req = (t: string) => new Request("http://127.0.0.1:4000/x", { headers: { a
 const url = new URL("http://127.0.0.1:4000/x");
 
 beforeAll(async () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-rt-"));
+  const d = scratchDir(join(tmpdir(), "agx-rt-"));
   mkdirSync(join(d, "config", "git"), { recursive: true });
   writeFileSync(join(d, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(d, "t.db");
@@ -129,3 +130,5 @@ describe("it can see every view and change nothing", () => {
     expect(block).toContain("} finally {");
   });
 });
+
+afterAll(removeScratch);

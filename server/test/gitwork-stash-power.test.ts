@@ -6,12 +6,13 @@
  * from.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-stashpw-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-stashpw-")));
 process.env.AGENTGLASS_ROOT = dir;
 const {
   stashList, stashPush, stashRename, stashToBranch, stashPartial, stashApplyOverwrite, stashDrop,
@@ -147,3 +148,5 @@ describe("stash power-ups", () => {
     expect(readFileSync(join(repo, "new.txt"), "utf8")).toBe("brand new\n");
   });
 });
+
+afterAll(removeScratch);

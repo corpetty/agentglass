@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The first provider that lives on the other side of a network.
@@ -18,7 +19,7 @@ import { join } from "node:path";
  * under `tasks`, dates are epoch milliseconds as strings, and the token is sent
  * bare in `Authorization`.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-cu-"));
+const dir = scratchDir(join(tmpdir(), "agx-cu-"));
 const C = await import("../src/credentials.ts");
 const CU = await import("../src/clickup.ts");
 // The write switch lives in clickup-views.json, and without this line that is
@@ -879,3 +880,5 @@ describe("an address somebody assembled by hand", () => {
     ]) expect(parseViewUrl(bad), bad).toBe(null);
   });
 });
+
+afterAll(removeScratch);

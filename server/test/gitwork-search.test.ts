@@ -4,12 +4,13 @@
  * file, with one committing a shared token ("needle") into two files.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-search-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-search-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { searchCommits, grepWorkingTree, searchHistory } = await import("../src/gitwork.ts");
 
@@ -126,3 +127,5 @@ describe("searchHistory (pickaxe)", () => {
     expect(r.ok).toBe(false);
   });
 });
+
+afterAll(removeScratch);

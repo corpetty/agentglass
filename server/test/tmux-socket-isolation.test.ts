@@ -20,12 +20,13 @@
  * is broken.
  */
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { engineSocketArgs, tmuxSocket } from "../src/tmuxbin.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir, trackScratch } from "./scratch.ts";
 
 const SAVED = {
   XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
@@ -40,7 +41,7 @@ function restore() {
 afterEach(restore);
 afterAll(restore);
 
-const isolatedConfig = () => join(mkdtempSync(join(tmpdir(), "agx-sock-")), "config");
+const isolatedConfig = () => join(scratchDir(join(tmpdir(), "agx-sock-")), "config");
 
 describe("the engine's socket name", () => {
   test("the ordinary install keeps `agentglass`", () => {
@@ -86,7 +87,7 @@ describe("the engine's socket name", () => {
 
   test("a TMUX_TMPDIR of the instance's own keeps the plain name", () => {
     process.env.XDG_CONFIG_HOME = isolatedConfig();
-    process.env.TMUX_TMPDIR = mkdtempSync(join(tmpdir(), "agx-sock-tmux-"));
+    process.env.TMUX_TMPDIR = scratchDir(join(tmpdir(), "agx-sock-tmux-"));
     delete process.env.AGENTGLASS_TMUX_SOCKET;
     expect(tmuxSocket()).toBe("agentglass");
   });
@@ -94,8 +95,8 @@ describe("the engine's socket name", () => {
   test("a config dir not made yet, under a linked temp dir, keeps one name once it is made", () => {
     // Where /tmp is a link (macOS), a path that exists realpaths through it and
     // one that does not stays lexical: the answer must not change between the two.
-    const target = mkdtempSync(join(tmpdir(), "agx-sock-target-"));
-    const link = `${target}-link`;
+    const target = scratchDir(join(tmpdir(), "agx-sock-target-"));
+    const link = trackScratch(`${target}-link`);
     symlinkSync(target, link);
     process.env.XDG_CONFIG_HOME = join(link, "config");
     delete process.env.TMUX_TMPDIR;
@@ -116,7 +117,7 @@ describe("the engine's socket name", () => {
 
 describe("the engine is named by path", () => {
   test("a TMUX_TMPDIR that is gone is made, never fallen back from", () => {
-    const gone = join(mkdtempSync(join(tmpdir(), "agx-sock-gone-")), "tmux");
+    const gone = join(scratchDir(join(tmpdir(), "agx-sock-gone-")), "tmux");
     process.env.XDG_CONFIG_HOME = isolatedConfig();
     process.env.TMUX_TMPDIR = gone;
     delete process.env.AGENTGLASS_TMUX_SOCKET;
@@ -133,7 +134,7 @@ describe("the engine is named by path", () => {
   test("a socket directory open to others is handed back to tmux's own check", () => {
     // `-S` skips the check `-L` makes, so a directory somebody else could write
     // is not used by path: `-L` goes back to tmux, which refuses it itself.
-    const base = mkdtempSync(join(tmpdir(), "agx-sock-open-"));
+    const base = scratchDir(join(tmpdir(), "agx-sock-open-"));
     const dir = join(base, `tmux-${process.getuid?.() ?? 0}`);
     mkdirSync(dir);
     chmodSync(dir, 0o777);
@@ -149,7 +150,7 @@ describe("the engine is named by path", () => {
 const LIVE = `/tmp/tmux-${process.getuid?.() ?? 0}/agentglass`;
 
 async function bootAndRecord(tmuxTmpdir: string): Promise<string[]> {
-  const dir = mkdtempSync(join(tmpdir(), "agx-sock-boot-"));
+  const dir = scratchDir(join(tmpdir(), "agx-sock-boot-"));
   const stubDir = join(dir, "bin");
   mkdirSync(stubDir);
   const log = join(dir, "tmux-calls");
@@ -212,9 +213,11 @@ describe("a booted server with a temporary config", () => {
   }, SERVER_BOOT_MS);
 
   test("and a TMUX_TMPDIR that was removed does not fall back to the engine", async () => {
-    const gone = join(mkdtempSync(join(tmpdir(), "agx-sock-gone-")), "tmux");
+    const gone = join(scratchDir(join(tmpdir(), "agx-sock-gone-")), "tmux");
     const sourced = await bootAndRecord(gone);
     expectNotTheEngine(sourced);
     expect(sourced[0]!).toContain(`-S ${gone}/`);
   }, SERVER_BOOT_MS);
 });
+
+afterAll(removeScratch);

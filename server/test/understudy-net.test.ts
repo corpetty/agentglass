@@ -25,12 +25,13 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-the-net-test";
 
@@ -47,7 +48,7 @@ let dir = "", base = "", dbFile = "";
 let proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-understudy-net-"));
+  dir = scratchDir(join(tmpdir(), "agx-understudy-net-"));
   dbFile = join(dir, "net.db");
 
   /*
@@ -221,7 +222,7 @@ describe("switching it on where the fences cannot hold", () => {
   let tproc: ReturnType<typeof Bun.spawn> | null = null;
 
   beforeAll(async () => {
-    tdir = mkdtempSync(join(tmpdir(), "agx-understudy-notoken-"));
+    tdir = scratchDir(join(tmpdir(), "agx-understudy-notoken-"));
     const port = await freePort();
     tbase = `http://127.0.0.1:${port}`;
     tproc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -275,3 +276,5 @@ describe("switching it on where the fences cannot hold", () => {
     expect(card.enabled).toBe(false);
   });
 });
+
+afterAll(removeScratch);

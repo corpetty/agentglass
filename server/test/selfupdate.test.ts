@@ -1,8 +1,9 @@
-import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
+import { describe, expect, it, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * The update path, which is the most dangerous code in the app: it runs
@@ -18,9 +19,9 @@ let work = "";
 const git = (dir: string, ...a: string[]) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" });
 
 function makeRemote() {
-  remote = mkdtempSync(join(tmpdir(), "agx-remote-"));
+  remote = scratchDir(join(tmpdir(), "agx-remote-"));
   spawnSync("git", ["init", "-q", "--bare", remote]);
-  work = mkdtempSync(join(tmpdir(), "agx-work-"));
+  work = scratchDir(join(tmpdir(), "agx-work-"));
   spawnSync("git", ["init", "-q", "-b", "main", work]);
   git(work, "config", "user.email", "t@example.com");
   git(work, "config", "user.name", "T");
@@ -40,7 +41,7 @@ function release(tag: string) {
 
 /** Provenance as build.mjs writes it, in a directory that is not a repo. */
 function installedAs(version: string, origin = remote, baseTag = "", distance = 0) {
-  const dir = mkdtempSync(join(tmpdir(), "agx-installed-"));
+  const dir = scratchDir(join(tmpdir(), "agx-installed-"));
   mkdirSync(join(dir, "electron", "staging"), { recursive: true });
   writeFileSync(join(dir, "electron", "staging", "build-info.json"), JSON.stringify({
     version, commit: "abc1234", builtAt: new Date(0).toISOString(), source: "/gone", origin, baseTag, distance,
@@ -59,7 +60,7 @@ let logDir = "";
 const log0 = process.env.AGENTGLASS_UPDATE_LOG;
 beforeEach(() => {
   cwd0 = process.cwd(); makeRemote();
-  logDir = mkdtempSync(join(tmpdir(), "agx-updlog-"));
+  logDir = scratchDir(join(tmpdir(), "agx-updlog-"));
   process.env.AGENTGLASS_UPDATE_LOG = join(logDir, "update.log");
 });
 afterEach(() => {
@@ -278,3 +279,5 @@ describe("self update", () => {
     expect(text).toContain(".cache/agentglass/source");
   });
 });
+
+afterAll(removeScratch);

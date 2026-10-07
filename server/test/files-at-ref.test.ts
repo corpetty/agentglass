@@ -10,10 +10,11 @@
  * Real repositories with a real remote throughout: whether `ls-tree` sees a
  * branch's files without touching the worktree is not a thing to mock.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { findFiles, grepFiles, fileText, fileToTemp, listRefs, resolveRef } = await import("../src/files.ts");
 
@@ -31,7 +32,7 @@ const put = (repo: string, rel: string, body: string) => {
 };
 
 beforeEach(() => {
-  box = mkdtempSync(join(tmpdir(), "agx-ref-"));
+  box = scratchDir(join(tmpdir(), "agx-ref-"));
   hadRoot = process.env.AGENTGLASS_ROOT;
   process.env.AGENTGLASS_ROOT = box;
 
@@ -276,3 +277,5 @@ describe("a branch's copy, on disk for the editor", () => {
     expect(fileToTemp(clone, "../../etc/passwd", "origin/master").ok).toBe(false);
   });
 });
+
+afterAll(removeScratch);

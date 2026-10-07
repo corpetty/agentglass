@@ -15,10 +15,11 @@ import { afterAll, afterEach, describe, expect, it } from "bun:test";
 // entries in the developer's own ~/.cache/agentglass — the same mistake the
 // ClickUp test made with the config file, where a toggle flipped in the app
 // decided whether a test passed.
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-const CACHE_DIR = mkdtempSync(join(tmpdir(), "agx-prcache-"));
+import { removeScratch, scratchDir } from "./scratch.ts";
+const CACHE_DIR = scratchDir(join(tmpdir(), "agx-prcache-"));
 process.env.AGENTGLASS_CACHE_DIR = CACHE_DIR;
 const P = await import("../src/prs.ts");
 
@@ -57,3 +58,5 @@ describe("what the diff cache agrees to hold", () => {
     }
   });
 });
+
+afterAll(removeScratch);

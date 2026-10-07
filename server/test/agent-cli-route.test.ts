@@ -11,13 +11,14 @@
  * repo has had before, and the CLI is what the worker actually calls.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCKET = `agx-agentops-${process.pid}`;
 const CLI = new URL("../../bin/agentglass-agent", import.meta.url).pathname;
@@ -49,7 +50,7 @@ sleep 300
 
 beforeAll(async () => {
   if (!have) return;
-  dir = mkdtempSync(join(tmpdir(), "agx-agent-cli-"));
+  dir = scratchDir(join(tmpdir(), "agx-agent-cli-"));
   stubDir = join(dir, "stub");
   mkdirSync(stubDir);
   writeFileSync(join(stubDir, "claude"), STUB);
@@ -467,3 +468,5 @@ describe.skipIf(!have)("enlisting a pane this app did not open", () => {
     await tmuxCmd("kill-session", "-t", "=plain").exited;
   }, SLOW);
 });
+
+afterAll(removeScratch);

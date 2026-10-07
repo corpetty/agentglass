@@ -8,12 +8,13 @@
  *   - diff = the three-dot diff (other...base) — your side's changes.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-compare-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-compare-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { compareRefs } = await import("../src/gitwork.ts");
 
@@ -77,3 +78,5 @@ describe("compareRefs", () => {
     expect(r.error).toContain("no-such-ref-zzz is not a commit");
   });
 });
+
+afterAll(removeScratch);

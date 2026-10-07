@@ -8,13 +8,13 @@
  * is the feature, and it is the kind of feature that quietly stops working
  * when somebody puts the elapsed time into the comparison.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Finding } from "../src/lanternwatch.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-seatwake-"));
+const dir = scratchDir(join(tmpdir(), "agx-seatwake-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 
 const { fingerprint, wakeLine, wakeSeats, wakeForReport, __resetSeatWake } = await import("../src/seatwake.ts");
@@ -306,3 +306,5 @@ describe("which findings are worth a turn", () => {
     expect(await wakeSeats([waiting("db-fix")], { seats, prompt, now: 60_000 })).toEqual([ROOT]);
   });
 });
+
+afterAll(removeScratch);

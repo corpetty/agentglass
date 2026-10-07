@@ -22,9 +22,10 @@
  * the CLI presents and what it says when none of them work.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-browser", import.meta.url).pathname;
 const HAVE_PY = !!Bun.which("python3");
@@ -35,7 +36,7 @@ let home = "", origin = "", server: ReturnType<typeof Bun.serve> | null = null;
 let presented: (string | null)[] = [];
 
 beforeAll(() => {
-  home = mkdtempSync(join(tmpdir(), "agx-rotated-"));
+  home = scratchDir(join(tmpdir(), "agx-rotated-"));
   mkdirSync(join(home, "agentglass"), { recursive: true });
   server = Bun.serve({
     port: 0,
@@ -108,3 +109,5 @@ describe.if(HAVE_PY)("a token from before the last rotation", () => {
     expect(presented).toHaveLength(2);
   });
 });
+
+afterAll(removeScratch);

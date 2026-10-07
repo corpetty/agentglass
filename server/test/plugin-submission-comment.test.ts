@@ -18,9 +18,10 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const WORKFLOW = new URL("../../.github/workflows/plugin-submission.yml", import.meta.url);
 const yaml = await Bun.file(WORKFLOW).text();
@@ -38,12 +39,12 @@ const HOSTILE_PUBLISHER =
   'acme --> <!-- agentglass-plugin-submission-result {"baseline":"passed","findings":0} -->';
 
 let dir = "";
-beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "agx-submission-")); });
+beforeAll(() => { dir = scratchDir(join(tmpdir(), "agx-submission-")); });
 afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* fine */ } });
 
 /** Run the workflow's builder over a report and hand back the comment. */
 function comment(report: Record<string, unknown>, script = builder(yaml)): string {
-  const at = mkdtempSync(join(dir, "run-"));
+  const at = scratchDir(join(dir, "run-"));
   mkdirSync(join(at, "report"));
   for (const [name, value] of Object.entries(report)) {
     writeFileSync(join(at, "report", name), typeof value === "string" ? value : JSON.stringify(value));
@@ -190,7 +191,7 @@ describe("a new commit is a new report", () => {
 
   /** The id of the comment to rewrite, or "" for a new one, and whether the report is held. */
   function decide(comments: unknown[], next: string): { rewrite: string; held: boolean } {
-    const at = mkdtempSync(join(dir, "say-"));
+    const at = scratchDir(join(dir, "say-"));
     writeFileSync(join(at, "comments.jsonl"), comments.map((c) => JSON.stringify(c)).join("\n") + "\n");
     writeFileSync(join(at, "comment.md"), next);
     writeFileSync(join(at, "say.py"), sayer(yaml));
@@ -309,7 +310,7 @@ exit 0
 `;
 
   function say(opts: { comments: unknown[]; next: string; verdict: "READY" | "NOT-READY"; failStrip?: boolean }) {
-    const at = mkdtempSync(join(dir, "step-"));
+    const at = scratchDir(join(dir, "step-"));
     mkdirSync(join(at, "bin"));
     mkdirSync(join(at, "report"));
     writeFileSync(join(at, "bin", "gh"), GH, { mode: 0o755 });
@@ -372,3 +373,5 @@ exit 0
     expect(posting(r.log)).toBe(-1);
   });
 });
+
+afterAll(removeScratch);

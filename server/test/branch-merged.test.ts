@@ -12,11 +12,12 @@
 // plus the two ways a correct answer can still be lost afterwards: an expiring
 // cache, and a branch that grows new commits once the verdict is already in.
 import { describe, expect, test, beforeAll, afterAll, setSystemTime } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-merged-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-merged-")));
 const REPO = join(dir, "repo");
 
 process.env.XDG_CONFIG_HOME = dir; // never inherit the developer's own scope
@@ -257,3 +258,5 @@ describe("checking", () => {
 });
 
 afterAll(() => setSystemTime());
+
+afterAll(removeScratch);

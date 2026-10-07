@@ -6,10 +6,11 @@
 // index.ts actually wires it into the two isAuthExempt calls in the request
 // path (a check that does not run is not a fix).
 import { afterAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loopbackPeerIsOtherUser, __resetProxyProbe, __setProcNetFiles } from "../src/remote.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("loopbackPeerIsOtherUser", () => {
   if (process.platform !== "linux") {
@@ -42,19 +43,19 @@ describe("loopbackPeerIsOtherUser", () => {
     });
 
     it("says true for a loopback peer owned by a different uid", () => {
-      dir = dir || mkdtempSync(join(tmpdir(), "agx-peeruid-"));
+      dir = dir || scratchDir(join(tmpdir(), "agx-peeruid-"));
       fake(row(other));
       expect(loopbackPeerIsOtherUser({ address: "127.0.0.1", port: peerPort }, ours)).toBe(true);
     });
 
     it("says false for a loopback peer owned by this uid", () => {
-      dir = dir || mkdtempSync(join(tmpdir(), "agx-peeruid-"));
+      dir = dir || scratchDir(join(tmpdir(), "agx-peeruid-"));
       fake(row(me));
       expect(loopbackPeerIsOtherUser({ address: "127.0.0.1", port: peerPort }, ours)).toBe(false);
     });
 
     it("says false (fail open) when there is no socket table to consult", () => {
-      dir = dir || mkdtempSync(join(tmpdir(), "agx-peeruid-"));
+      dir = dir || scratchDir(join(tmpdir(), "agx-peeruid-"));
       __resetProxyProbe();
       __setProcNetFiles([join(dir, "no-such-table")]);
       expect(loopbackPeerIsOtherUser({ address: "127.0.0.1", port: peerPort }, ours)).toBe(false);
@@ -71,7 +72,7 @@ describe("loopbackPeerIsOtherUser", () => {
     // this same file already told an unrelated uid which port a live
     // connection was using.
     it("does not trust a same-port row bound to a DIFFERENT loopback address", () => {
-      dir = dir || mkdtempSync(join(tmpdir(), "agx-peeruid-"));
+      dir = dir || scratchDir(join(tmpdir(), "agx-peeruid-"));
       fake(rowFor(me, "127.0.0.2", peerPort)); // same uid as us, wrong address
       expect(loopbackPeerIsOtherUser({ address: "127.0.0.1", port: peerPort }, ours)).toBe(true);
     });
@@ -79,7 +80,7 @@ describe("loopbackPeerIsOtherUser", () => {
     // L3: a readable table with no row for THIS connection is not the same
     // fact as no table at all, and must not fail the same way.
     it("fails CLOSED when the table is readable but has no row for this connection", () => {
-      dir = dir || mkdtempSync(join(tmpdir(), "agx-peeruid-"));
+      dir = dir || scratchDir(join(tmpdir(), "agx-peeruid-"));
       fake(rowFor(me, "127.0.0.1", peerPort + 1)); // some other connection entirely
       expect(loopbackPeerIsOtherUser({ address: "127.0.0.1", port: peerPort }, ours)).toBe(true);
     });
@@ -113,3 +114,5 @@ describe("index.ts wires the uid-aware origin into the token gate", () => {
     expect(body).toContain("loopbackPeerIsOtherUser(peerSock");
   });
 });
+
+afterAll(removeScratch);

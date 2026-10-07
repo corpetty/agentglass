@@ -8,15 +8,16 @@
  * `~/code/orbit-1042` are different checkouts whose paths share a prefix, and
  * every worktree on this machine is named exactly like that.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __resetBranchCacheForTest, branchOfCheckout, ownerOf } from "../src/dockerowner.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const made: string[] = [];
 const tmp = () => {
-  const d = mkdtempSync(join(tmpdir(), "agx-owner-"));
+  const d = scratchDir(join(tmpdir(), "agx-owner-"));
   made.push(d);
   return d;
 };
@@ -119,3 +120,5 @@ describe("reading the branch without spawning git", () => {
     expect(branchOfCheckout(d)).toBe("second");     // and it does move on
   });
 });
+
+afterAll(removeScratch);
