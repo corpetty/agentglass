@@ -9,10 +9,13 @@
  * pushed into swap. The desktop raised an out-of-memory warning with 1.9 GiB of
  * swap left; sweeping brought it back to 11.6 GiB.
  *
- * One preload rather than 182 `afterAll`s. Cleanup written at the call site is
- * cleanup somebody forgets on the 183rd file, and a test that fails half way
- * through never reaches its own `afterAll` anyway — which is exactly the run
- * that leaves the biggest mess.
+ * A preload, because cleanup written at the call site is cleanup somebody
+ * forgets on the next file. But a preload is only loaded from a bunfig.toml in
+ * the directory bun was started in, and a run started anywhere else — from
+ * `server/test/`, or from `~` with an absolute path — had none of this: 1,559
+ * directories left in one day, every one from such a run. So the test files
+ * now take their own away as well (scratch.ts), and this is what still catches
+ * a file that forgets, and anything `server/src` makes inside the test process.
  *
  * Two rules keep this from ever deleting something it should not:
  *
@@ -32,6 +35,7 @@ import { afterAll } from "bun:test";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { madeScratchHome } from "./isolation.ts";
 import { killServersUnder, manifestPath, reapDead, record } from "./tmpreap.ts";
 
 type Fs = {
@@ -62,6 +66,15 @@ const note = <T,>(p: T): T => {
 
 // Whatever a run that could not sweep (SIGKILL, out of memory) left behind.
 reapDead(TMP);
+
+/*
+ * The scratch HOME isolation.ts made before this file could patch anything.
+ * Its own `afterAll` removes it on a clean finish; a run stopped by a signal
+ * never gets there, and one that is SIGKILLed has only the manifest. Measured:
+ * three interrupted runs, three `agx-test-home-*` left behind.
+ */
+const home = madeScratchHome();
+if (home) note(home);
 
 const realSync = fs.mkdtempSync;
 fs.mkdtempSync = (...a: unknown[]) => note(realSync(...a));
