@@ -2830,7 +2830,21 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // a caller at all, so it cannot tell a node from anyone else on its port —
     // it says so instead of accepting rows from whoever asks.
     if (pathname === "/fleet/link") {
-      if (!trustedCaller(req, from)) return csrfBlocked();
+      /*
+       * Not trustedCaller. That gate trusts a request with no Origin only when
+       * it comes from this machine, and a node is the opposite on purpose: an
+       * agentglass on another machine, arriving through `tailscale serve` (so
+       * `from` is "remote") with no Origin, because it is not a browser. Held
+       * to trustedCaller, every real link was refused here — measured against a
+       * hub behind `tailscale serve`, the upgrade answered "cross-origin write
+       * blocked" before the credential was ever read. What the CSRF gate exists
+       * to stop is a browser page driving this server; a browser always sends
+       * an Origin on a WebSocket upgrade, so one this server does not vouch for
+       * is still refused, and everything else must present a node credential
+       * below — a bearer token, which no page holds or sends by itself.
+       */
+      const linkOrigin = req.headers.get("origin");
+      if (linkOrigin && !vouchedOrigin(linkOrigin)) return csrfBlocked();
       if (caller?.principal !== "node" || !caller.device?.host) {
         return json({
           ok: false,
