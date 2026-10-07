@@ -57,12 +57,27 @@ test("every suite in the repository loads it, and loads it first", async () => {
   /* First because bun freezes a builtin's exports the first time anything
      imports it, and the homedir patch has to land before that. Every suite,
      because each of them spawns or imports something that resolves a home. */
-  for (const f of ["../../bunfig.toml", "../bunfig.toml", "../../web/bunfig.toml", "../../mobile/bunfig.toml"]) {
-    const text = await Bun.file(new URL(f, import.meta.url).pathname).text();
+  for (const f of ["../../bunfig.toml", "../bunfig.toml", "./bunfig.toml", "../../web/bunfig.toml", "../../mobile/bunfig.toml"]) {
+    const url = new URL(f, import.meta.url);
+    const text = await Bun.file(url.pathname).text();
     const first = text.match(/^preload = \["([^"]+)"/m);
     expect(first, `${f} has no preload`).not.toBeNull();
-    expect(first![1]!.endsWith("/test/isolation.ts"), `${f} loads ${first![1]} first`).toBe(true);
+    // Resolved against the bunfig, so test/'s own `./isolation.ts` counts.
+    expect(new URL(first![1]!, url).pathname, `${f} loads ${first![1]} first`).toBe(new URL("./isolation.ts", import.meta.url).pathname);
   }
+});
+
+test("a run started in server/test loads the same preloads as one started in server", async () => {
+  /* bun reads the bunfig of the directory it was started in, so the one in
+     test/ is a second copy of the list, and a second copy is the one that
+     drifts. Compared as the files they name, not as text. */
+  const preloads = async (f: string) => {
+    const url = new URL(f, import.meta.url);
+    const text = await Bun.file(url.pathname).text();
+    const list = JSON.parse(/^preload = (\[.*\])$/m.exec(text)![1]!) as string[];
+    return list.map((p) => new URL(p, url).pathname);
+  };
+  expect(await preloads("./bunfig.toml")).toEqual(await preloads("../bunfig.toml"));
 });
 
 describe("what counts as real", () => {
