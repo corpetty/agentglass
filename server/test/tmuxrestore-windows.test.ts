@@ -15,14 +15,16 @@
  * reach the developer's tmux or their resurrect saves.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { killRunTmux, removeScratch, trackScratch } from "./scratch.ts";
 
 const SOCKET = `agx-restore-win-${process.pid}`;
 process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
-const TMPDIR = join(tmpdir(), `agx-tmux-restore-win-${process.pid}`);
-process.env.AGENTGLASS_STATE_DIR = join(tmpdir(), `agx-restore-win-state-${process.pid}`);
+// Both removed by removeScratch, after every server in them has been stopped.
+const TMPDIR = trackScratch(join(tmpdir(), `agx-tmux-restore-win-${process.pid}`));
+process.env.AGENTGLASS_STATE_DIR = trackScratch(join(tmpdir(), `agx-restore-win-state-${process.pid}`));
 const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 
 let restore: typeof import("../src/tmuxrestore.ts");
@@ -43,12 +45,12 @@ afterAll(async () => {
   /* The kill goes first: a `-L name` socket lives under $TMUX_TMPDIR, so
      restoring the variable before asking tmux to stop pointed the command at
      the developer's own directory and it failed into the catch. See the note
-     in tmuxrestore.test.ts and the 216 servers that were still running. */
-  try { await pane.tmux(["kill-server"]); } catch { /* already gone */ }
+     in tmuxrestore.test.ts and the 216 servers that were still running, and
+     for why a kill that came back not-ok is followed by one by pid. */
+  const killed = await pane.tmux(["kill-server"]).catch(() => null);
+  if (!killed?.ok) killRunTmux();
   if (REAL_TMPDIR === undefined) delete process.env.TMUX_TMPDIR;
   else process.env.TMUX_TMPDIR = REAL_TMPDIR;
-  try { rmSync(TMPDIR, { recursive: true, force: true }); } catch { /* never made */ }
-  try { rmSync(process.env.AGENTGLASS_STATE_DIR!, { recursive: true, force: true }); } catch { /* never made */ }
 });
 
 test("every window comes back, with its name and its splits", async () => {
@@ -78,3 +80,5 @@ test("every window comes back, with its name and its splits", async () => {
     .stdout.trim().split("\n").filter(Boolean);
   expect(logs.length).toBe(2);
 });
+
+afterAll(removeScratch);
