@@ -10,7 +10,7 @@ import type { Budget, GateRule } from "../../shared/types.ts";
 import { agentProvider } from "../../shared/agentKinds.ts";
 import { WORKER_ROLES, MODEL_RE, workerRole, type RoleChoice, type RoleId } from "../../shared/workerRoles.ts";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, realpathSync, readlinkSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join, resolve, dirname, relative, sep, delimiter } from "node:path";
 import { worktreeFamily } from "./worktree.ts";
 import { failed } from "./refused.ts";
@@ -109,6 +109,8 @@ interface Config {
   /** Projects the picker should stop offering. Absolute paths. See
    *  hiddenProjects(). */
   hiddenProjects?: string[];
+  /** What this machine is called in a fleet of them. See hostId(). */
+  hostId?: string;
   /** Which tmux binary the pane engine runs. "auto" (default) prefers the
    *  bundled static tmux and falls back to the system one; "system" skips the
    *  bundle; "custom" uses `tmuxPath`. See tmuxbin.ts — AGENTGLASS_TMUX_PATH
@@ -768,10 +770,14 @@ export function inScopeReal(path: string | null | undefined, scope: Scope = work
  * cockpit scoped somewhere else.
  */
 export function sessionInScope(
-  s: { project_path?: string | null; cwd_path?: string | null },
+  s: { project_path?: string | null; cwd_path?: string | null; host?: string | null },
   scope: Scope = workspaceRoots(),
 ): boolean {
   if (!scopeList(scope).length) return true; // whole-machine: nothing to filter
+  // A scope is a project on *this* machine. Another machine's session at the
+  // same path string is a different checkout, and resolving its path here would
+  // ask our git about a directory that only exists over there.
+  if (!isLocalHost(s.host)) return false;
   return inScope(s.project_path, scope) || inScope(s.cwd_path, scope);
 }
 
@@ -995,6 +1001,44 @@ export function accountForPath(cwd: string | null | undefined): string | null {
     if (cwd === p.prefix || cwd.startsWith(p.prefix + "/")) return p.account;
   }
   return null;
+}
+
+/**
+ * The name this machine goes by when its rows sit beside another machine's.
+ *
+ * Every row this instance records itself is stored with a NULL `host` — "here"
+ * — and only rows that arrived from another machine carry one (docs/FLEET.md).
+ * This is what "here" is *called*: the label a NULL reads as wherever a host is
+ * shown, and the value a host filter sends back to mean it. Keeping the stored
+ * value NULL is what lets this be renamed freely: the history follows the name
+ * instead of being stranded under the old one.
+ *
+ * AGENTGLASS_HOST_ID, then `hostId` in the config file, then the machine's
+ * short hostname. Anything that is not a plain label is ignored rather than
+ * trusted, because it travels: it goes in a URL query, a filter option and,
+ * later, a link handshake another machine has to agree with.
+ */
+const HOST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+// Read on every row a reader labels, so a bad value is said about once.
+const warnedHostIds = new Set<string>();
+export function hostId(): string {
+  for (const asked of [process.env.AGENTGLASS_HOST_ID, config().hostId]) {
+    if (typeof asked !== "string" || !asked.trim()) continue;
+    if (HOST_ID_RE.test(asked.trim())) return asked.trim();
+    if (!warnedHostIds.has(asked)) {
+      warnedHostIds.add(asked);
+      console.error(`[config] ignoring host id ${JSON.stringify(asked)}: letters, digits, . _ - only`);
+    }
+  }
+  // `bean.local` and `bean` are the same desk; the domain is noise in a chip.
+  const short = hostname().split(".")[0] ?? "";
+  return HOST_ID_RE.test(short) ? short : "local";
+}
+
+/** Is a row's `host` this machine? NULL is how a row recorded here is stored;
+ *  this instance's own id is how it reads once a reader has labelled it. */
+export function isLocalHost(host: string | null | undefined): boolean {
+  return !host || host === hostId();
 }
 
 /** The account registry as written on disk (empty when unconfigured — the

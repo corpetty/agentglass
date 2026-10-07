@@ -86,6 +86,11 @@ describe("deny by default", () => {
   const NAMED_LOWER = new Set([
     // Reads wearing POST, because their argument is a filesystem path.
     "/git/status",
+    // A read wearing POST because it carries the read it forwards: the hub's
+    // window onto a linked machine's repositories (docs/FLEET.md, phase 4).
+    // It forwards only what `tunnelAllows` calls a read, so a phone that may
+    // read this machine's repositories may read a linked one's — and no more.
+    "/fleet/proxy",
     // What a phone is for: answering something that is already asked.
     "/gate/decide", "/chat/send", "/chat/pane/key",
     // Saying something has been read, which moves a badge on the other devices

@@ -83,6 +83,13 @@ export interface WatchEvent {
    *  type as WatchEvent; rows read back from the events table always carry it
    *  (null when untagged). */
   account?: string | null;
+  /**
+   * The machine this ran on (docs/FLEET.md). Always a name on the wire: the
+   * server stores its own rows unlabelled and fills in its hostId() on the way
+   * out, so this is never null from a current server. Optional because an older
+   * one does not send it — absent means "the server you are talking to".
+   */
+  host?: string;
 }
 
 export interface SessionRollup {
@@ -92,6 +99,8 @@ export interface SessionRollup {
   /** Which Claude account/instance owns this session (e.g. "work" / "personal").
    *  Null for rows recorded before the column existed. */
   account?: string | null;
+  /** The machine the session ran on. Same contract as WatchEvent.host. */
+  host?: string;
   /** Directory the session ran in — what a resume needs to run in the right
    *  place. Null for rows recorded before the column existed. */
   project_path?: string | null;
@@ -778,6 +787,12 @@ export interface PendingGate {
   where?: string;
   /** The tmux pane it is running in, so the notification has somewhere to go. */
   pane?: string;
+  /** The machine holding it, when that is not the server you asked
+   *  (docs/FLEET.md, phase 3). Absent for this server's own holds. */
+  host?: string;
+  /** When it times out on the machine holding it. Sent for a forwarded hold,
+   *  so a hub can show how long is left. */
+  expires?: number;
 }
 
 /** A gate request that has been resolved. `resolution` is who resolved it:
@@ -1021,6 +1036,11 @@ export interface SessionDetail {
   session_id: string;
   source_app: string;
   model_name: string | null;
+  /** The machine it ran on. Same contract as WatchEvent.host. */
+  host?: string;
+  /** A cloud session's id on claude.ai (`cse_…`), when its hook reported one
+   *  (docs/FLEET.md, phase 5). */
+  cloud_session?: string | null;
   /** Where it ran — a resume has to start in the same directory. */
   project_path?: string | null;
   /** The linked worktree / subdir it actually ran in, if not the repo root. */
@@ -1120,6 +1140,8 @@ export interface SessionRisk extends RiskFlag {
 export interface OpenToolCall {
   session_id: string;
   source_app: string;
+  /** The machine the call is running on. Same contract as WatchEvent.host. */
+  host?: string;
   tool_name: string;
   since: number; // ms — the PreToolUse timestamp
   /** The file this tool's own input said it would touch, when it named one.
@@ -2193,6 +2215,9 @@ export interface WorkingTree {
 export interface GitRepoRef {
   root: string;
   name: string;
+  /** The machine it lives on, when that is not the server you asked — set by
+   *  the client for a repository read through the fleet link (phase 4). */
+  host?: string;
   branch: string;
   dirty: number; // count of changed files
   ahead: number;

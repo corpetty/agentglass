@@ -18,6 +18,7 @@
     "install:all": "bun install",
     "lint": "oxlint",
     "setup": "python3 hooks/install_hooks.py",
+    "fleet": "bun scripts/fleet.ts",
     "setup:undo": "python3 hooks/install_hooks.py --uninstall",
     "connect": "python3 hooks/connect_otel.py",
     "connect:opencode": "python3 hooks/connect_opencode.py",

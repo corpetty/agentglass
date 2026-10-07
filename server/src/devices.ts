@@ -81,6 +81,18 @@ export interface Device {
   /** Set when forgotten. The row is kept so the device list can say a
    *  credential was revoked rather than silently forgetting it existed. */
   revokedAt?: number;
+  /**
+   * Another agentglass, rather than a person's phone (docs/FLEET.md).
+   *
+   * A node credential opens the fleet link and nothing else — see `principal`
+   * in auth.ts. It is still a device so the one list that answers "what can
+   * reach this machine" shows it, and so Forget cuts it off like anything else.
+   */
+  role?: "node" | "cloud";
+  /** For a node or a cloud intake: the one host name its rows are stored
+   *  under. Bound when the credential is minted, so it cannot speak for a
+   *  machine it is not. */
+  host?: string;
 }
 
 /**
@@ -199,14 +211,18 @@ export function activeDevices(): Device[] {
  */
 export function issueDevice(
   label: string, scope: Scope = "answer", now = Date.now(),
+  node?: { host: string; role?: "node" | "cloud" },
 ): { device: Device; token: string } {
   const token = randomBytes(32).toString("base64url");
   const device: Device = {
     id: randomBytes(8).toString("hex"),
     label: (label || "A device").slice(0, 60),
     hash: hashToken(token),
-    scope,
+    // A node's scope is never consulted (auth.ts fences it by principal), so it
+    // is written as the narrowest there is rather than whatever was passed.
+    scope: node ? "read" : scope,
     createdAt: now,
+    ...(node ? { role: node.role ?? "node", host: node.host } : {}),
   };
   const f = store();
   save({ ...f, devices: [...(f.devices ?? []), device] });

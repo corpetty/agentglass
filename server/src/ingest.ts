@@ -18,6 +18,13 @@ export interface NormalizedEvent {
   model_name: string | null;
   /** Which Claude account/instance produced this (e.g. "work" / "personal"). */
   account: string;
+  /**
+   * The machine this ran on, when that is not this one. Never read from an
+   * ingest body: normalize() does not set it, so a hook — or a repo-local
+   * settings.json pointing one — cannot claim to be another machine. Only the
+   * fleet link, which knows who it is talking to, writes it (docs/FLEET.md).
+   */
+  host?: string | null;
   is_error: number;
   error_text: string | null;
   /** Raw token usage from this event (see usage_is_cumulative). */

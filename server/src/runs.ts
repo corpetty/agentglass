@@ -735,7 +735,7 @@ export function runActivity(run: Run): LegActivity[] {
                 COUNT(*) AS events,
                 COALESCE(SUM(cost_usd), 0) AS cost
            FROM events
-          WHERE cwd_path IN (${holes})
+          WHERE cwd_path IN (${holes}) AND +host IS NULL
           GROUP BY cwd_path, provider`,
       )
       .all(UNKNOWN_PROVIDER, ...dirs)
@@ -760,7 +760,7 @@ export function runActivity(run: Run): LegActivity[] {
                 COALESCE(SUM(cost_usd), 0) AS cost,
                 COALESCE(MAX(last_seen), 0) AS last
            FROM sessions
-          WHERE cwd_path IN (${holes})
+          WHERE cwd_path IN (${holes}) AND host IS NULL
           GROUP BY cwd_path`,
       )
       .all(...dirs)

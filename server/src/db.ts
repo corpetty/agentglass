@@ -19,7 +19,7 @@ import type {
 import type { NormalizedEvent } from "./ingest.ts";
 import { costUsd, modelLabel, hasPrice, equivalentTokens } from "./pricing.ts";
 import { providerOf as sharedProviderOf, UNKNOWN as UNKNOWN_MODEL } from "../../shared/models.ts";
-import { workspaceRoots, scopeKey, scopeRoots, isWithin, sessionInScope, accountForPath, type Scope } from "./config.ts";
+import { workspaceRoots, scopeKey, scopeRoots, isWithin, sessionInScope, accountForPath, hostId, type Scope } from "./config.ts";
 import { changeRisks, sessionRisks, SESSION_RISK_CAP } from "../../shared/riskFlags.ts";
 
 /**
@@ -510,6 +510,30 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_events_first_prompt ON events(hook_event
 try { db.exec("ALTER TABLE events ADD COLUMN account TEXT"); } catch { /* already present */ }
 try { db.exec("ALTER TABLE sessions ADD COLUMN account TEXT"); } catch { /* already present */ }
 db.exec("CREATE INDEX IF NOT EXISTS idx_events_account_ts ON events(account, timestamp)");
+
+// Which machine produced a row — the host dimension (docs/FLEET.md).
+//
+// NULL means *this* machine, and every row this instance records itself is
+// written NULL. Only a row that arrived from another machine carries a value.
+// That is a deliberate inversion of the obvious "stamp everything": there is no
+// backfill over a multi-GB events table, a single-machine install is byte-for-
+// byte what it was, and renaming this machine (hostId() in config.ts) carries
+// its whole history with it instead of stranding it under the old name. Readers
+// label NULL with hostId() on the way out, so nothing above this module ever
+// has to know the convention.
+//
+// The index is PARTIAL — foreign rows only — and that is load-bearing, not a
+// space saving. A plain (host, timestamp) index looks selective to a planner
+// with no statistics, so every `host IS NULL` (a scoped cockpit, the change
+// list) was steered onto it: on a one-machine install that is every row in the
+// window, walked in place of the (project_path, timestamp) index that bounds
+// the scope. stats-scope-index.test.ts caught exactly that plan. `IS NULL`
+// cannot use a `WHERE host IS NOT NULL` index, so those queries keep their old
+// plans; `host = ?` implies NOT NULL, so a filter to another machine still gets
+// it, windowed by timestamp like the other scope columns.
+try { db.exec("ALTER TABLE events ADD COLUMN host TEXT"); } catch { /* already present */ }
+try { db.exec("ALTER TABLE sessions ADD COLUMN host TEXT"); } catch { /* already present */ }
+db.exec("CREATE INDEX IF NOT EXISTS idx_events_foreign_host_ts ON events(host, timestamp) WHERE host IS NOT NULL");
 
 // Backfill `account` for rows ingested before this dimension existed (mostly
 // the transcript scanner's historical backfill, which never had a hook env to
@@ -1909,6 +1933,10 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_understudy_help_kind ON understudy_help(
  * this file has no migration system to sequence that against. Databases that
  * already carry the columns keep them, inert; new ones never grow them.
  */
+// The machine the held call is running on. NULL is this one, as on events —
+// see the host column there. A gate is always *held* where the session runs;
+// this is so a hub showing another machine's gate can say whose it is.
+try { db.exec("ALTER TABLE gates ADD COLUMN host TEXT"); } catch { /* already present */ }
 
 export interface GateRow {
   id: string;
@@ -1929,11 +1957,13 @@ export interface GateRow {
   fail_closed: number;
   /** The hold's own line, shown beside the summary. */
   note: string | null;
+  /** The machine the call is held on. NULL is this one — see the column. */
+  host: string | null;
 }
 
 const gateInsert = db.query(`
-  INSERT OR REPLACE INTO gates (id, source_app, session_id, tool_name, summary, created, expires, fail_closed, note)
-  VALUES ($id, $source_app, $session_id, $tool_name, $summary, $created, $expires, $fail_closed, $note)`);
+  INSERT OR REPLACE INTO gates (id, source_app, session_id, tool_name, summary, created, expires, fail_closed, note, host)
+  VALUES ($id, $source_app, $session_id, $tool_name, $summary, $created, $expires, $fail_closed, $note, $host)`);
 // Only ever resolves a still-pending row: a decision already recorded wins over
 // a late timeout, so a human's approve can't be overwritten by the clock.
 const gateResolve = db.query(`
@@ -1951,11 +1981,13 @@ const gatesRecentUnlisted = db.query<GateRow, [number]>(
 export function recordGate(g: {
   id: string; source_app: string; session_id: string; tool_name: string;
   summary: string; created: number; expires: number; fail_closed?: boolean; note?: string;
+  /** Absent for a gate held here, which is every gate until the link exists. */
+  host?: string | null;
 }): void {
   gateInsert.run({
     $id: g.id, $source_app: g.source_app, $session_id: g.session_id, $tool_name: g.tool_name,
     $summary: g.summary, $created: g.created, $expires: g.expires, $fail_closed: g.fail_closed ? 1 : 0,
-    $note: g.note ?? null,
+    $note: g.note ?? null, $host: g.host ?? null,
   } as any);
 }
 
@@ -2060,12 +2092,29 @@ function accountScope(account?: string | null): { clause: string; args: string[]
   return account ? { clause: " AND account = ?", args: [account] } : { clause: "", args: [] };
 }
 
-/** Combine provider + account scopes into one clause/args pair, in bind order.
- *  Named distinctly from the workspace `scopeClause()` it's often used beside. */
-function provAcctScope(provider?: string | null, account?: string | null): { clause: string; args: string[] } {
+/** SQL fragment + args to scope a query to one machine. A client names this
+ *  machine by its hostId(), but its rows are stored NULL (see the host column),
+ *  so that one value has to become `IS NULL` — `host = 'bean'` would match
+ *  nothing and this machine's own history would vanish from its own filter.
+ *  Works unchanged on `sessions`, which carries the same column. */
+function hostScope(host?: string | null): { clause: string; args: string[] } {
+  if (!host) return { clause: "", args: [] };
+  if (host === hostId()) return { clause: " AND host IS NULL", args: [] };
+  return { clause: " AND host = ?", args: [host] };
+}
+
+/** Combine provider + account + host scopes into one clause/args pair, in bind
+ *  order. Named distinctly from the workspace `scopeClause()` it's often used
+ *  beside. */
+function provAcctScope(
+  provider?: string | null,
+  account?: string | null,
+  host?: string | null,
+): { clause: string; args: string[] } {
   const p = providerScope(provider);
   const a = accountScope(account);
-  return { clause: p.clause + a.clause, args: [...p.args, ...a.args] };
+  const h = hostScope(host);
+  return { clause: p.clause + a.clause + h.clause, args: [...p.args, ...a.args, ...h.args] };
 }
 
 /**
@@ -2147,9 +2196,14 @@ export function scopeClause(scope: Scope = workspaceRoots()): { clause: string; 
   if (!inScope.length) return { clause: " AND 0", args: [] };
   // Column names stay unqualified: openToolCalls() rewrites them to `p.<col>`
   // for its aliased query.
+  //
+  // `host IS NULL` because a scope is a project on *this* machine. Another
+  // machine's checkout at the same path string — `/home/you/code/x` on a box
+  // and on a desk — is a different working tree, and matching it here would
+  // fold its sessions into this one's dashboard.
   const q = inScope.map(() => "?").join(",");
   return {
-    clause: ` AND (project_path IN (${q}) OR cwd_path IN (${q}))`,
+    clause: ` AND (project_path IN (${q}) OR cwd_path IN (${q})) AND host IS NULL`,
     args: [...inScope, ...inScope],
   };
 }
@@ -2188,12 +2242,12 @@ const ftsInsert = db.query("INSERT INTO events_fts(rowid, text) VALUES ($id, $te
 const insertStmt = db.query(`
   INSERT INTO events (
     source_app, session_id, event_id, hook_event_type, tool_name, tool_use_id,
-    agent_id, agent_type, model_name, provider, account, is_error, error_text, duration_ms,
+    agent_id, agent_type, model_name, provider, account, host, is_error, error_text, duration_ms,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
     cost_usd, summary, payload, timestamp
   ) VALUES (
     $source_app, $session_id, $event_id, $hook_event_type, $tool_name, $tool_use_id,
-    $agent_id, $agent_type, $model_name, $provider, $account, $is_error, $error_text, $duration_ms,
+    $agent_id, $agent_type, $model_name, $provider, $account, $host, $is_error, $error_text, $duration_ms,
     $input_tokens, $output_tokens, $cache_creation_tokens, $cache_read_tokens,
     $cost_usd, $summary, $payload, $timestamp
   )
@@ -2274,6 +2328,9 @@ const sessionById = db.query<Record<string, unknown>, [string]>(`SELECT * FROM s
 function parseEventRow(r: any): WatchEvent {
   return {
     ...r,
+    // Stored NULL for this machine (see the host column); every reader above
+    // this module gets a name, so none of them has to know the convention.
+    host: r.host ?? hostId(),
     equiv_tokens: equivalentTokens(r, r.model_name),
     payload: safeJson(r.payload),
   } as WatchEvent;
@@ -2293,6 +2350,7 @@ function parseSessionRow(r: Record<string, unknown>): SessionRollup {
   const { pricing_baseline_usd: _internal, ...session } = r;
   const s = session as unknown as SessionRollup;
   s.equiv_tokens = equivalentTokens(s, s.model_name);
+  s.host = (r.host as string | null | undefined) ?? hostId();
   return s;
 }
 
@@ -2367,7 +2425,12 @@ function foldExpiringEvents(cutoff: number): number {
             SUM(COALESCE(cost_usd, 0)),
             SUM(COALESCE(duration_ms, 0)),
             SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
-     FROM events WHERE timestamp < ?
+     -- This machine's rows only. The rollup has no host column, so another
+     -- machine's spend folded in here would land under a local project path
+     -- and in every budget and before-the-seam figure read from it. Forwarded
+     -- rows still expire with the rest; their long-range history is the node's
+     -- own rollup (docs/FLEET.md).
+     FROM events WHERE timestamp < ? AND +host IS NULL
      GROUP BY 1, 2, 3, 4, 5, 6
      ON CONFLICT(day, project_path, session_id, model_name, provider) DO UPDATE SET
        events = events + excluded.events,
@@ -2993,6 +3056,7 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
       $model_name: model,
       $provider: providerOf(model),
       $account: n.account,
+      $host: n.host ?? null,
       $is_error: n.is_error,
       $error_text: n.error_text,
       $duration_ms: duration_ms,
@@ -3052,12 +3116,12 @@ export function insertEvent(n: NormalizedEvent): InsertResult {
 
 const upsertStmt = db.query(`
   INSERT INTO sessions (
-    session_id, source_app, model_name, provider, account, project_path, cwd_path, started_at, ended_at, last_seen,
+    session_id, source_app, model_name, provider, account, host, project_path, cwd_path, started_at, ended_at, last_seen,
     event_count, tool_count, error_count,
     input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
     cost_usd, pricing_baseline_usd
   ) VALUES (
-    $sid, $src, $model, $provider, $account, $project, $cwd, $ts, $ended, $ts,
+    $sid, $src, $model, $provider, $account, $host, $project, $cwd, $ts, $ended, $ts,
     1, $tool, $err,
     $in, $out, $cw, $cr, $cost, $estimated
   )
@@ -3066,6 +3130,10 @@ const upsertStmt = db.query(`
     model_name = COALESCE(excluded.model_name, sessions.model_name),
     provider = COALESCE(excluded.provider, sessions.provider),
     account = COALESCE(excluded.account, sessions.account),
+    -- Where a session runs is settled by its first row and never moves: a
+    -- session is one process on one machine. Only a row that names a host can
+    -- set it, so this machine's NULL never erases another's.
+    host = COALESCE(sessions.host, excluded.host),
     project_path = COALESCE(excluded.project_path, sessions.project_path),
     cwd_path = COALESCE(excluded.cwd_path, sessions.cwd_path),
     -- An end can be taken back. A session that speaks after the moment it was
@@ -3110,6 +3178,7 @@ function upsertSession(
     $model: n.model_name,
     $provider: providerOf(n.model_name),
     $account: n.account,
+    $host: n.host ?? null,
     // Carried in the payload by both the scanner and the hooks; null for an
     // event that never recorded where it ran, which COALESCE leaves alone.
     $project: typeof n.payload?.project_path === "string" ? n.payload.project_path : null,
@@ -3204,16 +3273,17 @@ export function titleFromFirstPrompt(session_id: string): void {
 // project. started_at widens to the earliest seen, last_seen to the latest.
 const upsertSessionMetaStmt = db.query(`
   INSERT INTO sessions (
-    session_id, source_app, model_name, provider, account,
+    session_id, source_app, model_name, provider, account, host,
     project_path, cwd_path, started_at, ended_at, last_seen
   ) VALUES (
-    $sid, $src, $model, $provider, $account,
+    $sid, $src, $model, $provider, $account, $host,
     $project, $cwd, $started, $ended, $last
   )
   ON CONFLICT(session_id) DO UPDATE SET
     model_name   = COALESCE(sessions.model_name, excluded.model_name),
     provider     = COALESCE(sessions.provider, excluded.provider),
     account      = COALESCE(sessions.account, excluded.account),
+    host         = COALESCE(sessions.host, excluded.host),
     project_path = COALESCE(sessions.project_path, excluded.project_path),
     cwd_path     = COALESCE(sessions.cwd_path, excluded.cwd_path),
     started_at   = MIN(sessions.started_at, excluded.started_at),
@@ -3225,6 +3295,8 @@ export function upsertSessionMeta(m: {
   source_app: string;
   model_name?: string | null;
   account?: string | null;
+  /** The machine it ran on; absent for one catalogued here. See the column. */
+  host?: string | null;
   project_path?: string | null;
   cwd?: string | null;
   started_at: number;
@@ -3237,6 +3309,7 @@ export function upsertSessionMeta(m: {
     $model: m.model_name ?? null,
     $provider: m.model_name ? providerOf(m.model_name) : null,
     $account: m.account ?? null,
+    $host: m.host ?? null,
     $project: m.project_path ?? null,
     $cwd: m.cwd ?? null,
     $started: m.started_at,
@@ -3245,9 +3318,9 @@ export function upsertSessionMeta(m: {
   });
 }
 
-export function getRecent(limit = 300, provider?: string, account?: string): WatchEvent[] {
+export function getRecent(limit = 300, provider?: string, account?: string, host?: string): WatchEvent[] {
   const scope = scopeClause();
-  const acct = provAcctScope(provider, account);
+  const acct = provAcctScope(provider, account, host);
   // Unscoped there is nothing to filter, so the index is walked in the order
   // the answer wants and SQLite stops at LIMIT — nothing to improve.
   if (!scope.clause && !acct.clause) return recentStmt.all(limit).map(parseEventRow).reverse();
@@ -3325,7 +3398,7 @@ export function capPayloadStrings<T>(value: T, max = PAYLOAD_STRING_CAP): T {
 // to sessions with no Stop/SessionEnd after the Pre.
 const OPEN_TOOL_MAX_MS = 30 * 60_000;
 const openToolSql = (scoped: string) =>
-  `SELECT p.session_id AS session_id, p.source_app AS source_app,
+  `SELECT p.session_id AS session_id, p.source_app AS source_app, p.host AS host,
           COALESCE(p.tool_name, 'tool') AS tool_name, p.timestamp AS since,
           json_extract(p.payload, '$.tool_input.file_path') AS target,
           -- Where the call is running, for the tools whose only possible
@@ -3407,10 +3480,12 @@ export function openToolCalls(): OpenToolCall[] {
   // Aliased to `p`, so the shared clause needs qualifying to stay unambiguous
   // against the correlated subqueries above.
   const s = scopeClause();
-  const scoped = s.clause.replace(/\b(project_path|cwd_path)\b/g, "p.$1");
+  const scoped = s.clause.replace(/\b(project_path|cwd_path|host)\b/g, "p.$1");
   const data = db
     .query<OpenToolCall, any[]>(openToolSql(scoped))
-    .all(Date.now() - OPEN_TOOL_MAX_MS, ...s.args);
+    .all(Date.now() - OPEN_TOOL_MAX_MS, ...s.args)
+    // Named like every other row that leaves this module (see parseEventRow).
+    .map((c) => ({ ...c, host: c.host ?? hostId() }));
   openToolCache = { at: Date.now(), scope, data };
   return data;
 }
@@ -3496,6 +3571,9 @@ function computeFilterOptions() {
     hook_event_types: distinct<string>("hook_event_type"),
     models: distinct<string>("model_name", " AND model_name IS NOT NULL"),
     accounts: distinct<string>("account", " AND account IS NOT NULL"),
+    // Labelled here rather than with COALESCE in SQL so the one NULL bucket
+    // (this machine) cannot sort into a different place than its name would.
+    hosts: [...new Set(distinct<string | null>("host").map((h) => h ?? hostId()))].sort(),
   };
 }
 
@@ -3728,7 +3806,10 @@ export function wasPromptOf(sessionId: string, text: string, sinceMs = 0): boole
  * since it last asked (`newestPromptId`).
  */
 const promptSeenSince = db.query<{ one: number }, [number, string]>(
-  `SELECT 1 AS one FROM events WHERE timestamp >= ? AND hook_event_type = 'UserPromptSubmit' AND json_extract(payload, '$.prompt') = ? LIMIT 1`);
+  // `+host IS NULL`: a prompt typed on another machine (docs/FLEET.md) says
+  // nothing about what a pane HERE was started with, and this answer decides
+  // the command a restore relaunches. The `+` keeps the plan it had.
+  `SELECT 1 AS one FROM events WHERE timestamp >= ? AND hook_event_type = 'UserPromptSubmit' AND +host IS NULL AND json_extract(payload, '$.prompt') = ? LIMIT 1`);
 export function wasPromptAnywhere(text: string, sinceMs = 0): boolean {
   if (!text) return false;
   try { return promptSeenSince.get(Math.max(0, sinceMs), text) !== null; } catch { return false; }
@@ -3808,8 +3889,8 @@ export function latestWaits(ids: string[]): Map<string, SessionWait> {
   return out;
 }
 
-export function getSessions(limit = 100, provider?: string, account?: string): SessionRollup[] {
-  const key = `${limit}|${provider ?? ""}|${account ?? ""}|${scopeKey()}`;
+export function getSessions(limit = 100, provider?: string, account?: string, host?: string): SessionRollup[] {
+  const key = `${limit}|${provider ?? ""}|${account ?? ""}|${host ?? ""}|${scopeKey()}`;
   const hit = sessionsCache.get(key);
   if (hit && Date.now() - hit.at < SESSIONS_TTL_MS) return hit.data;
   const s = sessionScopeClause();
@@ -3823,11 +3904,13 @@ export function getSessions(limit = 100, provider?: string, account?: string): S
       : { clause: " AND session_id IN (SELECT session_id FROM events WHERE provider = ?)", args: [provider] };
   // account is a real column on sessions (one per session), so scope it directly.
   const acct = account ? { clause: " AND account = ?", args: [account] } : { clause: "", args: [] as string[] };
+  // host is a real column on sessions too, settled by the session's first row.
+  const hs = hostScope(host);
   const data = db
     .query<Record<string, unknown>, any[]>(
-      `SELECT * FROM sessions WHERE 1=1${prov.clause}${acct.clause}${s.clause} ORDER BY last_seen DESC LIMIT ?`
+      `SELECT * FROM sessions WHERE 1=1${prov.clause}${acct.clause}${hs.clause}${s.clause} ORDER BY last_seen DESC LIMIT ?`
     )
-    .all(...prov.args, ...acct.args, ...s.args, limit)
+    .all(...prov.args, ...acct.args, ...hs.args, ...s.args, limit)
     .map(parseSessionRow);
   // Only for the rows that need one: a session with a real title does not want
   // its first prompt, and asking for it would be work thrown away.
@@ -3883,16 +3966,16 @@ const statsCache = new Map<string, { at: number; data: StatsSummary }>();
 // heatmap test pins by position (db.statsSummary(window, provider, tz)), and
 // that call shape is worth keeping stable over adding a 3rd optional filter in
 // the middle of it.
-export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, tz?: string, account?: string): StatsSummary {
+export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, tz?: string, account?: string, host?: string): StatsSummary {
   // tz belongs in the key, not only the arguments. The heatmap buckets by
   // weekday and hour, which are only defined relative to a clock — and the
   // viewer is often not on the server (remote access, the phone companion).
   // Without it here, one viewer's grid is served to another in a different
   // zone for the whole TTL.
-  const key = `${windowMs}|${provider ?? ""}|${account ?? ""}|${scopeKey()}|${tz ?? ""}`;
+  const key = `${windowMs}|${provider ?? ""}|${account ?? ""}|${host ?? ""}|${scopeKey()}|${tz ?? ""}`;
   const hit = statsCache.get(key);
   if (hit && Date.now() - hit.at < STATS_TTL_MS) return hit.data;
-  const data = computeStatsSummary(windowMs, provider, tz, account);
+  const data = computeStatsSummary(windowMs, provider, tz, account, host);
   // One entry per (window, provider, scope). The window set is fixed and small
   // (the header's chips) and scope rarely changes, so this never grows unbounded
   // in practice; prune stale entries anyway so a long-lived server can't leak.
@@ -3901,9 +3984,9 @@ export function statsSummary(windowMs = 24 * 3600 * 1000, provider?: string, tz?
   return data;
 }
 
-function computeStatsSummary(windowMs: number, provider?: string, tz?: string, account?: string): StatsSummary {
+function computeStatsSummary(windowMs: number, provider?: string, tz?: string, account?: string, host?: string): StatsSummary {
   const since = Date.now() - windowMs;
-  const { clause: prov, args: pa } = provAcctScope(provider, account);
+  const { clause: prov, args: pa } = provAcctScope(provider, account, host);
   const { clause: sc, args: sa } = scopeClause();
   // Every query below appends `pf` and binds `A` in this order, so folding the
   // project filter in here reaches all of them at once.
@@ -4068,7 +4151,7 @@ function computeStatsSummary(windowMs: number, provider?: string, tz?: string, a
     .sort((a, b) => b.total_ms - a.total_ms);
 
   // Most-used skills with attributed cost and per-bucket activity.
-  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider, account).slice(0, 20);
+  const top_skills: SkillUsage[] = skillUsageDetail(since, 12, provider, account, host).slice(0, 20);
 
   // Per-app rollup within the window.
   /*
@@ -4226,8 +4309,8 @@ function computeStatsSummary(windowMs: number, provider?: string, tz?: string, a
  * skill starts). An approximation, but a useful one: it answers "what does
  * running /code-review actually cost?".
  */
-export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string, account?: string): SkillUsage[] {
-  const { clause: pf, args: pa } = provAcctScope(provider, account);
+export function skillUsageDetail(since = 0, bucketCount = 12, provider?: string, account?: string, host?: string): SkillUsage[] {
+  const { clause: pf, args: pa } = provAcctScope(provider, account, host);
   // Project scope, same as every other aggregation in computeStatsSummary. Its
   // absence here leaked top_skills — and the cost charged to them — from every
   // other project on the machine into a cockpit opened for one.
@@ -4503,6 +4586,12 @@ function changesWithFlagged(sessionId: string, limit: number): import("../../sha
  *  every added line, and on 500 changes that was half the call. */
 export function getChanges(limit = 200, sessionId?: string, withRisks = true): import("../../shared/types.ts").FileChange[] {
   const chg = scopeClause();
+  // The fleet-wide list is this machine's only. Its file paths are handed to
+  // discoverRepos and the diff panel, which resolve them with *our* git and
+  // read them off *our* disk — another machine's `/home/you/code/x/a.ts` would
+  // either resolve to nothing or, worse, to an unrelated local repo that
+  // happens to sit at the same path. One session's deep-dive is safe either
+  // way: its hunks come from the payload, not the filesystem.
   const rows = sessionId
     ? db.query<ChangeRow, any[]>(
         `SELECT id, timestamp, source_app, session_id, tool_name, payload FROM events
@@ -4510,7 +4599,7 @@ export function getChanges(limit = 200, sessionId?: string, withRisks = true): i
          ORDER BY timestamp DESC, id DESC LIMIT ?`).all(sessionId, ...chg.args, limit)
     : db.query<ChangeRow, any[]>(
         `SELECT id, timestamp, source_app, session_id, tool_name, payload FROM events
-         WHERE hook_event_type='PostToolUse' AND tool_name IN ('Edit','Write','MultiEdit')${chg.clause}
+         WHERE hook_event_type='PostToolUse' AND tool_name IN ('Edit','Write','MultiEdit') AND host IS NULL${chg.clause}
          ORDER BY timestamp DESC, id DESC LIMIT ?`).all(...chg.args, limit);
   return rows.map((r) => parseChange(r, withRisks)).filter((c): c is import("../../shared/types.ts").FileChange => c !== null);
 }
@@ -4677,6 +4766,17 @@ export function getSession(sessionId: string): import("../../shared/types.ts").S
      */
     custom_title: roll?.custom_title ?? null,
     ai_title: roll?.ai_title ?? null,
+    // Which machine it ran on, labelled like every other read — the deep-dive
+    // is where Resume lives, and Resume is exactly the button that must know.
+    host: roll?.host ?? hostId(),
+    // A cloud session's own id on claude.ai, when its hook sent one (phase 5,
+    // hooks/cloud_hook.py) — what the deep-dive links to, since a cloud session
+    // can be continued there and nowhere else. Only asked of a forwarded row.
+    cloud_session: roll?.host
+      ? (db.query<{ c: string | null }, [string]>(
+          "SELECT json_extract(payload, '$.cloud_session_id') AS c FROM events WHERE session_id = ? AND json_extract(payload, '$.cloud_session_id') IS NOT NULL ORDER BY id DESC LIMIT 1",
+        ).get(sessionId)?.c ?? null)
+      : null,
     // Same rule as the list: only when there is no title to use instead.
     first_prompt: roll?.custom_title || roll?.ai_title
       ? null
@@ -4770,7 +4870,7 @@ export function searchEvents(
   const s = scopeClause();
   // Joined as `e` — qualify every column that also exists on events_fts or is
   // ambiguous once the join is in play.
-  const scoped = s.clause.replace(/\b(project_path|cwd_path)\b/g, "e.$1");
+  const scoped = s.clause.replace(/\b(project_path|cwd_path|host)\b/g, "e.$1");
   const prov = providerScope(opts?.provider);
   const provClause = prov.clause.replace(/\bprovider\b/g, "e.provider");
   const since = opts?.since;
@@ -4802,6 +4902,45 @@ export function exportRows(limit = 100_000): WatchEvent[] {
     .query<any, any[]>(`SELECT * FROM events WHERE 1=1${s.clause} ORDER BY id ASC LIMIT ?`)
     .all(...s.args, limit)
     .map(parseEventRow);
+}
+
+/**
+ * Rows by key, parsed and labelled like every other read — for a writer that
+ * did not go through insertEvent (the fleet hub, fleethub.ts) and still has to
+ * hand the live socket the same shape a reload would show.
+ */
+/**
+ * The machine a session id belongs to when it is not this one — or null.
+ *
+ * For the routes that would act on a session by id: a resume, a handoff. A
+ * session forwarded from another machine (docs/FLEET.md) has its transcript,
+ * its checkout and its process over there, and acting on it here starts
+ * something local under somebody else's name. A `host:` prefix is how the hub
+ * stores an id another machine already held, so it is foreign even before the
+ * row is looked up.
+ */
+export function foreignHostOf(sessionId: string): string | null {
+  if (!sessionId) return null;
+  const row = db.query<{ host: string | null }, [string]>("SELECT host FROM sessions WHERE session_id = ?").get(sessionId);
+  if (row?.host) return row.host;
+  const colon = sessionId.indexOf(":");
+  return colon > 0 ? sessionId.slice(0, colon) : null;
+}
+
+export function eventsByIds(ids: number[]): WatchEvent[] {
+  if (!ids.length) return [];
+  return db
+    .query<any, number[]>(`SELECT * FROM events WHERE id IN (${ids.map(() => "?").join(",")}) ORDER BY id`)
+    .all(...ids)
+    .map(parseEventRow);
+}
+
+export function sessionsByIds(ids: string[]): SessionRollup[] {
+  if (!ids.length) return [];
+  return db
+    .query<Record<string, unknown>, string[]>(`SELECT * FROM sessions WHERE session_id IN (${ids.map(() => "?").join(",")})`)
+    .all(...ids)
+    .map(parseSessionRow);
 }
 
 export { db };

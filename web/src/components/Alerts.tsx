@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "motion/react";
 import type { Alert, AgentCard } from "../lib/derive.ts";
 import { collectAttention } from "../lib/attention.ts";
 import { listChats, subscribe as subscribeChats } from "../lib/chatStore.ts";
-import { listGates, subscribeGates, answerGate } from "../lib/gateStore.ts";
+import { listGates, subscribeGates, answerGate, gateWho } from "../lib/gateStore.ts";
 import type { Insight, PendingGate, GateRecord } from "../../../shared/types.ts";
 import { Panel } from "./Panel.tsx";
 import { api } from "../lib/api.ts";
@@ -154,7 +154,7 @@ export function Alerts({ alerts, agents = [], onSelectApp, bump, active = true }
               <div className="flex items-center gap-2">
                 <span className="flex" style={{ color: "var(--warning)" }}><HandIcon size={ICON.xs} /></span>
                 <span className="text-[11.5px] font-semibold" style={{ color: "var(--text)" }}>Approve {g.tool_name}?</span>
-                <span className="ml-auto text-[9.5px] t-dim2">{g.source_app}:{g.session_id.slice(0, 8)}</span>
+                <span className="ml-auto text-[9.5px] t-dim2">{gateWho(g)}</span>
               </div>
               <div className="text-[10.5px] t-dim mt-1 mb-2 break-all line-clamp-2" title={g.summary} style={{ display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
                 {g.summary || "(No details)"}

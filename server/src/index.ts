@@ -11,6 +11,11 @@ import { slackReachable } from "./slackreach.ts";
 import { normalize, detectError, clampIngestTimestamp, externalIngestError } from "./ingest.ts";
 import { pricingProvenance, startPricingRefresh } from "./pricing.ts";
 import { db } from "./db.ts";
+import { eventsByIds, sessionsByIds, foreignHostOf } from "./db.ts";
+import { fleetOpen, fleetMessage, fleetClose, fleetNodes, whenForeignRows, whenRemoteGate, remotePendingGates, remoteGate, decideRemote, requestRemote, streamRemote, type FleetWsData } from "./fleethub.ts";
+import { startUplink, uplinkStatus, setTunnelDispatch } from "./fleetlink.ts";
+import { HOST_ID_RE } from "./fleetwire.ts";
+import { startCloudIntake, cloudIntakeStatus } from "./cloudintake.ts";
 import {
   insertEvent,
   getRecent,
@@ -42,7 +47,7 @@ import {
   releaseDatabaseClaim,
   noteWaitFromHook,
 } from "./db.ts";
-import { maybeAlert, setAlertSink, pushDeviceStoreChanged, lanternSnapshot, pushJobFailed, pushAccountPaused } from "./alerts.ts";
+import { maybeAlert, setAlertSink, pushDeviceStoreChanged, lanternSnapshot, pushJobFailed, pushAccountPaused, pushGate } from "./alerts.ts";
 import { noteAction, actorOf, type ActorSource } from "./actions.ts";
 import { getSkills, catalogMarkdown, catalogCsv, usageSince } from "./skills.ts";
 import { getInsights } from "./insights.ts";
@@ -169,7 +174,7 @@ import { treeAuthors, liveSessions, recentSessions, editsBy } from "./sharedtree
 import { paneStatus } from "./agentdone.ts";
 import { windowRepo } from "./windowrepo.ts";
 import { takeSpawnSlot } from "./spawncap.ts";
-import { chatSend, activeTurns, turnActive, sentTurnTo, turnSenderKey, CHAT_ENABLED, CHAT_BYPASS_ALLOWED, CHAT_ENGINE_DEFAULT } from "./chat.ts";
+import { chatSend, activeTurns, turnActive, sentTurnTo, turnSenderKey, noteTurnSender, CHAT_ENABLED, CHAT_BYPASS_ALLOWED, CHAT_ENGINE_DEFAULT } from "./chat.ts";
 import { paneEngineCapability, attachCommand, validPaneName, screenNeedsYou } from "./chatpane.ts";
 import { tmuxBinStatus, tmuxSocket, engineSocketArgs } from "./tmuxbin.ts";
 import { applyTmuxConf, resetTmuxConf, confHealth, ensureConf, sweepStaleConfs } from "./tmuxconf.ts";
@@ -187,7 +192,7 @@ import { takeLease, endLease, leaseHeld, reapLeases } from "./panelease.ts";
 import { runAgentInteractivePane } from "./understudy-pane.ts";
 import { startScanner, ownsSession, knownProjects, projectsKnownAtStart, resyncScope, scanningEnabled } from "./transcripts.ts";
 import { conflictPrompt } from "./conflictPrompt.ts";
-import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots } from "./config.ts";
+import { workspaceRoot, workspaceRoots, setWorkspaceRoot, setWorkspaceRoots, inScope, sessionInScope, chatBypassAllowed, readBudgets, writeBudgets, hiddenProjects, setProjectHidden, setRepoDir, configuredRepoDirs, panelRepoDirs, configPath, repoDirsUnstated, seedRepoDirs, fileRoots, hostId, isLocalHost } from "./config.ts";
 import { startDispatcher, onDispatch } from "./dispatcher.ts";
 import { createJob, createJobs, listJobs, getJob, updateJob, cancelJob, jobEvents } from "./queue.ts";
 import { listInstances, launchInstance, stopInstance } from "./instances.ts";
@@ -200,7 +205,7 @@ import { join as joinPath, resolve as resolvePath, basename } from "node:path";
 import { hostname, tmpdir } from "node:os";
 import { privateHost, resolvePeer, originOf, guardedFetch, hostsOnly } from "./net.ts";
 import { DESK_HEADER, claimDesk, deskHeld } from "./desk.ts";
-import { resolveToken, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
+import { resolveToken, tunnelAllows, tunnelOfRequest, tunnelTokenFor, narrower, healthProof, tokenOk, isIntake, isAuthExempt, callerFor, allowed, scopeNeeded, pluginOfRequest, answersFromADevice, deskKeyOk, understudyRequiresToken, UNDERSTUDY_NO_TOKEN_ERROR, mintUnderstudyToken, revokeUnderstudyToken, tokenlessWarning, type Caller, type Origin } from "./auth.ts";
 import {
   listPlugins, masterEnabled, setMaster, installPlugin, installFromCatalogue, updatePlugin, enablePlugin, disablePlugin, removePlugin, setPluginUnboxedConsent,
   contributesOf, isRunning, pluginSettings, setPluginSettings, resumeEnabledPlugins, stopAllPluginsSync, pluginIcon,
@@ -1398,7 +1403,7 @@ import { bunBin, NO_BUN } from "./bunbin.ts";
 import { understudyRunEnv } from "./understudy-runenv.ts";
 import { recoverAfterRestart, startUnderstudyWatchdog, stopUnderstudyWatchdog, setResumeHook, setGitHook, setFenceHook, setAliveHook, setBunHook, setBusyHook } from "./understudy-watchdog.ts";
 import { openRequests, helpHistory, markAnswered } from "./understudy-help.ts";
-import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, type Scope } from "./devices.ts";
+import { activeDevices, markSeen, revokeDevice, devices, publicDevice, whenStoreTampered, issueDevice, scopeAllows, type Scope } from "./devices.ts";
 import { credentialsPath, hasCredential } from "./credentials.ts";
 import { startCardWatch, cardForTitle } from "./clickupwatch.ts";
 import * as CardIndex from "./clickupindex.ts";
@@ -1495,7 +1500,7 @@ const BUDGET_WRITE_ENABLED = process.env.AGENTGLASS_BUDGET_WRITE_DISABLED !== "1
 // it, forgetting a device revokes its credential and leaves whatever it is
 // already holding — an event stream, a terminal — running until it disconnects
 // on its own, which is a revoke in the list and not on the wire.
-type WsData = ({ kind: "events" } | { kind: "notify" } | PtyWsData) & { ip?: string | null; deviceId?: string | null };
+type WsData = ({ kind: "events" } | { kind: "notify" } | PtyWsData | FleetWsData) & { ip?: string | null; deviceId?: string | null };
 /** The docker reads that start a process per request and have no cache or
  *  single-flight in front of them. See spawncap.ts. */
 const DOCKER_SPAWNS = new Set([
@@ -2617,7 +2622,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // plugin over the plugin socket reached a full-scope route (measured:
     // `POST /plugins/master` answered 200; with a machine token set the same
     // call is 403).
-    if ((AUTH_TOKEN || pluginOfRequest(req, url)) && !isAuthExempt(pathname, sinkFrom)) {
+    // A request the fleet hub carried here (tunnelOfRequest) gets a caller the
+    // same way, so a node with no machine token still grades it by the scope it
+    // was granted rather than waving it through as this machine.
+    if ((AUTH_TOKEN || pluginOfRequest(req, url) || tunnelOfRequest(req, url)) && !isAuthExempt(pathname, sinkFrom)) {
       caller = callerFor(req, url, AUTH_TOKEN ?? "");
       if (!caller) return json({ ok: false, error: "unauthorized — pass ?token= or Authorization: Bearer" }, 401);
       if (!allowed(caller, req.method, pathname)) {
@@ -2642,6 +2650,15 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
             ok: false,
             error: `the orchestrator's seat may not ${req.method} ${pathname}: this chair is set to "${caller.seat?.powers ?? "speak"}"`,
           }, 403);
+        }
+        if (caller.principal === "node") {
+          return json({ ok: false, error: `a fleet node credential opens /fleet/link and nothing else, not ${req.method} ${pathname}` }, 403);
+        }
+        if (caller.principal === "cloud") {
+          return json({ ok: false, error: "a cloud session credential is only good at the cloud intake, not here" }, 403);
+        }
+        if (caller.principal === "hub") {
+          return json({ ok: false, error: `the hub's request was granted "${caller.scope}" here, and ${req.method} ${pathname} needs more — or is not something this machine opens to its hub` }, 403);
         }
         if (caller.principal === "understudy") {
           recordFence(pathname, req.method);
@@ -2806,6 +2823,27 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // so without this any page in the user's browser could open a socket to
     // localhost and read the whole fleet's prompts, paths and errors as they
     // stream — a read this feed is not meant to give to the open web.
+    // --- the fleet link: another agentglass forwarding its rows (docs/FLEET.md) ---
+    //
+    // Only a node credential gets here (`nodeAllows` in auth.ts), and it names
+    // the one host the socket may speak as. A hub with no token never resolves
+    // a caller at all, so it cannot tell a node from anyone else on its port —
+    // it says so instead of accepting rows from whoever asks.
+    if (pathname === "/fleet/link") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (caller?.principal !== "node" || !caller.device?.host) {
+        return json({
+          ok: false,
+          error: AUTH_TOKEN
+            ? "the fleet link needs a node credential — mint one on the hub with `bun run fleet add-node <host>`"
+            : "this hub has no token configured, so it cannot tell a node from anyone else — set AGENTGLASS_TOKEN",
+        }, 401);
+      }
+      const data: FleetWsData = { kind: "fleet", host: caller.device.host, deviceId: caller.device.id, ip: clientIp ?? null };
+      if (srv.upgrade(req, { data })) return undefined as unknown as Response;
+      return new Response("upgrade failed", { status: 426 });
+    }
+
     if (pathname === "/stream") {
       if (!trustedCaller(req, from)) return csrfBlocked();
       if (srv.upgrade(req, { data: { kind: "events", ip: clientIp ?? null, deviceId: caller?.device?.id ?? null } })) return undefined as unknown as Response;
@@ -2908,6 +2946,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const direct = peer.source === "socket" && !!clientIp && isLoopback(clientIp);
       const proof = challenge && challenge.length <= 128 && AUTH_TOKEN && direct
         ? healthProof(AUTH_TOKEN, srv.port ?? PORT, challenge) : undefined;
+      // No `host` here, though it would be convenient: it is usually the
+      // machine's hostname, and this route answers anyone who can reach the
+      // port without a credential (pair-routes.test.ts holds that line). The
+      // name is on /fleet/status, which is a read like any other.
       return json({
         ok: true, service: "agentglass", clients: clients.size,
         notifyWatching: notifyWatching(), build: buildStamp(), proof,
@@ -3060,7 +3102,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     // --- reads ---
     if (pathname === "/events/recent") {
       const limit = Math.min(2000, Number(url.searchParams.get("limit") || 300));
-      return json(getRecent(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
+      return json(getRecent(
+        limit,
+        url.searchParams.get("provider") || undefined,
+        url.searchParams.get("account") || undefined,
+        url.searchParams.get("host") || undefined,
+      ));
     }
     if (pathname === "/events/filter-options") return json(getFilterOptions());
     // Every project the scanner has seen, with the real folder it lives in —
@@ -3613,7 +3660,10 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       const out = await awaitGate(String(url.searchParams.get("id") || ""));
       return out ? json(out) : json({ decision: null, reason: "unknown gate" }, 404);
     }
-    if (pathname === "/gate/pending") return json({ gates: pendingGates() });
+    // This machine's holds, then the ones linked nodes are keeping (phase 3,
+    // docs/FLEET.md) — each of those carries `host`, which is how the client
+    // tells the two apart and how /gate/decide below knows where to send it.
+    if (pathname === "/gate/pending") return json({ gates: [...pendingGates(), ...remotePendingGates()] });
     // What was decided while you weren't looking — including the requests a
     // timeout or a restart resolved for you.
     if (pathname === "/gate/history") {
@@ -3642,6 +3692,33 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       // the line worth keeping is what was held, not the uuid it was held
       // under. "denied Bash · rm -rf build" is an audit line; a uuid is not.
       const held = getGate(String(b.id));
+      /*
+       * A hold another machine is keeping (phase 3, docs/FLEET.md).
+       *
+       * Every check above has already run — the Origin, and the one this route
+       * exists for: that the party being held cannot release itself. So the
+       * hub releases a node's hold under exactly the rule it releases its own.
+       * The answer travels down that node's link and takes effect there; the
+       * node says whether it took, because it may have timed out there first.
+       * There is no local row: the hold, its timer and its history all live on
+       * the machine that holds it, and that is where the actor is recorded.
+       *
+       * The one-device-asks-and-approves rule below has nothing to check here:
+       * a remote session cannot be sent a turn from this hub (resume refuses),
+       * so this hub never holds the record that rule reads.
+       */
+      const remote = held ? null : remoteGate(String(b.id));
+      if (remote && decision === "allow" && sentTurnTo(remote.session_id, turnSenderKey(caller))) {
+        return json({ ok: false, error: "this device sent that session its turn — another device or the desk has to allow it" }, 403);
+      }
+      if (remote) {
+        const origin = req.headers.get("origin");
+        const who = actorOf(clientIp, caller ? { ...asActor(caller)!, fromPage: !!origin && vouchedOrigin(origin) } : caller);
+        const r = await decideRemote(remote.id, decision, String(b.reason || ""), who);
+        noteAction(clientIp, `/gate/${decision}`,
+          { tool: remote.tool_name, summary: `${remote.summary} · on ${remote.host}` }, { ok: r.ok, error: r.error }, asActor(caller));
+        return json({ ok: r.ok, ...(r.error ? { error: r.error } : {}) });
+      }
       // The device that sent this session its last turn does not also let that
       // turn's tool call through: that is one phone asking for a command and
       // approving it, with nobody else in the loop. See noteTurnSender.
@@ -4888,6 +4965,143 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       return !AUTH_TOKEN || tokenOk(req, url, AUTH_TOKEN);
     };
     const notHere = () => json({ ok: false, error: "only this machine can do that" }, 403);
+
+    // --- the fleet (docs/FLEET.md) ---
+
+    // Both halves on one page: what this machine forwards to, and who forwards
+    // here. A read, so a paired phone can see whether the box is linked.
+    if (pathname === "/fleet/status") {
+      return json({ host: hostId(), upstream: uplinkStatus(), nodes: fleetNodes(), cloud: cloudIntakeStatus() });
+    }
+
+    /*
+     * Mint a node credential, at the hub, for one named host.
+     *
+     * At the machine for the reason a pairing ticket is: an invitation is made
+     * where the person is sitting. The fleet CLI runs on the hub's own shell —
+     * over ssh, for a headless box — and that shell is already all the
+     * authority there is here, so no six-digit ceremony is added on top. The
+     * token is shown once, in the answer, and only its hash is kept.
+     *
+     * One live credential per host: minting again for a name that already has
+     * one is refused unless `replace` says to revoke the old one, because two
+     * machines forwarding as "bean" would interleave into one history that
+     * neither of them recorded.
+     */
+    if (pathname === "/fleet/nodes" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (!atMachine()) return notHere();
+      if (!AUTH_TOKEN) {
+        return json({ ok: false, error: "this hub has no token configured, so a node credential could never be checked — set AGENTGLASS_TOKEN first" }, 409);
+      }
+      let b: { host?: unknown; replace?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.host === "string" ? b.host.trim() : "";
+      if (!HOST_ID_RE.test(host)) return json({ ok: false, error: "host must be a plain label: letters, digits, . _ -" }, 400);
+      if (host === hostId()) return json({ ok: false, error: `"${host}" is this hub's own name` }, 400);
+      if (activeDevices().some((d) => d.role === "cloud" && d.host === host)) {
+        return json({ ok: false, error: `"${host}" is the name cloud sessions are stored under — pick another for this machine` }, 409);
+      }
+      const existing = activeDevices().filter((d) => d.role === "node" && d.host === host);
+      if (existing.length && b.replace !== true) {
+        return json({ ok: false, error: `"${host}" already has a node credential — pass replace to revoke it and mint a new one` }, 409);
+      }
+      for (const d of existing) {
+        revokeDevice(d.id);
+        for (const ws of [...sockets]) if (ws.data?.deviceId === d.id) { try { ws.close(1008, "credential replaced"); } catch { /* gone */ } }
+      }
+      const { device, token } = issueDevice(`agentglass on ${host}`, "read", Date.now(), { host });
+      return json({ ok: true, token, device: publicDevice(device) });
+    }
+    /*
+     * Read a node's workspace from here (phase 4, docs/FLEET.md).
+     *
+     * `{ host, method, path, body? }`, where path may carry its query string.
+     * The node's answer comes back as itself — status, type, body — so a panel
+     * reading a remote repository reads exactly what it would have read there.
+     * A POST only because it carries a request; READ_POST in auth.ts says why
+     * it is a read. tunnelAllows is asked here so a refusal is fast and the
+     * hub never even forwards a write, and asked again on the node, where the
+     * answer is binding.
+     */
+    if (pathname === "/fleet/proxy" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      let b: { host?: unknown; method?: unknown; path?: unknown; body?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.host === "string" ? b.host : "";
+      const method = b.method === "POST" ? "POST" : "GET";
+      const raw = typeof b.path === "string" ? b.path : "";
+      const q = raw.indexOf("?");
+      const path = q < 0 ? raw : raw.slice(0, q);
+      const query = q < 0 ? "" : raw.slice(q + 1);
+      if (!HOST_ID_RE.test(host) || !path.startsWith("/")) return json({ ok: false, error: "host and path are required" }, 400);
+      // The widest a node could open; the node's own tier is the real ceiling.
+      if (!tunnelAllows(method, path, "chat")) {
+        return json({ ok: false, error: `${method} ${path} is not something a linked machine opens to its hub — do it on ${host}` }, 403);
+      }
+      /*
+       * The caller's own reach, for the request it is forwarding.
+       *
+       * /fleet/proxy itself is a read (READ_POST), so the gate above only knew
+       * this caller may read. A chat turn through it needs what that turn
+       * needs here — `answer` to reply, more to start one — so it is graded
+       * again against the inner route, and the caller's scope travels with the
+       * request: the node runs it with the lower of this and its own tier. A
+       * null caller is the machine (no token configured), which is `full`.
+       */
+      const scope = caller?.scope ?? "full";
+      const needs = scopeNeeded(method, path);
+      if (!scopeAllows(scope, needs)) {
+        return json({ ok: false, error: `this device is paired for "${scope}" access, and ${method} ${path} on ${host} needs "${needs}"` }, 403);
+      }
+      const body = b.body === undefined ? undefined : JSON.stringify(b.body);
+      if (method === "POST" && path === "/chat/send") {
+        const resumeId = typeof (b.body as { resumeId?: unknown })?.resumeId === "string" ? (b.body as { resumeId: string }).resumeId : "";
+        noteAction(clientIp, "/chat/send", { root: `${host}:${String((b.body as { cwd?: unknown })?.cwd ?? "")}`, name: String((b.body as { model?: unknown })?.model ?? "") }, { ok: true }, asActor(caller));
+        const a = await streamRemote(host, method, path, query, body, narrower(scope, "full"));
+        // The same rule a local turn keeps (chat.ts noteTurnSender): the device
+        // that sent a session its turn is not the one that allows that turn's
+        // held call. The hold arrives from the node and is decided here, so the
+        // record has to be here too — see the remote branch of /gate/decide.
+        if (a.status < 300 && scope !== "full" && resumeId) noteTurnSender(resumeId, turnSenderKey(caller));
+        return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
+      }
+      const a = await requestRemote(host, method, path, query, body, scope);
+      return new Response(a.body, { status: a.status, headers: { "content-type": a.type } });
+    }
+    /*
+     * Mint a cloud credential (phase 5): what a cloud environment's settings
+     * carry so its sessions can report to the cloud intake. At the machine, as
+     * a node credential is. It opens nothing on this server (`allowed` refuses
+     * principal "cloud" outright) and is checked only by the intake, which is
+     * why no machine token is required to mint one: there is nothing here for
+     * it to be checked against. `name` is the host its sessions are stored
+     * under — `cloud` unless you want to tell environments apart.
+     */
+    if (pathname === "/fleet/clouds" && req.method === "POST") {
+      if (!trustedCaller(req, from)) return csrfBlocked();
+      if (!atMachine()) return notHere();
+      let b: { name?: unknown; replace?: unknown };
+      try { b = (await req.json()) as typeof b; } catch { return json({ ok: false, error: "invalid json" }, 400); }
+      const host = typeof b.name === "string" && b.name.trim() ? b.name.trim() : "cloud";
+      if (!HOST_ID_RE.test(host)) return json({ ok: false, error: "name must be a plain label: letters, digits, . _ -" }, 400);
+      if (host === hostId()) return json({ ok: false, error: `"${host}" is this hub's own name` }, 400);
+      if (activeDevices().some((d) => d.role === "node" && d.host === host)) {
+        return json({ ok: false, error: `"${host}" is a linked machine's name — pick another for cloud sessions` }, 409);
+      }
+      const existing = activeDevices().filter((d) => d.role === "cloud" && d.host === host);
+      if (existing.length && b.replace !== true) {
+        return json({ ok: false, error: `"${host}" already has a cloud credential — pass replace to revoke it and mint a new one` }, 409);
+      }
+      for (const d of existing) revokeDevice(d.id);
+      const { device, token } = issueDevice(`cloud sessions (${host})`, "read", Date.now(), { host, role: "cloud" });
+      return json({ ok: true, token, device: publicDevice(device), intake: cloudIntakeStatus().port });
+    }
+    if (pathname === "/fleet/nodes") {
+      const creds = activeDevices().filter((d) => d.role === "node").map(publicDevice);
+      const clouds = activeDevices().filter((d) => d.role === "cloud").map(publicDevice);
+      return json({ nodes: fleetNodes(), credentials: creds, clouds, cloud: cloudIntakeStatus() });
+    }
 
     if (pathname === "/pair/ticket" && req.method === "POST") {
       if (!atMachine()) return notHere();
@@ -7914,7 +8128,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!d) return json({ ok: false, error: "no such session" }, 404);
       const wanted = typeof b.kind === "string" ? b.kind : "claude";
       if (!agentKind(wanted)) return json({ ok: false, error: "no such agent" }, 400);
-      const cwd = gitSafeAbs(b.cwd) || gitSafeAbs(d.cwd_path) || workspaceRoot() || "";
+      // Another machine's session hands over its story, not its directory: its
+      // cwd names a checkout on that machine, and the same path here — if it
+      // exists at all — is a different tree. Only a cwd the caller chose counts.
+      const foreign = !isLocalHost(d.host);
+      const cwd = gitSafeAbs(b.cwd) || (foreign ? "" : gitSafeAbs(d.cwd_path) || workspaceRoot()) || "";
+      if (foreign && !cwd) return json({ ok: false, error: `that session ran on ${d.host} — say which checkout here to hand it to` }, 400);
       if (!cwd || !inScope(cwd) || !fsExists(cwd)) return json({ ok: false, error: "that directory is not in the open project" }, 400);
       const prompt = handoffBrief(d);
       const title = `handoff: ${(d.custom_title || d.ai_title || session.slice(0, 8)).slice(0, 40)}`;
@@ -8336,6 +8555,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       // The launch, not the turn. chatSend returns a stream rather than an
       // outcome, and the auditable fact is that somebody started an agent in a
       // checkout through this cockpit — what it then does is gated and lands in
@@ -8479,6 +8700,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       // Same reasoning as /chat/send: the launch is the auditable fact, not the
       // turn, and the prompt is already in Codex's own rollout.
       noteAction(clientIp, "/codex/send",
@@ -8506,6 +8729,8 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       if (!trustedCaller(req, from)) return csrfBlocked();
       let b: any = {};
       try { b = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
+      const elsewhere = foreignResumeRefusal(b);
+      if (elsewhere) return json({ error: elsewhere }, 409);
       noteAction(clientIp, "/antigravity/send",
         { root: b.cwd, name: b.model }, { ok: true }, asActor(caller));
       // `ingestBody` is handed in rather than imported by antigravity.ts, which
@@ -8574,7 +8799,12 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
     }
     if (pathname === "/sessions") {
       const limit = Math.min(1000, Number(url.searchParams.get("limit") || 100));
-      return json(getSessions(limit, url.searchParams.get("provider") || undefined, url.searchParams.get("account") || undefined));
+      return json(getSessions(
+        limit,
+        url.searchParams.get("provider") || undefined,
+        url.searchParams.get("account") || undefined,
+        url.searchParams.get("host") || undefined,
+      ));
     }
     if (pathname === "/stats") {
       const windowMs = parseWindowMs(url.searchParams.get("window"));
@@ -8588,6 +8818,7 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
           url.searchParams.get("provider") || undefined,
           url.searchParams.get("tz") || undefined,
           url.searchParams.get("account") || undefined,
+          url.searchParams.get("host") || undefined,
         ),
         server_started_at: STARTED_AT,
         retention_days: RETENTION_DAYS,
@@ -8740,6 +8971,7 @@ const server = Bun.serve<WsData>({
       // user cuts that device off.
       sockets.add(ws);
       noteSocket(ws.data?.ip, 1);
+      if (ws.data?.kind === "fleet") { fleetOpen(ws as ServerWebSocket<FleetWsData>); return; }
       if (ws.data?.kind === "pty") {
         // Alive from the moment it connects — see the note on the sweep above.
         alive.set(ws, Date.now());
@@ -8783,6 +9015,7 @@ const server = Bun.serve<WsData>({
       // event streams only and leaks an entry per terminal.
       alive.delete(ws);
       noteSocket(ws.data?.ip, -1);
+      if (ws.data?.kind === "fleet") { fleetClose(ws as ServerWebSocket<FleetWsData>); return; }
       if (ws.data?.kind === "pty") { ptyClose(ws); return; }
       if (ws.data?.kind === "notify") {
         // Unsubscribing is what stops the monitor process once the last
@@ -8800,6 +9033,7 @@ const server = Bun.serve<WsData>({
       // A frame that did arrive is still proof somebody is running — for a
       // pty this is a keystroke or a resize, not just the event stream.
       alive.set(ws, Date.now());
+      if (ws.data?.kind === "fleet") { fleetMessage(ws as ServerWebSocket<FleetWsData>, msg as string | Buffer); return; }
       if (ws.data?.kind === "pty") { ptyMessage(ws, msg as string | Buffer); return; }
       if (ws.data?.kind === "events" && typeof msg === "string" && msg.length < 512 && msg.startsWith("{")) {
         let f: { type?: unknown; clientId?: unknown; browser?: unknown } = {};
@@ -9270,6 +9504,85 @@ startScanner(({ event, session }) => {
   if (event.hook_event_type === "PreToolUse" || event.hook_event_type.startsWith("PostToolUse")) pushOpenTools();
   maybeAlert(event);
 });
+
+/**
+ * Refuse to resume another machine's session here (docs/FLEET.md).
+ *
+ * Its transcript and checkout are on that machine. Resuming it locally either
+ * fails after spawning a process, or — the tmux engine, finding no transcript —
+ * starts a NEW local session under the remote id, whose rows then merge into
+ * the forwarded session and are labelled as the other machine's work. A
+ * `host:` id would otherwise fail the id check and be dropped silently,
+ * starting an unresumed agent with no error at all. Phase 4 is where a remote
+ * resume runs on the machine that owns it.
+ */
+function foreignResumeRefusal(b: { resumeId?: unknown }): string | null {
+  const rid = typeof b?.resumeId === "string" ? b.resumeId : "";
+  const host = foreignHostOf(rid);
+  return host ? `that session ran on ${host} — it can only be resumed there` : null;
+}
+
+// Another machine's rows, just stored by the fleet hub (fleethub.ts). Pushed
+// live like the scanner's, with two differences. Only the recent ones: a node
+// backfilling a week of history sends it in batches of hundreds, and drawing
+// last Tuesday's events into the live feed one by one is noise, not news — a
+// reload shows them where they belong. And no alert: an alert here is a
+// notification on this desk, and phase 3 is where another machine's holds
+// learn to reach it deliberately rather than as a side effect.
+const FOREIGN_LIVE_MS = 10 * 60_000;
+function pushForeign({ inserted, sessions }: { inserted: number[]; sessions: string[] }): void {
+  for (const sid of sessions) sessionCache.delete(sid);
+  const recent = Date.now() - FOREIGN_LIVE_MS;
+  let toolEdge = false;
+  for (const e of eventsByIds(inserted)) {
+    if (e.timestamp < recent || !sessionInScope({ host: e.host })) continue;
+    broadcast({ type: "event", data: e });
+    if (e.hook_event_type === "PreToolUse" || e.hook_event_type.startsWith("PostToolUse")) toolEdge = true;
+  }
+  for (const s of sessionsByIds(sessions)) {
+    if (s.last_seen >= recent && sessionInScope(s)) broadcast({ type: "session", data: s });
+  }
+  if (toolEdge) pushOpenTools();
+}
+whenForeignRows(pushForeign);
+// Cloud sessions' events (phase 5) arrive through their own listener and are
+// pushed the same way — they are another machine's rows, stored under `cloud`.
+startCloudIntake(pushForeign);
+
+// A linked node started holding a tool call (phase 3). The same alert a hold
+// here raises — the desk's notification and the paired phone's — with the
+// machine named, because "agentglass wants to run Bash" is three different
+// machines' worth of question in a fleet. No pane: that is a tmux window over
+// there, not a place this desk can take you.
+whenRemoteGate((host, g) => {
+  const what = g.budget ? (g.summary ? `${g.budget} · ${g.summary}` : g.budget) : g.summary;
+  pushGate(`${g.where || g.source_app} on ${host}`, g.tool_name, what);
+});
+
+// What runs a request the hub carried to this machine (phase 4): this server's
+// own router, over loopback, carrying a credential for exactly the scope the
+// request was granted — so this machine's own scope and repository checks
+// decide, and `allowed` fences it to tunnelAllows' routes again. The node's
+// ceiling has already been applied in fleetlink.ts; this is the door it walks
+// through, and the door checks too.
+const tunnelServer = {
+  requestIP: () => ({ address: "127.0.0.1", family: "IPv4" }),
+  port: PORT,
+  upgrade: () => false,
+} as unknown as Server<WsData>;
+setTunnelDispatch((r, scope) => {
+  const headers = new Headers(r.headers);
+  // The credential for the scope this request was granted — never this
+  // machine's own token. See tunnelTokenFor in auth.ts.
+  headers.set("Authorization", `Bearer ${tunnelTokenFor(scope)}`);
+  const url = new URL(r.url);
+  url.port = String(PORT);
+  return handleServerRequest(new Request(url.href, { method: r.method, headers, body: r.body }), tunnelServer);
+});
+
+// Forward this machine's rows to a hub, if it has joined one. Off by default
+// and inert until `bun run fleet join` writes upstream.json.
+startUplink({ version: buildStamp() || undefined });
 
 // Bring back the gate requests that were in flight when this process last
 // stopped. Anything still inside its window returns to "what needs you"; the

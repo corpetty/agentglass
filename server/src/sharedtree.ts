@@ -161,7 +161,7 @@ export function recentSessions(now = Date.now()): SessionSeen[] {
       SELECT s.session_id, s.last_seen,
         EXISTS (SELECT 1 FROM events e WHERE e.hook_event_type = 'SessionEnd' AND e.session_id = s.session_id
           AND e.timestamp >= s.last_seen) AS gone
-      FROM sessions s WHERE s.last_seen >= ?`).all(now - LIVE_MS)
+      FROM sessions s WHERE s.last_seen >= ? AND s.host IS NULL`).all(now - LIVE_MS)
       .map((r) => ({ session_id: r.session_id, last_seen: r.last_seen, gone: r.gone === 1 }));
   } catch { return []; }
 }
@@ -239,7 +239,7 @@ function editsIn(ids: string[], since: number, after: number, upTo: number): Tre
     SELECT session_id, timestamp,
       COALESCE(json_extract(payload, '$.tool_response.filePath'), json_extract(payload, '$.tool_input.file_path'),
                json_extract(payload, '$.tool_input.filePath')) AS fp
-    FROM events WHERE ${range} AND tool_name IN ('Edit','Write','MultiEdit')`).all(after, upTo, ...ids, since)
+    FROM events WHERE ${range} AND tool_name IN ('Edit','Write','MultiEdit') AND +host IS NULL`).all(after, upTo, ...ids, since)
     .filter((r): r is typeof r & { fp: string } => typeof r.fp === "string" && r.fp.startsWith("/"))
     .map((r) => ({ session_id: r.session_id, file_path: physical(r.fp), timestamp: r.timestamp }));
 }

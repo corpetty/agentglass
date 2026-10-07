@@ -117,7 +117,9 @@ function wired(a: Roster, path: string, found: boolean): boolean {
 function lastSeen(match: string, q: typeof db = db): number | null {
   const r = q
     .query<{ t: number | null }, [string]>(
-      "SELECT MAX(timestamp) AS t FROM events WHERE source_app LIKE '%' || ? || '%'"
+      // This machine's events: an agent that only reports on another machine
+      // (docs/FLEET.md) is not connected here.
+      "SELECT MAX(timestamp) AS t FROM events WHERE source_app LIKE '%' || ? || '%' AND +host IS NULL"
     )
     .get(match);
   return r?.t ?? null;
