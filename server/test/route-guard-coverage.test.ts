@@ -36,11 +36,12 @@ import { SOURCE, label, mutates, readRoutes } from "./routeTable.ts";
  * Keep this list short and keep the reasons true. An entry here is a decision
  * that a route which mutates or executes may be reached by a caller that sent
  * no Origin header — which on the `AGENTGLASS_BIND=0.0.0.0` install the README
- * documents means any machine that can reach the port. There are three reasons
+ * documents means any machine that can reach the port. There are four reasons
  * on the list and no others: eight callers that are subprocesses rather than
  * browsers and have no Origin to send, six steps of the pairing handshake that
- * happen before the device on the other end is trusted at all, and one read
- * that takes a POST because the question needs a body.
+ * happen before the device on the other end is trusted at all, one read that
+ * takes a POST because the question needs a body, and one other agentglass —
+ * a fleet node — which is a server, not a browser, and holds its own credential.
  */
 const EXEMPT = new Map<string, string>([
   ["POST /ingest",
@@ -82,6 +83,15 @@ const EXEMPT = new Map<string, string>([
   ["POST /pair/claim",
     "The phone redeeming its ticket for a token. It is the one call a device " +
     "makes before it has anything to authenticate with."],
+  ["ANY /fleet/link",
+    "A fleet node's WebSocket (docs/FLEET.md). The caller is another " +
+    "agentglass — a server, never a browser — reaching the hub from another " +
+    "machine through `tailscale serve`, so it is remote AND has no Origin, the " +
+    "one combination trustedCaller refuses; held to it, no node could ever " +
+    "link. It is gated instead by what actually distinguishes it: an Origin, " +
+    "when present, must be one this server vouches for (so a page cannot drive " +
+    "it), and the route refuses everything but a node credential bound to one " +
+    "host name. fleet-link-remote.test.ts holds both halves."],
 ]);
 
 /*
