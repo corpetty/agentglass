@@ -39,6 +39,17 @@ let snapshot: PendingGate[] = [];
 export const listGates = (): PendingGate[] => snapshot;
 
 /**
+ * Who is asking, in one string every surface shares — the server's `where`
+ * when it sent one, and the machine holding it when that is not this server
+ * (docs/FLEET.md, phase 3). In a fleet "agentglass wants to run Bash" is a
+ * question about three different machines; the answer has to say which.
+ */
+export function gateWho(g: PendingGate): string {
+  const base = g.where || `${g.source_app}:${g.session_id.slice(0, 8)}`;
+  return g.host ? `${base} on ${g.host}` : base;
+}
+
+/**
  * Which live gate a bell row's `key` is about, if any.
  *
  * The bell renders a `SystemNote`, which carries no gate id of its own — only
@@ -132,7 +143,7 @@ function announce(g: PendingGate) {
   // alert and the gate push both used until they stopped, and the same one that
   // was reported as identifying nothing. The fallback is only for a server old
   // enough not to send `where`.
-  const agent = g.where || `${g.source_app}:${g.session_id.slice(0, 8)}`;
+  const agent = gateWho(g);
   recordNote({
     app: "gate",
     summary: `Approve ${g.tool_name}?`,
@@ -262,7 +273,7 @@ export async function answerGate(gate: PendingGate, decision: "allow" | "deny"):
     snapshot = next;
     changed();
   }
-  const agent = `${gate.source_app}:${gate.session_id.slice(0, 8)}`;
+  const agent = gateWho(gate);
   recordNote({
     app: "gate",
     summary: `${decision === "allow" ? "Approve" : "Deny"} ${gate.tool_name} did not take`,

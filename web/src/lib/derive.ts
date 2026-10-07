@@ -142,6 +142,9 @@ export interface AgentCard {
    *  from the session row, where the server rolls them up. Empty until the
    *  sessions poll has seen it, and when nothing was flagged. */
   risks: SessionRisk[];
+  /** The machine this session runs on (docs/FLEET.md). Undefined from a server
+   *  too old to say, which means the one you are talking to. */
+  host?: string;
 }
 
 const STALL_MS = 20_000;
@@ -431,6 +434,7 @@ export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [
       // an event that does not carry the field blank one that did.
       if (p?.cwd) a.cwd = String(p.cwd);
       if (p?.project_path) a.project = String(p.project_path);
+      if (e.host) a.host = e.host;
       if (e.model_name) a.model_name = e.model_name; // latest, not last-in-array
       a.lastAction = e.tool_name
         ? `${e.hook_event_type} · ${e.tool_name}`
@@ -453,6 +457,7 @@ export function deriveAgents(events: WatchEvent[], openTools: OpenToolCall[] = [
       a = blankCard(key, s.source_app, s.session_id, null);
       a.lastSeen = s.since;
       a.lastType = "PreToolUse";
+      if (s.host) a.host = s.host;
       map.set(key, a);
     }
     if (s.since >= a.runningSince) {

@@ -35,19 +35,19 @@ function pollFor(windowMs: number): number {
  *
  * Pass `intervalMs` only to override the window-derived rate.
  */
-export function useStats(windowMs: number, intervalMs?: number, provider = "", account = "", enabled = true) {
+export function useStats(windowMs: number, intervalMs?: number, provider = "", account = "", enabled = true, host = "") {
   const [stats, setStats] = useState<StatsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api
-      .stats(windowMs, provider || undefined, account || undefined)
+      .stats(windowMs, provider || undefined, account || undefined, host || undefined)
       .then((s) => {
         setStats(s);
         setError(null);
       })
       .catch((e) => setError(String(e)));
-  }, [windowMs, provider, account]);
+  }, [windowMs, provider, account, host]);
 
   const every = intervalMs ?? pollFor(windowMs);
   useEffect(() => {

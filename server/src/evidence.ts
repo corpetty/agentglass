@@ -54,6 +54,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenToolCall, Liveness } from "../../shared/types.ts";
 import { transcriptPathOf } from "./transcripts.ts";
+import { isLocalHost } from "./config.ts";
 
 /** Tools whose own input names a file they are about to change. Bash is absent
  *  on purpose: its command may write anywhere, or nowhere, and guessing a path
@@ -205,6 +206,18 @@ export function withEvidence(calls: OpenToolCall[], now = Date.now()): OpenToolC
   const perDir = new Map<string, number | null>();
 
   return calls.map((c) => {
+    // Another machine's call. Its transcript, its target and its working
+    // directory are all on that machine's disk; statting the same paths here
+    // would read some unrelated local file and call that evidence. Classified
+    // on no evidence at all, which is the honest position — the node that owns
+    // it can say more once the link carries it (docs/FLEET.md).
+    if (!isLocalHost(c.host)) {
+      return {
+        ...c,
+        evidenceKind: "none",
+        liveness: classify(c, { transcriptAt: null, targetAt: null, dirAt: null }, now),
+      };
+    }
     if (!perSession.has(c.session_id)) {
       perSession.set(c.session_id, mtimeOf(transcriptPathOf(c.session_id)));
     }

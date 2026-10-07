@@ -116,7 +116,7 @@ const PICK_WAIT_MS = 3000;
 
 export default function App() {
   const [windowMs, setWindowMs] = useState(3_600_000);
-  const [filter, setFilter] = useState({ app: "", type: "", provider: "", account: "" });
+  const [filter, setFilter] = useState({ app: "", type: "", provider: "", account: "", host: "" });
   const [theme, setTheme] = useState(initialTheme());
   const [opts, setOpts] = useState<{ source_apps: string[]; hook_event_types: string[]; accounts: string[] }>({ source_apps: [], hook_event_types: [], accounts: [] });
   const [selected, setSelected] = useState<WatchEvent | null>(null);
@@ -473,7 +473,7 @@ export default function App() {
   // full chart re-render). The 4s interval is plenty for a summary.
   // Only while the dashboard is the view on screen. It is the app's dearest
   // poll and it feeds nothing else — see useStats for the numbers.
-  const { stats } = useStats(windowMs, undefined, filter.provider, filter.account, dashActive);
+  const { stats } = useStats(windowMs, undefined, filter.provider, filter.account, dashActive, filter.host);
 
   useEffect(() => {
     applyTheme(theme);
@@ -569,17 +569,20 @@ export default function App() {
   // (cost, latency, timeline) is scoped in parallel on the server via
   // useStats(provider, account). Account lives directly on the event (unlike
   // provider, which is derived from model_name), so no session map is needed.
-  const scoped = !!(filter.provider || filter.account);
+  // Host is on the event as well, labelled by the server, so it filters the
+  // same way account does.
+  const scoped = !!(filter.provider || filter.account || filter.host);
   const visibleEvents = useMemo(
     () =>
       scoped
         ? events.filter(
             (e) =>
               (!filter.provider || sessionProvider.get(e.session_id) === filter.provider) &&
-              (!filter.account || e.account === filter.account)
+              (!filter.account || e.account === filter.account) &&
+              (!filter.host || e.host === filter.host)
           )
         : events,
-    [events, filter.provider, filter.account, scoped, sessionProvider]
+    [events, filter.provider, filter.account, filter.host, scoped, sessionProvider]
   );
   const agents = useMemo(
     () =>
@@ -587,13 +590,15 @@ export default function App() {
         ? deriveAgents(
             visibleEvents,
             openTools.filter(
-              (s) => !filter.provider || sessionProvider.get(s.session_id) === filter.provider
+              (s) =>
+                (!filter.provider || sessionProvider.get(s.session_id) === filter.provider) &&
+                (!filter.host || s.host === filter.host)
             ),
             titles,
             rollups
           )
         : agentsAll,
-    [scoped, filter.provider, visibleEvents, agentsAll, openTools, sessionProvider, titles, rollups]
+    [scoped, filter.provider, filter.host, visibleEvents, agentsAll, openTools, sessionProvider, titles, rollups]
   );
   const alerts = useMemo(() => deriveAlerts(agents), [agents]);
   const notifyPrefs = useSyncExternalStore(subscribeNotifyPrefs, getNotifyPrefs, getNotifyPrefs);
@@ -715,7 +720,7 @@ export default function App() {
     publishAgents(agentsAll);
   }, [agentsAll]);
 
-  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "", account: "" }), []);
+  const clearFilters = useCallback(() => setFilter({ app: "", type: "", provider: "", account: "", host: "" }), []);
 
   // Zoom steps through a fixed ladder rather than taking a target, so every
   // caller (keys, settings, palette) lands on the same rungs. uiScale owns the

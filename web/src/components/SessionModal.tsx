@@ -7,6 +7,9 @@ import { Portal } from "./Portal.tsx";
 import { PresetDiff } from "./diff/PresetDiff.tsx";
 import { api } from "../lib/api.ts";
 import { usePoll } from "../lib/usePoll.ts";
+import { useServerHost, ranElsewhere } from "../lib/useServerHost.ts";
+import { remoteRoot } from "../lib/remoteRoot.ts";
+import { openExternal } from "../lib/externalUrl.ts";
 import { Markdown } from "../lib/markdown.tsx";
 import { fmtUsd, fmtTokens, fmtEq, fmtAgo, fmtTime, modelLabelOf, modelColor, sessionTitle } from "../lib/format.ts";
 import { ToolRow } from "./ToolRow.tsx";
@@ -15,7 +18,7 @@ import { sessionIsLive } from "../lib/derive.ts";
 import { sessionWorktree, sessionCwd } from "../lib/worktree.ts";
 import { useStuckBottom } from "../lib/useStuckBottom.ts";
 import { CloseButton } from "./CloseButton.tsx";
-import { BranchIcon, CopyIcon, IconLabel } from "../lib/glyphIcons.tsx";
+import { BranchIcon, CopyIcon, IconLabel, MonitorIcon } from "../lib/glyphIcons.tsx";
 import { agentsOf, subscribeAgents } from "../lib/fleetAgents.ts";
 import { branchesOf, subscribeBranches } from "../lib/repoBranches.ts";
 import {
@@ -59,8 +62,41 @@ const Bubble = memo(function Bubble({ role, ts, text }: { role: string; ts: numb
   );
 });
 
+/**
+ * The same session, addressed on the machine it ran on: its directories as
+ * `@host:/path` (lib/remoteRoot.ts), so a chat opened from it sends every turn
+ * there. The id is the node's own — a hub that stored it as `host:id` to keep
+ * it apart from one of its own strips that back off.
+ */
+function remoteResume(d: SessionDetail): SessionDetail {
+  const host = d.host!;
+  const id = d.session_id.startsWith(`${host}:`) ? d.session_id.slice(host.length + 1) : d.session_id;
+  return {
+    ...d,
+    session_id: id,
+    project_path: d.project_path ? remoteRoot(host, d.project_path) : d.project_path,
+    cwd_path: d.cwd_path ? remoteRoot(host, d.cwd_path) : d.cwd_path,
+  };
+}
+
 export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume }:{ sessionId: string | null; sourceApp?: string; onClose: () => void; onFilter?: (app: string) => void; onResume?: (s: SessionDetail) => void }) {
   const [d, setD] = useState<SessionDetail | null>(null);
+  const here = useServerHost();
+  /*
+   * Whether the machine this session ran on takes turns from here: linked, and
+   * open at the `chat` tier — the only one that can wake an idle session (see
+   * TunnelTier in server/src/auth.ts). Asked only for another machine's session.
+   */
+  const [resumeThere, setResumeThere] = useState(false);
+  useEffect(() => {
+    setResumeThere(false);
+    if (!d?.host || !ranElsewhere(d.host, here)) return;
+    let live = true;
+    api.fleetStatus()
+      .then((st) => { if (live) setResumeThere(st.nodes.some((n) => n.host === d.host && n.connected && n.tunnel === "chat")); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [d?.host, here]);
   const [loading, setLoading] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [diffPath, setDiffPath] = useState<string | undefined>(undefined);
@@ -199,7 +235,37 @@ export function SessionModal({ sessionId, sourceApp, onClose, onFilter, onResume
                   </div>
                   <div className="ml-auto flex items-center gap-2 shrink-0">
                     {d && onResume && (
-                      live ? (
+                      ranElsewhere(d.host, here) ? (
+                        resumeThere && sessionCwd(d) ? (
+                          // Resumed ON that machine: the chat's directory is
+                          // written `@host:/path`, so every turn is carried
+                          // there through the fleet link and runs in its
+                          // checkout, with its transcript (docs/FLEET.md, phase 4).
+                          <button onClick={() => { onResume(remoteResume(d)); onClose(); }} className="chip cursor-pointer"
+                            title={`Continue this conversation on ${d.host}, in ${sessionCwd(d)} — it runs there, not here`}
+                            style={{ color: "var(--success)", background: "color-mix(in srgb, var(--success) 12%, transparent)", borderColor: "color-mix(in srgb, var(--success) 45%, transparent)" }}>
+                            <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Resume on {d.host}
+                          </button>
+                        ) : d.cloud_session ? (
+                          // A cloud session (phase 5): it can be continued on
+                          // claude.ai and nowhere else. Its id there is the
+                          // reported `cse_…` with the prefix swapped for
+                          // `session_` — what Claude Code's own docs say the
+                          // session URL carries.
+                          <button onClick={() => openExternal(`https://claude.ai/code/${d.cloud_session!.replace(/^cse_/, "session_")}`)}
+                            className="chip cursor-pointer" title="Continue this cloud session on claude.ai">
+                            <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Open on claude.ai
+                          </button>
+                        ) : (
+                          // Its transcript and checkout are on that machine, and
+                          // that machine does not take turns from here (or is
+                          // not linked), so say where it can be resumed instead
+                          // of offering a button that fails.
+                          <span className="chip t-dim2" title={`This session ran on ${d.host} — resume it from there.`}>
+                            <MonitorIcon size={ICON.xs} className="inline-block align-[-2px] mr-1" />Ran on {d.host}
+                          </span>
+                        )
+                      ) : live ? (
                         // A claude session has one owner. Resuming one that's
                         // still running would put a second writer on the same
                         // transcript, so say why rather than offer a button

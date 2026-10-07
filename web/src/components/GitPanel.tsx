@@ -20,6 +20,7 @@ import { ICON } from "../lib/iconSize.ts";
 import { BlockedIcon, BranchIcon, ChartIcon, CommitIcon, CrossIcon, DoneIcon, FileIcon, IconLabel, ListIcon, MinusIcon, PlusIcon, RefreshIcon, SparkleIcon, StashIcon, TargetIcon, TreeIcon, UndoIcon } from "../lib/glyphIcons.tsx";
 import type { GitRepoRef, WorkingTree, GitFileChange, GitBranch, GitBranchInfo, GitStash, GitGraphLine, GitWorktree, WorktreeLeftovers, GitRemote, GitRemoteBranch, GitTag, GitReflogEntry, ConflictBlock, BlockChoice, MergeInfo, FileChange, WalkthroughResult, WalkthroughFile, TidyReport, TidyFinding, GitSubmodule } from "../../../shared/types.ts";
 import { partitionByWorktree, splitReadable, goneConfirmTitle, goneConfirmBody, forcedDeletePrompt } from "../lib/goneCleanup.ts";
+import { isRemoteRoot } from "../lib/remoteRoot.ts";
 import { CheckoutPicker } from "./CheckoutPicker.tsx";
 import { BasePicker } from "./BasePicker.tsx";
 import { ShellConsole } from "./ShellConsole.tsx";
@@ -1218,7 +1219,11 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
 
 
   const { hilite, themePref, setThemePref, bold, setBold, hiliteError } = useDiffHighlight(selected?.file_path);
-  const writeEnabled = tree?.writeEnabled ?? false;
+  // Another machine's repository is read through the fleet link, which is
+  // read-only by the node's own ceiling (phase 4). Its tree answer reports
+  // that machine's switch, so it is overridden here: every write control
+  // already reads this, and disabling them says so before a press is refused.
+  const writeEnabled = (tree?.writeEnabled ?? false) && !isRemoteRoot(root);
   const flash = (ok: boolean, msg: string) => { setToast({ ok, msg }); setTimeout(() => setToast(null), 2600); };
 
   // AI walkthrough of the *working tree* — cached per changeset (shared cache
@@ -1268,7 +1273,9 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     // an empty Git that stayed empty until the view was opened again.
     let live = true;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    const readRepos = () => api.gitRepos().then(({ repos }) => {
+    // Every linked machine's repositories too (phase 4): this panel reads a
+    // remote one through the link, read-only.
+    const readRepos = () => api.gitReposFleet().then(({ repos }) => {
       if (!live) return;
       setRepos(repos);
       const first = repos[0]?.root ?? "";
@@ -1385,7 +1392,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
     if (!open) return;
     if (root) loadTree(root);
     loadView();
-    api.gitRepos().then((r) => setRepos(r.repos)).catch(() => {});
+    api.gitReposFleet().then((r) => setRepos(r.repos)).catch(() => {});
   }), [open, root, loadTree, loadView]);
 
   // The working tree changes from outside this app — a commit in a terminal, a
@@ -1434,7 +1441,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
       await loadTree(root);
       // Cheap, and the only way the header chip and the repo dropdown stop
       // showing counts from before the action.
-      api.gitRepos().then(({ repos }) => setRepos(repos)).catch(() => {});
+      api.gitReposFleet().then(({ repos }) => setRepos(repos)).catch(() => {});
       return r.ok;
     } catch (e) { flash(false, String(e)); return false; } finally { setBusy(false); setPending(null); }
   };
@@ -2634,7 +2641,7 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
      * since, from this very panel, left it naming a branch you had already
      * left. It is the one line in the picker that claims to be live.
      */
-    api.gitRepos().then(({ repos }) => setRepos(repos)).catch(() => { /* keep the stale list rather than an empty one */ });
+    api.gitReposFleet().then(({ repos }) => setRepos(repos)).catch(() => { /* keep the stale list rather than an empty one */ });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [root]);
   // A different repo has different remotes: carrying the selection over asks for
@@ -3201,7 +3208,9 @@ export function GitView({ active, onOpenChat }: { active: boolean; onOpenChat?: 
                         <input value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") doCommit(); }} placeholder="Summary of what changed…" disabled={!writeEnabled} className="w-full px-2.5 py-1.5 rounded-lg text-[11.5px] outline-none" style={{ background: "color-mix(in srgb, var(--text) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", color: "var(--text)" }} />
                         <textarea value={body} onChange={(e) => setBody(e.target.value)} onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") doCommit(); }} placeholder="Why, if it needs saying (optional)…" rows={2} disabled={!writeEnabled} className="agx-scroll w-full px-2.5 py-1.5 rounded-lg text-[11px] outline-none resize-none" style={{ background: "color-mix(in srgb, var(--text) 5%, transparent)", border: "1px solid color-mix(in srgb, var(--text) 9%, transparent)", color: "var(--text)" }} />
                         <button onClick={doCommit} disabled={!writeEnabled || busy || !tree?.staged.length || !title.trim()} className="w-full py-1.5 rounded-lg text-[11.5px] font-semibold" style={{ background: "color-mix(in srgb, var(--primary) 22%, transparent)", border: "1px solid color-mix(in srgb, var(--primary) 45%, transparent)", color: "var(--text)", opacity: (!writeEnabled || !tree?.staged.length || !title.trim()) ? 0.45 : 1 }}><IconLabel icon={<CommitIcon size={ICON.xs} />}>Commit {tree?.staged.length ? `${tree.staged.length} staged` : ""}</IconLabel></button>
-                        {!writeEnabled && <div className="text-[9.5px] t-dim2 text-center">read-only (AGENTGLASS_GIT_WRITE_DISABLED)</div>}
+                        {!writeEnabled && <div className="text-[9.5px] t-dim2 text-center">{isRemoteRoot(root)
+                          ? "read-only — another machine's repository, read over the fleet link"
+                          : "read-only (AGENTGLASS_GIT_WRITE_DISABLED)"}</div>}
                       </div>
                     </div>
                     <SidebarGrip />
