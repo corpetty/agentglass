@@ -38,8 +38,13 @@ beforeAll(async () => {
 
 const FIXTURES = ["b-many", "b-usage", "b-oversize", "b-drift"];
 afterAll(() => {
-  process.env.AGENTGLASS_SCAN_BATCH_LINES = priorBatchLines;
-  process.env.AGENTGLASS_SCAN_BATCH_BYTES = priorBatchBytes;
+  // Assigning undefined to process.env stores the string "undefined", which the
+  // scanner reads as a NaN batch size and never finishes a file: every later
+  // file's sweep hung. An unset knob is restored by deleting it.
+  if (priorBatchLines === undefined) delete process.env.AGENTGLASS_SCAN_BATCH_LINES;
+  else process.env.AGENTGLASS_SCAN_BATCH_LINES = priorBatchLines;
+  if (priorBatchBytes === undefined) delete process.env.AGENTGLASS_SCAN_BATCH_BYTES;
+  else process.env.AGENTGLASS_SCAN_BATCH_BYTES = priorBatchBytes;
   if (!db) return;
   const marks = FIXTURES.map(() => "?").join(",");
   for (const t of ["events", "sessions", "transcript_files"]) {
@@ -166,7 +171,8 @@ describe("batched transcript sweep", () => {
       // next sweep does not re-read the giant.
       expect(progress("oversize")?.lines_done).toBe(3);
     } finally {
-      process.env.AGENTGLASS_SCAN_MAX_LINE_BYTES = prior;
+      if (prior === undefined) delete process.env.AGENTGLASS_SCAN_MAX_LINE_BYTES;
+      else process.env.AGENTGLASS_SCAN_MAX_LINE_BYTES = prior;
     }
   });
 });

@@ -156,7 +156,8 @@ describe("capability", () => {
     const cap = await mod.taskCapability(true);
     expect(readdirSync(probe)).toEqual([]);
     if (Bun.which("task")) expect(cap.configured).toBe(false);
-    process.env.TASKRC = savedRc; process.env.TASKDATA = savedData;
+    if (savedRc === undefined) delete process.env.TASKRC; else process.env.TASKRC = savedRc;
+    if (savedData === undefined) delete process.env.TASKDATA; else process.env.TASKDATA = savedData;
     mod.__resetTaskPaths();
     rmSync(probe, { recursive: true, force: true });
   });

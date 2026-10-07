@@ -152,7 +152,8 @@ describe("kill switch", () => {
       await scan.scanOnce(null);
       expect(session(disabledId)).toBeFalsy();
     } finally {
-      process.env.AGENTGLASS_COWORK_DISABLED = prior;
+      if (prior === undefined) delete process.env.AGENTGLASS_COWORK_DISABLED;
+      else process.env.AGENTGLASS_COWORK_DISABLED = prior;
     }
   });
 });
