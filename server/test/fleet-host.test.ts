@@ -59,13 +59,13 @@ const editPayload = (file: string) => ({
 beforeAll(async () => {
   db = await import("../src/db.ts");
   config = await import("../src/config.ts");
-  db.insertEvent(event("s-here") as any);
-  db.insertEvent(event("s-box", { host: "box" }) as any);
+  db.insertEvent(event("fh-here") as any);
+  db.insertEvent(event("fh-box", { host: "fh-box-host" }) as any);
   // A later write for the same session that does not name a host — Cowork
   // catalog metadata, say — must not move the session onto this machine.
-  db.upsertSessionMeta({ session_id: "s-box", source_app: "proj", started_at: Date.now(), last_seen: Date.now() });
-  db.insertEvent(event("s-here", EDIT, editPayload(join(PROJ, "here.ts"))) as any);
-  db.insertEvent(event("s-box", { ...EDIT, host: "box" }, editPayload(join(PROJ, "box.ts"))) as any);
+  db.upsertSessionMeta({ session_id: "fh-box", source_app: "proj", started_at: Date.now(), last_seen: Date.now() });
+  db.insertEvent(event("fh-here", EDIT, editPayload(join(PROJ, "here.ts"))) as any);
+  db.insertEvent(event("fh-box", { ...EDIT, host: "fh-box-host" }, editPayload(join(PROJ, "box.ts"))) as any);
 });
 
 describe("host id", () => {
@@ -89,7 +89,7 @@ describe("host id", () => {
     expect(config.isLocalHost(null)).toBe(true);
     expect(config.isLocalHost(undefined)).toBe(true);
     expect(config.isLocalHost("desk")).toBe(true);
-    expect(config.isLocalHost("box")).toBe(false);
+    expect(config.isLocalHost("fh-box-host")).toBe(false);
   });
 });
 
@@ -97,20 +97,20 @@ describe("storage", () => {
   test("a row recorded here is stored NULL — no stamp, nothing to backfill", () => {
     const rows = db.db
       .query<{ host: string | null }, [string]>("SELECT host FROM events WHERE session_id = ?")
-      .all("s-here");
+      .all("fh-here");
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((r) => r.host === null)).toBe(true);
   });
 
   test("but every reader gets a name", () => {
-    const here = db.getRecent(500).filter((e) => e.session_id === "s-here");
+    const here = db.getRecent(500).filter((e) => e.session_id === "fh-here");
     expect(here.length).toBeGreaterThan(0);
     expect(here.every((e) => e.host === "desk")).toBe(true);
   });
 
   test("a session's host is settled by its first row and never moves", () => {
-    const box = db.getSessions(100).find((s) => s.session_id === "s-box");
-    expect(box?.host).toBe("box");
+    const box = db.getSessions(100).find((s) => s.session_id === "fh-box");
+    expect(box?.host).toBe("fh-box-host");
   });
 
   test("normalize() never reads a host off an ingest body", async () => {
@@ -120,7 +120,7 @@ describe("storage", () => {
       session_id: "s-claims",
       hook_event_type: "PostToolUse",
       payload: { cwd: PROJ },
-      host: "box",
+      host: "fh-box-host",
     } as any);
     expect(n.host).toBeUndefined();
   });
@@ -129,34 +129,37 @@ describe("storage", () => {
 describe("the host filter", () => {
   test("this machine's name selects the NULL rows", () => {
     const ids = new Set(db.getRecent(500, undefined, undefined, "desk").map((e) => e.session_id));
-    expect(ids.has("s-here")).toBe(true);
-    expect(ids.has("s-box")).toBe(false);
+    expect(ids.has("fh-here")).toBe(true);
+    expect(ids.has("fh-box")).toBe(false);
   });
 
   test("another machine's name selects only its rows", () => {
-    const ids = new Set(db.getRecent(500, undefined, undefined, "box").map((e) => e.session_id));
-    expect(ids.has("s-box")).toBe(true);
-    expect(ids.has("s-here")).toBe(false);
+    const ids = new Set(db.getRecent(500, undefined, undefined, "fh-box-host").map((e) => e.session_id));
+    expect(ids.has("fh-box")).toBe(true);
+    expect(ids.has("fh-here")).toBe(false);
   });
 
   // Membership, not equality: `bun test` shares one process, and the database
   // this file opens may already hold sessions another suite wrote — all of
   // them local, which is exactly the side of the line they should land on.
   test("sessions filter the same way", () => {
-    const box = db.getSessions(1000, undefined, undefined, "box").map((s) => s.session_id);
+    const box = db.getSessions(1000, undefined, undefined, "fh-box-host").map((s) => s.session_id);
     const desk = db.getSessions(1000, undefined, undefined, "desk").map((s) => s.session_id);
-    expect(box).toEqual(["s-box"]);
-    expect(desk).toContain("s-here");
-    expect(desk).not.toContain("s-box");
+    expect(box).toEqual(["fh-box"]);
+    expect(desk).toContain("fh-here");
+    expect(desk).not.toContain("fh-box");
   });
 
   test("stats split by host reconcile with the total", () => {
+    // Summed over every host the database holds, not two: `bun test` shares one
+    // process and one database, and other suites leave their own machines' rows.
     const all = db.statsSummary(3600_000).totals.events;
     const desk = db.statsSummary(3600_000, undefined, undefined, undefined, "desk").totals.events;
-    const box = db.statsSummary(3600_000, undefined, undefined, undefined, "box").totals.events;
+    const box = db.statsSummary(3600_000, undefined, undefined, undefined, "fh-box-host").totals.events;
     expect(desk).toBeGreaterThan(0);
     expect(box).toBeGreaterThan(0);
-    expect(desk + box).toBe(all);
+    const each = (db.getFilterOptions().hosts ?? []).map((h) => db.statsSummary(3600_000, undefined, undefined, undefined, h).totals.events);
+    expect(each.reduce((a, b) => a + b, 0)).toBe(all);
   });
 
   // The index is partial (foreign rows only) so `host IS NULL` can never be
@@ -166,14 +169,18 @@ describe("the host filter", () => {
     const plan = db.db
       .query<{ detail: string }, [string, number]>(
         "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM events WHERE host = ? AND timestamp >= ?")
-      .all("box", 0)
+      .all("fh-box-host", 0)
       .map((r) => r.detail)
       .join(" | ");
     expect(plan).toContain("idx_events_foreign_host_ts");
   });
 
   test("the picker offers every machine seen, this one by name", () => {
-    expect(db.getFilterOptions().hosts).toEqual(["box", "desk"]);
+    // Membership, not equality — other suites' machines may be in the same database.
+    const hosts = db.getFilterOptions().hosts ?? [];
+    expect(hosts).toContain("fh-box-host");
+    expect(hosts).toContain("desk");
+    expect(hosts).not.toContain(null as any);
   });
 });
 
@@ -185,7 +192,7 @@ describe("another machine's paths are not ours to resolve", () => {
   });
 
   test("one session's deep-dive still shows its own changes — they come from the payload", () => {
-    const files = db.getSession("s-box")?.changes.map((c) => c.file_path) ?? [];
+    const files = db.getSession("fh-box")?.changes.map((c) => c.file_path) ?? [];
     expect(files).toContain(join(PROJ, "box.ts"));
   });
 
@@ -193,10 +200,10 @@ describe("another machine's paths are not ours to resolve", () => {
     process.env.AGENTGLASS_ROOT = PROJ;
     try {
       const ids = new Set(db.getRecent(500).map((e) => e.session_id));
-      expect(ids.has("s-here")).toBe(true);
-      expect(ids.has("s-box")).toBe(false);
-      expect(db.getSessions(100).map((s) => s.session_id)).not.toContain("s-box");
-      expect(config.sessionInScope({ project_path: PROJ, host: "box" })).toBe(false);
+      expect(ids.has("fh-here")).toBe(true);
+      expect(ids.has("fh-box")).toBe(false);
+      expect(db.getSessions(100).map((s) => s.session_id)).not.toContain("fh-box");
+      expect(config.sessionInScope({ project_path: PROJ, host: "fh-box-host" })).toBe(false);
       expect(config.sessionInScope({ project_path: PROJ, host: "desk" })).toBe(true);
     } finally {
       delete process.env.AGENTGLASS_ROOT;
@@ -211,7 +218,7 @@ describe("another machine's paths are not ours to resolve", () => {
     const call = { session_id: "s", source_app: "proj", tool_name: "Write", since, target };
     const [local, foreign] = withEvidence([
       { ...call, host: "desk" },
-      { ...call, session_id: "s2", host: "box" },
+      { ...call, session_id: "s2", host: "fh-box-host" },
     ]);
     expect(local.evidenceKind).toBe("target");
     expect(foreign.evidenceKind).toBe("none");
