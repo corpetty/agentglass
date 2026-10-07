@@ -12,9 +12,10 @@
  * directory, so a suite cannot rewrite the settings of the machine it runs on.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", cfg = "";
 
@@ -28,7 +29,7 @@ afterAll(() => {
 });
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-hidden-"));
+  dir = scratchDir(join(tmpdir(), "agx-hidden-"));
   process.env.XDG_CONFIG_HOME = dir;
   cfg = join(dir, "agentglass", "config.json");
 });
@@ -114,3 +115,5 @@ describe("hiding a project", () => {
     expect((await load()).hiddenProjects()).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

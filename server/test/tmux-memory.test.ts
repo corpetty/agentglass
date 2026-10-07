@@ -15,12 +15,13 @@
  * believed. `-f /dev/null` on every one of them: nothing here may read the
  * user's configuration, and nothing here may touch their tmux.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { memoryPath, recall, remember, STALE_AFTER_MS } from "../src/tmuxmemory.ts";
 import { deskAttachArgv, listPanes } from "../src/tmuxctl.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let home = "";
 let sockdir = "";
@@ -32,7 +33,7 @@ const tmux = (sock: string, ...args: string[]): string => {
 };
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "agx-tmuxmem-"));
+  home = scratchDir(join(tmpdir(), "agx-tmuxmem-"));
   process.env.XDG_CONFIG_HOME = home;
   /*
    * Discovery lists `$TMUX_TMPDIR/tmux-<uid>`, and with TMUX_TMPDIR unset that
@@ -255,3 +256,5 @@ describe("the command that puts the desk back", () => {
     expect(deskAttachArgv("", "workbench")).toBe(null);
   });
 });
+
+afterAll(removeScratch);

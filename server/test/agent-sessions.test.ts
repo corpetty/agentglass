@@ -17,9 +17,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let repo: string, wt: string, home: string;
 let mod: typeof import("../src/agentsessions.ts");
@@ -37,8 +38,8 @@ const user = (text: string) => ({ type: "user", message: { role: "user", content
 const assistant = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
 
 beforeAll(async () => {
-  repo = mkdtempSync(join(tmpdir(), "agx-sess-"));
-  home = mkdtempSync(join(tmpdir(), "agx-claude-"));
+  repo = scratchDir(join(tmpdir(), "agx-sess-"));
+  home = scratchDir(join(tmpdir(), "agx-claude-"));
   process.env.AGENTGLASS_ROOT = repo;
   process.env.AGENTGLASS_CLAUDE_HOME = home;
   run(repo, "init", "-q", "-b", "main");
@@ -129,3 +130,5 @@ describe("sessions for a project", () => {
     expect(await mod.sessionsForProject("/etc")).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

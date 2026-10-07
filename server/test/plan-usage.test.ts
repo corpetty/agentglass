@@ -12,11 +12,12 @@
 // long. The module holds one process-wide cache by design, so these run as a
 // single story in order rather than as independent cases.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-plan-usage-"));
+const dir = scratchDir(join(tmpdir(), "agx-plan-usage-"));
 const creds = join(dir, "credentials.json");
 writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: "test-token" } }));
 // Read when the module loads, so both have to be set before the import below.
@@ -491,3 +492,5 @@ describe("a live feed cannot silence the endpoint forever", () => {
     expect(calls).toBe(0);
   });
 });
+
+afterAll(removeScratch);

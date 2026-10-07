@@ -25,13 +25,14 @@
  * so no `~/.tmux.conf` and no restore plugin can reach in.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { readFrame, setStatusLine, remountPhoneClient, isPhoneSession } from "../src/tmuxctl.ts";
 import type { TmuxClient, TmuxTarget } from "../src/tmuxctl.ts";
 import { TEST_TERM } from "./tmuxTerm.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Own socket AND an empty config — see tmux-attach.test.ts for what each half
 // is for. Unique per run, or a leftover server from a previous one is what
@@ -170,7 +171,7 @@ describe("the bar the panel repaints, kept off", () => {
     // rather than switched off, so tmux has somewhere to draw a message that is
     // not the pane. What the reload must not do is put the user's FORMAT back,
     // and that is what the second assertion pins.
-    const dir = mkdtempSync(join(tmpdir(), "agx-watchdog-reload-"));
+    const dir = scratchDir(join(tmpdir(), "agx-watchdog-reload-"));
     const file = join(dir, "reload.conf");
     writeFileSync(file, "set -g status on\n");
     raw(["source-file", file]);
@@ -279,3 +280,5 @@ function awaitTty(): void {
     Bun.sleepSync(50);
   }
 }
+
+afterAll(removeScratch);

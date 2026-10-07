@@ -21,7 +21,7 @@
  * would otherwise stand in for the one this test exists to prove matters.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -33,10 +33,11 @@ import { mintPluginToken } from "../src/auth.ts";
 import { boxExtraRo } from "../src/plugins.ts";
 import type { PluginSandbox } from "../../shared/pluginSandbox.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const roots: string[] = [];
 function scratch(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const dir = scratchDir(join(tmpdir(), prefix));
   roots.push(dir);
   return dir;
 }
@@ -46,7 +47,7 @@ function scratch(prefix: string): string {
 function scratchOutsideTmp(prefix: string): string {
   const base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   mkdirSync(base, { recursive: true });
-  const dir = mkdtempSync(join(base, prefix));
+  const dir = scratchDir(join(base, prefix));
   roots.push(dir);
   return dir;
 }
@@ -826,3 +827,5 @@ except OSError as e:
     expect(stderr).toMatch(/no such file|not found|does not exist/i);
   }, 15000);
 });
+
+afterAll(removeScratch);

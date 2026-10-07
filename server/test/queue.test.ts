@@ -2,12 +2,12 @@
 // parts that don't spawn `claude`. Driven against a throwaway DB with no
 // accounts configured, so the registry synthesizes the default "work" account
 // (the only id these tests need to be valid).
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-queue-"));
+const dir = scratchDir(join(tmpdir(), "agx-queue-"));
 process.env.AGENTGLASS_DB = join(dir, "queue.db");
 process.env.XDG_CONFIG_HOME = dir; // empty config → registry synthesizes "work"
 
@@ -140,3 +140,5 @@ describe("restart recovery", () => {
     expect(q.getJob(id(r))?.status).toBe("queued");
   });
 });
+
+afterAll(removeScratch);

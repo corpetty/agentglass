@@ -7,12 +7,13 @@
  * these tests are about that paragraph existing, being editable, and carrying
  * the four rules that were paid for rather than designed.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-brief-"));
+const dir = scratchDir(join(tmpdir(), "agx-brief-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 /* The open project, so `seatable` lets these through: its gate fires first and
    would otherwise answer every adoption test with "not a project this app
@@ -231,3 +232,5 @@ describe("an adopted seat's powers are a claim, not a credential", () => {
     expect(Seat.seatRow(root)?.adoptedPane).toBe("%88");
   });
 });
+
+afterAll(removeScratch);

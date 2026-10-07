@@ -5,11 +5,12 @@
 // first-prompt titling that names an otherwise-anonymous audit session, and the
 // kill switch.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cowork-"));
+const dir = scratchDir(join(tmpdir(), "agx-cowork-"));
 const COWORK = join(dir, "config-claude");
 const USERFILES = join(COWORK, "userfiles");
 // Isolate: sweep the fixture Cowork store and an empty CLI projects dir, never
@@ -187,3 +188,5 @@ describe("pure parsers", () => {
     expect(cowork.parseIndexEntry("{not json")).toBeNull();
   });
 });
+
+afterAll(removeScratch);

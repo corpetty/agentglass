@@ -38,8 +38,9 @@ import {
   forgetSuppressedTmuxWrites, FRAME_ARGV, type TmuxTarget,
 } from "../src/tmuxctl.ts";
 import { startSession } from "./tmuxIsolated.ts";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
-const SOCK = `/tmp/agx-observe-${process.pid}.sock`;
+const SOCK = trackScratch(`/tmp/agx-observe-${process.pid}.sock`);
 const SOCKET = ["-S", SOCK];
 const T = ["tmux", "-f", "/dev/null", ...SOCKET];
 
@@ -232,3 +233,5 @@ describe("what counts as a write", () => {
     expect(tmuxWriteCommands(["respawn-pane", "-k", "-t", "%3"])).toEqual([["respawn-pane", "-k", "-t", "%3"]]);
   });
 });
+
+afterAll(removeScratch);

@@ -10,11 +10,12 @@
 // temporary directory rather than the developer's own — a suite that walks the
 // real home directory is both slow and rude.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diskAllows, diskFind, diskPlaces, diskRoots, diskWalk } from "../src/disk.ts";
 import { fileText, fileTree } from "../src/files.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HOME0 = process.env.HOME;
 const ROOT0 = process.env.AGENTGLASS_ROOT;
@@ -27,14 +28,14 @@ let docs: string;
 let project: string;
 
 beforeAll(() => {
-  home = mkdtempSync(join(tmpdir(), "agx-home-"));
+  home = scratchDir(join(tmpdir(), "agx-home-"));
   docs = join(home, "Documents", "projects", "PoL ORBIT-1042");
   mkdirSync(docs, { recursive: true });
   writeFileSync(join(docs, "evidence.md"), "# what the fix proves\n");
   mkdirSync(join(home, ".ssh"), { recursive: true });
   writeFileSync(join(home, ".ssh", "id_ed25519"), "PRIVATE KEY\n");
 
-  outside = mkdtempSync(join(tmpdir(), "agx-elsewhere-"));
+  outside = scratchDir(join(tmpdir(), "agx-elsewhere-"));
   writeFileSync(join(outside, "secret.txt"), "not yours\n");
   symlinkSync(outside, join(home, "shortcut"));
 
@@ -182,3 +183,5 @@ describe("reading what it found", () => {
     expect(fileText(home, "shortcut/secret.txt").ok).toBe(false);
   });
 });
+
+afterAll(removeScratch);

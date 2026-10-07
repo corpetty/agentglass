@@ -8,14 +8,15 @@
 // These tests drive the real query layer against a throwaway DB, because the
 // regression is "the WHERE clause isn't there at all": asserting on a SQL
 // fragment would happily pass while the rows stayed unfiltered.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Both are read once at module load inside db.ts / config.ts, so they have to
 // be set before the dynamic import below — not at the top of a normal import.
-const dir = mkdtempSync(join(tmpdir(), "agx-scope-"));
+const dir = scratchDir(join(tmpdir(), "agx-scope-"));
 
 // Real directories: config.ts resolves a scope against the filesystem and
 // discards one that doesn't exist, so string-only paths would silently leave
@@ -173,3 +174,5 @@ describe("what is pushed live is what a reload would show", () => {
     expect(cfg.sessionInScope({ project_path: null, cwd_path: null }, null)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

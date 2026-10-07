@@ -8,12 +8,12 @@
  * finished, each one waiting on a single action only a person can take, each
  * one lost the moment the conversation moved on.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-process.env.AGENTGLASS_DOCTRINE = join(mkdtempSync(join(tmpdir(), "agx-need-")), "data");
+process.env.AGENTGLASS_DOCTRINE = join(scratchDir(join(tmpdir(), "agx-need-")), "data");
 const N = await import("../src/seatneed.ts");
 const { db } = await import("../src/db.ts");
 
@@ -88,3 +88,5 @@ describe("what the seat reads back", () => {
     expect(text).toContain("you said: yes, the bot is clean");
   });
 });
+
+afterAll(removeScratch);

@@ -17,19 +17,20 @@
  * before the token gate rather than behind it.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { rmSync, readFileSync } from "node:fs";
 import { docSection } from "./docs.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "metrics-test-token-not-a-real-one";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-metrics-"));
+  dir = scratchDir(join(tmpdir(), "agx-metrics-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -163,3 +164,5 @@ describe("what the documentation says about it", () => {
     expect(otlp).toMatch(/double-counting/);
   });
 });
+
+afterAll(removeScratch);

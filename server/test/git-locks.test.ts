@@ -11,17 +11,18 @@
  * is starting a real git and racing it — see pane-routes.test.ts for what a
  * test that starts a real agent costs.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allCheckouts, gitDirOf, gitLocks, removeStaleLock } from "../src/gitlocks.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let boxes: string[] = [];
 afterEach(() => { for (const b of boxes) rmSync(b, { recursive: true, force: true }); boxes = []; });
 
 function box(): string {
-  const d = mkdtempSync(join(tmpdir(), "agx-locks-"));
+  const d = scratchDir(join(tmpdir(), "agx-locks-"));
   boxes.push(d);
   return d;
 }
@@ -290,3 +291,5 @@ describe("removing one", () => {
     expect(existsSync(outside)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

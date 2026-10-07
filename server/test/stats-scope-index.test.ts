@@ -9,12 +9,13 @@
 // the index lets the same OR bound the window inside the index. The shape is the
 // fix, so this pins the plan: the query plan must reach the rows through the
 // composite indexes with a timestamp bound.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-statsidx-"));
+const dir = scratchDir(join(tmpdir(), "agx-statsidx-"));
 const SCOPED = join(dir, "scoped");
 const OTHER = join(dir, "other");
 mkdirSync(SCOPED, { recursive: true });
@@ -82,3 +83,5 @@ describe("scoped stats queries stay inside the time window via the index", () =>
     expect(s.totals.events).toBe(3);
   });
 });
+
+afterAll(removeScratch);

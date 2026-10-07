@@ -12,12 +12,13 @@
 // And `calls` counted every Post while the percentiles were computed only over
 // paired rows, so "200 calls · p95 5ms" could be five milliseconds measured
 // twice, with nothing on the wire disclosing it.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-pairing-"));
+const dir = scratchDir(join(tmpdir(), "agx-pairing-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "pair.db");
@@ -145,3 +146,5 @@ describe("the percentiles declare their sample size", () => {
     }
   });
 });
+
+afterAll(removeScratch);

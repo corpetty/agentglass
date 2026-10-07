@@ -11,11 +11,12 @@
  * a test.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentProvider } from "../../shared/agentKinds.ts";
 import { DENIED_COMMANDS, WORKER_ROLES, roleLaunch, workerRole } from "../../shared/workerRoles.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REAL_XDG = process.env.XDG_CONFIG_HOME;
 const HOME = join(tmpdir(), `agx-worker-roles-${process.pid}`);
@@ -106,7 +107,7 @@ describe("starting a role", () => {
   });
 
   test("Qwen Code's lock file is written owner-only, and its variable names it", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-locks-"));
+    const dir = scratchDir(join(tmpdir(), "agx-locks-"));
     const r = ops.roleStart("scout", roles("qwen"), dir);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -293,3 +294,5 @@ describe.skipIf(!OPENCODE)("the OpenCode lock, checked by OpenCode itself when a
     expect(r.error).toBe("lock-loosened");
   }, 30_000);
 });
+
+afterAll(removeScratch);

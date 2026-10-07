@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The boards on the bar, one of which nobody added.
@@ -12,7 +13,7 @@ import { join } from "node:path";
  * address to paste back — while a pinned one cannot be lost and cannot drift
  * from what the code believes is there.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-views-"));
+const dir = scratchDir(join(tmpdir(), "agx-views-"));
 const V = await import("../src/clickupviews.ts");
 const { ASSIGNED_VIEW_ID } = await import("../../shared/providers.ts");
 
@@ -151,3 +152,5 @@ describe("a folder on the sidebar", () => {
     expect(V.savedViews()[0]!.id).toBe(ASSIGNED_VIEW_ID);
   });
 });
+
+afterAll(removeScratch);

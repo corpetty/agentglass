@@ -17,12 +17,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { BROWSER_OPS } from "../src/browserdrive.ts";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-browser", import.meta.url).pathname;
 const HAVE_PY = !!Bun.which("python3");
@@ -43,7 +44,7 @@ let controls: unknown[] = [];
 const CLIENT = "test-window";
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-cli-"));
+  dir = scratchDir(join(tmpdir(), "agx-cli-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -186,7 +187,7 @@ function cliIn(stateDir: string, ...args: string[]) {
 
 /** A state dir nothing has ever written to. */
 function freshState() {
-  return mkdtempSync(join(dir, "st-"));
+  return scratchDir(join(dir, "st-"));
 }
 
 /**
@@ -1581,7 +1582,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
     await openWindow();
     answers = { checkup: { ok: true, value: { verdict: "ok", url: "u", title: "t" } } };
     askedArgs = []; asked = [];
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const a = await cliCache(cache, "checkup", "http://localhost:5173/", "--no-shot", "--settle-ms", "99999");
     expect(a.code, a.err).toBe(0);
     expect(verbArgs(0)).toMatchObject({ url: "http://localhost:5173/", noShot: true, settleMs: 15_000 });
@@ -1598,7 +1599,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
     await openWindow();
     answers = { shot: { ok: true, value: { url: "u", title: "t", png: PNG, marks: ["e1", "e2"] } } };
     askedArgs = []; asked = [];
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const out = join(dir, "marked.png");
     const r = await cliCache(cache, "shot", out, "--marks");
     expect(r.code, r.err).toBe(0);
@@ -1610,7 +1611,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
     await openWindow();
     answers = { dialog: { ok: true, value: { armed: null, last: null } } };
     askedArgs = []; asked = [];
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const a = await cliCache(cache, "dialog", "--dismiss", "--always");
     expect(a.code, a.err).toBe(0);
     expect(verbArgs(0)).toEqual({ dismiss: true, always: true });
@@ -1625,7 +1626,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
   test("a failure's picture is written to a private file and the answer carries its path", async () => {
     await openWindow();
     answers = { checkup: { ok: true, value: { verdict: "1 problem", url: "u", title: "t", errors: ["TypeError: x"], png: PNG } } };
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const r = await cliCache(cache, "checkup", "--no-shot");
     expect(r.code, r.err).toBe(0);
     const v = JSON.parse(r.out);
@@ -1641,7 +1642,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
   test("only the newest 20 pictures are kept", async () => {
     await openWindow();
     answers = { checkup: { ok: true, value: { verdict: "1 problem", url: "u", title: "t", errors: ["TypeError: x"], png: PNG } } };
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const shots = join(cache, "agentglass");
     mkdirSync(shots, { recursive: true });
     for (let i = 1; i <= 25; i++) writeFileSync(join(shots, `checkup-${1_000 + i}.png`), "old");
@@ -1661,7 +1662,7 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
     const issues = Array.from({ length: 5 }, (_, i) => ({ code: `Issue${i}`, n: 3, about: "https://cdn.orbit.example/" + "x".repeat(150) }));
     const errors = Array.from({ length: 10 }, (_, i) => `TypeError: e${i} ` + "y".repeat(120));
     answers = { checkup: { ok: true, value: { verdict: "10 problems", url: "u", title: "t", errors, issues, a11y: { unlabelled: 1, samples: ["e4 button"] } } } };
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const r = await cliCache(cache, "checkup", "--max-tokens", "200");
     expect(r.code, r.err).toBe(0);
     const v = JSON.parse(r.out);
@@ -1676,9 +1677,11 @@ describe.skipIf(!HAVE_PY)("checkup, the dev loop in one call", () => {
   test("--summary is one line: the verdict and the counts", async () => {
     await openWindow();
     answers = { checkup: { ok: true, value: { verdict: "2 problems", url: "u", title: "t", errors: ["a"], failed: ["500 GET /x"], issues: [{ code: "C", n: 1 }] } } };
-    const cache = mkdtempSync(join(dir, "cache-"));
+    const cache = scratchDir(join(dir, "cache-"));
     const r = await cliCache(cache, "checkup", "--summary", "--no-shot");
     expect(r.code, r.err).toBe(0);
     expect(r.out).toBe("2 problems errors:1 failed:1 visible:0 issues:1");
   });
 });
+
+afterAll(removeScratch);

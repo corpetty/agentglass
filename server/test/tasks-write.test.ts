@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * Writing to a store somebody else is also writing to.
@@ -28,7 +29,7 @@ const raw = (args: string[]) =>
   });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-tw-"));
+  dir = scratchDir(join(tmpdir(), "agx-tw-"));
   data = join(dir, "data"); rc = join(dir, "taskrc");
   writeFileSync(rc, `data.location=${data}\nuda.ticket.type=string\nuda.ticket.label=Ticket\n`);
   process.env.TASKDATA = data; process.env.TASKRC = rc; process.env.TZ = TZ;
@@ -280,3 +281,5 @@ describe("the same change to a run of tasks", () => {
     for (const u of picked) expect(exportOne(u).priority).toBeUndefined();
   });
 });
+
+afterAll(removeScratch);

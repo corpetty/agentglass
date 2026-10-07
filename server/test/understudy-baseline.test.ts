@@ -16,15 +16,16 @@
  * one.
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let U: typeof import("../src/understudy.ts");
 let P: typeof import("../src/understudy-predict.ts");
 
 beforeAll(async () => {
-  const jail = mkdtempSync(join(tmpdir(), "agx-baseline-"));
+  const jail = scratchDir(join(tmpdir(), "agx-baseline-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing-here\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -121,3 +122,5 @@ describe("the baseline says whether the model earned anything", () => {
     }
   });
 });
+
+afterAll(removeScratch);

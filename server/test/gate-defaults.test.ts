@@ -12,12 +12,13 @@
 // The disposition is deliberately NOT changed here: a lapsed window still allows.
 // Flipping that would start blocking agents on somebody's machine after an
 // upgrade, and that is theirs to choose with AGENTGLASS_GATE_FAILCLOSED=1.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-gate-def-"));
+const dir = scratchDir(join(tmpdir(), "agx-gate-def-"));
 process.env.AGENTGLASS_DB = join(dir, "gate.db");
 process.env.XDG_CONFIG_HOME = dir; // keep the developer's own scope out of it
 // The knob is read once, at import, so the shipped default is only observable
@@ -116,3 +117,5 @@ describe("the hook and the server agree on the default", () => {
     expect(Number(m![1]) * 1000).toBe(gate.GATE_DEFAULT_MS);
   });
 });
+
+afterAll(removeScratch);

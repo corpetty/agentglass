@@ -22,11 +22,12 @@
  * because the bug was entirely about what git was asked and what was on disk.
  * Asserting on the source text would have passed against the broken version.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync, appendFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const BUILD_MJS = new URL("../../electron/build.mjs", import.meta.url).pathname;
 const trash: string[] = [];
@@ -45,7 +46,7 @@ function write(dir: string, rel: string, body: string) {
  * nothing — a README and a web test.
  */
 function fixture() {
-  const dir = mkdtempSync(join(tmpdir(), "agx-stamp-"));
+  const dir = scratchDir(join(tmpdir(), "agx-stamp-"));
   trash.push(dir);
   write(dir, ".gitignore", "node_modules\nelectron/staging\nelectron/dist-app\nweb/dist\n");
   write(dir, "package.json", JSON.stringify({ name: "agentglass", version: "0.8.0" }));
@@ -325,3 +326,5 @@ describe("what a release is allowed to call itself", () => {
     expect(s.stamp).not.toMatch(LOOKS_LIKE_A_COMMIT);
   });
 });
+
+afterAll(removeScratch);

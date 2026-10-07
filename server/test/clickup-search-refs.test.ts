@@ -17,11 +17,12 @@
  * these assert, by watching what is asked of ClickUp.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-search-refs-"));
+const dir = scratchDir(join(tmpdir(), "agx-search-refs-"));
 const C = await import("../src/credentials.ts");
 const CU = await import("../src/clickup.ts");
 
@@ -168,3 +169,5 @@ test("the sweep asks for the most recently updated cards, not the oldest", async
   expect(asked[0]).toContain("order_by=updated");
   expect(asked[0], "reverse=true is the OLDEST cards — this searched an archive").not.toContain("reverse");
 });
+
+afterAll(removeScratch);

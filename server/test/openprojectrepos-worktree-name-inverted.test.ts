@@ -26,11 +26,11 @@
  * `isOpenProjectPath(p.path)` — so discovery can never again drift narrower
  * than what it is filtered by two lines later anyway.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let U: typeof import("../src/understudy.ts");
 
@@ -40,7 +40,7 @@ function git(cwd: string, args: string[]): string {
 
 beforeAll(async () => {
   U = await import("../src/understudy.ts");
-  U.__setUnderstudyStorePath(join(mkdtempSync(join(tmpdir(), "agx-wt-name-")), "understudy.json"));
+  U.__setUnderstudyStorePath(join(scratchDir(join(tmpdir(), "agx-wt-name-")), "understudy.json"));
   U.setOpenProject("widget", ["/tmp/widget"]);
 });
 
@@ -70,3 +70,5 @@ describe("the wanted-block's own match must not be narrower than the fence", () 
     expect(block).not.toContain("leaf === wanted || leaf.startsWith(`${wanted}-`)");
   });
 });
+
+afterAll(removeScratch);

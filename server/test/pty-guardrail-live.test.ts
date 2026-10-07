@@ -11,18 +11,19 @@
  * cannot: boot the real process, open a real socket, and read what came back.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-ptyguard-"));
+  dir = scratchDir(join(tmpdir(), "agx-ptyguard-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -83,3 +84,5 @@ describe("/terminal/pty enforces the auth gate at runtime, not just in scopeNeed
     expect(settled.opened).toBe(true);
   });
 });
+
+afterAll(removeScratch);

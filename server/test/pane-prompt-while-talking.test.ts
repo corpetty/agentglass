@@ -40,11 +40,12 @@
  * `understudy-verdict-capture.test.ts` writes a child test the same way.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /* Nothing here mutates this process's own environment: everything the run needs
    is handed to the child's `env`, which is the only place it takes effect. */
@@ -158,7 +159,7 @@ const have = Boolean(Bun.which("tmux"));
 
 beforeAll(async () => {
   if (!have) return;
-  jail = mkdtempSync(join(tmpdir(), "agx-prompttalk-"));
+  jail = scratchDir(join(tmpdir(), "agx-prompttalk-"));
   mkdirSync(join(jail, "bin"), { recursive: true });
   mkdirSync(join(jail, "repo"), { recursive: true });
   writeFileSync(join(jail, "bin", "claude"), STUB);
@@ -244,3 +245,5 @@ describe("a prompt on screen while the transcript is still growing", () => {
     expect(code, out.slice(-1200)).toBe(0);
   });
 });
+
+afterAll(removeScratch);

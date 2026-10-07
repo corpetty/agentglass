@@ -9,12 +9,13 @@
  * taken from the request body instead, driven against a real, isolated tmux.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { freePort } from "./freePort.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", base = "", socket = "", proc: ReturnType<typeof Bun.spawn> | null = null;
 const HAVE_TMUX = !!Bun.which("tmux") && existsSync("/proc");
@@ -26,7 +27,7 @@ const tmux = (...args: string[]) =>
   });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-openshell-"));
+  dir = scratchDir(join(tmpdir(), "agx-openshell-"));
   socket = `agx-os-${dir.slice(dir.lastIndexOf("-") + 1)}`;
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
@@ -105,3 +106,5 @@ describe("POST /terminal/open-shell", () => {
     expect(r.status).toBe(400);
   });
 });
+
+afterAll(removeScratch);

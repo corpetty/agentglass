@@ -22,12 +22,13 @@
  * So this test warms the cache first, deliberately, because reading an empty
  * rollup is the step that used to poison everything after it.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-rollup-cache-"));
+const dir = scratchDir(join(tmpdir(), "agx-rollup-cache-"));
 const ROOT = join(dir, "proj");
 const PKG = join(ROOT, "packages", "api");
 const OTHER = join(dir, "elsewhere");
@@ -90,3 +91,5 @@ describe("the rollup's path set", () => {
     expect(db.rollupDays().map((d) => d.day)).toEqual(["2026-07-27", "2026-07-30"]);
   });
 });
+
+afterAll(removeScratch);

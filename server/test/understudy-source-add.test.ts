@@ -8,9 +8,10 @@
  * is a fake home with HOME, XDG_CONFIG_HOME and the database all jailed.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const saved = { HOME: process.env.HOME, XDG: process.env.XDG_CONFIG_HOME, DB: process.env.AGENTGLASS_DB, HIST: process.env.HISTFILE };
 let home = "";
@@ -18,7 +19,7 @@ let U: typeof import("../src/understudy.ts");
 let S: typeof import("../src/understudy-sources.ts");
 
 beforeAll(async () => {
-  home = realpathSync(mkdtempSync(join(tmpdir(), "agx-source-add-home-")));
+  home = realpathSync(scratchDir(join(tmpdir(), "agx-source-add-home-")));
   process.env.HOME = home;
   process.env.XDG_CONFIG_HOME = join(home, ".config");
   process.env.AGENTGLASS_DB = join(home, "t.db");
@@ -85,3 +86,5 @@ describe("registering", () => {
     expect(U.consent().extra.some((e) => e.id === id)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

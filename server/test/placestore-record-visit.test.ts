@@ -13,12 +13,13 @@
  * developer's real places.db.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __setPlacesPath, allPlaces, placeCount, recordVisit, saveFrom } from "../src/placestore.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const box = mkdtempSync(join(tmpdir(), "agx-record-visit-"));
+const box = scratchDir(join(tmpdir(), "agx-record-visit-"));
 
 beforeEach(() => {
   // A fresh empty db per test: a new temp path, and the store reopens on it.
@@ -122,3 +123,5 @@ describe("recordVisit — the browser's own history", () => {
     expect(placeCount().sources.sort()).toEqual(["agentglass", "chrome"]);
   });
 });
+
+afterAll(removeScratch);

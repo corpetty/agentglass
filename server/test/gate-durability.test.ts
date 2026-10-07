@@ -6,12 +6,12 @@
 // These tests drive the real module against a throwaway DB and simulate the
 // restart by re-importing it with a fresh module registry, because the whole
 // regression is "the state only existed in this process".
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-gate-"));
+const dir = scratchDir(join(tmpdir(), "agx-gate-"));
 process.env.AGENTGLASS_DB = join(dir, "gate.db");
 process.env.XDG_CONFIG_HOME = dir; // keep the developer's own scope out of it
 
@@ -183,3 +183,5 @@ describe("a rule's decision is one write", () => {
     expect(db.getGate(id)).toBeNull();
   });
 });
+
+afterAll(removeScratch);

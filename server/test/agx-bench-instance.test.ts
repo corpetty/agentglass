@@ -2,10 +2,11 @@
  * agx-bench's launcher (scripts/agx-bench/instance.sh), asserted against its
  * source: starting it for real needs a desktop, which the suite does not have.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SH = await Bun.file(new URL("../../scripts/agx-bench/instance.sh", import.meta.url)).text();
 /* Comment lines out, so a sentence ABOUT a command is not the command. */
@@ -68,7 +69,7 @@ describe("a relative DIR is the same instance as its absolute path", () => {
   const script = new URL("../../scripts/agx-bench/instance.sh", import.meta.url).pathname;
 
   test("status finds the process through a relative DIR", async () => {
-    const base = mkdtempSync(join(tmpdir(), "agx-inst-"));
+    const base = scratchDir(join(tmpdir(), "agx-inst-"));
     const dir = join(base, "bench");
     mkdirSync(dir);
     const holder = Bun.spawn(["bash", "-c", `exec 3>>"${dir}/hold"; exec sleep 30`]);
@@ -107,3 +108,5 @@ describe("start does not trust what it did not make", () => {
     expect(line!).toMatch(/\|\| true\)$/);
   });
 });
+
+afterAll(removeScratch);

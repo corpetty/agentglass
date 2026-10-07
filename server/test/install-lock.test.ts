@@ -11,10 +11,11 @@
 // These drive electron/appctl.sh against a fake install, like
 // install-stop.test.ts, and model "replace the files" as the one thing it
 // means for a running instance: it does not survive.
-import { describe, expect, test, afterEach } from "bun:test";
+import { describe, expect, test, afterEach, afterAll } from "bun:test";
 import { mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { APPCTL, AWAIT_MAIN, fakeInstall as sharedFakeInstall } from "./fakeInstall.ts";
+import { removeScratch } from "./scratch.ts";
 
 const INSTALLER = await Bun.file(join(import.meta.dir, "..", "..", "electron", "install-local.sh")).text();
 
@@ -121,3 +122,5 @@ describe("installs that overlap", () => {
     expect(r.out).not.toContain("waiting");
   });
 });
+
+afterAll(removeScratch);

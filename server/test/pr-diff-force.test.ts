@@ -25,11 +25,12 @@ import { afterAll, describe, expect, it } from "bun:test";
  * to the network. A child is also the only way to be sure the module under test
  * evaluates fresh, caches and all.
  */
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const TMP = mkdtempSync(join(tmpdir(), "agx-diff-force-"));
+const TMP = scratchDir(join(tmpdir(), "agx-diff-force-"));
 const BIN = join(TMP, "bin");
 const REPO = join(TMP, "repo");
 const CACHE_DIR = join(TMP, "cache");
@@ -111,3 +112,5 @@ describe("a diff after somebody pushes", () => {
     expect(read.kept).toBe("SECOND");
   });
 });
+
+afterAll(removeScratch);

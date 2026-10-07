@@ -15,11 +15,12 @@
 // with a real binary in it, and real processes running that binary, because the
 // bug was entirely about which processes get matched. Asserting on the script's
 // text would have passed against the broken version too.
-import { describe, expect, test, afterEach } from "bun:test";
+import { describe, expect, test, afterEach, afterAll } from "bun:test";
 import { readFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { APPCTL, AWAIT_MAIN, fakeInstall } from "./fakeInstall.ts";
+import { removeScratch } from "./scratch.ts";
 
 const spawned: number[] = [];
 
@@ -522,3 +523,5 @@ describe("the update script does not race the installer", () => {
     expect(SELFUPDATE.match(/setsid nohup "\$BIN"/g)?.length ?? 0).toBe(1);
   });
 });
+
+afterAll(removeScratch);

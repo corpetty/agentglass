@@ -11,11 +11,12 @@
  * because a backfill inserts old edits late.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-risk-"));
+const dir = scratchDir(join(tmpdir(), "agx-risk-"));
 const ROOT = join(dir, "orbit");
 mkdirSync(ROOT, { recursive: true });
 const saved = { db: process.env.AGENTGLASS_DB, cfg: process.env.XDG_CONFIG_HOME, root: process.env.AGENTGLASS_ROOT };
@@ -275,3 +276,5 @@ test("the roll-up's first read of a session goes through the session index, not 
   const fn = src.slice(src.indexOf("function attachRisks("), src.indexOf("\n}\n", src.indexOf("function attachRisks(")));
   expect(fn).toContain("INDEXED BY idx_events_session");
 });
+
+afterAll(removeScratch);

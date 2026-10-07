@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * A real conflict, produced the way one actually happens: two branches editing
@@ -13,7 +14,7 @@ let repo: string, gw: typeof import("../src/gitwork.ts");
 const run = (dir: string, ...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
 
 beforeAll(async () => {
-  repo = mkdtempSync(join(tmpdir(), "agx-conflict-"));
+  repo = scratchDir(join(tmpdir(), "agx-conflict-"));
   process.env.AGENTGLASS_ROOT = repo;
   run(repo, "init", "-q", "-b", "main");
   run(repo, "config", "user.email", "t@example.com");
@@ -102,3 +103,5 @@ describe("merge conflicts", () => {
     expect(readFileSync(join(repo, "shared.txt"), "utf8")).toBe(before);
   });
 });
+
+afterAll(removeScratch);

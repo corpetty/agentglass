@@ -7,19 +7,19 @@
  * pins below are the rows each list held before it became a view: moving the
  * data must not move what any of them says about the CLIs they already had.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AGENT_KINDS, AGENT_PROVIDERS, agentKind } from "../../shared/agentKinds.ts";
 import { ROSTER } from "../src/agentprobe.ts";
 import { SPELLINGS } from "../src/agents/launch.ts";
 import { agentArgv } from "../src/agentticket.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let savedHome: string | undefined;
 beforeEach(() => {
   savedHome = process.env.HOME;
-  process.env.HOME = mkdtempSync(join(tmpdir(), "agx-catalogue-"));
+  process.env.HOME = scratchDir(join(tmpdir(), "agx-catalogue-"));
 });
 afterEach(() => {
   if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
@@ -90,3 +90,5 @@ describe("Qwen Code on the tab menu", () => {
       .toEqual(["/usr/bin/qwen", "--prompt-interactive", "go"]);
   });
 });
+
+afterAll(removeScratch);

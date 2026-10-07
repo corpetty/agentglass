@@ -1,7 +1,8 @@
-import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { describe, expect, it, afterAll } from "bun:test";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * An unquoted heredoc (`<<EOF`) is expanded like a double-quoted string, so a
@@ -49,7 +50,7 @@ describe("unquoted heredocs", () => {
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf("\nEOF\n", start);
     expect(end).toBeGreaterThan(start);
-    const dir = mkdtempSync(join(tmpdir(), "agx-desktop-"));
+    const dir = scratchDir(join(tmpdir(), "agx-desktop-"));
     try {
       const p = Bun.spawnSync(["bash", "-c", src.slice(start, end + 5)], {
         env: { PATH: process.env.PATH ?? "", APP: "/opt/orbit", DESKTOP: dir },
@@ -65,3 +66,5 @@ describe("unquoted heredocs", () => {
     }
   });
 });
+
+afterAll(removeScratch);

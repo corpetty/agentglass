@@ -12,12 +12,13 @@
 //
 // Paths, hyphenated flags, dotted symbols and error strings are most of what
 // anyone searches an agent's output for, so this was the common case.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-search-"));
+const dir = scratchDir(join(tmpdir(), "agx-search-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "search.db");
@@ -114,3 +115,5 @@ describe("a query that cannot be parsed does not take the panel down", () => {
     });
   }
 });
+
+afterAll(removeScratch);

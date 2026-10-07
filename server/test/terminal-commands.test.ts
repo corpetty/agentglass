@@ -1,15 +1,16 @@
 // makeCommands + scriptCommands from #10 wishlist.
 // Uses real temp dirs so runner detection / -C paths stay honest.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeCommands, scriptCommands, shellSafeRel } from "../src/terminal.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let root: string;
 
 beforeAll(() => {
-  root = mkdtempSync(join(tmpdir(), "ag-cmd-"));
+  root = scratchDir(join(tmpdir(), "ag-cmd-"));
   // root Makefile with inline + above-comment descriptions, assignment noise
   writeFileSync(
     join(root, "Makefile"),
@@ -91,3 +92,5 @@ describe("scriptCommands", () => {
     expect(byName[";rm"]).toBeUndefined();
   });
 });
+
+afterAll(removeScratch);

@@ -16,12 +16,13 @@
  * `-f /dev/null`, because this is a question about tmux's behaviour and a mock
  * of tmux would only be able to confirm what I already believed.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
 import { runAction } from "../src/tmuxctl.ts";
 import { TEST_TERM } from "./tmuxTerm.ts";
 import { startSession } from "./tmuxIsolated.ts";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
-const SOCK = `/tmp/agx-wsize-${process.pid}.sock`;
+const SOCK = trackScratch(`/tmp/agx-wsize-${process.pid}.sock`);
 const T = ["tmux", "-f", "/dev/null", "-S", SOCK];
 
 const tmux = (...args: string[]) => {
@@ -196,3 +197,5 @@ describe("the fit action sizes the window to the client, not taller", () => {
     expect(tmux("show-options", "-wv", "-t", "probe", "window-size").out).toBe("manual");
   });
 });
+
+afterAll(removeScratch);

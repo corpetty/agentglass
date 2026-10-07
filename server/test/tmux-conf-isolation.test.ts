@@ -18,11 +18,11 @@
  * The default install keeps the plain name — an installed app must not orphan
  * the file its running server was started with.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { confPath } from "../src/tmuxconf.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HOME = process.env.HOME;
 const CFG = process.env.XDG_CONFIG_HOME;
@@ -45,15 +45,15 @@ describe("the generated conf is named after the settings it came from", () => {
     // keeps the plain name; the hashed name is for a SHARED state dir. This
     // used to lean on whichever earlier file had left a state dir set, and
     // failed in any order that ran it first.
-    process.env.AGENTGLASS_STATE_DIR = mkdtempSync(join(tmpdir(), "agx-conf-state-"));
-    process.env.XDG_CONFIG_HOME = join(mkdtempSync(join(tmpdir(), "agx-conf-")), "config");
+    process.env.AGENTGLASS_STATE_DIR = scratchDir(join(tmpdir(), "agx-conf-state-"));
+    process.env.XDG_CONFIG_HOME = join(scratchDir(join(tmpdir(), "agx-conf-")), "config");
     const name = basename(confPath());
     expect(name).not.toBe("tmux.conf");
     expect(name).toMatch(/^tmux-[0-9a-f]{8}\.conf$/);
   });
 
   test("and keeps the same one across restarts", () => {
-    const dir = join(mkdtempSync(join(tmpdir(), "agx-conf-")), "config");
+    const dir = join(scratchDir(join(tmpdir(), "agx-conf-")), "config");
     process.env.XDG_CONFIG_HOME = dir;
     const first = confPath();
     process.env.XDG_CONFIG_HOME = dir;
@@ -61,9 +61,9 @@ describe("the generated conf is named after the settings it came from", () => {
   });
 
   test("two isolated instances do not collide", () => {
-    process.env.XDG_CONFIG_HOME = join(mkdtempSync(join(tmpdir(), "agx-conf-a-")), "config");
+    process.env.XDG_CONFIG_HOME = join(scratchDir(join(tmpdir(), "agx-conf-a-")), "config");
     const a = confPath();
-    process.env.XDG_CONFIG_HOME = join(mkdtempSync(join(tmpdir(), "agx-conf-b-")), "config");
+    process.env.XDG_CONFIG_HOME = join(scratchDir(join(tmpdir(), "agx-conf-b-")), "config");
     expect(confPath()).not.toBe(a);
   });
 });
@@ -86,3 +86,5 @@ describe("the harnesses that boot a real server", () => {
     expect(bad, "redirect AGENTGLASS_STATE_DIR too — the engine's tmux.conf lives there").toEqual([]);
   });
 });
+
+afterAll(removeScratch);

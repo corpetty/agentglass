@@ -9,12 +9,13 @@
  *     (the reflog's own recovery path, which double-confirms).
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-guard-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-guard-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { protectedBranches, setProtectedBranches, resetTo, push, commitStaged } = await import("../src/gitwork.ts");
 
@@ -111,3 +112,5 @@ describe("guardrails", () => {
     expect(git("log", "-1", "--format=%s").stdout.toString().trim()).toBe("third");
   });
 });
+
+afterAll(removeScratch);

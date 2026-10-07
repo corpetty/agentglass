@@ -15,12 +15,12 @@
 import { describe, expect, test, afterAll } from "bun:test";
 import { FRAME_ARGV, parsePrefix, parseFrame } from "../src/tmuxctl.ts";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCK = "agx-frame-prefix";
-const TMPDIR = mkdtempSync(join(tmpdir(), "agx-fp-"));
+const TMPDIR = scratchDir(join(tmpdir(), "agx-fp-"));
 const env = { ...process.env, TMUX_TMPDIR: TMPDIR };
 
 function run(...args: string[]): string {
@@ -122,3 +122,5 @@ describe("the frame carries the prefix", () => {
     expect(f?.windows.length).toBe(1);
   });
 });
+
+afterAll(removeScratch);

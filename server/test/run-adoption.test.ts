@@ -20,12 +20,13 @@
 //     we made and may remove. A losing leg we adopted is a person's afternoon.
 //     The last test runs a real teardown over one of each and asserts the
 //     directories that are still there afterwards.
-import { describe, expect, test, beforeAll, beforeEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, realpathSync } from "node:fs";
+import { describe, expect, test, beforeAll, beforeEach, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, symlinkSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-run-adopt-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-run-adopt-")));
 const REPO = join(dir, "repo");
 /** Cut with plain git, never through this app — the case the feature is for. */
 const HAND = join(dir, "repo-handmade");
@@ -326,3 +327,5 @@ describe("finishing a run", () => {
     expect(again.ok).toBe(true);
   });
 });
+
+afterAll(removeScratch);

@@ -16,11 +16,12 @@
  *   back smaller, well formed, with a field naming what was dropped.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const MCP = new URL("../../bin/agentglass-cockpit-mcp", import.meta.url).pathname;
 const SOURCE = readFileSync(MCP, "utf8");
@@ -45,7 +46,7 @@ async function ingest(ev: Record<string, unknown>) {
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-cockpit-mcp-"));
+  dir = scratchDir(join(tmpdir(), "agx-cockpit-mcp-"));
   // A tmux of its own. The board lists every pane of the server's engine, and
   // on the shared test directory that engine holds other test files' panes:
   // then an agent with no pane of its own reads as nowhere to go, not waiting.
@@ -820,7 +821,7 @@ describe.skipIf(!HAVE_PY)("the stdio server outlives a bad call", () => {
     // The loader caches what it compiles in a __pycache__ next to the source,
     // and the source is the app's own resources/bin: a stray directory in an
     // installed package, or a write refused on a read-only one.
-    const bin = mkdtempSync(join(tmpdir(), "agx-cockpit-bin-"));
+    const bin = scratchDir(join(tmpdir(), "agx-cockpit-bin-"));
     try {
       for (const f of ["agentglass-cockpit-mcp", "agentglass-browser-mcp"]) {
         await Bun.write(join(bin, f), Bun.file(new URL(`../../bin/${f}`, import.meta.url).pathname));
@@ -863,3 +864,5 @@ describe.skipIf(!HAVE_PY)("the browser endpoint refuses the cockpit's token", ()
     expect(err).toContain("AGENTGLASS_MCP_TOKEN must not be AGENTGLASS_COCKPIT_TOKEN");
   });
 });
+
+afterAll(removeScratch);

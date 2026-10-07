@@ -13,9 +13,10 @@
  * under test. Each test imports config.ts fresh, since it caches the parsed file.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const XDG0 = process.env.XDG_CONFIG_HOME;
 const ROOT0 = process.env.AGENTGLASS_ROOT;
@@ -26,7 +27,7 @@ afterAll(() => {
 
 let dir = "", cfg = "", A = "", B = "", C = "";
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-multi-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-multi-")));
   process.env.XDG_CONFIG_HOME = dir;
   delete process.env.AGENTGLASS_ROOT;
   cfg = join(dir, "agentglass", "config.json");
@@ -187,3 +188,5 @@ describe("what several open projects bring with them", () => {
     expect(narrowed.rows.every((r) => r.outside)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

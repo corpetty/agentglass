@@ -1,7 +1,8 @@
-import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { beforeAll, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /*
  * The reminder engine, which is the half of this feature that must not fail.
@@ -13,7 +14,7 @@ import { join } from "node:path";
  *
  * Its own database, because these tests write.
  */
-const dir = mkdtempSync(join(tmpdir(), "agx-rem-"));
+const dir = scratchDir(join(tmpdir(), "agx-rem-"));
 process.env.AGENTGLASS_DB = join(dir, "t.db");
 process.env.AGENTGLASS_SCAN_DISABLED = "1";
 // Deliberately NOT setting AGENTGLASS_NOTIFY: an attached client is handed the
@@ -256,3 +257,5 @@ describe("delivery", () => {
     }
   });
 });
+
+afterAll(removeScratch);

@@ -9,12 +9,13 @@
  * is gone is refused by name instead of answered by the visible tab.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-browser", import.meta.url).pathname;
 const HAVE_PY = !!Bun.which("python3");
@@ -44,7 +45,7 @@ async function windowNamed(name: string, answer: (op: string, args: Record<strin
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-lanecli-"));
+  dir = scratchDir(join(tmpdir(), "agx-lanecli-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -181,3 +182,5 @@ describe.skipIf(!HAVE_PY)("agentglass-browser lane", () => {
     expect((await cli("read", "--lane", "../x")).code).not.toBe(0);
   });
 });
+
+afterAll(removeScratch);

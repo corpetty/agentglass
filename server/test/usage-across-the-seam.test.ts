@@ -15,12 +15,13 @@
 // Fixtures write daily_rollup directly instead of pruning, so the split day is
 // a day this test chooses rather than whatever hour it happens to run at.
 // Whether the prune folds correctly is rollup-before-prune.test.ts's question.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-seam-"));
+const dir = scratchDir(join(tmpdir(), "agx-seam-"));
 const ROOT = join(dir, "proj");
 const PKG = join(ROOT, "packages", "api"); // a monorepo subdir, not the root
 const OTHER = join(dir, "other");
@@ -228,3 +229,5 @@ describe("saying where the seam is", () => {
     expect(db.retentionSeamDay()! > OLD).toBe(true);
   });
 });
+
+afterAll(removeScratch);

@@ -14,16 +14,15 @@
  * guess. Empty means no checkout matches, the loop declines every task, and
  * the Work tab says so in red — loud, and harmless.
  */
-import { describe, expect, test } from "bun:test";
-
-import { mkdtempSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Its own store: this file calls into the real module, and the settings file
 // is not moved by AGENTGLASS_DB. See understudy-fence-name.test.ts.
 (await import("../src/understudy.ts")).__setUnderstudyStorePath(
-  join(mkdtempSync(join(tmpdir(), "agx-fence2-")), "understudy.json"));
+  join(scratchDir(join(tmpdir(), "agx-fence2-")), "understudy.json"));
 
 const src = await Bun.file(new URL("../src/understudy.ts", import.meta.url)).text();
 const fn = (() => {
@@ -126,3 +125,5 @@ describe("the app's scope is not the fence", () => {
     expect(code).toContain("roots.filter((r) => isOpenProjectPath(r) && fsExists(r))");
   });
 });
+
+afterAll(removeScratch);

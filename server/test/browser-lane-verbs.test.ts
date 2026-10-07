@@ -11,13 +11,14 @@
  * gone, or somebody else's, nothing does either, and the refusal says why.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BROWSER_OPS } from "../src/browserdrive.ts";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "", base = "", proc: ReturnType<typeof Bun.spawn> | null = null;
 const sockets: WebSocket[] = [];
@@ -49,7 +50,7 @@ async function windowNamed(name: string) {
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-laneverbs-"));
+  dir = scratchDir(join(tmpdir(), "agx-laneverbs-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -128,3 +129,5 @@ describe.skipIf(!Bun.which("bun"))("every verb, addressed to a lane", () => {
     expect(seen).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

@@ -10,9 +10,10 @@
  *     marker comment the workflow writes at the end of its own report.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SCAN = new URL("../../scripts/plugin-baseline.py", import.meta.url).pathname;
 let dir: string, secret: string;
@@ -26,7 +27,7 @@ function scan(folder: string): Result {
 }
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-baseline-"));
+  dir = scratchDir(join(tmpdir(), "agx-baseline-"));
   secret = join(dir, "not-in-the-repo.txt");
   writeFileSync(secret, "GH_TOKEN=ghp_thisisnotarealtoken https://evil.example.com/collect\n");
   mkdirSync(join(dir, "plugin"));
@@ -203,3 +204,5 @@ describe("configuration that is the person's, not the plugin's", () => {
     expect(ids(p)).not.toContain("edits-your-configuration");
   });
 });
+
+afterAll(removeScratch);

@@ -11,12 +11,13 @@
  * prompt is ingested as a `UserPromptSubmit` event. So the rollup carries it,
  * which also means sessions recorded long before this existed get named.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-names-"));
+const dir = scratchDir(join(tmpdir(), "agx-names-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "names.db");
@@ -283,3 +284,5 @@ describe("sessionNames skips prompts that are not a name", () => {
     expect(db.sessionNames(["n-short"]).has("n-short")).toBe(false);
   });
 });
+
+afterAll(removeScratch);

@@ -19,10 +19,11 @@
  * sweep to find; a redirect is not that fatal (cookies are seeded either
  * way), so that case is a warning and a live lane, not a refusal.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HAVE_PY = !!Bun.which("python3");
 const BIN = (name: string) => new URL(`../../bin/${name}`, import.meta.url).pathname;
@@ -70,7 +71,7 @@ ns["call"] = fake_call
 
 describe.skipIf(!HAVE_PY)("lane new --from-template", () => {
   test("opens an ephemeral lane, writes cookies BEFORE navigating, then confirms the landing before seeding storage", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -98,7 +99,7 @@ print(json.dumps({"code": code, "calls": [[op, b.get("action") or b.get("url") o
   });
 
   test("a redirect on the empty jar seeds cookies but never writes storage into the wrong origin", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 answers = {
@@ -120,7 +121,7 @@ print(json.dumps({"code": code, "storageCalls": sum(1 for op, _ in calls if op =
   });
 
   test("a template that was never saved never opens a lane at all", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 called = []
@@ -136,7 +137,7 @@ print(json.dumps({"code": code, "called": called}))
   });
 
   test("when the lane cannot open, the template file is never even read for its cookies", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -152,7 +153,7 @@ print(code)
   });
 
   test("when navigation to the origin fails, the lane is closed rather than left seedless", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -203,7 +204,7 @@ ns["call"] = fake_call
 
 describe.skipIf(!HAVE_PY)("newtab --from-template", () => {
   test("opens an ephemeral tab, writes cookies BEFORE navigating, then confirms the landing before seeding storage", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -235,7 +236,7 @@ print(json.dumps({"code": code, "calls": [[op, b.get("url") or b.get("js") or op
     // The one real difference from a lane: a lane owns its one page
     // implicitly (`a.lane`), but a window can hold many tabs, so this rides
     // an explicit `page` the same way `--page` lets any verb name one.
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -251,7 +252,7 @@ print(json.dumps({"pages": [b.get("page") for op, b in calls if op in ("cdp", "o
   });
 
   test("a redirect on the empty jar seeds cookies but never writes storage into the wrong origin", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 answers = {
@@ -273,7 +274,7 @@ print(json.dumps({"code": code, "storageCalls": sum(1 for op, _ in calls if op =
   });
 
   test("a template that was never saved never opens a tab at all", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 called = []
@@ -289,7 +290,7 @@ print(json.dumps({"code": code, "called": called}))
   });
 
   test("when the tab cannot open, the template file is never even read for its cookies", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -305,7 +306,7 @@ print(code)
   });
 
   test("when navigation to the origin fails, the tab is closed rather than left seedless", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-fork-tab-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-fork-tab-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${CAPTURE_ANSWERS}
@@ -334,3 +335,5 @@ print(json.dumps({"code": code, "closed": any(op == "closetab" and b.get("id") =
     } finally { rmSync(dataHome, { recursive: true, force: true }); }
   });
 });
+
+afterAll(removeScratch);

@@ -23,13 +23,14 @@
  * shape it prints — is in browser-cli-ownership.test.ts, end to end.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   askBrowser, BROWSER_OPS, containerRecord, exportAudit, noteBrowserReady,
   parseAsk, resetAudit, resetBrowserDrive, resetContainerLedger, setBrowserSink,
 } from "../src/browserdrive.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /* The ledger is a FILE, and its path is resolved on every call precisely so a
    test can put it somewhere that is not the operator's ~/.config. A previous
@@ -39,7 +40,7 @@ let scratch = "";
 let previous: string | undefined;
 
 beforeAll(() => {
-  scratch = mkdtempSync(join(tmpdir(), "agx-owner-"));
+  scratch = scratchDir(join(tmpdir(), "agx-owner-"));
   previous = process.env.AGENTGLASS_STATE_DIR;
   process.env.AGENTGLASS_STATE_DIR = scratch;
 });
@@ -287,3 +288,5 @@ describe("§13 — who created this container", () => {
     expect(rows.find((p) => p.name === "peer-9f9f9f").lastActivityMs).toBeGreaterThan(0);
   });
 });
+
+afterAll(removeScratch);

@@ -18,13 +18,14 @@
  * directories under NODE_ENV=test outright — this suite must never be able to
  * read, copy or repoint the developer's own resurrect saves.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   bestSnapshot, clobbered, KEEP, panesIn, readLast, repairLast, resurrectDir, snapshot, snapshotDir, snapshots,
 } from "../src/tmuxsnapshot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let home = "";
 
@@ -80,7 +81,7 @@ const put = (name: string, text: string, asLast = true): string => {
 const savedEnv = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME };
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "agx-snap-"));
+  home = scratchDir(join(tmpdir(), "agx-snap-"));
   process.env.HOME = home;
   process.env.XDG_CONFIG_HOME = join(home, ".config");
 });
@@ -253,3 +254,5 @@ describe("the developer's own resurrect is unreachable from a test", () => {
     process.env.HOME = scratch;
   });
 });
+
+afterAll(removeScratch);

@@ -14,12 +14,13 @@
  * error instead of a browser.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CLI = new URL("../../bin/agentglass-browser", import.meta.url).pathname;
 const MCP = new URL("../../bin/agentglass-browser-mcp", import.meta.url).pathname;
@@ -32,7 +33,7 @@ let asked: string[] = [];
 const CLIENT = "test-window-ownership";
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-own-cli-"));
+  dir = scratchDir(join(tmpdir(), "agx-own-cli-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -340,3 +341,5 @@ describe.skipIf(!HAVE_PY)("what an agent sees before it acts", () => {
     expect(r.err).toContain("ownership ledger");
   });
 });
+
+afterAll(removeScratch);

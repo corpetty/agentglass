@@ -15,10 +15,11 @@
  * Loaded as a module without running main(), same trick as
  * bin-token-and-files.test.ts.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HAVE_PY = !!Bun.which("python3");
 const BIN = (name: string) => new URL(`../../bin/${name}`, import.meta.url).pathname;
@@ -50,7 +51,7 @@ ns["call"] = lambda op, body=None, *a, **k: answers.get(op, {"ok": True, "value"
 
 describe.skipIf(!HAVE_PY)("template store", () => {
   test("template save writes 0600 in a 0700 dir, meta only in what it prints", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
     try {
       const r = probe(BIN("agentglass-browser"), `
 ${STUB_ANSWERS}
@@ -82,7 +83,7 @@ print(json.dumps({
   });
 
   test("template list prints origins and expiry, never a value", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
     try {
       probe(BIN("agentglass-browser"), `${STUB_ANSWERS}\nns["template_save"]("acme-corp", "", None)`, { XDG_DATA_HOME: dataHome });
       const r = probe(BIN("agentglass-browser"), `ns["template_list"]()`, { XDG_DATA_HOME: dataHome });
@@ -96,7 +97,7 @@ print(json.dumps({
   });
 
   test("template list on an empty store says so, without inventing a name", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
     try {
       const r = probe(BIN("agentglass-browser"), `ns["template_list"]()`, { XDG_DATA_HOME: dataHome });
       expect(r.code, r.err).toBe(0);
@@ -105,7 +106,7 @@ print(json.dumps({
   });
 
   test("template rm deletes a saved template; a name that was never saved is a named refusal, not a crash", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
     try {
       probe(BIN("agentglass-browser"), `${STUB_ANSWERS}\nns["template_save"]("acme-corp", "", None)`, { XDG_DATA_HOME: dataHome });
       const gone = probe(BIN("agentglass-browser"), `print(ns["template_rm"]("acme-corp"))`, { XDG_DATA_HOME: dataHome });
@@ -117,7 +118,7 @@ print(json.dumps({
   });
 
   test("a name that is not [a-z0-9-]{1,32} is refused by save AND rm — no path, no traversal", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
     try {
       for (const bad of ["../../etc/passwd", "Acme-Corp", "has space", "a".repeat(33), ""]) {
         const s = probe(BIN("agentglass-browser"), `${STUB_ANSWERS}\nprint(ns["template_save"](${JSON.stringify(bad)}, "", None))`, { XDG_DATA_HOME: dataHome });
@@ -132,8 +133,8 @@ print(json.dumps({
   });
 
   test("a symlinked or foreign-owned templates directory is refused, not written into", () => {
-    const dataHome = mkdtempSync(join(tmpdir(), "agx-tmpl-data-"));
-    const outside = mkdtempSync(join(tmpdir(), "agx-tmpl-outside-"));
+    const dataHome = scratchDir(join(tmpdir(), "agx-tmpl-data-"));
+    const outside = scratchDir(join(tmpdir(), "agx-tmpl-outside-"));
     try {
       mkdirSync(join(dataHome, "agentglass"), { recursive: true });
       // A symlink where `_template_dir` expects a real, owned directory — the
@@ -164,7 +165,7 @@ print(ns["template_save"]("acme-corp", "", None))
     const { uploadPathError } = await import("../src/browserdrive.ts");
     const savedHome = process.env.HOME;
     const savedXdg = process.env.XDG_DATA_HOME;
-    const fakeHome = mkdtempSync(join(tmpdir(), "agx-tmpl-uploadhome-"));
+    const fakeHome = scratchDir(join(tmpdir(), "agx-tmpl-uploadhome-"));
     try {
       delete process.env.XDG_DATA_HOME; // an ambient one must not shadow HOME for this check
       process.env.HOME = fakeHome;
@@ -183,3 +184,5 @@ print(ns["template_save"]("acme-corp", "", None))
     }
   });
 });
+
+afterAll(removeScratch);

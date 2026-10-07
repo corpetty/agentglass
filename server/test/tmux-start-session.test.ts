@@ -14,13 +14,14 @@
  * loop, through the helper, never loses a session.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { TMUX_ISOLATED, startSession } from "./tmuxIsolated.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HAVE_TMUX = !!Bun.which("tmux");
 // Short on purpose: a Unix socket path over 107 bytes is refused outright.
-const dir = mkdtempSync(join("/tmp", "agx-start-"));
+const dir = scratchDir(join("/tmp", "agx-start-"));
 const env = { ...process.env, TMUX: undefined, TMUX_TMPDIR: dir };
 const T = ["tmux", ...TMUX_ISOLATED, "-L", "agx-start"];
 const run = (...args: string[]) => Bun.spawnSync([...T, ...args], { env, stdout: "ignore", stderr: "ignore" });
@@ -62,3 +63,5 @@ describe.if(HAVE_TMUX)("a session made on a server that is still going down", ()
       .toThrow(/new-session/);
   });
 });
+
+afterAll(removeScratch);

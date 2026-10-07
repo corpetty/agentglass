@@ -11,10 +11,11 @@
  * developer's machine: 136 files, 772 KB, not one of them referenced by a
  * running tmux, accumulating since the hash was introduced.
  */
-import { test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync, utimesSync } from "node:fs";
+import { test, expect, afterEach, afterAll } from "bun:test";
+import { rmSync, mkdirSync, writeFileSync, existsSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { confPath, sweepStaleConfs } = await import("../src/tmuxconf.ts");
 const { tmuxStateDir } = await import("../src/tmuxbin.ts");
@@ -30,7 +31,7 @@ afterEach(() => {
 });
 
 test("a redirected config keeps its conf beside itself, not in the shared state dir", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-conf-"));
+  const dir = scratchDir(join(tmpdir(), "agx-conf-"));
   made.push(dir);
   process.env.XDG_CONFIG_HOME = dir;
   delete process.env.AGENTGLASS_STATE_DIR;
@@ -44,8 +45,8 @@ test("a redirected config keeps its conf beside itself, not in the shared state 
 });
 
 test("an explicit state dir still wins, so an installed app is untouched", () => {
-  const cfg = mkdtempSync(join(tmpdir(), "agx-conf-"));
-  const st = mkdtempSync(join(tmpdir(), "agx-state-"));
+  const cfg = scratchDir(join(tmpdir(), "agx-conf-"));
+  const st = scratchDir(join(tmpdir(), "agx-state-"));
   made.push(cfg, st);
   process.env.XDG_CONFIG_HOME = cfg;
   process.env.AGENTGLASS_STATE_DIR = st;
@@ -53,7 +54,7 @@ test("an explicit state dir still wins, so an installed app is untouched", () =>
 });
 
 test("the sweep removes the hashed confs the old placement left, and nothing else", () => {
-  const st = mkdtempSync(join(tmpdir(), "agx-state-"));
+  const st = scratchDir(join(tmpdir(), "agx-state-"));
   made.push(st);
   process.env.AGENTGLASS_STATE_DIR = st;
   const dir = tmuxStateDir();
@@ -79,3 +80,5 @@ test("the sweep removes the hashed confs the old placement left, and nothing els
   expect(existsSync(other), "nor is anything that is not one of ours").toBe(true);
   expect(readdirSync(dir).sort()).toEqual(["override.conf", "tmux-cafe1234.conf", "tmux.conf"]);
 });
+
+afterAll(removeScratch);

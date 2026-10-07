@@ -10,10 +10,11 @@
  * A worktree this server cut is the only thing this feature creates and the
  * only thing it may destroy.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const src = await Bun.file(new URL("../src/index.ts", import.meta.url)).text();
 const route = (() => {
@@ -71,9 +72,11 @@ describe("the ownership test itself", () => {
 
   test("a directory that exists but was never a run is still refused", async () => {
     const W = await import("../src/understudy-work.ts");
-    const real = mkdtempSync(join(tmpdir(), "agx-notmine-"));
+    const real = scratchDir(join(tmpdir(), "agx-notmine-"));
     writeFileSync(join(real, "something.txt"), "somebody's work\n");
     expect(existsSync(real)).toBe(true);
     expect(W.runOwning(real), "existing is not owning").toBe(null);
   });
 });
+
+afterAll(removeScratch);

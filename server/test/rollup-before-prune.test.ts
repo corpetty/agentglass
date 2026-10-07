@@ -9,12 +9,13 @@
 //
 // So expiring events are folded into a day-grained summary before the DELETE,
 // in the same transaction — either both happened or neither did.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-rollup-"));
+const dir = scratchDir(join(tmpdir(), "agx-rollup-"));
 const ROOT = join(dir, "proj");
 const OTHER = join(dir, "other");
 for (const d of [ROOT, OTHER]) mkdirSync(d, { recursive: true });
@@ -123,3 +124,5 @@ describe("folding twice does not double-count", () => {
     expect(after.input_tokens).toBe(before.input_tokens + 100);
   });
 });
+
+afterAll(removeScratch);

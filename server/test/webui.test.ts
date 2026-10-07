@@ -2,15 +2,16 @@
 // request path is attacker-supplied, and a miss here serves files from outside
 // web/dist. Plus the marker injection api.ts keys same-origin resolution off.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, relative } from "node:path";
 import { resolveAsset, injectSameOrigin, resolveDist } from "../src/webui.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dist: string;
 
 beforeAll(() => {
-  dist = mkdtempSync(join(tmpdir(), "agentglass-webui-"));
+  dist = scratchDir(join(tmpdir(), "agentglass-webui-"));
   writeFileSync(join(dist, "index.html"), "<html><head></head><body></body></html>");
   writeFileSync(join(dist, "favicon.svg"), "<svg/>");
   mkdirSync(join(dist, "assets"));
@@ -105,7 +106,7 @@ describe("resolveDist", () => {
 
   test("an override with no index.html is ignored rather than fatal", () => {
     // A wrong path should cost the UI, not the server behind it.
-    const empty = mkdtempSync(join(tmpdir(), "agentglass-webui-empty-"));
+    const empty = scratchDir(join(tmpdir(), "agentglass-webui-empty-"));
     try {
       expect(resolveDist(empty, dist)).toBe(dist);
     } finally {
@@ -158,3 +159,5 @@ describe("resolveDist", () => {
     expect(resolveDist("/nonexistent/override", "/nonexistent/fallback")).toBe(null);
   });
 });
+
+afterAll(removeScratch);

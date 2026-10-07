@@ -9,11 +9,12 @@
  * daemon and never skips.
  */
 import { afterAll, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-dockerleak-"));
+const dir = scratchDir(join(tmpdir(), "agx-dockerleak-"));
 const pidFile = join(dir, "docker.pid");
 const stray: number[] = [];
 afterAll(() => {
@@ -55,3 +56,5 @@ test("SIGKILL of the server takes the watcher with it", async () => {
 test("SIGTERM of the server takes the watcher with it", async () => {
   expect(await leaked((s) => s.kill("SIGTERM"))).toBe(false);
 }, 20_000);
+
+afterAll(removeScratch);

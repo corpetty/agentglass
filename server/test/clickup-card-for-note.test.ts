@@ -12,11 +12,12 @@
  * in the file it uses to tell a status change from a new assignment. This looks
  * a title up in that. The cases below are the ways a title lookup goes wrong.
  */
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cardForTitle, __setWatchPath } from "../src/clickupwatch.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -26,7 +27,7 @@ afterEach(() => {
 
 /** A watch file holding the cards the watcher has seen. */
 function watching(seen: Record<string, { status: string; customId?: string; title: string }>): void {
-  const dir = mkdtempSync(join(tmpdir(), "agx-watch-"));
+  const dir = scratchDir(join(tmpdir(), "agx-watch-"));
   dirs.push(dir);
   const p = join(dir, "clickup-watch.json");
   writeFileSync(p, JSON.stringify({ seen, at: 1 }));
@@ -93,3 +94,5 @@ describe("which card a notification is about", () => {
     expect(cardForTitle("")).toBeNull();
   });
 });
+
+afterAll(removeScratch);

@@ -12,13 +12,13 @@
  * turned the Clone off for twenty other tests. The property is about what this
  * module reads, so it is checked on the module rather than on the environment.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import { readFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-recall-"));
+const dir = scratchDir(join(tmpdir(), "agx-recall-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 
 const { recall, recallBlock } = await import("../src/seatmemory.ts");
@@ -53,3 +53,5 @@ describe("what it answers with", () => {
     expect(recall("  do I\n  squash  ").question).toBe("do I squash");
   });
 });
+
+afterAll(removeScratch);

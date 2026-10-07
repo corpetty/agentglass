@@ -15,18 +15,19 @@
  * its own AGENTGLASS_DB, and what comes back is a line of JSON.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const UNDERSTUDY = new URL("../src/understudy.ts", import.meta.url).pathname;
 const DB = new URL("../src/db.ts", import.meta.url).pathname;
-const dir = mkdtempSync(join(tmpdir(), "agx-refile-"));
+const dir = scratchDir(join(tmpdir(), "agx-refile-"));
 afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* fine */ } });
 
 /** Run one scenario against a database of its own and give back what it printed. */
 function scenario(body: string): Record<string, unknown> {
-  const home = mkdtempSync(join(dir, "run-"));
+  const home = scratchDir(join(dir, "run-"));
   const script = join(home, "scenario.ts");
   writeFileSync(script, `
 import { db } from ${JSON.stringify(DB)};
@@ -134,3 +135,5 @@ describe("the bank follows the drawers", () => {
     expect(out.cls).toBe("C2");
   });
 });
+
+afterAll(removeScratch);

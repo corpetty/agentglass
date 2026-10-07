@@ -13,12 +13,13 @@
 // `ended_at` from the session row. Retention prunes events, so the start
 // walked forward while the end stayed put, and one session reported two
 // different durations depending on which panel you asked.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-lifecycle-"));
+const dir = scratchDir(join(tmpdir(), "agx-lifecycle-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "lifecycle.db");
@@ -119,3 +120,5 @@ describe("the deep dive agrees with the list", () => {
     expect(after.last_seen).toBe(row.last_seen);
   });
 });
+
+afterAll(removeScratch);

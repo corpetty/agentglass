@@ -12,12 +12,13 @@
  * inside the test.
  */
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCK = `agx-forget-${process.pid}`;
-const STATE = mkdtempSync(join(tmpdir(), "agx-forget-"));
+const STATE = scratchDir(join(tmpdir(), "agx-forget-"));
 const sock = ["-f", "/dev/null", "-L", SOCK];
 const sh = (a: string[]) => Bun.spawnSync(["tmux", ...sock, ...a], { stdout: "pipe", stderr: "pipe" });
 const live = () => sh(["list-sessions", "-F", "#{session_name}"]).stdout.toString().trim().split("\n").filter(Boolean).sort();
@@ -70,3 +71,5 @@ test("a session that is merely not running is still kept", async () => {
   await restore.captureLayout();
   expect(layout(), "an unplanned disappearance is not a decision").toEqual(["alsoend", "keepme"]);
 });
+
+afterAll(removeScratch);

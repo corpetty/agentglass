@@ -6,11 +6,12 @@
  * ended or gone quiet stops counting.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-collisions-"));
+const dir = scratchDir(join(tmpdir(), "agx-collisions-"));
 const priorDb = process.env.AGENTGLASS_DB;
 process.env.AGENTGLASS_DB = join(dir, "collisions.db");
 delete process.env.AGENTGLASS_ROOT;
@@ -394,3 +395,5 @@ describe("listeners on the dashboard poll", () => {
     expect(code).not.toContain("spawnSync");
   });
 });
+
+afterAll(removeScratch);

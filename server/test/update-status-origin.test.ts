@@ -17,12 +17,13 @@
  * the install path ends up on a phone screen.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /** Stands in for the developer's home directory in the build record. If this
  *  string reaches a browser, the redaction failed. */
@@ -34,7 +35,7 @@ const FAKE_ORIGIN = "/nonexistent/agentglass.git";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-update-origin-"));
+  dir = scratchDir(join(tmpdir(), "agx-update-origin-"));
   // buildInfo() prefers a staged build record over asking git, which is what
   // gives this test a known source path and origin to look for.
   mkdirSync(join(dir, "electron", "staging"), { recursive: true });
@@ -179,3 +180,5 @@ describe("the desktop shell asking", () => {
     expect(j.info.tree).toHaveLength(64);
   });
 });
+
+afterAll(removeScratch);

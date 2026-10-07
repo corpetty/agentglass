@@ -31,11 +31,12 @@
  * silently bypassed and the real binary answered — twice, before it was noticed.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-tailnet-"));
+const dir = scratchDir(join(tmpdir(), "agx-tailnet-"));
 const bin = join(dir, "bin");
 const NAME = "test-box.example-tailnet.ts.net";
 
@@ -195,3 +196,5 @@ describe("the serve offer", () => {
     }));
   });
 });
+
+afterAll(removeScratch);

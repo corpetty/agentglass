@@ -4,7 +4,7 @@
  * and the runner's options. The browser half is the benchmark itself.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -31,6 +31,7 @@ import { afterOf, pick, runArm, Session, StepFailed, View, type Exec, type Task 
 import { buildResults, toMarkdown } from "../../scripts/agx-bench/report.ts";
 import { TASKS, checkupProblems } from "../../scripts/agx-bench/tasks.ts";
 import { cliEnv, parseOptions } from "../../scripts/agx-bench/run.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const O = "http://127.0.0.1:1";
 const get = (h: ReturnType<typeof makeHandler>, path: string) => h(new Request(O + path));
@@ -370,7 +371,7 @@ describe("report and runner options", () => {
     expect(md).toContain("- nav-spa / baseline / rep 1: ended at /");
   });
 
-  const dir = mkdtempSync(join(tmpdir(), "agx-bench-test-"));
+  const dir = scratchDir(join(tmpdir(), "agx-bench-test-"));
   afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
   test("an instance directory supplies the server, the token and the CLI's private caches", () => {
@@ -486,3 +487,5 @@ describe("phase-2 fixtures and graders", () => {
     expect(g({ heading: "Home" }, freshState())).toContain("ended on");
   });
 });
+
+afterAll(removeScratch);

@@ -9,11 +9,12 @@
  * server could write is jailed under one temp dir.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-this-test";
 const SOCKET = "agx-readscope";
@@ -40,13 +41,13 @@ async function send(cred: string, resumeId: string): Promise<Response | "streami
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-readscope-live-"));
+  dir = scratchDir(join(tmpdir(), "agx-readscope-live-"));
   repo = join(dir, "orbit");
   mkdirSync(repo);
   Bun.spawnSync(["git", "init", "-q", repo]);
   // A link inside the project to a checkout outside it: spelled in scope,
   // opened out of it.
-  outside = mkdtempSync(join(tmpdir(), "agx-readscope-outside-"));
+  outside = scratchDir(join(tmpdir(), "agx-readscope-outside-"));
   Bun.spawnSync(["git", "init", "-q", outside]);
   symlinkSync(outside, join(dir, "vendor-link"));
   const bin = join(dir, "bin");
@@ -202,3 +203,5 @@ describe("where a turn runs", () => {
     expect(await r.text()).toContain("outside the open project");
   });
 });
+
+afterAll(removeScratch);

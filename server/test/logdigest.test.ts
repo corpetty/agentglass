@@ -1,16 +1,17 @@
 import { describe, expect, test, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { digest, normalize, displayText, parseLog, type LogEntry } from "../src/logdigest.ts";
 import { formatEntry, appendEntry, readEntries, LOG_MAX } from "../src/serverlog.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const H = 3_600_000;
 const NOW = Date.UTC(2026, 0, 15, 12, 0, 0);
 const e = (agoMs: number, text: string, level: LogEntry["level"] = "error"): LogEntry =>
   ({ at: NOW - agoMs, level, text });
 
-const scratch = mkdtempSync(join(tmpdir(), "agx-logdigest-"));
+const scratch = scratchDir(join(tmpdir(), "agx-logdigest-"));
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe("normalize", () => {
@@ -158,3 +159,5 @@ describe("serverlog", () => {
     expect(readFileSync(path, "utf8")).toContain('"level":"warn"');
   });
 });
+
+afterAll(removeScratch);

@@ -10,11 +10,12 @@
 // The obvious fix (read X-Forwarded-For) is a worse bug, so most of what is
 // asserted here is the *refusals*.
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePeer, originOf, tailnetAddress, type Peer } from "../src/net.ts";
 import { proxiedByTailscaled, __resetProxyProbe, __setProcNetFiles, __trustProxyUid } from "../src/remote.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const H = (h: Record<string, string>) => new Headers(h);
 
@@ -210,7 +211,7 @@ describe("proxiedByTailscaled — a raw TCP forward carries no header", () => {
   let dir = "";
 
   beforeAll(() => {
-    dir = mkdtempSync(join(tmpdir(), "agx-procnet-"));
+    dir = scratchDir(join(tmpdir(), "agx-procnet-"));
   });
   afterAll(() => {
     __setProcNetFiles(null);
@@ -284,3 +285,5 @@ describe("proxiedByTailscaled — a raw TCP forward carries no header", () => {
     expect(proxiedByTailscaled({ address: "127.0.0.1", port: peerPort }, ours, H({}))).toBe(false);
   });
 });
+
+afterAll(removeScratch);

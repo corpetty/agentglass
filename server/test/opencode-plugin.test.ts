@@ -13,11 +13,12 @@
  * A `.test.mjs` next to the plugin, or a `test_*.py` next to the installer, is
  * a test nothing executes.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const plugin = await import("../../hooks/opencode-plugin.js" as string);
 const CONNECT = new URL("../../hooks/connect_opencode.py", import.meta.url).pathname;
@@ -33,7 +34,7 @@ afterEach(() => {
 
 /** A throwaway XDG_CONFIG_HOME, so nothing here can reach a real config. */
 function xdg(): string {
-  const d = mkdtempSync(join(tmpdir(), "agx-oc-"));
+  const d = scratchDir(join(tmpdir(), "agx-oc-"));
   dirs.push(d);
   return d;
 }
@@ -186,3 +187,5 @@ describe("deploying it", () => {
     expect(existsSync(pluginPath(home))).toBe(false);
   });
 });
+
+afterAll(removeScratch);

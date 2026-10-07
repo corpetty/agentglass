@@ -6,15 +6,16 @@
  * confidently wrong is worse than no answer at all, because the wrong one gets
  * believed and the missing one gets checked.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __setLedgerPath, forget, ledgerAll, ledgerFor, noteWrite } from "../src/dockerledger.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const dirs: string[] = [];
 function ledgerAt(): string {
-  const d = mkdtempSync(join(tmpdir(), "agx-ledger-"));
+  const d = scratchDir(join(tmpdir(), "agx-ledger-"));
   dirs.push(d);
   const p = join(d, "docker-owners.json");
   __setLedgerPath(p);
@@ -121,3 +122,5 @@ describe("staying honest", () => {
     expect(require("node:fs").statSync(p).mode & 0o077).toBe(0);
   });
 });
+
+afterAll(removeScratch);

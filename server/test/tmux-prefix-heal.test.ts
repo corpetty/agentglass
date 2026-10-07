@@ -17,12 +17,13 @@
  * is about what a real server does with `-f`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { healPrefix, prefixKeys, __resetHeal, type TmuxTarget } from "../src/tmuxctl.ts";
 import { TMUX_ISOLATED } from "./tmuxIsolated.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /* A private socket directory, for this file's spawns and for the code under
    test alike: a bare `-L` lands in /tmp/tmux-<uid> and `kill-server` leaves
@@ -33,7 +34,7 @@ process.env.TMUX_TMPDIR = TMUX_TEST_TMPDIR;
 const SOCK = [...TMUX_ISOLATED, "-L", "agx-prefix-heal"];
 const tmux = (...a: string[]) =>
   Bun.spawnSync(["tmux", ...SOCK, ...a], { stdout: "pipe", stderr: "pipe" }).stdout.toString().trim();
-const dir = mkdtempSync(join(tmpdir(), "agx-prefix-heal-"));
+const dir = scratchDir(join(tmpdir(), "agx-prefix-heal-"));
 const conf = join(dir, "tmux.conf");
 writeFileSync(conf, "unbind C-b\nset -g prefix C-f\nbind C-f send-prefix\n");
 
@@ -133,3 +134,5 @@ describe("where the check lives", () => {
     });
   });
 });
+
+afterAll(removeScratch);

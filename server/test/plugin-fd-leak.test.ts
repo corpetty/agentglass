@@ -18,16 +18,17 @@
  * file both before and after.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __resetPlugins, enablePlugin, installPlugin, MANIFEST_NAME } from "../src/plugins.ts";
 import { __resetSandboxProbe, sandboxProbe } from "../src/plugin-sandbox.ts";
 import { ensurePluginSocketServer, pluginSocketPath, stopPluginSocketServer } from "../src/plugin-socket.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const dirs: string[] = [];
 function scratch(prefix: string): string {
-  const d = mkdtempSync(join(tmpdir(), prefix));
+  const d = scratchDir(join(tmpdir(), prefix));
   dirs.push(d);
   return d;
 }
@@ -101,7 +102,7 @@ describe("a refused start over a live plugin socket", () => {
 
     const before = fdsPointingAt(file).length;
 
-    const src = mkdtempSync(join(tmpdir(), "agx-fdleak-src-"));
+    const src = scratchDir(join(tmpdir(), "agx-fdleak-src-"));
     writeFileSync(join(src, MANIFEST_NAME), JSON.stringify({
       name: "orbit-fd-leak", publisher: "acme", description: "idles, boxed, networked",
       entrypoint: "sleep 60", scope: "read",
@@ -131,3 +132,5 @@ describe("a refused start over a live plugin socket", () => {
     expect(await r.text()).toBe("other instance");
   });
 });
+
+afterAll(removeScratch);

@@ -9,15 +9,16 @@ import { test, expect, afterAll, beforeAll } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
 const SOCKET = `agx-conf-test-${process.pid}`;
 process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
-const TMPDIR = join(tmpdir(), `agx-tmux-conf-${process.pid}`);
+const TMPDIR = trackScratch(join(tmpdir(), `agx-tmux-conf-${process.pid}`));
 const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 // config.ts refuses to WRITE to a real config dir under test (writeTmuxSettings
 // guard), so point it at scratch like terminal-disabled-config.test.ts does.
 const REAL_XDG = process.env.XDG_CONFIG_HOME;
-process.env.XDG_CONFIG_HOME = join(tmpdir(), `agx-tmux-conf-home-${process.pid}`);
+process.env.XDG_CONFIG_HOME = trackScratch(join(tmpdir(), `agx-tmux-conf-home-${process.pid}`));
 
 let conf: typeof import("../src/tmuxconf.ts");
 let cfg: typeof import("../src/config.ts");
@@ -276,3 +277,5 @@ test("tabs are numbered from 1, where the number keys are", () => {
   expect(content).toContain("set -g renumber-windows on");
   expect(conf.validateConf(content).ok).toBe(true);
 });
+
+afterAll(removeScratch);

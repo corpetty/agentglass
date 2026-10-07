@@ -25,20 +25,34 @@
  *   private-terms gate cannot catch a token: a token is not a known term, it is
  *   a string nobody has ever seen. Only its shape gives it away.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let SRC: typeof import("../src/understudy-sources.ts");
 
 beforeAll(async () => {
-  const jail = mkdtempSync(join(tmpdir(), "agx-machine-"));
+  const jail = scratchDir(join(tmpdir(), "agx-machine-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
   process.env.XDG_CONFIG_HOME = join(jail, "config");
-  SRC = await import("../src/understudy-sources.ts");
+  /*
+   * A home of its own, and a module instance that reads it. understudy-sources
+   * takes HOME once, at import, and whichever file imported it first decides
+   * which home that is; it also drops a candidate whose directory exists and
+   * holds nothing it would read. A login fish started by an earlier suite
+   * leaves exactly that, an empty `~/.config/fish`, and `shell-config` went
+   * missing here depending on which home the run had left behind. The query
+   * string is a separate module record; the HOME is put back straight after.
+   */
+  const realHome = process.env.HOME;
+  process.env.HOME = join(jail, "home");
+  const fresh: string = "../src/understudy-sources.ts?machine-sources";
+  SRC = (await import(fresh)) as typeof import("../src/understudy-sources.ts");
+  process.env.HOME = realHome;
 });
 
 describe("the machine has more than prose on it", () => {
@@ -215,3 +229,5 @@ describe("it does not claim you wrote things you did not", () => {
     expect(provenanceOf("/home/dev/x/memory/feedback-thing.md")).toContain("you recorded");
   });
 });
+
+afterAll(removeScratch);

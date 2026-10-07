@@ -10,14 +10,15 @@ import { test, expect, afterAll, beforeAll } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, trackScratch } from "./scratch.ts";
 
 // Unique per run, like the state dirs below. A fixed socket name is not a
 // private server — it is a path, and anything already listening there is what
 // the suite ends up talking to.
 const SOCKET = `agx-pane-test-${process.pid}`;
 process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
-process.env.AGENTGLASS_STATE_DIR = join(tmpdir(), `agx-pane-test-${process.pid}`);
-process.env.AGENTGLASS_CLAUDE_HOME = join(tmpdir(), `agx-claude-home-${process.pid}`);
+process.env.AGENTGLASS_STATE_DIR = trackScratch(join(tmpdir(), `agx-pane-test-${process.pid}`));
+process.env.AGENTGLASS_CLAUDE_HOME = trackScratch(join(tmpdir(), `agx-claude-home-${process.pid}`));
 
 /* A unique NAME still leaves the socket in the developer's DIRECTORY, which is
  * where a `-L` with no TMUX_TMPDIR goes: measured with a recording tmux on
@@ -27,7 +28,7 @@ process.env.AGENTGLASS_CLAUDE_HOME = join(tmpdir(), `agx-claude-home-${process.p
  * reason the comment above gives about names: "nothing is listening there" is
  * an assumption, and `tmuxSockets()` hands every server in that directory to
  * `listPanes`. */
-const TMPDIR = join(tmpdir(), `agx-tmux-chatpane-${process.pid}`);
+const TMPDIR = trackScratch(join(tmpdir(), `agx-tmux-chatpane-${process.pid}`));
 const REAL_TMPDIR = process.env.TMUX_TMPDIR;
 
 let mod: typeof import("../src/chatpane.ts");
@@ -411,3 +412,5 @@ test("a picker still wins over a queue, so Enter is never pressed into a menu", 
   // other state may be allowed to reach past that guard.
   expect(mod.__submitVerdict(`${MODEL_PICKER}\n❯ Press up to edit queued messages`, "/model")).toBe("diverted");
 });
+
+afterAll(removeScratch);

@@ -10,18 +10,19 @@
 // it writes nothing, and that the lines it hands over cannot lose work — on a
 // throwaway repository built here, never on anybody's real one.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { tidyReport, vetCommand } from "../src/tidy.ts";
 import { git } from "../src/git.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let repo: string;
 let remoteDir: string;
 let liveWt: string;
 
 beforeAll(() => {
-  repo = mkdtempSync(join(tmpdir(), "agx-tidy-"));
+  repo = scratchDir(join(tmpdir(), "agx-tidy-"));
   git(repo, ["init", "-q", "-b", "main"]);
   git(repo, ["config", "user.email", "t@t"]);
   git(repo, ["config", "user.name", "t"]);
@@ -43,7 +44,7 @@ beforeAll(() => {
    * quietly checking a code path it never reached. Deliberately breaking the
    * module is what exposed that: swapping `-d` for `-D` turned nothing red.
    */
-  const remote = mkdtempSync(join(tmpdir(), "agx-tidy-remote-"));
+  const remote = scratchDir(join(tmpdir(), "agx-tidy-remote-"));
   git(remote, ["init", "-q", "--bare"]);
   git(repo, ["remote", "add", "origin", remote]);
   git(repo, ["push", "-q", "-u", "origin", "main"]);
@@ -355,3 +356,5 @@ describe("it reads and does not write", () => {
     expect(state()).toBe(before);
   });
 });
+
+afterAll(removeScratch);

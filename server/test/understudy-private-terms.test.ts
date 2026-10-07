@@ -25,12 +25,13 @@
  * understudy test file owns its own classes rather than its own database. This
  * one is the only user of C11.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-understudy-terms-"));
+const dir = scratchDir(join(tmpdir(), "agx-understudy-terms-"));
 process.env.AGENTGLASS_DB = join(dir, "terms.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -260,3 +261,5 @@ describe("no terms file", () => {
     expect(u.privateTermsGate("the fix for ORBIT-1042 landed")!.termIndex).toBe(TICKET_LINE);
   });
 });
+
+afterAll(removeScratch);

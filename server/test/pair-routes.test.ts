@@ -10,13 +10,14 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createECDH, hkdfSync, createDecipheriv } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { INFO } from "../src/pairing.ts";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -39,7 +40,7 @@ function phone() {
 }
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-pairsrv-"));
+  dir = scratchDir(join(tmpdir(), "agx-pairsrv-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -378,3 +379,5 @@ describe("the ceremony a machine token cannot complete on its own", () => {
   });
 });
 });
+
+afterAll(removeScratch);

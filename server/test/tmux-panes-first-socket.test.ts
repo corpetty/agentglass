@@ -11,9 +11,10 @@
  * alone first; the rest are only asked when it comes back empty.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { panesWithPids, activePane } from "../src/tmuxctl.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const uid = process.getuid?.() ?? 0;
 let tmpdir = "";
@@ -36,7 +37,7 @@ let windowId = "";
 
 describe("panesWithPids/activePane ask the known socket alone first", () => {
   beforeAll(() => {
-    tmpdir = mkdtempSync("/tmp/agx-firstsock-");
+    tmpdir = scratchDir("/tmp/agx-firstsock-");
     sockDir = join(tmpdir, `tmux-${uid}`);
     if (tmux("agx-first-a", "new-session", "-d", "sleep", "60").exitCode !== 0) {
       throw new Error("could not start server A");
@@ -85,3 +86,5 @@ describe("panesWithPids/activePane ask the known socket alone first", () => {
     }
   });
 });
+
+afterAll(removeScratch);

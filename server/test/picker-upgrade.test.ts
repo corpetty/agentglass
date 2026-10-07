@@ -10,12 +10,13 @@
  * state and database, and no scanner.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir = "", base = "", code = "", A = "", B = "";
@@ -25,7 +26,7 @@ const get = (path: string) => fetch(base + path, { headers: auth }).then((r) => 
 const saved = () => JSON.parse(readFileSync(join(dir, "cfg", "agentglass", "config.json"), "utf8"));
 
 beforeAll(async () => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-picker-upgrade-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-picker-upgrade-")));
   code = join(dir, "code");
   A = join(code, "orbit");
   B = join(code, "lander");
@@ -82,3 +83,5 @@ test("the unscoped panel call reports the held roots, not the seeded list — a 
   const r = await get("/git/repos");
   expect(r.roots).toEqual([]);
 });
+
+afterAll(removeScratch);

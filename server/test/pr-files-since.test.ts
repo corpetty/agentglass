@@ -10,10 +10,11 @@
  * consecutive tries. Git answers it exactly, offline, in one process.
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { filesSince } from "../src/prs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 let first = "";
@@ -27,7 +28,7 @@ const git = (...args: string[]) => {
 };
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-since-"));
+  dir = scratchDir(join(tmpdir(), "agx-since-"));
   git("init", "-q", "-b", "main");
   git("config", "user.email", "t@example.com");
   git("config", "user.name", "T");
@@ -94,3 +95,5 @@ describe("filesSince", () => {
     expect(typeof r.ok).toBe("boolean");
   });
 });
+
+afterAll(removeScratch);

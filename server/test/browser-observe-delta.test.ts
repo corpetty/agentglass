@@ -9,18 +9,19 @@
  * --observe`) ask for a delta.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   askBrowser, noteBrowserReady, parseAsk, resetAudit, resetBrowserDrive, runSteps, setBrowserSink, settleBrowser,
   withObservation, type BrowserAsk,
 } from "../src/browserdrive.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let stateScratch = "";
 let stateBefore: string | undefined;
 beforeAll(() => {
-  stateScratch = mkdtempSync(join(tmpdir(), "agx-delta-state-"));
+  stateScratch = scratchDir(join(tmpdir(), "agx-delta-state-"));
   stateBefore = process.env.AGENTGLASS_STATE_DIR;
   process.env.AGENTGLASS_STATE_DIR = stateScratch;
 });
@@ -147,3 +148,5 @@ describe("act-then-look asks for a delta", () => {
     expect(asks.at(-1)!.args.delta).toBe(true);
   });
 });
+
+afterAll(removeScratch);

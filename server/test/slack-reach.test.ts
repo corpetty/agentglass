@@ -12,13 +12,14 @@
  * tokens, and the config beside it holds counters that only say how often
  * somebody was shown an advert for the integration.
  */
-import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { describe, expect, it, afterAll } from "bun:test";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { slackReachable } from "../src/slackreach.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-slack-"));
+const dir = scratchDir(join(tmpdir(), "agx-slack-"));
 let n = 0;
 const write = (name: string, body: unknown) => {
   const p = join(dir, `${n++}-${name}`);
@@ -85,3 +86,5 @@ describe("finding a Slack connection", () => {
     expect(slackReachable(NONE, creds)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

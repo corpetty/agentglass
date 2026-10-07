@@ -18,10 +18,11 @@
  * So the point of what follows is not that the two current prefixes match. It is
  * that the MAKER and the CHECK cannot disagree, whatever is added later.
  */
-import { describe, expect, it } from "bun:test";
-import { rmSync, writeFileSync, mkdtempSync } from "node:fs";
+import { describe, expect, it, afterAll } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { makeViewTempDir, isViewTemp, viewTempDirOf } = await import("../src/viewtemp.ts");
 
@@ -49,7 +50,7 @@ describe("a read-only copy is openable in the editor", () => {
     // The whole reason the check is a prefix and not "is it under tmp": a pane
     // that can open anything in the system temp directory is a file viewer for
     // whatever any other program left there.
-    const stranger = mkdtempSync(join(tmpdir(), "not-ours-"));
+    const stranger = scratchDir(join(tmpdir(), "not-ours-"));
     try {
       const file = join(stranger, "thing.py");
       writeFileSync(file, "# hi\n");
@@ -103,3 +104,5 @@ describe("nobody re-writes the prefix by hand", () => {
     }
   });
 });
+
+afterAll(removeScratch);

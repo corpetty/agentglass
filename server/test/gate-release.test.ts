@@ -30,13 +30,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import { DESK_HEADER } from "../src/desk.ts";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-this-test";
 
@@ -104,7 +105,7 @@ let phone = "", tablet = "";
 const savedXdg = process.env.XDG_CONFIG_HOME;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-gaterelease-"));
+  dir = scratchDir(join(tmpdir(), "agx-gaterelease-"));
   // Minted into the store the server will read. The server loads it once, when
   // it starts, so writing it before the spawn is the ordering requirement.
   process.env.XDG_CONFIG_HOME = dir;
@@ -284,7 +285,7 @@ describe("on a server the desktop app started, an Origin no longer lets a hold g
   const deskHeader = { "x-agentglass-desk": DESK };
 
   beforeAll(async () => {
-    dDir = mkdtempSync(join(tmpdir(), "agx-gatedesk-"));
+    dDir = scratchDir(join(tmpdir(), "agx-gatedesk-"));
     // The same paired phone and look-only tablet as the server above.
     cpSync(join(dir, "agentglass"), join(dDir, "agentglass"), { recursive: true });
     const p = await freePort();
@@ -406,7 +407,7 @@ describe("a desk is its pipe and its parent, not a variable", () => {
   const procs: { kill: () => unknown }[] = [];
 
   beforeAll(() => {
-    eDir = mkdtempSync(join(tmpdir(), "agx-gatedesk-edge-"));
+    eDir = scratchDir(join(tmpdir(), "agx-gatedesk-edge-"));
     cpSync(join(dir, "agentglass"), join(eDir, "a", "agentglass"), { recursive: true });
     cpSync(join(dir, "agentglass"), join(eDir, "b", "agentglass"), { recursive: true });
   });
@@ -565,7 +566,7 @@ describe("the budget brake has an off switch", () => {
   let bDir: string, bBase: string, bProc: ReturnType<typeof Bun.spawn> | null = null;
 
   beforeAll(async () => {
-    bDir = mkdtempSync(join(tmpdir(), "agx-budgetoff-"));
+    bDir = scratchDir(join(tmpdir(), "agx-budgetoff-"));
     const p = await freePort();
     bBase = `http://127.0.0.1:${p}`;
     bProc = spawnServer(bDir, p, { AGENTGLASS_BUDGET_WRITE_DISABLED: "1" });
@@ -592,3 +593,5 @@ describe("the budget brake has an off switch", () => {
     expect(after.budgets).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

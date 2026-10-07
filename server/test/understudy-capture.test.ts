@@ -20,12 +20,13 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "machine-token-for-the-capture-test";
 
@@ -47,7 +48,7 @@ const git = (args: string[]) =>
   Bun.spawnSync(["git", ...args], { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: dir } });
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-understudy-capture-"));
+  dir = scratchDir(join(tmpdir(), "agx-understudy-capture-"));
   dbFile = join(dir, "capture.db");
   repo = join(dir, "orbit");
 
@@ -290,3 +291,5 @@ describe("neither canary is anywhere in the understudy's tables", () => {
     expect(seen).toBeGreaterThan(0);
   });
 });
+
+afterAll(removeScratch);

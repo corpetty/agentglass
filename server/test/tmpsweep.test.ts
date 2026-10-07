@@ -12,12 +12,13 @@
  * child `bun test` and looks at what the child left behind — the only place the
  * question can actually be answered.
  */
-import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const report = join(mkdtempSync(join(tmpdir(), "agx-sweepcheck-")), "paths.txt");
+const report = join(scratchDir(join(tmpdir(), "agx-sweepcheck-")), "paths.txt");
 
 const child = Bun.spawnSync(
   ["bun", "test", "--preload", "./test/tmpsweep.ts", "./test/fixtures/tmpsweep-fixture.ts"],
@@ -48,3 +49,5 @@ describe("what a run leaves in /tmp", () => {
     expect(existsSync(report)).toBe(true);
   });
 });
+
+afterAll(removeScratch);

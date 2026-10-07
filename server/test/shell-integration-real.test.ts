@@ -22,11 +22,12 @@
  * a fact about the machine, and a red suite that means "not installed here"
  * teaches people to ignore it.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { familyOf, install, SNIPPETS } from "../src/shellmark.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const FIXTURE = new URL("./fixtures/shell-drive.ts", import.meta.url).pathname;
 
@@ -40,7 +41,7 @@ type Driven = {
 };
 
 function drive(shell: string): Driven {
-  const home = mkdtempSync(join(tmpdir(), "agx-shellrun-"));
+  const home = scratchDir(join(tmpdir(), "agx-shellrun-"));
   try {
     const p = Bun.spawnSync(["bun", "run", FIXTURE, shell, home], {
       // Named, never `...process.env`. This spawns a login shell that sources
@@ -183,3 +184,5 @@ describe("every snippet, whether or not that shell is installed here", () => {
     }
   });
 });
+
+afterAll(removeScratch);

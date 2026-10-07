@@ -22,12 +22,13 @@
 //
 // The third is the one that has to keep being true: nothing about any of this
 // changes what happens when nobody names an agent.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-run-agents-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-run-agents-")));
 const REPO = join(dir, "repo");
 const BIN = join(dir, "bin");
 
@@ -295,3 +296,5 @@ describe("the default path, when nobody names an agent", () => {
     expect(launch.launchArgv("someone-new", CODEX, req)).toEqual([CODEX, "compare these"]);
   });
 });
+
+afterAll(removeScratch);

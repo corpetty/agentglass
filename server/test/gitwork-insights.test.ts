@@ -3,12 +3,13 @@
  * conventional-commits grouping in generateChangelog.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-insights-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-insights-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { repoStats, generateChangelog } = await import("../src/gitinsights.ts");
 
@@ -124,3 +125,5 @@ describe("changelog", () => {
     expect(c.sections[0].entries.map((e) => e.subject)).toEqual(["new"]);
   });
 });
+
+afterAll(removeScratch);

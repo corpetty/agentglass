@@ -9,12 +9,13 @@
 //
 // Two mappers is how they drifted, so what is pinned here is the one mapper and
 // the cases the hand-rolled copy got wrong.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-reviewers-"));
+const dir = scratchDir(join(tmpdir(), "agx-reviewers-"));
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_DB = join(dir, "r.db");
 
@@ -63,3 +64,5 @@ describe("one shape for both views", () => {
     // name is the whole sentence and no face is ever drawn.
   });
 });
+
+afterAll(removeScratch);

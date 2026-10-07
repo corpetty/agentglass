@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * The gate hook has to find the token without being handed it.
@@ -40,7 +41,7 @@ afterEach(() => { for (const b of boxes) rmSync(b, { recursive: true, force: tru
 
 /** A throwaway XDG config home, optionally holding a minted token. */
 function configHome(token?: string): string {
-  const box = mkdtempSync(join(tmpdir(), "agx-gate-"));
+  const box = scratchDir(join(tmpdir(), "agx-gate-"));
   boxes.push(box);
   if (token !== undefined) {
     mkdirSync(join(box, "agentglass"), { recursive: true });
@@ -83,3 +84,5 @@ describe.skipIf(!PY)("gate hook token resolution", () => {
     expect(secret({ XDG_CONFIG_HOME: "/nonexistent/nowhere" })).toBe("");
   });
 });
+
+afterAll(removeScratch);

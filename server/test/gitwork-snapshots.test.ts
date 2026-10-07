@@ -11,12 +11,13 @@
  *     failure path leaves the stash where the error message says it is.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-snap-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-snap-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot, withAutoStash } = await import("../src/gitwork.ts");
 
@@ -127,3 +128,5 @@ describe("WIP snapshots", () => {
     expect(git("stash", "list").stdout.toString()).toContain("agx: auto-stash");
   });
 });
+
+afterAll(removeScratch);

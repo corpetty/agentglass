@@ -6,12 +6,13 @@
  * `bun test` — a refusal fails the run it happens in, on purpose, so it can
  * only be watched from outside that run.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { childTargets, isRealAgentglassPath } from "./isolation";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TMP = resolve(tmpdir());
 const REAL = process.env.AGX_TEST_REAL_HOME!;
@@ -90,7 +91,7 @@ describe("what counts as real", () => {
 
 /** The fixture in a child `bun test`, and what it wrote down. */
 function runFixture(env: Record<string, string>) {
-  const report = join(mkdtempSync(join(tmpdir(), "agx-isolation-check-")), "report.json");
+  const report = join(scratchDir(join(tmpdir(), "agx-isolation-check-")), "report.json");
   const child = Bun.spawnSync(["bun", "test", "./test/fixtures/isolation-fixture.ts"], {
     cwd: new URL("..", import.meta.url).pathname,
     env: { ...process.env, ...env, ISOLATION_REPORT: report },
@@ -137,3 +138,5 @@ describe("the guard, watched from outside the run it fails", () => {
     expect(r.filledHome).toBe(process.env.HOME!);
   });
 });
+
+afterAll(removeScratch);

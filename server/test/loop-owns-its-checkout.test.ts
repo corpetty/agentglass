@@ -16,8 +16,8 @@
  * being written the row is legitimately not `running`. Only the loop knows,
  * so the loop says so.
  */
-import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "../src/db.ts";
@@ -25,13 +25,14 @@ import * as Work from "../src/understudy-work.ts";
 import {
   sweepEmptyWorktrees, sweepVanishedRuns, setGitHook, setAliveHook, setBusyHook, VANISHED_GRACE_MS,
 } from "../src/understudy-watchdog.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const REPO = "/tmp/understudy-busy-probe";
 let worktree: string;
 
 beforeEach(() => {
   db.exec("DELETE FROM understudy_work");
-  worktree = mkdtempSync(join(tmpdir(), "understudy-busy-"));
+  worktree = scratchDir(join(tmpdir(), "understudy-busy-"));
   setGitHook(async (args) => {
     if (args[0] === "rev-list") return { ok: true, out: "0\n" };
     if (args[0] === "status") return { ok: true, out: "" };
@@ -107,3 +108,5 @@ test("a busy hook that throws is read as busy", async () => {
   setBusyHook(() => { throw new Error("no idea"); });
   expect(await sweepEmptyWorktrees()).toEqual([]);
 });
+
+afterAll(removeScratch);

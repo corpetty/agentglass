@@ -3,16 +3,17 @@
 // device, a plugin, an understudy run, a seat) does not get the
 // dot-directories directly under $HOME.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Caller } from "../src/auth.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const saved = { HOME: process.env.HOME, AGENTGLASS_ROOT: process.env.AGENTGLASS_ROOT };
 let home: string;
 
 beforeAll(() => {
-  home = realpathSync(mkdtempSync(join(tmpdir(), "agx-dothome-")));
+  home = realpathSync(scratchDir(join(tmpdir(), "agx-dothome-")));
   mkdirSync(join(home, ".ssh"));
   writeFileSync(join(home, ".ssh", "id_orbit"), "fake key\n");
   mkdirSync(join(home, "code", "orbit"), { recursive: true });
@@ -75,3 +76,5 @@ describe("dot-directories under home", () => {
     }
   });
 });
+
+afterAll(removeScratch);

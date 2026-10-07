@@ -12,11 +12,12 @@
  * takes a long-running server's socket, liveness without age races a suite
  * whose server is still booting and whose `list-sessions` therefore fails.
  */
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { rmSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { socketDirUnder, sweepDeadSockets, TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const HOUR = 60 * 60_000;
 const have = Boolean(Bun.which("tmux"));
@@ -35,7 +36,7 @@ function deadSocket(dir: string, name: string, ageMs: number): string {
 describe("sweeping the test socket directory", () => {
   test("takes a stale socket whose server is gone", () => {
     if (!have) return;
-    const dir = mkdtempSync(join(tmpdir(), "agx-sweep-"));
+    const dir = scratchDir(join(tmpdir(), "agx-sweep-"));
     try {
       deadSocket(dir, "old-and-dead", 3 * HOUR);
       const r = sweepDeadSockets(dir);
@@ -49,7 +50,7 @@ describe("sweeping the test socket directory", () => {
        server may still be booting, which makes `list-sessions` fail on a server
        that is about to be perfectly fine. */
     if (!have) return;
-    const dir = mkdtempSync(join(tmpdir(), "agx-sweep-"));
+    const dir = scratchDir(join(tmpdir(), "agx-sweep-"));
     try {
       deadSocket(dir, "young-and-dead", 5_000);
       expect(sweepDeadSockets(dir).removed).toBe(0);
@@ -60,7 +61,7 @@ describe("sweeping the test socket directory", () => {
   test("and leaves an old socket whose server is still running", () => {
     // Age alone is not death. A suite that takes hours keeps its server.
     if (!have) return;
-    const dir = mkdtempSync(join(tmpdir(), "agx-sweep-"));
+    const dir = scratchDir(join(tmpdir(), "agx-sweep-"));
     const path = join(dir, "old-and-alive");
     try {
       Bun.spawnSync(["tmux", "-f", "/dev/null", "-S", path, "new-session", "-d", "-s", "x"]);
@@ -77,7 +78,7 @@ describe("sweeping the test socket directory", () => {
   test("never touches a file that is not a socket", () => {
     // The directory is tmux's, but a stray file in it is somebody's, and this
     // runs unattended at import.
-    const dir = mkdtempSync(join(tmpdir(), "agx-sweep-"));
+    const dir = scratchDir(join(tmpdir(), "agx-sweep-"));
     try {
       const path = join(dir, "notes.txt");
       writeFileSync(path, "not a socket");
@@ -105,3 +106,5 @@ describe("sweeping the test socket directory", () => {
     expect(socketDirUnder("/x")).not.toBe("/x");
   });
 });
+
+afterAll(removeScratch);

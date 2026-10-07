@@ -11,12 +11,13 @@
  * state and database, and no scanner.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir = "", base = "", A = "", B = "";
@@ -28,7 +29,7 @@ const post = (path: string, body: unknown) =>
 const get = (path: string) => fetch(base + path, { headers: auth }).then((r) => r.json() as Promise<any>);
 
 beforeAll(async () => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-picker-route-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-picker-route-")));
   A = join(dir, "code", "orbit");
   B = join(dir, "code", "lander");
   for (const p of [A, B]) mkdirSync(p, { recursive: true });
@@ -136,3 +137,5 @@ describe("the folders the picker lists from", () => {
     expect((await get("/git/repos?all=1")).repos).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

@@ -8,13 +8,14 @@
  * sentence in a prompt, and a second seating that opens a second agent under
  * one name.
  */
-import { describe, expect, test, beforeEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-seat-"));
+const dir = scratchDir(join(tmpdir(), "agx-seat-"));
 process.env.AGENTGLASS_DOCTRINE = join(dir, "data");
 
 const { doctrineSlug, doctrinePath, readDoctrine, writeDoctrine, doctrineTemplate, MAX_DOCTRINE } = await import("../src/seatdoctrine.ts");
@@ -90,7 +91,7 @@ describe("where a seat may be opened", () => {
      * `bun test` shares one process, and a suite that sets it at module scope
      * pins the scope for every file after it.
      */
-    const repo = mkdtempSync(join(tmpdir(), "agx-seat-repo-"));
+    const repo = scratchDir(join(tmpdir(), "agx-seat-repo-"));
     const wt = join(repo, "..", `${basename(repo)}-work`);
     const run = (args: string[], cwd: string) => spawnSync("git", args, { cwd, stdio: "ignore" });
     run(["init", "-q"], repo);
@@ -107,7 +108,7 @@ describe("where a seat may be opened", () => {
       expect("root" in r && r.root).toBe(realpathSync(repo));
       /* And the fold is not a way in: a directory that is nobody's project is
          still refused. */
-      expect("error" in Seat.seatable(mkdtempSync(join(tmpdir(), "agx-seat-nope-")))).toBe(true);
+      expect("error" in Seat.seatable(scratchDir(join(tmpdir(), "agx-seat-nope-")))).toBe(true);
     } finally {
       if (before === undefined) delete process.env.AGENTGLASS_ROOT;
       else process.env.AGENTGLASS_ROOT = before;
@@ -295,3 +296,5 @@ describe("the three rules every published orchestrator converged on", () => {
     expect(b).toContain("unknown");
   });
 });
+
+afterAll(removeScratch);

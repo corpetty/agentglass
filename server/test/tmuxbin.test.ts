@@ -3,10 +3,11 @@
 // Nothing here runs tmux. The point is the ORDER: env override beats config
 // beats bundled beats system PATH, and under `bun test` the developer's real
 // state dir and execPath must never answer a test.
-import { test, expect, afterEach, beforeEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { test, expect, afterEach, beforeEach, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // Keyed by the REAL variable names: the restore below writes `process.env[k]`,
 // so a nickname here would put back a variable nobody reads and leave the one
@@ -52,7 +53,7 @@ test("resolves nothing when env, config and PATH all lack tmux", () => {
 });
 
 test("AGENTGLASS_TMUX_PATH wins over everything, even a bundled dir", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-tb-"));
+  const dir = scratchDir(join(tmpdir(), "agx-tb-"));
   const env = fakeTmux(dir, "env-tmux");
   process.env.AGENTGLASS_TMUX_PATH = env;
   process.env.AGENTGLASS_TMUX_DIR = dir;
@@ -61,7 +62,7 @@ test("AGENTGLASS_TMUX_PATH wins over everything, even a bundled dir", () => {
 });
 
 test("a bundled dir is preferred over system PATH", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-tb-"));
+  const dir = scratchDir(join(tmpdir(), "agx-tb-"));
   const bundled = fakeTmux(dir, "tmux");
   process.env.AGENTGLASS_TMUX_DIR = dir;
   process.env.AGENTGLASS_TMUX_PATH = "";
@@ -71,7 +72,7 @@ test("a bundled dir is preferred over system PATH", () => {
 });
 
 test("falls back to system PATH when no bundled binary exists", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-tb-"));
+  const dir = scratchDir(join(tmpdir(), "agx-tb-"));
   fakeTmux(dir, "other-bin"); // no `tmux` in the bundled dir
   process.env.AGENTGLASS_TMUX_DIR = dir;
   delete process.env.AGENTGLASS_TMUX_PATH;
@@ -85,7 +86,7 @@ test("the real state dir never answers a test", () => {
   // Point the state dir at something real-shaped; the resolver must not look
   // inside it under `bun test` (tmuxbin.ts honours AGENTGLASS_STATE_DIR only
   // under scratch).
-  const real = mkdtempSync(join(tmpdir(), "agx-tb-"));
+  const real = scratchDir(join(tmpdir(), "agx-tb-"));
   process.env.AGENTGLASS_STATE_DIR = real; // outside tmpdir? no — still scratch
   // With no env dir and no PATH tmux the answer must be null even though a
   // bundled binary would live under a REAL state dir in production.
@@ -130,9 +131,9 @@ function fakeSocket(base: string, name: string): void {
 }
 
 test("with a server up, a bundled tmux that cannot talk to it hands over to PATH", () => {
-  const bundledDir = mkdtempSync(join(tmpdir(), "agx-tb-b-"));
-  const pathDir = mkdtempSync(join(tmpdir(), "agx-tb-p-"));
-  const sockBase = mkdtempSync(join(tmpdir(), "agx-tb-s-"));
+  const bundledDir = scratchDir(join(tmpdir(), "agx-tb-b-"));
+  const pathDir = scratchDir(join(tmpdir(), "agx-tb-p-"));
+  const sockBase = scratchDir(join(tmpdir(), "agx-tb-s-"));
   mismatchedTmux(bundledDir);
   const system = fakeTmux(pathDir, "tmux"); // exits 0: it speaks
   process.env.AGENTGLASS_TMUX_DIR = bundledDir;
@@ -145,9 +146,9 @@ test("with a server up, a bundled tmux that cannot talk to it hands over to PATH
 });
 
 test("with no server up, the bundled tmux is used without being probed", () => {
-  const bundledDir = mkdtempSync(join(tmpdir(), "agx-tb-b-"));
-  const pathDir = mkdtempSync(join(tmpdir(), "agx-tb-p-"));
-  const sockBase = mkdtempSync(join(tmpdir(), "agx-tb-s-"));
+  const bundledDir = scratchDir(join(tmpdir(), "agx-tb-b-"));
+  const pathDir = scratchDir(join(tmpdir(), "agx-tb-p-"));
+  const sockBase = scratchDir(join(tmpdir(), "agx-tb-s-"));
   const bundled = mismatchedTmux(bundledDir); // would fail a probe; none is run
   fakeTmux(pathDir, "tmux");
   process.env.AGENTGLASS_TMUX_DIR = bundledDir;
@@ -169,7 +170,7 @@ test("status reports why the engine is off", () => {
 });
 
 test("a PATH override that is not executable is refused with its reason", () => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-tb-"));
+  const dir = scratchDir(join(tmpdir(), "agx-tb-"));
   const p = join(dir, "tmux");
   writeFileSync(p, "#!/bin/sh\n"); // not chmod +x
   process.env.AGENTGLASS_TMUX_PATH = p;
@@ -178,3 +179,5 @@ test("a PATH override that is not executable is refused with its reason", () => 
   expect(st.source).toBe("env");
   expect(st.reason).toContain("not executable");
 });
+
+afterAll(removeScratch);

@@ -5,12 +5,13 @@
 // events fell into no bucket and vanished from the chart while still counting in
 // the totals. An event at exactly `now` is always outside the aligned buckets,
 // so it is the sharp case.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-timeline-"));
+const dir = scratchDir(join(tmpdir(), "agx-timeline-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "timeline.db");
@@ -54,3 +55,5 @@ describe("the timeline accounts for every event in the window", () => {
     expect(tlSum).toBe(s.totals.events); // fails on pre-fix code: the ~now event has no bucket
   });
 });
+
+afterAll(removeScratch);

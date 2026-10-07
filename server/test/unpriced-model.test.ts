@@ -10,12 +10,13 @@
 // and the file's own header says to re-verify the rates against each provider.
 // A rename is all it takes for a whole vendor's spend to become a guess
 // rendered as a fact.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-unpriced-"));
+const dir = scratchDir(join(tmpdir(), "agx-unpriced-"));
 const ROOT = join(dir, "proj");
 mkdirSync(ROOT, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "unpriced.db");
@@ -109,3 +110,5 @@ describe("the spend panel marks what it could not price", () => {
     expect(opus.sessions).toBeGreaterThan(1);
   });
 });
+
+afterAll(removeScratch);

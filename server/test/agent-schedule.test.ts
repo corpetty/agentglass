@@ -2,11 +2,12 @@
  * "At 08:00 start this agent" — a reminder whose firing is a start.
  */
 import { describe, expect, test, beforeEach, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "../src/db.ts";
 import { whenFrom, addSchedule, cancelSchedule, listSchedules, drainDueSchedules } from "../src/agentschedule.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const NOW = new Date(2026, 8, 5, 12, 0, 0, 0).getTime();
 beforeEach(() => { db.exec("DELETE FROM agent_schedule"); });
@@ -34,7 +35,7 @@ let jail = "";
 let WT = "";
 let rootBefore: string | undefined;
 beforeAll(() => {
-  jail = mkdtempSync(join(tmpdir(), "agx-sched-"));
+  jail = scratchDir(join(tmpdir(), "agx-sched-"));
   WT = join(jail, "wt");
   mkdirSync(WT);
   rootBefore = process.env.AGENTGLASS_ROOT;
@@ -129,3 +130,5 @@ describe("the id a command line has to carry", () => {
     expect(ids.every((id) => id.startsWith("sc_"))).toBe(true);
   });
 });
+
+afterAll(removeScratch);

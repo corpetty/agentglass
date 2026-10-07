@@ -6,12 +6,13 @@
 // a credential taken back at the hub stops the node — so this drives both for
 // real, each with its own HOME, database and port.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "hub-secret-for-fleet-link-test";
 let root: string;
@@ -87,7 +88,7 @@ async function until<T>(what: string, fn: () => Promise<T | null | undefined | f
 const nodeStatus = async () => (await body(fetch(node.base + "/fleet/status"))).upstream;
 
 beforeAll(async () => {
-  root = mkdtempSync(join(tmpdir(), "agx-fleet-link-"));
+  root = scratchDir(join(tmpdir(), "agx-fleet-link-"));
   [hub, node] = await Promise.all([
     boot("hub", { AGENTGLASS_HOST_ID: "hub", AGENTGLASS_TOKEN: TOKEN }),
     boot("node", { AGENTGLASS_HOST_ID: "bean" }),
@@ -345,3 +346,5 @@ describe("joining a node to a hub", () => {
     expect(st.error).toBeTruthy();
   }, 20_000);
 });
+
+afterAll(removeScratch);

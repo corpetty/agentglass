@@ -6,7 +6,7 @@
 // makes `sandboxProbe()` fail deterministically, without needing a host that
 // actually lacks bwrap.
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
   setPluginUnboxedConsent, setMaster, pluginsPath, MANIFEST_NAME,
 } from "../src/plugins.ts";
 import { __resetSandboxProbe } from "../src/plugin-sandbox.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const manifest = {
   name: "watcher", publisher: "someone in the community",
@@ -21,7 +22,7 @@ const manifest = {
 };
 
 function fixture(): string {
-  const dir = mkdtempSync(join(tmpdir(), "agx-plugin-unboxed-"));
+  const dir = scratchDir(join(tmpdir(), "agx-plugin-unboxed-"));
   writeFileSync(join(dir, MANIFEST_NAME), JSON.stringify(manifest));
   writeFileSync(join(dir, "run.sh"), "#!/bin/bash\nsleep 5\n");
   chmodSync(join(dir, "run.sh"), 0o755);
@@ -45,7 +46,7 @@ beforeEach(async () => {
   process.env.AGENTGLASS_BWRAP = "/nonexistent/bwrap"; // sandboxProbe() fails deterministically
   delete process.env.AGENTGLASS_PLUGINS_UNBOXED;
   __resetSandboxProbe();
-  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "agx-plugins-unboxed-"));
+  process.env.XDG_CONFIG_HOME = scratchDir(join(tmpdir(), "agx-plugins-unboxed-"));
   await __resetPlugins();
 });
 
@@ -161,3 +162,5 @@ describe("index.ts requires an explicit boolean for /plugins/allow-unboxed", () 
     expect(block).not.toContain("b.allow !== false");
   });
 });
+
+afterAll(removeScratch);

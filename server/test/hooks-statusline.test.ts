@@ -11,10 +11,11 @@
 //
 // Nothing here touches the real ~/.claude: every case installs into a throwaway
 // project directory, which is what `--project` is for.
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const INSTALLER = join(import.meta.dir, "..", "..", "hooks", "install_hooks.py");
 const has = !!Bun.which("python3");
@@ -23,7 +24,7 @@ let boxes: string[] = [];
 afterEach(() => { for (const b of boxes) rmSync(b, { recursive: true, force: true }); boxes = []; });
 
 function project(settings: unknown): string {
-  const box = mkdtempSync(join(tmpdir(), "agx-hooks-"));
+  const box = scratchDir(join(tmpdir(), "agx-hooks-"));
   boxes.push(box);
   mkdirSync(join(box, ".claude"), { recursive: true });
   writeFileSync(join(box, ".claude", "settings.json"), JSON.stringify(settings, null, 2));
@@ -84,3 +85,5 @@ describe.if(has)("the status line slot is borrowed, not taken", () => {
     expect(back.miAjuste).toBe(true);
   });
 });
+
+afterAll(removeScratch);

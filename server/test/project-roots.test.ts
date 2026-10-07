@@ -13,11 +13,12 @@
  * real module against real repositories in a temp directory.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { configuredRepoDirs, fileRoots, repoDirsUnstated, seedRepoDirs, setRepoDir, setWorkspaceRoots, workspaceRoots } from "../src/config.ts";
 import { discoverRepos, invalidateRepos, knownProjectRoots } from "../src/gitwork.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const saved0 = {
   XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
@@ -31,7 +32,7 @@ afterAll(() => {
 
 let dir = "", code = "", cfg = "";
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-roots-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-roots-")));
   code = join(dir, "code");
   mkdirSync(code, { recursive: true });
   process.env.XDG_CONFIG_HOME = dir;
@@ -341,3 +342,5 @@ describe("the projects the app knew", () => {
     expect(found.sort()).toEqual([handbook, lander, orbit].sort());
   });
 });
+
+afterAll(removeScratch);

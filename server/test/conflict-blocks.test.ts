@@ -1,9 +1,10 @@
-import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { describe, expect, it, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { conflictBlocks, resolveBlocks } from "../src/gitwork.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Resolving one conflict at a time.
@@ -34,7 +35,7 @@ const CONFLICTED = [
 ].join("\n");
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-conflict-"));
+  dir = scratchDir(join(tmpdir(), "agx-conflict-"));
   // The write path is scope-guarded, so the repo has to be inside the open
   // project the way it is in real use.
   process.env.AGENTGLASS_ROOT = dir;
@@ -177,3 +178,5 @@ describe("conflict blocks", () => {
     expect(git("diff", "--name-only", "--diff-filter=U").stdout.trim()).toBe("");
   });
 });
+
+afterAll(removeScratch);

@@ -17,11 +17,12 @@
  * and the XDG home are all scratch; nothing of the person's is read or written.
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const TMP = mkdtempSync(join(tmpdir(), "agx-judge-room-"));
+const TMP = scratchDir(join(tmpdir(), "agx-judge-room-"));
 const BIN = join(TMP, "bin");
 const STATE = join(TMP, "state");
 const SEEN = join(TMP, "claude-saw.json");
@@ -107,3 +108,5 @@ describe("the judge's room", () => {
     expect(src).toContain("symlinkSync(cred, here)");
   });
 });
+
+afterAll(removeScratch);

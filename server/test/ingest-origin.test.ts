@@ -31,18 +31,19 @@
  * checks that the gate actually asks the rule the address question.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
 import { freePort } from "./freePort.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "test-machine-token-not-a-real-one";
 let dir: string, base: string, proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-ingest-origin-"));
+  dir = scratchDir(join(tmpdir(), "agx-ingest-origin-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -177,3 +178,5 @@ test("the gate asks WHERE a request came from, not only which path it is", () =>
   expect(src, "index.ts no longer resolves the peer behind a proxy").toContain("resolvePeer({");
   expect(src, "index.ts trusts a forwarding header without verifying the proxy").toContain("proxiedByTailscaled(");
 });
+
+afterAll(removeScratch);

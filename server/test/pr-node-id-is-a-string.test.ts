@@ -16,10 +16,11 @@
  * real gh — and the real gh would then be asked to hide a comment.
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { nodeIdOk } from "../src/prs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("what counts as a node id", () => {
   it("is the base64 and PREFIX_ forms GitHub actually issues", () => {
@@ -35,7 +36,7 @@ describe("what counts as a node id", () => {
   });
 });
 
-const TMP = mkdtempSync(join(tmpdir(), "agx-node-id-"));
+const TMP = scratchDir(join(tmpdir(), "agx-node-id-"));
 const BIN = join(TMP, "bin");
 const REPO = join(TMP, "repo");
 const ARGV = join(TMP, "gh-argv");
@@ -113,3 +114,5 @@ describe("what gh is handed", () => {
     expect(edit![i - 1]).toBe("-f");
   });
 });
+
+afterAll(removeScratch);

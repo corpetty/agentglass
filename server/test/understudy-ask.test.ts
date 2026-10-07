@@ -19,10 +19,11 @@
  *   worse than one that says nothing, because from the outside the two are
  *   indistinguishable.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let U: typeof import("../src/understudy.ts");
 let ASK: typeof import("../src/understudy-ask.ts");
@@ -31,7 +32,7 @@ const OPEN = "agentglass";
 const CLOSED = "closed";
 
 beforeAll(async () => {
-  const jail = mkdtempSync(join(tmpdir(), "agx-ask-"));
+  const jail = scratchDir(join(tmpdir(), "agx-ask-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -158,3 +159,5 @@ describe("a question lands in the drawer its answer was filed in", () => {
     }
   });
 });
+
+afterAll(removeScratch);

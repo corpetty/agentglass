@@ -9,9 +9,10 @@
 // the gap between the spelling of a path and what the kernel opens; stubbing
 // either side asserts the bug away.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ROOT0 = process.env.AGENTGLASS_ROOT;
 let box: string;     // the workspace
@@ -19,11 +20,11 @@ let repo: string;    // a checkout inside it
 let outside: string; // somewhere the workspace does not reach
 
 beforeAll(() => {
-  box = realpathSync(mkdtempSync(join(tmpdir(), "agx-symesc-")));
+  box = realpathSync(scratchDir(join(tmpdir(), "agx-symesc-")));
   repo = join(box, "repo");
   mkdirSync(join(repo, "src"), { recursive: true });
   writeFileSync(join(repo, "src", "a.ts"), "export const a = 1;\n");
-  outside = realpathSync(mkdtempSync(join(tmpdir(), "agx-symesc-out-")));
+  outside = realpathSync(scratchDir(join(tmpdir(), "agx-symesc-out-")));
   mkdirSync(join(outside, "config"));
   writeFileSync(join(outside, "config", "token"), "fake-token-0000\n");
   // A link to a directory outside, one to a file outside, one to nothing
@@ -234,3 +235,5 @@ describe("the /files/ narrowing judges the path that is opened", () => {
     expect(filesReach("/files/exist", e)).toContain("/home/orbit/.ssh/id_orbit");
   });
 });
+
+afterAll(removeScratch);

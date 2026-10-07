@@ -4,12 +4,13 @@
  * the working repo tracks, so pushes are hermetic.
  */
 import { afterAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { identify } from "./gitIdentity.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-tags-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-tags-")));
 process.env.AGENTGLASS_ROOT = dir;
 const { createTag, deleteTag, pushTag, deleteRemoteTag, tags } = await import("../src/gitwork.ts");
 
@@ -100,3 +101,5 @@ describe("tags", () => {
     expect(r.error).toBe("no such remote");
   });
 });
+
+afterAll(removeScratch);

@@ -5,9 +5,10 @@
 // the app was simply dead, with a stack trace and no port. These pin that a
 // corrupt config degrades to "no scope" instead.
 import { afterAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const XDG0 = process.env.XDG_CONFIG_HOME;
 const ROOT0 = process.env.AGENTGLASS_ROOT;
@@ -17,7 +18,7 @@ afterAll(() => {
 });
 
 function loadWith(json: string) {
-  const dir = mkdtempSync(join(tmpdir(), "agx-config-"));
+  const dir = scratchDir(join(tmpdir(), "agx-config-"));
   mkdirSync(join(dir, "agentglass"), { recursive: true });
   writeFileSync(join(dir, "agentglass", "config.json"), json);
   process.env.XDG_CONFIG_HOME = dir;
@@ -66,3 +67,5 @@ describe("config load tolerates a corrupt config.json", () => {
     expect(cfg.configuredRepoDirs()).toEqual(["/tmp/agx-ok"]);
   });
 });
+
+afterAll(removeScratch);

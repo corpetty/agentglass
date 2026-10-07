@@ -5,11 +5,12 @@
 // batch boundaries, and — the deliberate part — steps over a single abnormally
 // large line without dropping its neighbours. Each test below is one of those.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-batch-"));
+const dir = scratchDir(join(tmpdir(), "agx-batch-"));
 const PROJECTS = join(dir, "projects", "-tmp-batchproj");
 mkdirSync(PROJECTS, { recursive: true });
 // Sweep this fixture, never ~/.claude/projects. Set before importing.
@@ -170,3 +171,5 @@ describe("batched transcript sweep", () => {
     }
   });
 });
+
+afterAll(removeScratch);

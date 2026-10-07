@@ -10,11 +10,12 @@ import { afterAll, beforeEach, describe, expect, it } from "bun:test";
  * a shallower version of every test below and freeze the catalogue on the day
  * somebody first touched it.
  */
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const TMP = mkdtempSync(join(tmpdir(), "agx-review-prompts-"));
+const TMP = scratchDir(join(tmpdir(), "agx-review-prompts-"));
 const FILE = join(TMP, "review-prompts.json");
 
 const P = await import("../src/reviewPrompts.ts");
@@ -213,3 +214,5 @@ describe("the text that reaches the agent", () => {
     expect(out).toContain("Stay on the branch.");
   });
 });
+
+afterAll(removeScratch);

@@ -48,14 +48,15 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "upstream");
 const HOOKS = join(FIXTURES, "hooks");
 
-const dir = mkdtempSync(join(tmpdir(), "agx-upstream-"));
+const dir = scratchDir(join(tmpdir(), "agx-upstream-"));
 // Sweep this fixture tree, never the developer's ~/.claude/projects. Read per
 // sweep by the scanner, so it holds however the module got imported.
 process.env.AGENTGLASS_PROJECTS_DIR = join(dir, "projects");
@@ -496,3 +497,5 @@ describe("OTLP GenAI attributes", () => {
     expect(n.usage_is_cumulative).toBe(false);
   });
 });
+
+afterAll(removeScratch);

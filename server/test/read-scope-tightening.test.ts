@@ -11,17 +11,18 @@
  * read-scope-live.test.ts.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { scopeNeeded } from "../src/auth.ts";
 import { scopedTurn, noteTurnSender, sentTurnTo, turnSenderKey } from "../src/chat.ts";
 import { takeSpawnSlot } from "../src/spawncap.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 // prs.ts reads its pull-request cache when it loads; point it at an empty one
 // before it does, never at the developer's own.
 const savedCache = process.env.AGENTGLASS_CACHE_DIR;
-const cacheDir = mkdtempSync(join(tmpdir(), "agx-readscope-"));
+const cacheDir = scratchDir(join(tmpdir(), "agx-readscope-"));
 process.env.AGENTGLASS_CACHE_DIR = cacheDir;
 const { assetReferenced, __seedDetail } = await import("../src/prs.ts");
 afterAll(() => {
@@ -152,3 +153,5 @@ describe("the routes ask the rules above", () => {
     expect(block.indexOf("takeSpawnSlot(")).toBeLessThan(block.indexOf('pathname === "/docker/disk"'));
   });
 });
+
+afterAll(removeScratch);

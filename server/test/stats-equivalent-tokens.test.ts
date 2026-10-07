@@ -22,11 +22,12 @@
  * imported it first. An in-process version of this file found zero of its own
  * rows in a full run while passing on its own.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { equivalentTokens, priceFor, modelLabel } from "../src/pricing.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 type Row = Record<string, any>;
 let out: Row;
@@ -37,7 +38,7 @@ const MODELS = ["claude-opus-4.5", "claude-haiku-4.5", "gpt-5.2-pro"];
 const IN_OUT = 1_500;
 
 beforeAll(() => {
-  const dir = mkdtempSync(join(tmpdir(), "agx-eqstats-"));
+  const dir = scratchDir(join(tmpdir(), "agx-eqstats-"));
   const p = Bun.spawnSync(["bun", "run", new URL("./fixtures/eqtok-probe.ts", import.meta.url).pathname, dir], {
     // Named, never `...process.env`: this suite's own AGENTGLASS_DB and
     // workspace scope are precisely what the child must not inherit.
@@ -162,3 +163,5 @@ describe("the price table backs all of it", () => {
     for (const m of MODELS) expect(priceFor(m), m).not.toBeNull();
   });
 });
+
+afterAll(removeScratch);

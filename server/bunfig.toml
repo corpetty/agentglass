@@ -1,5 +1,5 @@
-# Every suite here opens scratch directories under /tmp and almost none of them
-# remove one. See test/tmpsweep.ts for what that cost and why the cleanup lives
-# in a preload rather than in 182 `afterAll`s.
+# Every suite here opens scratch directories under /tmp. Each file removes its
+# own (test/scratch.ts); test/tmpsweep.ts is the backstop for the rest, and
+# says why both exist.
 [test]
 preload = ["./test/isolation.ts", "./test/tmuxleak.ts", "./test/tmpsweep.ts"]

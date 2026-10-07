@@ -7,16 +7,17 @@
  * a delete-and-add — a saved reply is referred to by id from a menu that may be open
  * while it is being changed.
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MAX_REPLIES, __setSavedRepliesPath, putSavedReply, removeSavedReply, savedReplies } from "../src/savedReplies.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 let file = "";
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-replies-"));
+  dir = scratchDir(join(tmpdir(), "agx-replies-"));
   file = join(dir, "saved-replies.json");
   __setSavedRepliesPath(file);
 });
@@ -96,3 +97,5 @@ describe("saved replies", () => {
     expect(savedReplies()).toEqual([{ id: "a", title: "t", text: "x" }]);
   });
 });
+
+afterAll(removeScratch);

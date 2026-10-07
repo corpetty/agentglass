@@ -19,13 +19,13 @@
  * one is the only user of C2, C3, C6 and C8, and the seal counts it asserts are
  * measured as a delta across its own writes for the same reason.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { beforeAll, describe, expect, test, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { wilsonLower } from "../../shared/wilson.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-understudy-score-"));
+const dir = scratchDir(join(tmpdir(), "agx-understudy-score-"));
 process.env.AGENTGLASS_DB = join(dir, "score.db");
 process.env.XDG_CONFIG_HOME = dir;
 
@@ -314,3 +314,5 @@ describe("halt", () => {
     expect(u.scorecard().halted).toBe(false);
   });
 });
+
+afterAll(removeScratch);

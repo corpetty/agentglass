@@ -27,10 +27,11 @@
  * windows — on his machine it would count HIS.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SOCKET = `agx-noempty-${process.pid}`;
 const REAL_SOCKET = process.env.AGENTGLASS_TMUX_SOCKET;
@@ -46,7 +47,7 @@ const have = tmuxCapability().available;
 beforeAll(() => {
   process.env.AGENTGLASS_TMUX_SOCKET = SOCKET;
   process.env.TMUX_TMPDIR = TMUX_TEST_TMPDIR;
-  dir = mkdtempSync(join(tmpdir(), "agx-noempty-"));
+  dir = scratchDir(join(tmpdir(), "agx-noempty-"));
 });
 afterAll(async () => {
   // The kill BEFORE the env is put back: restore first and it goes to whichever
@@ -129,3 +130,5 @@ describe("the session a run creates", () => {
     expect(await Bun.file(out).text()).toBe("reached-the-pane");
   });
 });
+
+afterAll(removeScratch);

@@ -16,15 +16,16 @@
  * `Date.now()`, and the spend lookup is injected — what is worth pinning is the
  * decision, not SQLite's ability to add.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import {
   periodWindow, periodLabel, budgetStatus, budgetScopeLabel, usable, emptyBudget, WARN_AT,
 } from "../src/budget.ts";
 import type { Budget } from "../../shared/types.ts";
 import { readBudgets } from "../src/config.ts";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const b = (over: Partial<Budget> = {}): Budget => ({ ...emptyBudget(), limit: 100, ...over });
 
@@ -98,7 +99,7 @@ describe("the window a period covers", () => {
       // Jailed: budget.ts imports db.ts, and a child with the real HOME opened
       // the developer's own database — running every migration on it, and
       // failing this test whenever the live app held a write lock on it.
-      const jail = mkdtempSync(join(tmpdir(), "agx-budget-tz-"));
+      const jail = scratchDir(join(tmpdir(), "agx-budget-tz-"));
       const r = Bun.spawnSync(["bun", "-e", script], {
         // NODE_ENV=test as well, so db.ts takes its test path even if a
         // variable above is missed.
@@ -234,7 +235,7 @@ describe("saying what a budget is about", () => {
 describe("reading budgets off disk", () => {
   const withConfig = <T,>(budgets: unknown, fn: () => T): T => {
     // A fresh directory per case, which is also what invalidates the cache.
-    const home = mkdtempSync(join(tmpdir(), "agx-bcfg-"));
+    const home = scratchDir(join(tmpdir(), "agx-bcfg-"));
     process.env.XDG_CONFIG_HOME = home;
     mkdirSync(join(home, "agentglass"), { recursive: true });
     writeFileSync(join(home, "agentglass", "config.json"), JSON.stringify({ budgets }));
@@ -271,8 +272,10 @@ describe("reading budgets off disk", () => {
   });
 
   test("and no budgets key at all is simply none", () => {
-    const home = mkdtempSync(join(tmpdir(), "agx-bcfg-"));
+    const home = scratchDir(join(tmpdir(), "agx-bcfg-"));
     process.env.XDG_CONFIG_HOME = home;
     expect(readBudgets()).toEqual([]);
   });
 });
+
+afterAll(removeScratch);

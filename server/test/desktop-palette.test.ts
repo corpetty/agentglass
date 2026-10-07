@@ -7,7 +7,7 @@
  * the terminal colours — with invented values.
  */
 import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { desktopTheme, parseColors, mix } from "../../shared/desktopPalette.ts";
@@ -90,7 +90,7 @@ describe("where the desktop keeps it", () => {
   /* Where Omarchy stages the theme: under HOME, whatever XDG_STATE_HOME says. */
   let root = "";
   beforeEach(() => {
-    home = mkdtempSync(join(tmpdir(), "agx-desk-"));
+    home = scratchDir(join(tmpdir(), "agx-desk-"));
     root = join(home, ".local", "state");
     process.env.HOME = home;
     delete process.env.XDG_STATE_HOME;
@@ -130,7 +130,7 @@ describe("where the desktop keeps it", () => {
     mkdirSync(join(dir, "theme"), { recursive: true });
     writeFileSync(join(dir, "theme", "colors.toml"), COLORS);
     writeFileSync(join(dir, "theme.name"), "orbit-night");
-    const elsewhere = mkdtempSync(join(tmpdir(), "agx-desk-state-"));
+    const elsewhere = scratchDir(join(tmpdir(), "agx-desk-state-"));
     process.env.XDG_STATE_HOME = elsewhere;
     try { expect(desktopPalette()?.name).toBe("Orbit Night"); }
     finally { rmSync(elsewhere, { recursive: true, force: true }); }
@@ -154,6 +154,7 @@ describe("where the desktop keeps it", () => {
 });
 
 import { rebuildMark } from "../src/desktopPalette.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 describe("the desktop's mark, rebuilt from geometry", () => {
   const MARK = `<svg fill="none" height="10" viewBox="0 0 40 10" width="40" xmlns="http://www.w3.org/2000/svg"><g fill="#000"><path clip-rule="evenodd" d="m0 0h10v10h-10z" fill-rule="evenodd"/><path d="m20 0h10v10h-10z"/></g></svg>`;
@@ -182,3 +183,5 @@ describe("the desktop's mark, rebuilt from geometry", () => {
     expect(rebuildMark("<svg><path d=\"m0 0\"/></svg>")).toBeNull();
   });
 });
+
+afterAll(removeScratch);

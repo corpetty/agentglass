@@ -12,15 +12,16 @@
 // byte-for-byte assertions hold regardless; TMUX_TMPDIR and an empty
 // XDG_RUNTIME_DIR keep them from perturbing a real tmux/nvim while tests run.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ENV0 = { ...process.env };
-const home = mkdtempSync(join(tmpdir(), "agx-238-home-"));
+const home = scratchDir(join(tmpdir(), "agx-238-home-"));
 const config = join(home, ".config");
-const runtime = mkdtempSync(join(tmpdir(), "agx-238-run-"));
-const tmuxTmp = mkdtempSync(join(tmpdir(), "agx-238-tmux-"));
+const runtime = scratchDir(join(tmpdir(), "agx-238-run-"));
+const tmuxTmp = scratchDir(join(tmpdir(), "agx-238-tmux-"));
 mkdirSync(config, { recursive: true });
 
 process.env.HOME = home;
@@ -245,3 +246,5 @@ test("the theme colours the status bar without deciding what is in it", async ()
   expect(conf).not.toMatch(/^set -g status-left "/m);
   expect(conf).not.toMatch(/^set -g status-right "/m);
 });
+
+afterAll(removeScratch);

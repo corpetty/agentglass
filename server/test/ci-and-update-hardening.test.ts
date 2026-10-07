@@ -2,10 +2,11 @@
 // moment it runs: a third-party action resolved from a moving tag, a token left
 // on disk for the next step, an update built from whatever a tag points at
 // today. These assert the source, because there is no runner here to ask.
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ROOT = join(import.meta.dir, "..", "..");
 const WF = join(ROOT, ".github", "workflows");
@@ -155,7 +156,7 @@ describe("self-update.sh on a fixture origin", () => {
   const run = (tagKind: "lightweight" | "annotated",
     { files = {}, bin = {}, env = {}, sign = true }:
       { files?: Record<string, string>; bin?: Record<string, string>; env?: Record<string, string>; sign?: boolean | "wrong-key" | "pgp-with-fake-marker" } = {}) => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-upd-"));
+    const dir = scratchDir(join(tmpdir(), "agx-upd-"));
     // Declared outside `try` so `finally` — a sibling block, not nested
     // inside it — can still see them for cleanup.
     let gnupgHome = "";
@@ -304,7 +305,7 @@ describe("self-update.sh on a fixture origin", () => {
   // M3, reproduced: the ref name alone was trusted; the signed object could
   // have been cut for a different tag entirely.
   test("a signed tag object republished under a different ref name is refused", () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-upd-replay-"));
+    const dir = scratchDir(join(tmpdir(), "agx-upd-replay-"));
     try {
       const origin = join(dir, "origin");
       const home = join(dir, "home");
@@ -348,3 +349,5 @@ describe("self-update.sh on a fixture origin", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+afterAll(removeScratch);

@@ -8,17 +8,18 @@
  * written when a turn runs, so "the newest reading wins" is not a nicety, it is
  * the difference between today's number and one from last week.
  */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import { afterEach, describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { windowLabel } from "../../shared/quota.ts";
 import { codexUsage, __resetCodexUsageCache } from "../src/codexusage.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string | null = null;
 
 function home(): string {
-  dir = mkdtempSync(join(tmpdir(), "agx-codex-usage-"));
+  dir = scratchDir(join(tmpdir(), "agx-codex-usage-"));
   process.env.CODEX_HOME = dir;
   __resetCodexUsageCache();
   return dir;
@@ -187,3 +188,5 @@ describe("when there is nothing to read", () => {
     expect(JSON.stringify(codexUsage())).not.toContain(root);
   });
 });
+
+afterAll(removeScratch);

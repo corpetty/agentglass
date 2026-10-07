@@ -15,12 +15,13 @@
  * holding a device credential. Hence a test that speaks HTTP.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const TOKEN = "env-reveal-route-token";
 /** The scheme the packaged app serves its renderer from. Nothing on the web can
@@ -30,7 +31,7 @@ const DESKTOP = "agentglass://app";
 let dir = "", base = "", proc: ReturnType<typeof Bun.spawn> | null = null;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-envroute-"));
+  dir = scratchDir(join(tmpdir(), "agx-envroute-"));
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   proc = Bun.spawn(["bun", "run", new URL("../src/index.ts", import.meta.url).pathname], {
@@ -155,3 +156,5 @@ describe("revealing one", () => {
     expect(body).not.toContain("not-a-real-secret-but-shaped-like-one");
   });
 });
+
+afterAll(removeScratch);

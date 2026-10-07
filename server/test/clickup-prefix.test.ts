@@ -8,16 +8,17 @@
  * second must never act on an empty answer — "nothing read yet" is not "not
  * ours" — and the only way to keep that honest is to pin what empty means here.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, afterAll } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ASSIGNED_VIEW_ID } from "../../shared/providers.ts";
 import type { ProviderTask, SavedView } from "../../shared/providers.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const V = await import("../src/clickupviews.ts");
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cuprefix-"));
+const dir = scratchDir(join(tmpdir(), "agx-cuprefix-"));
 
 beforeEach(() => { V.__setViewsPath(join(dir, `${Math.random().toString(36).slice(2)}.json`)); });
 afterEach(() => { V.__setViewsPath(null); });
@@ -127,3 +128,5 @@ describe("what the saved-view list can and cannot be asked", () => {
 
 // The temp directory outlives the individual files each test wrote into it.
 process.on("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* going away anyway */ } });
+
+afterAll(removeScratch);

@@ -18,10 +18,11 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DbNotice } from "../../shared/types.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const ASK = `${JSON.stringify(new URL("../src/db.ts", import.meta.url).pathname)}`;
 /** Ask a fresh process where its database is. NODE_ENV is cleared: under
@@ -63,15 +64,15 @@ function rowsOf(path: string): string[] {
 
 describe("where a second server puts its database", () => {
   test("a state directory of its own owns the database too", async () => {
-    const state = mkdtempSync(join(tmpdir(), "agx-state-"));
+    const state = scratchDir(join(tmpdir(), "agx-state-"));
     const where = await dbPathWith({ AGENTGLASS_STATE_DIR: state, AGENTGLASS_DB: "" });
     expect(where, "a probe with its own state directory opened the real history").toBe(join(state, "agentglass.db"));
     expect(existsSync(where)).toBe(true);
   });
 
   test("an explicit AGENTGLASS_DB still wins — naming a file is the stronger statement", async () => {
-    const state = mkdtempSync(join(tmpdir(), "agx-state-"));
-    const asked = join(mkdtempSync(join(tmpdir(), "agx-asked-")), "mine.db");
+    const state = scratchDir(join(tmpdir(), "agx-state-"));
+    const asked = join(scratchDir(join(tmpdir(), "agx-asked-")), "mine.db");
     const where = await dbPathWith({ AGENTGLASS_STATE_DIR: state, AGENTGLASS_DB: asked });
     expect(where).toBe(asked);
   });
@@ -86,10 +87,10 @@ describe("where a second server puts its database", () => {
    * somebody is looking.
    */
   test("a stray agentglass.db in the working directory does not shadow the data dir", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     historyAt(stray, "stale");
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     mkdirSync(join(data, "agentglass"));
     historyAt(current, "current");
@@ -107,10 +108,10 @@ describe("where a second server puts its database", () => {
   });
 
   test("the switch command in that notice moves the history over, rows in the -wal included", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     historyAt(stray, "stale");
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     mkdirSync(join(data, "agentglass"));
     historyAt(current, "current");
@@ -130,11 +131,11 @@ describe("where a second server puts its database", () => {
    * original stays where it was, byte for byte.
    */
   test("with no database in the data dir yet, the stray one is copied there once and left alone", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     historyAt(stray, "orbit-history");
     const before = { main: readFileSync(stray), wal: readFileSync(stray + "-wal") };
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     const env = { XDG_DATA_HOME: data, AGENTGLASS_DB: "", AGENTGLASS_STATE_DIR: "" };
 
@@ -160,13 +161,13 @@ describe("where a second server puts its database", () => {
   test("a -wal left behind by a deleted data-dir database is not replayed over the copy", async () => {
     // The data dir's database was deleted but its -wal survived: SQLite would
     // replay those old pages over the fresh copy, and quick_check still says ok.
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     historyAt(stray, "orbit-history");
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     mkdirSync(join(data, "agentglass"));
-    const old = join(mkdtempSync(join(tmpdir(), "agx-old-")), "agentglass.db");
+    const old = join(scratchDir(join(tmpdir(), "agx-old-")), "agentglass.db");
     historyAt(old, "deleted-history");
     writeFileSync(current + "-wal", readFileSync(old + "-wal"));
     // And a marker from an earlier copy of the same file must not hide it.
@@ -180,10 +181,10 @@ describe("where a second server puts its database", () => {
   });
 
   test("a failed copy clears the marker of an earlier one, so the stray file is reported", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     writeFileSync(stray, "not a database");
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     mkdirSync(join(data, "agentglass"));
     writeFileSync(current + ".imported-from", stray + "\n");
@@ -193,10 +194,10 @@ describe("where a second server puts its database", () => {
   });
 
   test("a stray file that is not a database is not copied over an empty data dir", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
     const stray = join(cwd, "agentglass.db");
     writeFileSync(stray, "not a database, just a file with that name");
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const current = join(data, "agentglass", "agentglass.db");
     const { path, notice } = await dbPathAndWarning(
       { XDG_DATA_HOME: data, AGENTGLASS_DB: "", AGENTGLASS_STATE_DIR: "" }, cwd,
@@ -207,8 +208,8 @@ describe("where a second server puts its database", () => {
   });
 
   test("no stray file, no warning", async () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agx-cwd-"));
-    const data = mkdtempSync(join(tmpdir(), "agx-data-"));
+    const cwd = scratchDir(join(tmpdir(), "agx-cwd-"));
+    const data = scratchDir(join(tmpdir(), "agx-data-"));
     const { path, err, notice } = await dbPathAndWarning(
       { XDG_DATA_HOME: data, AGENTGLASS_DB: "", AGENTGLASS_STATE_DIR: "" }, cwd,
     );
@@ -217,3 +218,5 @@ describe("where a second server puts its database", () => {
     expect(notice).toBeNull();
   });
 });
+
+afterAll(removeScratch);

@@ -14,9 +14,10 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const yaml = await Bun.file(new URL("../../.github/workflows/plugin-approve.yml", import.meta.url)).text();
 
@@ -43,7 +44,7 @@ const listed = (id: string, url: string) => ({
 });
 
 let dir = "";
-beforeAll(() => { dir = mkdtempSync(join(tmpdir(), "agx-approve-")); });
+beforeAll(() => { dir = scratchDir(join(tmpdir(), "agx-approve-")); });
 afterAll(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* fine */ } });
 
 type Run = { code: number | null; stderr: string; stdout: string; catalogue: { plugins: Record<string, unknown>[] }; refused: string; body: string };
@@ -52,7 +53,7 @@ function approve(opts: {
   source?: string; publisher?: string; name?: string; sha?: string;
   plugins?: unknown[]; hash?: unknown; baseline?: unknown; preview?: boolean;
 }): Run {
-  const at = mkdtempSync(join(dir, "run-"));
+  const at = scratchDir(join(dir, "run-"));
   const plugin = join(at, "plugin");
   mkdirSync(plugin);
   if (opts.preview) writeFileSync(join(plugin, "preview.png"), "png");
@@ -245,7 +246,7 @@ describe("the listed commit is the one the check validated", () => {
   const LABELLED = [{ label: "approved for listing", created_at: "2026-09-22T11:00:00Z" }];
 
   function decide(opts: { comments?: unknown[]; events?: unknown[]; head?: string; repo?: string }) {
-    const at = mkdtempSync(join(dir, "decide-"));
+    const at = scratchDir(join(dir, "decide-"));
     writeFileSync(join(at, "comments.jsonl"), (opts.comments ?? [bot(marker())]).map((x) => JSON.stringify(x)).join("\n") + "\n");
     writeFileSync(join(at, "events.jsonl"), (opts.events ?? LABELLED).map((x) => JSON.stringify(x)).join("\n") + "\n");
     writeFileSync(join(at, "head"), (opts.head ?? VALIDATED) + "\n");
@@ -407,7 +408,7 @@ describe("the listing merges on its own only behind the catalogue check", () => 
 
   /** Whether the gate lets auto-merge be armed over these rules (one per line, as `gh api --paginate --jq` prints them). */
   function armed(rules: unknown[] | string): boolean {
-    const at = mkdtempSync(join(dir, "gate-"));
+    const at = scratchDir(join(dir, "gate-"));
     writeFileSync(join(at, "rules.jsonl"), typeof rules === "string" ? rules : rules.map((r) => JSON.stringify(r)).join("\n") + "\n");
     writeFileSync(join(at, "gate.py"), gate(yaml));
     const r = spawnSync("python3", ["gate.py"], { cwd: at, encoding: "utf8", env: { PATH: process.env.PATH, RULES: join(at, "rules.jsonl") } });
@@ -459,7 +460,7 @@ describe("the approval runs only on an issue that is ready for listing", () => {
   }
 
   function run(labels: string): { code: number | null; stdout: string } {
-    const at = mkdtempSync(join(dir, "who-"));
+    const at = scratchDir(join(dir, "who-"));
     mkdirSync(join(at, "bin"));
     writeFileSync(join(at, "bin", "gh"), `#!/bin/sh
 case "$*" in
@@ -486,3 +487,5 @@ esac
     expect(r.stdout).toContain("ready for listing");
   });
 });
+
+afterAll(removeScratch);

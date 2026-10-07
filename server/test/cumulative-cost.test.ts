@@ -7,12 +7,13 @@
 // the parent's rate. sumTranscriptCost prices each transcript message at its own
 // message.model, and the DB charges the difference of those totals, so the switch
 // is billed correctly.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sumTranscriptCost, normalize } from "../src/ingest.ts";
 import { costUsd } from "../src/pricing.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const OPUS = "claude-opus-4-8";
 const HAIKU = "claude-haiku-4-5";
@@ -51,7 +52,7 @@ describe("sumTranscriptCost prices each turn at its own model", () => {
 });
 
 // --- DB path: a model switch across two cumulative events -------------------
-const dir = mkdtempSync(join(tmpdir(), "agx-cumcost-"));
+const dir = scratchDir(join(tmpdir(), "agx-cumcost-"));
 const PROJ = join(dir, "proj");
 mkdirSync(PROJ, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "cumcost.db");
@@ -89,3 +90,5 @@ describe("insertEvent charges a mid-run model switch at the right rates", () => 
     expect(s.cost_usd).not.toBeCloseTo(wrong, 6);
   });
 });
+
+afterAll(removeScratch);

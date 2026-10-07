@@ -25,11 +25,12 @@
 // saw the sleep. The test was measuring its own fix. Config lives in the repo
 // and reaches git either way, which is what makes the failure real.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-git-timeout-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-git-timeout-")));
 const REPO = join(dir, "repo");
 const HELD = join(dir, "held");
 
@@ -130,3 +131,5 @@ describe("a git that never answers", () => {
     expect(r.stderr.trim().length).toBeGreaterThan(0);
   });
 });
+
+afterAll(removeScratch);

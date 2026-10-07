@@ -13,10 +13,11 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contentHash, walkPluginDir } from "../src/plugin-sources.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const CHECK = new URL("../../scripts/catalogue-check.py", import.meta.url).pathname;
 const ci = await Bun.file(new URL("../../.github/workflows/ci.yml", import.meta.url)).text();
@@ -31,7 +32,7 @@ const git = (cwd: string, ...args: string[]) => {
 };
 
 beforeAll(() => {
-  root = mkdtempSync(join(tmpdir(), "agx-catalogue-check-"));
+  root = scratchDir(join(tmpdir(), "agx-catalogue-check-"));
   repo = join(root, "acme", "orbit-clock");
   mkdirSync(repo, { recursive: true });
   git(repo, "init", "-q", "-b", "main");
@@ -88,7 +89,7 @@ const entry = (over: Record<string, unknown> = {}) => ({
 
 /** `gitconfig`, when given, is the global git config the check runs under. */
 function check(base: unknown, head: unknown, gitconfig?: string): { code: number | null; out: string } {
-  const at = mkdtempSync(join(root, "run-"));
+  const at = scratchDir(join(root, "run-"));
   writeFileSync(join(at, "base.json"), JSON.stringify(base));
   writeFileSync(join(at, "head.json"), JSON.stringify(head));
   if (gitconfig !== undefined) writeFileSync(join(at, "gitconfig"), gitconfig);
@@ -269,3 +270,5 @@ describe("the published catalogue", () => {
     }
   });
 });
+
+afterAll(removeScratch);

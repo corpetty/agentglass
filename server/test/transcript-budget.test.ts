@@ -5,11 +5,12 @@
 // budget passed over is still visible to a light sweep (it is not mistaken for
 // a finished one).
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-budget-"));
+const dir = scratchDir(join(tmpdir(), "agx-budget-"));
 const PROJECTS = join(dir, "projects", "-tmp-budgetproj");
 mkdirSync(PROJECTS, { recursive: true });
 process.env.AGENTGLASS_PROJECTS_DIR = join(dir, "projects");
@@ -76,3 +77,5 @@ describe("budgeted transcript sweep", () => {
     expect(count("b-old")).toBe(3);
   });
 });
+
+afterAll(removeScratch);

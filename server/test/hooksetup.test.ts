@@ -3,13 +3,14 @@
 // port of hooks/install_hooks.py — so the property that matters most is that the
 // two AGREE: either can undo the other, and neither disturbs a third party's
 // hooks. Every case here is one a real settings.json can be in.
-import { describe, expect, test, beforeEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { applyHooks, applyGate, hookStatus, hooksDir, hookCommand, _internal } from "../src/hooksetup.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const { doInstall, doUninstall, isOurs, EVENTS, MARKER } = _internal;
 
@@ -28,7 +29,7 @@ function readSettings(): any {
 }
 
 beforeEach(() => {
-  HOME = mkdtempSync(join(tmpdir(), "agx-hooks-"));
+  HOME = scratchDir(join(tmpdir(), "agx-hooks-"));
   process.env.HOME = HOME;
   delete process.env.USERPROFILE; // homedir() prefers this on some platforms
 });
@@ -226,7 +227,7 @@ describe("golden parity with install_hooks.py", () => {
 
     // Python side: a separate project tree, installed via --project so it writes
     // <proj>/.claude/settings.json using the same repo hooks dir.
-    const proj = mkdtempSync(join(tmpdir(), "agx-pyproj-"));
+    const proj = scratchDir(join(tmpdir(), "agx-pyproj-"));
     mkdirSync(join(proj, ".claude"), { recursive: true });
     writeFileSync(join(proj, ".claude", "settings.json"), JSON.stringify(seed, null, 2));
     const run = spawnSync("python3", [join(repoHooks!, "install_hooks.py"), "--project", proj], { encoding: "utf8" });
@@ -313,7 +314,7 @@ describe("golden parity with install_hooks.py --gate", () => {
     applyGate("install");
     const tsOut = readSettings();
 
-    const proj = mkdtempSync(join(tmpdir(), "agx-pygate-"));
+    const proj = scratchDir(join(tmpdir(), "agx-pygate-"));
     mkdirSync(join(proj, ".claude"), { recursive: true });
     writeFileSync(join(proj, ".claude", "settings.json"), JSON.stringify(seed, null, 2));
     const run = spawnSync("python3", [join(repoHooks!, "install_hooks.py"), "--gate", "--project", proj], { encoding: "utf8" });
@@ -329,3 +330,5 @@ describe("golden parity with install_hooks.py --gate", () => {
     rmSync(proj, { recursive: true, force: true });
   });
 });
+
+afterAll(removeScratch);

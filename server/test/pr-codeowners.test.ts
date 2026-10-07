@@ -7,15 +7,16 @@
  * differently depending on which you read, and the one it enforces is the one to
  * show.
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { codeowners } from "../src/prs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir = "";
 const repo = () => {
-  dir = mkdtempSync(join(tmpdir(), "agx-owners-"));
+  dir = scratchDir(join(tmpdir(), "agx-owners-"));
   Bun.spawnSync(["git", "-C", dir, "init", "-q"]);
   return dir;
 };
@@ -76,3 +77,5 @@ describe("codeowners", () => {
     expect(r.ok).toBe(false);
   });
 });
+
+afterAll(removeScratch);

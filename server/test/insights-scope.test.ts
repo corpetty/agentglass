@@ -4,12 +4,13 @@
 // queries (scope.test.ts), but which getInsights() never applied. Both
 // directions are asserted: what should appear does, and what should not still
 // does not (project isolation, the highest-risk class here).
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-insights-scope-"));
+const dir = scratchDir(join(tmpdir(), "agx-insights-scope-"));
 const SCOPED = join(dir, "scoped");
 const OTHER = join(dir, "other");
 const MONO = join(dir, "mono"); // root outside the scope, but its turn ran inside it (cwd)
@@ -118,3 +119,5 @@ describe("insights are scoped to the project", () => {
     expect(cacheIds.some((id) => id.startsWith("cache:other:"))).toBe(false);
   });
 });
+
+afterAll(removeScratch);

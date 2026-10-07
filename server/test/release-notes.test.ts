@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Release notes read from the update clone.
@@ -21,7 +22,7 @@ const NOTES = "### Terminal\n\n- tmux windows are the panel's own tabs (#154).\n
 beforeAll(async () => {
   // A fixture clone, not the developer's real one under ~/.cache: selfupdate.ts
   // reads AGENTGLASS_UPDATE_SRC, set here before it is imported.
-  clone = join(mkdtempSync(join(tmpdir(), "agx-notes-")), "source");
+  clone = join(scratchDir(join(tmpdir(), "agx-notes-")), "source");
   process.env.AGENTGLASS_UPDATE_SRC = clone;
   mkdirSync(clone, { recursive: true });
   run(clone, "init", "-q", "-b", "main");
@@ -36,7 +37,7 @@ beforeAll(async () => {
   run(clone, "tag", "v9.9.8");
   // A signed tag — every release is one now — so %(contents) includes the
   // trailing armor block along with the message.
-  const signKey = join(mkdtempSync(join(tmpdir(), "agx-notes-key-")), "k");
+  const signKey = join(scratchDir(join(tmpdir(), "agx-notes-key-")), "k");
   spawnSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", signKey]);
   spawnSync("git", ["-C", clone, "-c", "gpg.format=ssh", "-c", `user.signingkey=${signKey}`,
     "tag", "-s", "-a", "--cleanup=verbatim", "v9.9.7", "-F", "-"], { input: NOTES, encoding: "utf8" });
@@ -129,3 +130,5 @@ describe("release notes", () => {
     if (!r.ok) expect(typeof r.error).toBe("string");
   });
 });
+
+afterAll(removeScratch);

@@ -16,13 +16,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import { freePort } from "./freePort.ts";
 import { TMUX_TEST_TMPDIR } from "./tmuxTmp.ts";
 import { SERVER_BOOT_MS } from "./serverBoot.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const require = createRequire(import.meta.url);
 const shell = require("../../electron/server-probe.js") as {
@@ -121,7 +122,7 @@ describe("a server the app did not start", () => {
   let dir = "", base = "", port = 0, proc: ChildProcess | null = null, said = "";
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-claim-"));
+    dir = scratchDir(join(tmpdir(), "agx-claim-"));
     port = await freePort();
     base = `http://127.0.0.1:${port}`;
     proc = boot(dir, port, null);
@@ -270,7 +271,7 @@ describe("a server the app started", () => {
   const PIPED = "desk-key-down-the-pipe-0123456789abcdefghij";
 
   beforeAll(async () => {
-    dir = mkdtempSync(join(tmpdir(), "agx-claim-desk-"));
+    dir = scratchDir(join(tmpdir(), "agx-claim-desk-"));
     port = await freePort();
     base = `http://127.0.0.1:${port}`;
     proc = boot(dir, port, PIPED);
@@ -383,3 +384,5 @@ describe("the wiring", () => {
       'if (p.origin !== undefined || p.token !== undefined) window.dispatchEvent(new CustomEvent("agentglass:server-changed"));');
   });
 });
+
+afterAll(removeScratch);

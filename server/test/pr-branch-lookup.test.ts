@@ -22,13 +22,14 @@
 //     variable is stripped, so "logged out" is the real `gh` reaching its real
 //     logged-out branch (exit 4, no network) without this suite ever reading —
 //     or writing — the credentials of whoever is running it.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { chmodSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-prbranch-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-prbranch-")));
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_DB = join(dir, "b.db");
 
@@ -383,3 +384,5 @@ describe("what a found pull request looks like", () => {
     expect(shimLog()).toContain("--head feat/acme-panel --state open");
   }, 30_000);
 });
+
+afterAll(removeScratch);

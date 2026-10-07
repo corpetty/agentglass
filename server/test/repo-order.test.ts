@@ -14,9 +14,10 @@
 // written, measured against a real repo, and backed out.
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, realpathSync, utimesSync } from "node:fs";
+import { writeFileSync, rmSync, realpathSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, repo: string, gw: typeof import("../src/gitwork.ts"), wtm: typeof import("../src/worktree.ts");
 const wt = (name: string) => join(dir, `orbit-${name}`);
@@ -48,7 +49,7 @@ function commitAt(cwd: string, file: string, secondsAgo: number) {
 }
 
 beforeAll(async () => {
-  dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-order-")));
+  dir = realpathSync(scratchDir(join(tmpdir(), "agx-order-")));
   repo = join(dir, "orbit");
   // Scope the cockpit at the fixture, so discoverRepos takes its "one project
   // and its worktrees" path — the shape these dropdowns actually run in.
@@ -139,3 +140,5 @@ describe("repo picker order", () => {
     expect(await order()).toEqual(before);
   });
 });
+
+afterAll(removeScratch);

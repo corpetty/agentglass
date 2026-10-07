@@ -1,12 +1,13 @@
 // External harnesses retry when a POST times out, and some already know the
 // exact provider charge. The ingest seam must make retries safe and prefer an
 // authoritative per-event cost without changing the existing token counters.
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync } from "node:fs";
+import { describe, expect, test, afterAll } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-reliable-ingest-"));
+const dir = scratchDir(join(tmpdir(), "agx-reliable-ingest-"));
 const root = join(dir, "project");
 mkdirSync(root, { recursive: true });
 process.env.AGENTGLASS_DB = join(dir, "events.db");
@@ -178,3 +179,5 @@ describe("reported cost precedence", () => {
     expect(second.session.cost_usd).toBeCloseTo(7 + fullLocalEstimate - firstLocalEstimate, 10);
   });
 });
+
+afterAll(removeScratch);

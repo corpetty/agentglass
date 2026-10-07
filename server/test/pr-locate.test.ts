@@ -12,10 +12,11 @@
  * remote get-url` says.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { locateRepo } from "../src/prs.ts";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let dir: string, orbit: string, billing: string, bare: string;
 
@@ -33,7 +34,7 @@ function checkout(name: string, remote?: string): string {
 }
 
 beforeAll(() => {
-  dir = mkdtempSync(join(tmpdir(), "agx-pr-locate-"));
+  dir = scratchDir(join(tmpdir(), "agx-pr-locate-"));
   orbit = checkout("orbit", "https://github.com/acme/orbit.git");
   billing = checkout("billing", "git@github.com:acme/billing.git");
   bare = checkout("scratch");
@@ -60,3 +61,5 @@ describe("finding the checkout a pull request belongs to", () => {
     expect(await locateRepo("acme/scratch", [bare])).toBeNull();
   });
 });
+
+afterAll(removeScratch);

@@ -6,11 +6,12 @@
 // committed to a repository other people clone, so its property is silence:
 // outside a cloud session, or without its two settings, it sends nothing.
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-cloud-"));
+const dir = scratchDir(join(tmpdir(), "agx-cloud-"));
 process.env.AGENTGLASS_DB ||= join(dir, "cloud.db");
 process.env.XDG_CONFIG_HOME = dir;
 process.env.AGENTGLASS_HOST_ID = "hub";
@@ -127,3 +128,5 @@ describe("the hook", () => {
     expect(r).toEqual({ code: 0, out: "", err: "" });
   });
 });
+
+afterAll(removeScratch);

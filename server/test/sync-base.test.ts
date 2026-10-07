@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 /**
  * Against a real repository with a real worktree, because the whole point of
@@ -21,7 +22,7 @@ let repo: string, wt: string, gw: typeof import("../src/gitwork.ts");
 const run = (dir: string, ...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
 
 beforeAll(async () => {
-  repo = mkdtempSync(join(tmpdir(), "agx-base-"));
+  repo = scratchDir(join(tmpdir(), "agx-base-"));
   process.env.AGENTGLASS_ROOT = repo;
   run(repo, "init", "-q", "-b", "main");
   run(repo, "config", "user.email", "t@example.com");
@@ -133,10 +134,10 @@ let stack: string, originDir: string, stackWt: string;
 
 describe("a base that has moved on", () => {
   beforeAll(() => {
-    originDir = mkdtempSync(join(tmpdir(), "agx-origin-"));
+    originDir = scratchDir(join(tmpdir(), "agx-origin-"));
     run(originDir, "init", "-q", "--bare", "-b", "master");
 
-    stack = mkdtempSync(join(tmpdir(), "agx-stack-"));
+    stack = scratchDir(join(tmpdir(), "agx-stack-"));
     run(stack, "init", "-q", "-b", "master");
     run(stack, "config", "user.email", "t@example.com");
     run(stack, "config", "user.name", "t");
@@ -241,7 +242,7 @@ describe("a stack with no remote at all", () => {
   // to name: there, every branch is local and the distinction does not exist.
   let solo: string;
   beforeAll(() => {
-    solo = mkdtempSync(join(tmpdir(), "agx-solo-"));
+    solo = scratchDir(join(tmpdir(), "agx-solo-"));
     run(solo, "init", "-q", "-b", "main");
     run(solo, "config", "user.email", "t@example.com");
     run(solo, "config", "user.name", "t");
@@ -340,3 +341,5 @@ describe("syncFromBase", () => {
     expect(r.error).toMatch(/no base/i);
   });
 });
+
+afterAll(removeScratch);

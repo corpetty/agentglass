@@ -10,12 +10,13 @@
 // These pin the difference: the ignored file that git hides, the noise that
 // would bury it, and the two answers that must never read as "nothing to lose"
 // — a path that isn't ours, and a checkout we couldn't read at all.
-import { describe, expect, test, beforeAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync } from "node:fs";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { mkdirSync, writeFileSync, readFileSync, realpathSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = realpathSync(mkdtempSync(join(tmpdir(), "agx-leftovers-")));
+const dir = realpathSync(scratchDir(join(tmpdir(), "agx-leftovers-")));
 const REPO = join(dir, "repo");
 const WT = join(dir, "repo-feature");   // has ignored work in it
 const BARE = join(dir, "repo-empty");   // nothing but rebuildable noise
@@ -289,3 +290,5 @@ describe("rescueLeftovers", () => {
     expect(r.skipped?.[0]?.path).toBe("nope-does-not-exist");
   });
 });
+
+afterAll(removeScratch);

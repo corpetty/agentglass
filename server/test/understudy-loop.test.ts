@@ -21,7 +21,7 @@
  *   a worktree is cut fresh and never reused;
  *   a failed run is LEFT on disk, because it is the evidence.
  */
-import { describe, expect, test, beforeAll } from "bun:test";
+import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 
 /**
  * The end of the declaration that starts at `from`, for tests that read shape.
@@ -35,9 +35,10 @@ function endOfBlock(text: string, from: number): number {
   const close = text.indexOf("\n}", from);
   return close === -1 ? text.length : close;
 }
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 let L: typeof import("../src/understudy-loop.ts");
 let W: typeof import("../src/understudy-work.ts");
@@ -53,7 +54,7 @@ const ITEM = {
 };
 
 beforeAll(async () => {
-  jail = mkdtempSync(join(tmpdir(), "agx-loop-"));
+  jail = scratchDir(join(tmpdir(), "agx-loop-"));
   mkdirSync(join(jail, "config", "git"), { recursive: true });
   writeFileSync(join(jail, "config", "git", "private-terms.txt"), "\\bnothing\\b\n");
   process.env.AGENTGLASS_DB = join(jail, "t.db");
@@ -1591,3 +1592,5 @@ describe("the four ways a run used to leave the machine stuck", () => {
     expect(body).not.toContain('"-D", branch');
   });
 });
+
+afterAll(removeScratch);

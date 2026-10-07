@@ -13,11 +13,12 @@
  * a regression whose symptom is ten seconds of nothing.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
-const dir = mkdtempSync(join(tmpdir(), "agx-pf-"));
+const dir = scratchDir(join(tmpdir(), "agx-pf-"));
 const C = await import("../src/credentials.ts");
 const CU = await import("../src/clickup.ts");
 const P = await import("../src/providers.ts");
@@ -136,3 +137,5 @@ describe("what a status probe is allowed to cost", () => {
     expect(src).not.toMatch(/for \(const p of PROVIDERS\)/);
   });
 });
+
+afterAll(removeScratch);

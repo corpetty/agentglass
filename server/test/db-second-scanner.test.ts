@@ -11,12 +11,13 @@
 // batch instead of re-ingesting. Half two: the database is claimed at boot, so
 // the second process never starts a scanner at all, and a claim left behind by
 // a SIGKILLed process is taken over rather than honoured for ever.
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeScratch, scratchDir } from "./scratch.ts";
 
 const SRC = join(import.meta.dir, "..", "src");
 const scanUrl = pathToFileURL(join(SRC, "transcripts.ts")).href;
@@ -82,7 +83,7 @@ async function saysReady(p: ReturnType<typeof spawnServerLike>, word: string, ms
 
 describe("two server processes, one database", () => {
   test("a racing sweep abandons its batch instead of ingesting the same lines twice", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-2nd-scanner-"));
+    const dir = scratchDir(join(tmpdir(), "agx-2nd-scanner-"));
     const projects = join(dir, "projects");
     const proj = join(projects, "-second-scanner");
     const cwd = join(dir, "secondproj");
@@ -186,7 +187,7 @@ describe("two server processes, one database", () => {
   }, 30_000);
 
   test("the second process finds the file claimed and does not scan; a killed holder's claim is taken over", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agx-db-claim-"));
+    const dir = scratchDir(join(tmpdir(), "agx-db-claim-"));
     const dbFile = join(dir, "claimed.db");
     const env = { AGENTGLASS_DB: dbFile, XDG_CONFIG_HOME: join(dir, "cfg"), XDG_DATA_HOME: join(dir, "data") };
 
@@ -250,3 +251,5 @@ describe("two server processes, one database", () => {
     expect(JSON.parse(await out(third))).toEqual({ ok: true, tookOver: claimedPid, scanning: true });
   }, 90_000);
 });
+
+afterAll(removeScratch);

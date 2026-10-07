@@ -1,7 +1,8 @@
 // The fake install the installer tests drive electron/appctl.sh against.
-import { mkdtempSync, mkdirSync, copyFileSync } from "node:fs";
+import { mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scratchDir } from "./scratch.ts";
 
 export const APPCTL = join(import.meta.dir, "..", "..", "electron", "appctl.sh");
 
@@ -12,7 +13,7 @@ export const AWAIT_MAIN = 'for _ in $(seq 200); do [ -n "$(main_pids)" ] && brea
 /** A fake install: our own copy of a shell, named the way the real one is. The
  *  copy matters — /proc/<pid>/exe has to point inside the install directory. */
 export function fakeInstall(prefix = "agx-install-") {
-  const app = mkdtempSync(join(tmpdir(), prefix));
+  const app = scratchDir(join(tmpdir(), prefix));
   mkdirSync(join(app, "resources"));
   copyFileSync("/bin/sh", join(app, "agentglass"));
   copyFileSync("/bin/sh", join(app, "resources", "agentglass-server"));
