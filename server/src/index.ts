@@ -46,6 +46,7 @@ import {
   claimDatabase,
   releaseDatabaseClaim,
   noteWaitFromHook,
+  noteAccountFromHook,
 } from "./db.ts";
 import { maybeAlert, setAlertSink, pushDeviceStoreChanged, lanternSnapshot, pushJobFailed, pushAccountPaused, pushGate } from "./alerts.ts";
 import { noteAction, actorOf, type ActorSource } from "./actions.ts";
@@ -2991,6 +2992,9 @@ async function handleServerRequest(req: Request, srv: Server<WsData>): Promise<R
       // scanner check: an owned session's hook events never get past it, and
       // its notifications are hook-only, so this is the one place they exist.
       noteWaitFromHook(body);
+      // And which account it runs under, for the same reason: the scanner
+      // writes this session's rows, and only the hook knows (session_account).
+      noteAccountFromHook(body);
       /* The Lantern's own chat is an observer: its "waiting for your input"
          is you having asked it something, not an agent stopped on you, and
          the reminder to say what it is on would be the watcher watching
