@@ -18,7 +18,7 @@ import { basename, delimiter, dirname, join } from "node:path";
 import type { IngestBody } from "../../shared/types.ts";
 import { normalize } from "./ingest.ts";
 import { entered, backoff, terminalHot } from "./loopwatch.ts";
-import { db, insertEvent, setSessionTitles, upsertSessionMeta, titleFromFirstPrompt, RETENTION_DAYS, dbClaimedElsewhere, dbPath, type InsertResult } from "./db.ts";
+import { db, insertEvent, setSessionTitles, upsertSessionMeta, titleFromFirstPrompt, RETENTION_DAYS, dbClaimedElsewhere, dbPath, sessionAccount, type InsertResult } from "./db.ts";
 // safeAbs: translates Windows drive paths, so a WSL-side transcript groups
 // under its own folder rather than collapsing onto the server's cwd.
 import { projectRootOf, safeAbs } from "./git.ts";
@@ -384,7 +384,7 @@ function isMetaPrompt(o: Record<string, unknown>, text: string): boolean {
  */
 function lineToBodies(
   o: Record<string, unknown>,
-  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; rootAccount: string | null; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
+  ctx: { source_app: string; project_path: string; cwd: string; session_id: string; rootAccount: string | null; hookAccount: string | null; toolCalls: Map<string, { name: string; input: unknown }>; seenUsage: Set<string> },
   fallbackTs: number
 ): IngestBody[] {
   const type = str(o.type);
@@ -399,12 +399,15 @@ function lineToBodies(
     source_app: ctx.source_app,
     session_id: ctx.session_id,
     model_name: model ?? undefined,
-    // Which login wrote this transcript is authoritative (ctx.rootAccount, set
-    // when the file came from an account's own config dir). Only when the dir
-    // is untagged (the shared ~/.claude/projects) do we fall back to the
-    // cwd-prefix accountPaths — normalize() re-derives the same, but doing it
-    // here keeps the scan and live-hook paths symmetric.
-    account: ctx.rootAccount ?? accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
+    // The account the session's own hook named (AGENTGLASS_ACCOUNT) comes
+    // first, as docs/HARNESS.md orders it: /ingest turns this session's hook
+    // events away, so this is the only way that tag reaches a row. Then which
+    // login wrote this transcript (ctx.rootAccount, set when the file came
+    // from an account's own config dir). Only when the dir is untagged (the
+    // shared ~/.claude/projects) do we fall back to the cwd-prefix
+    // accountPaths — normalize() re-derives the same, but doing it here keeps
+    // the scan and live-hook paths symmetric.
+    account: ctx.hookAccount ?? ctx.rootAccount ?? accountForPath(ctx.cwd || ctx.project_path) ?? undefined,
   };
   // Shared payload bits so every event carries where it came from — this is
   // what the folder filter and the project column read.
@@ -937,7 +940,7 @@ async function ingestFile(
   if (refused.has(path)) refused.delete(path);
   if (cwd || (opts?.projectFor && project_path)) projectPaths.set(source_app, project_path);
 
-  const ctx = { source_app, project_path, cwd, session_id, rootAccount, toolCalls, seenUsage };
+  const ctx = { source_app, project_path, cwd, session_id, rootAccount, hookAccount: sessionAccount(session_id), toolCalls, seenUsage };
   let ingested = 0;
   const fileMtime = statSync(path).mtimeMs;
   // What the session is called. Both kinds are appended as their own lines and

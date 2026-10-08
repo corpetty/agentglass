@@ -1632,6 +1632,28 @@ CREATE TABLE IF NOT EXISTS session_role (
 `);
 
 /*
+ * The account a session's hook says it runs under (AGENTGLASS_ACCOUNT), kept
+ * for the scanner. docs/HARNESS.md makes that variable the first word on
+ * attribution, but a session the scanner owns has its hook events turned away
+ * at /ingest before they are stored, so the tag went with them and the scanner
+ * fell back to the login dir. Two desktop instances on one machine share the
+ * default ~/.claude, so every session from both was tagged `work`: measured on
+ * a node, one session had its first two events (before the scanner claimed it)
+ * as `personal` and the next 2,686 as `work`.
+ *
+ * A table, not a map in this process: the scanner can be running in another
+ * server process on the same database (the claim in this file), and the tag
+ * has to survive the restart a deploy is.
+ */
+db.run(`
+CREATE TABLE IF NOT EXISTS session_account (
+  session_id TEXT PRIMARY KEY,
+  account TEXT NOT NULL,
+  at INTEGER NOT NULL
+);
+`);
+
+/*
  * The understudy's one nap: when the agent's session limit is hit, the loop
  * sleeps until the reset the CLI announced and picks the work up again. One
  * row, overwritten; cleared by writing `until = 0`, never deleted — a person
@@ -2642,6 +2664,8 @@ export function pruneOldRows(): { events: number; sessions: number; rolled: numb
   db.run(`DELETE FROM seat_need WHERE done_at IS NOT NULL AND done_at < ?`, [Date.now() - UNDERSTUDY_STUB_DAYS * 86_400_000]);
   /* A role outlives its session by ninety days, then nothing needs it. */
   db.run(`DELETE FROM session_role WHERE at < ?`, [Date.now() - UNDERSTUDY_STUB_DAYS * 86_400_000]);
+  /* So does the account its hook named: the events already carry it. */
+  db.run(`DELETE FROM session_account WHERE at < ?`, [Date.now() - UNDERSTUDY_STUB_DAYS * 86_400_000]);
   /* A schedule that fired or was cancelled is a record, kept ninety days; one
      still waiting is a person's intent and is never swept. */
   db.run(`DELETE FROM agent_schedule WHERE (fired_at IS NOT NULL OR cancelled_at IS NOT NULL) AND created < ?`, [Date.now() - UNDERSTUDY_STUB_DAYS * 86_400_000]);
@@ -3758,6 +3782,25 @@ const roleUpsert = db.query<never, [string, string, number]>(`INSERT INTO sessio
 const roleAll = db.query<{ session_id: string; role: string }, []>(`SELECT session_id, role FROM session_role`);
 export function setSessionRole(sessionId: string, role: string, at = Date.now()): void { if (sessionId) roleUpsert.run(sessionId, role, at); }
 export function sessionRoles(): Map<string, string> { return new Map(roleAll.all().map((r) => [r.session_id, r.role])); }
+
+/* Written on every hook event, so it skips the write unless the account
+   changed or a day has passed: the day keeps `at` honest for the prune. */
+const accountUpsert = db.query<never, [string, string, number]>(
+  `INSERT INTO session_account (session_id, account, at) VALUES (?, ?, ?)
+   ON CONFLICT(session_id) DO UPDATE SET account = excluded.account, at = excluded.at
+   WHERE session_account.account != excluded.account OR session_account.at < excluded.at - 86400000`);
+const accountOne = db.query<{ account: string }, [string]>(`SELECT account FROM session_account WHERE session_id = ?`);
+/** Remember the account a hook names for its session — see session_account. */
+export function noteAccountFromHook(e: { session_id?: unknown; account?: unknown }, at = Date.now()): void {
+  const session = typeof e.session_id === "string" ? e.session_id : "";
+  const account = typeof e.account === "string" ? e.account.trim() : "";
+  if (!session || session === "unknown" || !account || account.length > 64) return;
+  try { accountUpsert.run(session, account, at); } catch { /* the scanner falls back to the login dir */ }
+}
+/** The account this session's hook named, if it ever named one. */
+export function sessionAccount(sessionId: string): string | null {
+  return accountOne.get(sessionId)?.account ?? null;
+}
 /** Sessions whose first prompt carries a marker — how the Lantern's chats
  *  from before the role existed are found, once, at boot. */
 export function sessionsWhosePromptStarts(mark: string): string[] {
