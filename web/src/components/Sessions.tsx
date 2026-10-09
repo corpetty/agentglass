@@ -8,14 +8,20 @@ import { usePoll } from "../lib/usePoll.ts";
 import { fmtUsd, fmtMs, fmtEq, modelColor, modelLabelOf } from "../lib/format.ts";
 import { sharedPhase } from "../lib/sharedPhase.ts";
 
-export const Sessions = memo(function Sessions({ provider = "", host = "", active = true }: { provider?: string; host?: string; active?: boolean }) {
+export const Sessions = memo(function Sessions({ provider = "", account = "", host = "", active = true }: { provider?: string; account?: string; host?: string; active?: boolean }) {
   const [sessions, setSessions] = useState<SessionRollup[]>([]);
   // Five seconds is the fastest poll on the dashboard, and it was the only one
   // with no gate at all: it kept asking from a panel behind another view, on a
   // hidden window, for as long as the app was open. `usePoll` covers both — see
   // the note in Alerts.
-  const load = () => { api.sessions(40, provider || undefined, undefined, host || undefined).then(setSessions).catch(() => {}); };
-  useEffect(() => { if (active) load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [active, provider, host]);
+  //
+  // The account follows the dashboard's filter like the provider and host do.
+  // It was passed as undefined, so on a hub, where one machine's sessions sit
+  // among every other machine's, picking an account narrowed the feed and the
+  // stats but not this list, and an account's older sessions stayed below the
+  // forty most recent.
+  const load = () => { api.sessions(40, provider || undefined, account || undefined, host || undefined).then(setSessions).catch(() => {}); };
+  useEffect(() => { if (active) load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [active, provider, account, host]);
   usePoll(active, load, 5000);
 
   const now = Date.now();
